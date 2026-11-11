@@ -43,10 +43,6 @@ struct RayTracingDispatchParams {
     bool cameraMovedLastFrame = false;
     bool diagnosticHalfTiles = false;
     bool isRestirActive = false;
-    Image* ffxDirectDiffuseImage = nullptr;
-    Image* ffxDirectSpecularImage = nullptr;
-    Image* ffxIndirectDiffuseImage = nullptr;
-    Image* ffxIndirectSpecularImage = nullptr;
 };
 
 class RayTracingOrchestrator {
@@ -104,6 +100,7 @@ public:
         const std::vector<char>& trainCode,
         const std::vector<char>& resolveCode
     );
+    void releaseNRC() noexcept { m_nrcManager.reset(); }
 
     /// Initializes ReSTIRManager (reservoir grid allocation is deferred until
     /// ReSTIR is first enabled; see Engine lazy-init path).

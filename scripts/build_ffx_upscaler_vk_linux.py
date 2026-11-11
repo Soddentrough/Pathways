@@ -8,7 +8,198 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
+
+SPIRV_VAL_BIN = shutil.which("spirv-val")
+
+
+def normalize_storage_image_formats(spv_bytes: bytes) -> bytes:
+    """
+    AMD FidelityFX SDK 2.4.0 FSR 3.1.6 precompiled Vulkan SPIR-V declares non-atomic
+    HLSL RWTexture2D<float/float2/float4> storage images with explicit formats
+    (Rgba32f, Rg32f, R32f, etc.) while binding R16F / RG16F / RGBA16F / RGBA8_UNORM
+    VkImageViews on the host. With shaderStorageImageReadWithoutFormat and
+    shaderStorageImageWriteWithoutFormat enabled on the Vulkan 1.4 device, setting
+    Format = Unknown (0) on non-atomic float storage OpTypeImages and deduplicating
+    resulting non-aggregate SPIR-V types makes all permutations 100% SPIR-V & VUID clean.
+    """
+    if len(spv_bytes) < 20 or (len(spv_bytes) % 4) != 0:
+        return spv_bytes
+    words = list(struct.unpack(f"<{len(spv_bytes) // 4}I", spv_bytes))
+    if words[0] != 0x07230203:
+        return spv_bytes
+
+    header = words[:5]
+    insts = []
+    pos = 5
+    nwords = len(words)
+    while pos < nwords:
+        wc = words[pos] >> 16
+        op = words[pos] & 0xFFFF
+        if wc == 0 or pos + wc > nwords:
+            return spv_bytes
+        insts.append([op, words[pos:pos + wc]])
+        pos += wc
+
+    caps = set()
+    ptr_pointee = {}
+    var_type = {}
+    arr_elem = {}
+    atomic_img_types = set()
+
+    for op, w in insts:
+        if op == 17 and len(w) >= 2:  # OpCapability
+            caps.add(w[1])
+        elif op in (28, 29) and len(w) >= 3:  # OpTypeArray / OpTypeRuntimeArray
+            arr_elem[w[1]] = w[2]
+        elif op == 32 and len(w) >= 4:  # OpTypePointer
+            ptr_pointee[w[1]] = w[3]
+        elif op == 59 and len(w) >= 4:  # OpVariable
+            var_type[w[2]] = w[1]
+        elif op == 60 and len(w) >= 4:  # OpImageTexelPointer
+            v_ptr_ty = var_type.get(w[3])
+            if v_ptr_ty is not None:
+                pointee = ptr_pointee.get(v_ptr_ty)
+                if pointee is not None:
+                    atomic_img_types.add(pointee)
+
+    expanded_atomic = set(atomic_img_types)
+    for t_id in list(atomic_img_types):
+        while t_id in arr_elem:
+            t_id = arr_elem[t_id]
+            expanded_atomic.add(t_id)
+
+    # Float storage formats in SPIR-V ImageFormat:
+    # 1=Rgba32f, 2=Rgba16f, 3=R32f, 6=Rg32f, 7=Rg16f, 8=R11fG11fB10f, 9=R16f
+    float_storage_formats = {1, 2, 3, 6, 7, 8, 9}
+    modified = False
+    for op, w in insts:
+        if op == 25 and len(w) >= 9:  # OpTypeImage
+            res_id = w[1]
+            sampled = w[7]
+            img_fmt = w[8]
+            if sampled == 2 and img_fmt in float_storage_formats and res_id not in expanded_atomic:
+                w[8] = 0  # ImageFormatUnknown
+                modified = True
+
+    if not modified:
+        return spv_bytes
+
+    # Pass 2: deduplicate non-aggregate OpType* instructions in declaration order so
+    # merged OpTypeImage -> Unknown declarations never trigger duplicate OpTypeImage /
+    # OpTypeArray / OpTypePointer / OpTypeFunction errors in spirv-val.
+    non_agg_types = {19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32, 33}
+    seen_types = {}
+    type_remap = {}
+
+    def resolve_type(tid: int) -> int:
+        while tid in type_remap:
+            tid = type_remap[tid]
+        return tid
+
+    # First scan type section to build complete type_remap before touching decorations/names
+    kept_after_types = []
+    for op, w in insts:
+        if op in (23, 24, 25, 27, 28, 29) and len(w) >= 3:
+            w[2] = resolve_type(w[2])
+        elif op == 30 and len(w) >= 2:  # OpTypeStruct (aggregate: remap members, never dedup)
+            for i in range(2, len(w)):
+                w[i] = resolve_type(w[i])
+        elif op == 32 and len(w) >= 4:  # OpTypePointer
+            w[3] = resolve_type(w[3])
+        elif op == 33 and len(w) >= 3:  # OpTypeFunction
+            for i in range(2, len(w)):
+                w[i] = resolve_type(w[i])
+        elif op == 39 and len(w) >= 3:  # OpTypeForwardPointer
+            w[1] = resolve_type(w[1])
+        elif op == 4456 and len(w) >= 3:  # OpTypeCooperativeMatrixKHR
+            w[2] = resolve_type(w[2])
+
+        if op in non_agg_types:
+            key = (op, tuple(w[2:]))
+            if key in seen_types:
+                type_remap[w[1]] = seen_types[key]
+                continue
+            seen_types[key] = w[1]
+        kept_after_types.append((op, w))
+
+    # Literal-in-w[1] opcodes (never carry Result Type <id> in w[1])
+    literal_w1_ops = {
+        2, 3, 4, 7, 8, 10, 11, 14, 15, 16, 17,
+        225, 246, 247, 250, 252, 253, 255, 317, 330, 331,
+    }
+    type_ops = non_agg_types | {30, 31, 34, 35, 36, 37, 38, 39, 4456, 4472, 5341}
+
+    seen_decorates = set()
+    final_insts = []
+    inserted_caps = False
+
+    def emit_extra_caps():
+        nonlocal inserted_caps
+        if inserted_caps:
+            return
+        inserted_caps = True
+        if 55 not in caps:  # StorageImageReadWithoutFormat
+            final_insts.append([(2 << 16) | 17, 55])
+        if 56 not in caps:  # StorageImageWriteWithoutFormat
+            final_insts.append([(2 << 16) | 17, 56])
+
+    for op, w in kept_after_types:
+        if op != 17 and not inserted_caps:
+            emit_extra_caps()
+
+        if op == 5 and len(w) >= 2:  # OpName
+            if w[1] in type_remap:
+                continue
+        elif op == 6 and len(w) >= 2:  # OpMemberName
+            if w[1] in type_remap:
+                continue
+        elif op in (71, 332, 5632) and len(w) >= 2:  # OpDecorate*
+            w[1] = resolve_type(w[1])
+            dkey = (op, tuple(w[1:]))
+            if dkey in seen_decorates:
+                continue
+            seen_decorates.add(dkey)
+        elif op in (72, 5633):  # OpMemberDecorate*
+            pass
+        elif op == 74 and len(w) >= 2:  # OpGroupDecorate
+            new_targets = []
+            seen_t = set()
+            for tid in w[2:]:
+                rt = resolve_type(tid)
+                if rt not in seen_t:
+                    seen_t.add(rt)
+                    new_targets.append(rt)
+            w = [((2 + len(new_targets)) << 16) | 74, w[1]] + new_targets
+        elif op not in type_ops and op not in literal_w1_ops:
+            if len(w) >= 2 and w[1] in type_remap:
+                w[1] = resolve_type(w[1])
+            if op == 54 and len(w) >= 5 and w[4] in type_remap:  # OpFunction FunctionType
+                w[4] = resolve_type(w[4])
+
+        final_insts.append(w)
+
+    out_words = list(header)
+    for w in final_insts:
+        out_words.extend(w)
+    out_bytes = struct.pack(f"<{len(out_words)}I", *out_words)
+
+    if SPIRV_VAL_BIN:
+        with tempfile.NamedTemporaryFile(suffix=".spv", delete=True) as tmp:
+            tmp.write(out_bytes)
+            tmp.flush()
+            subprocess.check_call([
+                SPIRV_VAL_BIN,
+                tmp.name,
+                "--relax-block-layout",
+                "--scalar-block-layout",
+                "--allow-localsizeid",
+                "--target-env",
+                "vulkan1.4",
+            ])
+
+    return out_bytes
 
 
 def main():
@@ -194,7 +385,7 @@ typedef union ffx_fsr3upscaler_{pass_name}_PermutationKey {{
                 blob_size, blob_va, entry_va = struct.unpack_from("<IxxxxQQ", data, e_off)
                 b_off = va_to_offset(blob_va)
                 raw_blob = data[b_off:b_off + blob_size]
-                spv = zlib.decompress(raw_blob[8:])
+                spv = normalize_storage_image_formats(zlib.decompress(raw_blob[8:]))
                 entry_name = read_cstr(entry_va)
 
                 hex_bytes = ", ".join(f"0x{b:02x}" for b in spv)

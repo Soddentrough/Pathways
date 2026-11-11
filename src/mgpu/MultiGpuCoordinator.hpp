@@ -127,14 +127,16 @@ public:
         const std::function<void(VkCommandBuffer)>& onPreRecord
     );
 
-    /// Records merge compute pass, memory barriers, FP16 radiance copy to G-Buffer, and running avg into activeCmd.
+    /// Records merge compute pass, memory barriers, G-Buffer history update, and running avg into activeCmd.
     void recordMergePass(
         VkCommandBuffer activeCmd,
         const MultiGpuFramePlan& plan,
         const MultiGpuPlanParams& params,
         PostProcessPipeline* postProcess,
         Image* frameImage,
-        Image* mlDiffuseImage
+        Image* mlDiffuseImage,
+        Image* normalDepthImage = nullptr,
+        Image* prevNormalDepthImage = nullptr
     );
 
     /// Awaits secondary GPU completion and syncs host/PCIe staging buffer if host fallback is active.
@@ -148,7 +150,9 @@ public:
         PostProcessPipeline* postProcess,
         Image* frameImage,
         Image* mlDiffuseImage,
-        VkSemaphore rtCompleteSemaphore
+        VkSemaphore rtCompleteSemaphore,
+        Image* normalDepthImage = nullptr,
+        Image* prevNormalDepthImage = nullptr
     );
 
     /// Populates semaphore wait lists for the final post-processing/presentation queue submission.

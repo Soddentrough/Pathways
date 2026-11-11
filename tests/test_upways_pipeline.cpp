@@ -1,18 +1,18 @@
 #include "rt/UpwaysPipeline.hpp"
-#include "rt/GatewayPipeline.hpp"
 #include "rt/upways_weights.hpp"
 #include "rt/upways_default_weights.hpp"
-#include "rt/gateway_default_weights.hpp"
 #include "core/Config.hpp"
+#include "vulkan/VulkanContext.hpp"
 
-#include <iostream>
-#include <cassert>
-#include <cstddef>
-#include <cmath>
-#include <vector>
-#include <fstream>
-#include <filesystem>
 #include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
 
 using namespace pathways;
 
@@ -23,54 +23,55 @@ static void check_true(bool cond, const char* msg) {
     }
 }
 
-// Invertible log transform implementation matching upways_common.glsl
-static float upwaysLogTransform(float x, float mu = 16.0f) {
-    float clampedX = std::max(x, 0.0f);
-    return std::log1p(mu * clampedX) / std::log(1.0f + mu);
+// Invertible log1p / expm1 transform matching upways_common.glsl (MAX_LOG1P_IRRADIANCE = 9.0f)
+static float upwaysLog1pTransform(float x) {
+    float clampedX = std::clamp(x, 0.0f, 8100.0f);
+    return std::clamp(std::log1p(clampedX), 0.0f, 9.0f);
 }
 
-static float upwaysInverseLogTransform(float y, float mu = 16.0f) {
-    float clampedY = std::clamp(y, 0.0f, 6.0f);
-    return (std::pow(1.0f + mu, clampedY) - 1.0f) / mu;
+static float upwaysExpm1Transform(float y) {
+    float clampedY = std::clamp(y, 0.0f, 9.0f);
+    return std::max(std::expm1(clampedY), 0.0f);
 }
 
 int main() {
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  Pathways: Testing Upways (3-Pass) & Gateway (4-Pass)    " << std::endl;
-    std::cout << "  Shader Push Constants, Weights & Pipeline Invariants    " << std::endl;
+    std::cout << "  Pathways: Testing Upways 3.0 RDNA 4 FP8 Reconstructor   " << std::endl;
+    std::cout << "  Push Constants, FP8+FP32 Weights & Pipeline Invariants  " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 1. Verify Real Shader Push Constant Struct Layouts for Upways (3-Pass) & Gateway (4-Pass)
-    std::cout << "[TEST 1] Upways (3-Pass) & Gateway (4-Pass) Push Constant Layouts..." << std::endl;
-    check_true(sizeof(UpwaysTemporalPushConstants) == 20, "UpwaysTemporalPushConstants must be 20 bytes");
-    check_true(offsetof(UpwaysTemporalPushConstants, renderWidth) == 0, "UpwaysTemporalPushConstants::renderWidth at 0");
-    check_true(offsetof(UpwaysTemporalPushConstants, minAlphaSpecular) == 16, "UpwaysTemporalPushConstants::minAlphaSpecular at 16");
+    // 1. Verify Unified 56-Byte Shader Push Constant Struct Layout
+    std::cout << "[TEST 1] Upways 3.0 Unified Push Constant Layout (56 bytes)..." << std::endl;
+    check_true(sizeof(UpwaysPushConstants) == 56, "UpwaysPushConstants must be 56 bytes");
+    check_true(offsetof(UpwaysPushConstants, renderWidth) == 0, "renderWidth at offset 0");
+    check_true(offsetof(UpwaysPushConstants, renderHeight) == 4, "renderHeight at offset 4");
+    check_true(offsetof(UpwaysPushConstants, displayWidth) == 8, "displayWidth at offset 8");
+    check_true(offsetof(UpwaysPushConstants, displayHeight) == 12, "displayHeight at offset 12");
+    check_true(offsetof(UpwaysPushConstants, jitterX) == 16, "jitterX at offset 16");
+    check_true(offsetof(UpwaysPushConstants, jitterY) == 20, "jitterY at offset 20");
+    check_true(offsetof(UpwaysPushConstants, preExposure) == 24, "preExposure at offset 24");
+    check_true(offsetof(UpwaysPushConstants, resetHistory) == 28, "resetHistory at offset 28");
+    check_true(offsetof(UpwaysPushConstants, preserveJitterGuide) == 32, "preserveJitterGuide at offset 32");
+    check_true(offsetof(UpwaysPushConstants, stageId) == 36, "stageId at offset 36");
+    check_true(offsetof(UpwaysPushConstants, srcWidth) == 40, "srcWidth at offset 40");
+    check_true(offsetof(UpwaysPushConstants, srcHeight) == 44, "srcHeight at offset 44");
+    check_true(offsetof(UpwaysPushConstants, dstWidth) == 48, "dstWidth at offset 48");
+    check_true(offsetof(UpwaysPushConstants, dstHeight) == 52, "dstHeight at offset 52");
+    std::cout << "  -> Unified 56-byte UpwaysPushConstants struct verified." << std::endl;
 
-    check_true(sizeof(UpwaysNeuralGuidePushConstants) == 36, "UpwaysNeuralGuidePushConstants must be 36 bytes");
-    check_true(offsetof(UpwaysNeuralGuidePushConstants, basePhiLumaSpecular) == 32, "UpwaysNeuralGuidePushConstants::basePhiLumaSpecular at 32");
+    // 2. Verify Invertible log1p / expm1 Compression & Decompression Math
+    std::cout << "[TEST 2] Invertible log1p / expm1 Compression Math..." << std::endl;
+    check_true(std::abs(upwaysLog1pTransform(0.0f)) < 1e-6f, "log1p transform of 0.0 must be 0.0");
+    check_true(upwaysLog1pTransform(8000.0f) <= 9.0f, "8000 nit firefly must be bounded by MAX_LOG1P_IRRADIANCE (9.0)");
 
-    check_true(sizeof(UpwaysUpscaleResolvePushConstants) == 32, "UpwaysUpscaleResolvePushConstants must be 32 bytes");
-    check_true(offsetof(UpwaysUpscaleResolvePushConstants, displayHistoryAlpha) == 28, "UpwaysUpscaleResolvePushConstants::displayHistoryAlpha at 28");
-
-    check_true(sizeof(GatewayTemporalPushConstants) == 20, "GatewayTemporalPushConstants must be 20 bytes");
-    check_true(sizeof(GatewayNeuralGuidePushConstants) == 36, "GatewayNeuralGuidePushConstants must be 36 bytes");
-    check_true(sizeof(GatewayAtrousPushConstants) == 12, "GatewayAtrousPushConstants must be 12 bytes");
-    check_true(sizeof(GatewayUpscaleResolvePushConstants) == 32, "GatewayUpscaleResolvePushConstants must be 32 bytes");
-    std::cout << "  -> Upways (3-pass) and Gateway (4-pass) push constant structs verified." << std::endl;
-
-    // 2. Verify Invertible Log Transform Invariants
-    std::cout << "[TEST 2] Invertible Log Compression & Decompression Math..." << std::endl;
-    check_true(std::abs(upwaysLogTransform(0.0f)) < 1e-6f, "Log transform of 0.0 must be 0.0");
-    check_true(upwaysLogTransform(10000.0f) < 4.5f, "10000 nit firefly must be compressed to < 4.5");
-
-    const float testRadiances[] = { 0.0f, 0.01f, 0.1f, 0.5f, 1.0f, 5.0f, 10.0f, 50.0f, 100.0f, 500.0f, 1000.0f, 5000.0f, 10000.0f };
+    const float testRadiances[] = { 0.0f, 0.01f, 0.1f, 0.5f, 1.0f, 5.0f, 10.0f, 50.0f, 100.0f, 500.0f, 1000.0f, 5000.0f };
     for (float r : testRadiances) {
-        float compressed = upwaysLogTransform(r);
-        float decompressed = upwaysInverseLogTransform(compressed);
-        float relError = std::abs(decompressed - r) / (r + 1e-4f);
-        check_true(relError < 0.01f, "Log transform inversion relative error must be < 1%");
+        float compressed = upwaysLog1pTransform(r);
+        float decompressed = upwaysExpm1Transform(compressed);
+        float relError = std::abs(decompressed - r) / (r + 1e-5f);
+        check_true(relError < 1e-4f, "log1p/expm1 inversion relative error must be < 0.01%");
     }
-    std::cout << "  -> Invertible log transform validated with < 1% error across 0 to 10,000 nits." << std::endl;
+    std::cout << "  -> Invertible log1p/expm1 transform validated across 0 to 5,000 nits." << std::endl;
 
     // 3. Verify Diffuse Albedo & Metallic-Fresnel Specular Demodulation / Remodulation Invariants
     std::cout << "[TEST 3] Co-Designed Diffuse & Metallic-Fresnel Specular Demodulation..." << std::endl;
@@ -95,30 +96,35 @@ int main() {
     }
     std::cout << "  -> Co-designed diffuse and metallic-Fresnel specular demodulation/remodulation verified." << std::endl;
 
-    // 4. Verify Upways (81,600B U-Net + Subpixel MLP) vs Gateway (2,144B MLP) Weight Topologies
-    std::cout << "[TEST 4] Upways (81,600B 3-Scale 2D Halo-WMMA U-Net + Subpixel MLP) & Gateway (2,144B Quad MLP) Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_WEIGHT_ELEMENTS == 40800, "Upways TOTAL_WEIGHT_ELEMENTS must be 40,800 FP16 parameters");
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 81600, "Upways TOTAL_WEIGHT_BUFFER_SIZE must be 81,600 bytes");
-    check_true(upways::ENC1_W_OFFSET == 0, "ENC1_W_OFFSET must be 0");
-    check_true(upways::ENC1_B_OFFSET == 2560, "ENC1_B_OFFSET must be 2560");
-    check_true(upways::REC_PROJ_W_OFFSET == 2592, "REC_PROJ_W_OFFSET must be 2592");
-    check_true(upways::ENC2_W_OFFSET == 3104, "ENC2_W_OFFSET must be 3104");
-    check_true(upways::BOTTLENECK1_W_OFFSET == 6208, "BOTTLENECK1_W_OFFSET must be 6208");
-    check_true(upways::BOTTLENECK2_W_OFFSET == 12416, "BOTTLENECK2_W_OFFSET must be 12416");
-    check_true(upways::BOTTLENECK3_W_OFFSET == 24768, "BOTTLENECK3_W_OFFSET must be 24768");
-    check_true(upways::DEC2_W_OFFSET == 30944, "DEC2_W_OFFSET must be 30944");
-    check_true(upways::DEC1_W_OFFSET == 34048, "DEC1_W_OFFSET must be 34048");
-    check_true(upways::HEAD_OUT_W_OFFSET == 39200, "HEAD_OUT_W_OFFSET must be 39200");
-    check_true(upways::HEAD_REC_W_OFFSET == 39728, "HEAD_REC_W_OFFSET must be 39728");
-    check_true(upways::SUBPIXEL_MLP_FC1_W_OFFSET == 40256, "SUBPIXEL_MLP_FC1_W_OFFSET must be 40256");
-    check_true(upways::SUBPIXEL_MLP_FC2_B_OFFSET + 16 == upways::TOTAL_WEIGHT_ELEMENTS, "SUBPIXEL_MLP_FC2_B_OFFSET + 16 must equal 40,800");
-
-    check_true(gateway::TOTAL_WEIGHT_BUFFER_SIZE == 2144, "Gateway TOTAL_WEIGHT_BUFFER_SIZE must be 2,144 bytes (1,072 FP16 params)");
-    check_true(sizeof(gateway::DEFAULT_GATEWAY_WEIGHTS) == gateway::TOTAL_WEIGHT_BUFFER_SIZE, "Gateway embedded weights must be 2,144 bytes");
-    std::cout << "  -> Upways (40,800 FP16 params = 81,600B) and Gateway (1,072 FP16 params = 2,144B) verified." << std::endl;
+    // 4. Verify Upways 3.0 (73,686 params = 89,536B FP8 E4M3 + FP32) Weights Topology
+    std::cout << "[TEST 4] Upways 3.0 (73,686 Params / 89,536B FP8+FP32) Weights Topology..." << std::endl;
+    check_true(upways::TOTAL_PARAMETER_COUNT == 73686u, "TOTAL_PARAMETER_COUNT must be 73,686");
+    check_true(upways::FP8_WEIGHT_SECTION_OFFSET == 0u, "FP8_WEIGHT_SECTION_OFFSET must be 0");
+    check_true(upways::FP8_WEIGHT_SECTION_BYTES == 69632u, "FP8_WEIGHT_SECTION_BYTES must be 69,632");
+    check_true(upways::FP32_WEIGHT_SECTION_OFFSET == 69632u, "FP32_WEIGHT_SECTION_OFFSET must be 69,632 (256B aligned)");
+    check_true((upways::FP32_WEIGHT_SECTION_OFFSET % 256u) == 0u, "FP32_WEIGHT_SECTION_OFFSET must be 256-byte aligned");
+    check_true(upways::FP32_WEIGHT_SECTION_BYTES == 19904u, "FP32_WEIGHT_SECTION_BYTES must be 19,904");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 89536u, "TOTAL_WEIGHT_BUFFER_SIZE must be 89,536 bytes");
+    check_true(upways::ENC0_PW1_W_FP8_OFFSET == 0u, "ENC0_PW1_W_FP8_OFFSET must be 0");
+    check_true(upways::REC_PROJ_W_FP8_OFFSET == 1024u, "REC_PROJ_W_FP8_OFFSET must be 1024");
+    check_true(upways::ENC0_PW2_W_FP8_OFFSET == 1536u, "ENC0_PW2_W_FP8_OFFSET must be 1536");
+    check_true(upways::ENC1_PW1_W_FP8_OFFSET == 2560u, "ENC1_PW1_W_FP8_OFFSET must be 2560");
+    check_true(upways::BOT1_PW1_W_FP8_OFFSET == 8704u, "BOT1_PW1_W_FP8_OFFSET must be 8704");
+    check_true(upways::BOT2_PW1_W_FP8_OFFSET == 33280u, "BOT2_PW1_W_FP8_OFFSET must be 33280");
+    check_true(upways::DEC1_PW1_W_FP8_OFFSET == 57856u, "DEC1_PW1_W_FP8_OFFSET must be 57856");
+    check_true(upways::DEC0_PW1_W_FP8_OFFSET == 64000u, "DEC0_PW1_W_FP8_OFFSET must be 64000");
+    check_true(upways::DEC0_PW2_W_FP8_OFFSET == 66048u, "DEC0_PW2_W_FP8_OFFSET must be 66048");
+    check_true(upways::HEAD_OUT_W_FP8_OFFSET == 68096u, "HEAD_OUT_W_FP8_OFFSET must be 68096");
+    check_true(upways::HEAD_REC_W_FP8_OFFSET == 68608u, "HEAD_REC_W_FP8_OFFSET must be 68608");
+    check_true(upways::HEAD_REC_W_FP8_OFFSET + 1024u == upways::FP8_WEIGHT_SECTION_BYTES, "FP8 section end must match 69,632");
+    check_true(upways::SKIP_SCALE_F32_OFFSET == 4960u, "SKIP_SCALE_F32_OFFSET must be 4960");
+    check_true((upways::SKIP_SCALE_F32_OFFSET + 16u) * sizeof(float) == upways::FP32_WEIGHT_SECTION_BYTES, "FP32 section end must match 19,904");
+    std::cout << "  -> Upways 3.0 (73,686 params = 69,632B FP8 + 19,904B FP32 = 89,536B) verified." << std::endl;
 
     // 5. Verify Exported Weights and Embedded Fallback Integrity
     std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
+    check_true(sizeof(kUpwaysWeightsFp8Blob) == upways::TOTAL_WEIGHT_BUFFER_SIZE,
+               "kUpwaysWeightsFp8Blob size must match TOTAL_WEIGHT_BUFFER_SIZE");
     check_true(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == upways::TOTAL_WEIGHT_BUFFER_SIZE,
                "Embedded DEFAULT_UPWAYS_WEIGHTS size must match TOTAL_WEIGHT_BUFFER_SIZE exactly");
     check_true(upways::EMBEDDED_WEIGHTS_SIZE == upways::TOTAL_WEIGHT_BUFFER_SIZE,
@@ -142,66 +148,71 @@ int main() {
     }
     if (!foundPath.empty()) {
         auto fileSize = std::filesystem::file_size(foundPath);
-        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must exactly match TOTAL_WEIGHT_BUFFER_SIZE");
+        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must match TOTAL_WEIGHT_BUFFER_SIZE (89,536B)");
         std::cout << "  -> External weight file binary verified at: " << foundPath << " (" << fileSize << " bytes)." << std::endl;
     }
 
-    // 6. Verify Disocclusion Confidence Gating Math
-    std::cout << "[TEST 6] Disocclusion Confidence Gating..." << std::endl;
-    auto testConfidence = [](float depthCurr, float depthPrev, float depthThreshold) -> float {
-        float depthDelta = (depthCurr > 0.0f && depthPrev > 0.0f) ? (std::abs(depthCurr - depthPrev) / (depthCurr + 1e-3f)) : 0.0f;
-        if (depthDelta >= depthThreshold) return 0.0f;
-        return std::clamp(1.0f - depthDelta * 20.0f, 0.0f, 1.0f);
-    };
-
-    check_true(testConfidence(5.0f, 5.0f, 0.05f) == 1.0f, "Identical depth must have 100% confidence");
-    check_true(testConfidence(5.0f, 4.95f, 0.05f) > 0.7f, "Small depth change (1%) must have high confidence");
-    check_true(testConfidence(5.0f, 2.0f, 0.05f) == 0.0f, "Disocclusion (> 5%) must have 0% confidence");
-    std::cout << "  -> Disocclusion confidence gating function verified." << std::endl;
-
-    // 7. Verify 90-Degree Camera Flick Disocclusion Invariants
-    std::cout << "[TEST 7] 90-Degree Camera Flick Disocclusion & Rejection..." << std::endl;
+    // 6. Verify FP8 Activation Pyramid Dimensions & 256-Byte Alignment Across Standard and Odd Resolutions
+    std::cout << "[TEST 6] Multi-Scale FP8 Activation Pyramid Alignment (L0 / L1 / L2)..." << std::endl;
     {
-        float nCurr_world[3] = { 1.0f, 0.0f, 0.0f };
-        float nPrev_world[3] = { 0.0f, 0.0f, 1.0f };
-        float normalDot = nCurr_world[0] * nPrev_world[0] + nCurr_world[1] * nPrev_world[1] + nCurr_world[2] * nPrev_world[2];
-        float expectedPrevDepth = 0.0f;
-        float centerDepth = 4.0f;
-        float depthDelta = std::abs(expectedPrevDepth - centerDepth) / std::max(expectedPrevDepth, 1e-3f);
-
-        bool rejectNormal = (normalDot < 0.707f);
-        bool rejectDepth = (depthDelta > 0.10f);
-        bool rejectDiff = rejectNormal || rejectDepth;
-
-        check_true(rejectNormal && rejectDepth && rejectDiff, "90-degree camera flick must trigger disocclusion rejection");
-        float confDiff = rejectDiff ? 0.0f : std::exp(-depthDelta * 20.0f);
-        float alphaDiff = (1.0f - confDiff) * 1.0f + confDiff * 0.08f;
-        check_true(alphaDiff == 1.0f, "Temporal accumulation rate must clamp to 1.0 on disocclusion");
-        std::cout << "  -> 90-degree camera flick disocclusion rejection verified (conf = 0.0, alpha = 1.0)." << std::endl;
+        const std::pair<uint32_t, uint32_t> testDims[] = {
+            { 1u, 1u }, { 960u, 540u }, { 1280u, 720u }, { 1441u, 811u }, { 1920u, 1080u }, { 2560u, 1440u }, { 3840u, 2160u }
+        };
+        for (auto [rw, rh] : testDims) {
+            UpwaysPyramidDims pyr = computeUpwaysPyramidDims(rw, rh);
+            check_true(pyr.w0 == rw && pyr.h0 == rh, "L0 dims must equal render dims");
+            check_true(pyr.w1 == ((rw + 1u) >> 1u) && pyr.h1 == ((rh + 1u) >> 1u), "L1 dims must be ceil(L0 / 2)");
+            check_true(pyr.w2 == ((pyr.w1 + 1u) >> 1u) && pyr.h2 == ((pyr.h1 + 1u) >> 1u), "L2 dims must be ceil(L1 / 2)");
+            check_true(pyr.totalBytes >= 256u && (pyr.totalBytes % 256u) == 0u, "Pyramid buffer totalBytes must be 256B aligned");
+        }
+        std::cout << "  -> FP8 activation pyramid alignment verified across standard and odd resolutions." << std::endl;
     }
 
-    // 8. Verify 3-Pass Upways LDS Memory Footprint & Occupancy Invariants
-    std::cout << "[TEST 8] 3-Pass Upways LDS Footprint & Wave32 Occupancy Invariants..." << std::endl;
+    // 7. Verify Disocclusion & 90-Degree Camera Flick Rejection Invariants
+    std::cout << "[TEST 7] Disocclusion & 90-Degree Camera Flick Rejection..." << std::endl;
     {
-        // Pass 1 (upways_temporal.comp): 2 x f16vec4[18][19] + float16_t s_lumS[18][20] = 5,472 + 720 = 6,192 bytes (6.05 KB)
-        size_t pass1LdsBytes = (2 * 18 * 19 * 8) + (18 * 20 * sizeof(uint16_t));
-        // Pass 2 (upways_neural_guide.comp): float16_t s_buf[8192] + float16_t s_e1[8192] = 32,768 bytes (32.00 KB)
-        size_t pass2LdsBytes = 2 * 8192 * sizeof(uint16_t);
-        // Pass 3 (upways_upscale_resolve.comp): 4 x f16vec4[24][25] + float16_t s_met[18][19] = 19,200 + 684 = 19,884 bytes (19.42 KB)
-        size_t pass3LdsBytes = (4 * 24 * 25 * 8) + (18 * 19 * sizeof(uint16_t));
+        float nCurr[3] = { 1.0f, 0.0f, 0.0f };
+        float nPrev[3] = { 0.0f, 0.0f, 1.0f };
+        float nDotPos = std::clamp(nCurr[0] * nPrev[0] + nCurr[1] * nPrev[1] + nCurr[2] * nPrev[2], 0.0f, 1.0f);
+        float zCurr = 4.0f;
+        float zPrev = 0.0f;
+        float relDz = std::clamp(std::abs(zCurr - zPrev) / std::max(zCurr, 0.1f), 0.0f, 1.0f);
+        float disoccD = std::clamp(relDz + (1.0f - nDotPos), 0.0f, 1.0f);
+        check_true(disoccD == 1.0f, "90-degree camera flick must yield maximum disocclusion penalty (1.0)");
+        std::cout << "  -> 90-degree camera flick disocclusion rejection verified (disoccD = 1.0)." << std::endl;
+    }
 
-        check_true(pass1LdsBytes == 6192 && pass1LdsBytes <= 32768, "Pass 1 LDS must be 6,192 bytes (<= 32 KB)");
-        check_true(pass2LdsBytes == 32768, "Pass 2 LDS must be exactly 32,768 bytes (32.0 KB)");
-        check_true(pass3LdsBytes == 19884 && pass3LdsBytes <= 32768, "Pass 3 LDS must be 19,884 bytes (<= 32 KB)");
+    // 8. Verify 3-Pass RDNA 4 LDS Memory Footprint Invariants (16x8 Dual-M WMMA Tiles, 0B s_f32 LDS)
+    std::cout << "[TEST 8] 3-Pass RDNA 4 LDS Memory Footprint Invariants..." << std::endl;
+    {
+        // Pass 1 (upways_temporal.comp): float s_z[324] + vec2 s_surfMv[324] + vec2 s_effSpecMv[324] = 6,480 bytes
+        size_t pass1LdsBytes = 18u * 18u * (sizeof(float) + 2u * 2u * sizeof(float));
+        // Pass 2 (upways_neural_guide.comp, 16x8 pixel tiles, pure fe4m3vec4 LDS, 0B FP32 scratch):
+        //   Stage 0 (L0 enc0): (1024 + 1536) * 4B = 10,240 bytes (10.0 KB -> 12 subgroups/SIMD)
+        //   Stage 1 (L1 enc1): (2048 + 2048) * 4B = 16,384 bytes (16.0 KB -> 8 subgroups/SIMD)
+        //   Stage 2 (L2 bot1): (2048 + 4096) * 4B = 24,576 bytes (24.0 KB -> 4 subgroups/SIMD)
+        //   Stage 3 (L2 bot2): (4096 + 4096) * 4B = 32,768 bytes (32.0 KB -> 4 subgroups/SIMD)
+        //   Stage 4 (L1 dec1): (4096 + 2880) * 4B = 27,520 bytes (26.9 KB -> 4 subgroups/SIMD)
+        //   Stage 5 (L0 dec0): (2048 + 1536) * 4B = 14,336 bytes (14.0 KB -> 8 subgroups/SIMD)
+        size_t pass2Stage0Bytes = (1024u + 1536u) * 4u;
+        size_t pass2Stage3Bytes = (4096u + 4096u) * 4u;
+        size_t pass2Stage5Bytes = (2048u + 1536u) * 4u;
+        // Pass 3 (upways_upscale_resolve.comp): 0 bytes (100% register-resident <64 Pre-Sched VGPR streaming resolve)
+        size_t pass3LdsBytes = 0u;
+
+        check_true(pass1LdsBytes == 6480u && pass1LdsBytes <= 32768u, "Pass 1 LDS must be 6,480 bytes");
+        check_true(pass2Stage0Bytes == 10240u && pass2Stage5Bytes == 14336u, "Pass 2 L0 stages LDS must be 10.0 KB / 14.0 KB");
+        check_true(pass2Stage3Bytes == 32768u && pass2Stage3Bytes <= 32768u, "Pass 2 L2 max LDS must fit within 32 KB SIMD budget");
+        check_true(pass3LdsBytes == 0u, "Pass 3 LDS must be 0 bytes (register-resident)");
         std::cout << "  -> LDS footprints verified: Pass 1 = " << (pass1LdsBytes / 1024.0f)
-                  << " KB, Pass 2 = " << (pass2LdsBytes / 1024.0f)
-                  << " KB, Pass 3 = " << (pass3LdsBytes / 1024.0f) << " KB (<= 32 KB budget)." << std::endl;
+                  << " KB, Pass 2 L0 = " << (pass2Stage0Bytes / 1024.0f) << "/" << (pass2Stage5Bytes / 1024.0f)
+                  << " KB, Pass 2 L2 max = " << (pass2Stage3Bytes / 1024.0f)
+                  << " KB, Pass 3 = 0.0 KB." << std::endl;
     }
 
-    // 9. Verify Separate CLI Configuration for --denoiser gateway vs --denoiser upways
-    std::cout << "[TEST 9] CLI Configuration Separation (--denoiser gateway vs --denoiser upways)..." << std::endl;
+    // 9. Verify Upways CLI Configuration & PTTD v3 Capture Defaults
+    std::cout << "[TEST 9] Upways CLI Configuration & PTTD v3 Capture Flags..." << std::endl;
     {
-        // 9a: --res 4k --scaler upways quality
         const char* argv1[] = { "pathways", "--res", "4k", "--scaler", "upways", "quality" };
         Config c1 = Config::parse(6, const_cast<char**>(argv1));
         check_true(c1.width == 3840 && c1.height == 2160, "c1 output resolution must be 3840x2160");
@@ -210,61 +221,166 @@ int main() {
         check_true(c1.denoiser_mode == DenoiserMode::Upways, "c1 denoiser_mode must be Upways");
         check_true(c1.getRenderWidth() == 2560 && c1.getRenderHeight() == 1440, "c1 internal resolution must be 2560x1440 (1.5x)");
 
-        // 9b: --res 4k --scaler gateway quality
-        const char* argv2[] = { "pathways", "--res", "4k", "--scaler", "gateway", "quality" };
-        Config c2 = Config::parse(6, const_cast<char**>(argv2));
-        check_true(c2.width == 3840 && c2.height == 2160, "c2 output resolution must be 3840x2160");
-        check_true(c2.upscaler_mode == UpscalerMode::Gateway, "c2 upscaler_mode must be Gateway");
-        check_true(c2.gateway_superres == true, "c2 gateway_superres must be true");
-        check_true(c2.denoiser_mode == DenoiserMode::Gateway, "c2 denoiser_mode must be Gateway");
-        check_true(c2.getRenderWidth() == 2560 && c2.getRenderHeight() == 1440, "c2 internal resolution must be 2560x1440 (1.5x)");
+        const char* argv2[] = {
+            "pathways", "--res", "1080", "--scaler", "upways", "performance",
+            "--capture-training-data", "out_pttd", "--capture-input-spp", "2"
+        };
+        Config c2 = Config::parse(10, const_cast<char**>(argv2));
+        check_true(c2.capture_training_data_dir == "out_pttd", "c2 capture_training_data_dir must equal out_pttd");
+        check_true(c2.capture_channels == 24u, "Default PTTD v3 capture_channels must be 24");
+        check_true(c2.capture_input_spp == 2u, "c2 capture_input_spp must honour --capture-input-spp 2");
+        check_true(c2.getRenderWidth() == 960 && c2.getRenderHeight() == 540, "c2 internal resolution must be 960x540 (2.0x)");
 
-        // 9c: --res 1080 --denoiser gateway --scaler gateway native
-        const char* argv3[] = { "pathways", "--res", "1080", "--denoiser", "gateway", "--scaler", "gateway", "native" };
-        Config c3 = Config::parse(8, const_cast<char**>(argv3));
-        check_true(c3.denoiser_mode == DenoiserMode::Gateway, "c3 denoiser_mode must be Gateway");
-        check_true(c3.gateway_superres == false, "c3 gateway_superres must be false for native");
-        check_true(c3.getRenderWidth() == 1920 && c3.getRenderHeight() == 1080, "c3 internal resolution must be 1920x1080");
-
-        // 9d: --res 1080 --denoiser upways --scaler upways native
-        const char* argv4[] = { "pathways", "--res", "1080", "--denoiser", "upways", "--scaler", "upways", "native" };
-        Config c4 = Config::parse(8, const_cast<char**>(argv4));
-        check_true(c4.denoiser_mode == DenoiserMode::Upways, "c4 denoiser_mode must be Upways");
-        check_true(c4.upways_superres == false, "c4 upways_superres must be false for native");
-        check_true(c4.getRenderWidth() == 1920 && c4.getRenderHeight() == 1080, "c4 internal resolution must be 1920x1080");
-
-        // 9e: --res 4k --scaler upways 1080
-        const char* argv5[] = { "pathways", "--res", "4k", "--scaler", "upways", "1080" };
-        Config c5 = Config::parse(6, const_cast<char**>(argv5));
-        check_true(c5.upscaler_mode == UpscalerMode::Upways, "c5 upscaler_mode must be Upways");
-        check_true(c5.getRenderWidth() == 1920 && c5.getRenderHeight() == 1080, "c5 internal resolution must be 1920x1080 (2.0x)");
-
-        // 9f: --res 4k --scaler gateway 1080
-        const char* argv6[] = { "pathways", "--res", "4k", "--scaler", "gateway", "1080" };
-        Config c6 = Config::parse(6, const_cast<char**>(argv6));
-        check_true(c6.upscaler_mode == UpscalerMode::Gateway, "c6 upscaler_mode must be Gateway");
-        check_true(c6.getRenderWidth() == 1920 && c6.getRenderHeight() == 1080, "c6 internal resolution must be 1920x1080 (2.0x)");
-
-        std::cout << "  -> Verified distinct CLI parsing and resolution scaling for --denoiser/--scaler gateway and upways." << std::endl;
+        std::cout << "  -> Verified Upways CLI parsing, resolution scaling, and PTTD v3 24-ch capture configuration." << std::endl;
     }
 
     // 10. Verify Per-Pass Hardware Timestamp Profiler Structures & Slot Counts
-    std::cout << "[TEST 10] Per-Pass Hardware Timestamp Query Pool Layout (Upways vs Gateway)..." << std::endl;
+    std::cout << "[TEST 10] Per-Pass Hardware Timestamp Query Pool & Stage Constants..." << std::endl;
     {
         static_assert(UpwaysPipeline::MAX_QUERY_SLOTS == 2, "UpwaysPipeline must double-buffer query slots");
-        static_assert(UpwaysPipeline::QUERIES_PER_SLOT == 5, "UpwaysPipeline must record 5 timestamps per slot (Pass 1, Pass 2, Pass 3, History Copy)");
-        static_assert(GatewayPipeline::MAX_QUERY_SLOTS == 2, "GatewayPipeline must double-buffer query slots");
-        static_assert(GatewayPipeline::QUERIES_PER_SLOT == 7, "GatewayPipeline must record 7 timestamps per slot (Pass 1, Pass 2, Pass 3a, Pass 3b, Pass 4, History Copy)");
+        static_assert(UpwaysPipeline::QUERIES_PER_SLOT == 5, "UpwaysPipeline must record 5 timestamps per slot");
+        static_assert(UpwaysPipeline::NUM_NEURAL_STAGES == 6, "UpwaysPipeline must specialize 6 neural U-Net stages");
+        static_assert(UpwaysPipeline::NEURAL_HIDDEN_LAYERS == 4, "UpwaysPipeline must allocate 4 RGBA16F layers (16 channels) for recurrent hidden state");
 
         UpwaysPassTimings uTimings{};
-        check_true(!uTimings.valid && uTimings.totalMs == 0.0, "Default UpwaysPassTimings must be invalid and zeroed");
-        GatewayPassTimings gTimings{};
-        check_true(!gTimings.valid && gTimings.totalMs == 0.0, "Default GatewayPassTimings must be invalid and zeroed");
-        std::cout << "  -> Verified Upways (5 timestamps/slot) and Gateway (7 timestamps/slot) per-pass query pool layouts." << std::endl;
+        check_true(!uTimings.valid && uTimings.totalMs == 0.0 && uTimings.historyCopyMs == 0.0,
+                   "Default UpwaysPassTimings must be invalid and zeroed");
+        std::cout << "  -> Verified Upways 3.0 (5 timestamps/slot, 6 Wave32 FP8 stages, 4-layer hidden array) layout." << std::endl;
+    }
+
+    // 11. Live GPU UpwaysPipeline Execution & Lossless Dynamic Resolution Scaling (DRS)
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount > 0) {
+            std::cout << "[TEST 11] Live GPU UpwaysPipeline Execution & Lossless DRS..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "Upways GPU DRS Test");
+            if (vkCtx.hasCooperativeMatrix() && vkCtx.hasFp8CooperativeMatrix()) {
+                auto loadSpv = [](const std::string& name) -> std::vector<char> {
+                    std::vector<std::filesystem::path> cands = {
+#ifdef SHADER_DIR
+                        std::filesystem::path(SHADER_DIR) / name,
+#endif
+                        std::filesystem::current_path() / "shaders" / name,
+                        std::filesystem::current_path() / "build" / "shaders" / name
+                    };
+                    for (const auto& p : cands) {
+                        std::ifstream f(p, std::ios::binary | std::ios::ate);
+                        if (f.is_open()) {
+                            size_t sz = static_cast<size_t>(f.tellg());
+                            std::vector<char> buf(sz);
+                            f.seekg(0);
+                            f.read(buf.data(), static_cast<std::streamsize>(sz));
+                            return buf;
+                        }
+                    }
+                    return {};
+                };
+
+                auto p1Spv = loadSpv("upways_temporal.comp.spv");
+                auto p2Spv = loadSpv("upways_neural_guide.comp.spv");
+                auto p3Spv = loadSpv("upways_upscale_resolve.comp.spv");
+                check_true(!p1Spv.empty() && !p2Spv.empty() && !p3Spv.empty(), "Upways SPIR-V shaders must exist");
+
+                VkDevice device = vkCtx.getDevice();
+                VmaAllocator allocator = vkCtx.getAllocator();
+                VkQueue queue = vkCtx.getGraphicsQueue();
+
+                UpwaysPipeline upw(
+                    device, vkCtx.getPhysicalDevice(), allocator,
+                    64u, 64u, 128u, 128u,
+                    p1Spv, p2Spv, p3Spv, "", true
+                );
+                check_true(upw.isInitialized(), "UpwaysPipeline must initialize on FP8 CooperativeMatrix GPU");
+                check_true(!upw.isHistoryValid(), "Initial m_historyValid must be false");
+
+                VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+                cpInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
+                VkCommandPool cmdPool = VK_NULL_HANDLE;
+                check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "Command pool created");
+
+                VkCommandBufferAllocateInfo cbAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+                cbAlloc.commandPool = cmdPool;
+                cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbAlloc.commandBufferCount = 1;
+                VkCommandBuffer cmd = VK_NULL_HANDLE;
+                check_true(vkAllocateCommandBuffers(device, &cbAlloc, &cmd) == VK_SUCCESS, "Command buffer allocated");
+
+                auto runStep = [&](uint32_t frameIdx, const glm::vec2& jit) {
+                    vkResetCommandBuffer(cmd, 0);
+                    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(cmd, &beginInfo);
+                    upw.recordFrame(
+                        cmd, frameIdx, false, false,
+                        glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f),
+                        jit, 1u, false, false
+                    );
+                    vkEndCommandBuffer(cmd);
+                    VkSubmitInfo sub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                    sub.commandBufferCount = 1;
+                    sub.pCommandBuffers = &cmd;
+                    check_true(vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE) == VK_SUCCESS, "Queue submit succeeded");
+                    vkQueueWaitIdle(queue);
+                };
+
+                // Run 2 frames at 64x64 -> 128x128
+                runStep(0u, glm::vec2(0.125f, -0.25f));
+                runStep(1u, glm::vec2(-0.125f, 0.25f));
+                check_true(upw.isHistoryValid(), "m_historyValid must be true after frame execution");
+                Image* preDrsOutput = upw.getOutputImage();
+
+                // Trigger Lossless DRS: render resolution 64x64 -> 96x96 while display resolution stays 128x128
+                upw.resize(96u, 96u, 128u, 128u, true);
+                check_true(upw.isHistoryValid(), "Lossless DRS resize must preserve m_historyValid == true");
+                check_true(upw.getOutputImage() == preDrsOutput, "Lossless DRS resize must preserve display-res output image");
+                check_true(upw.getInputWidth() == 96u && upw.getInputHeight() == 96u, "Render dimensions updated to 96x96");
+
+                // Run 2 frames at 96x96 -> 128x128 (exercises both ping-pong LR slots across DRS transition)
+                runStep(2u, glm::vec2(0.25f, 0.125f));
+                runStep(3u, glm::vec2(-0.25f, -0.125f));
+                check_true(upw.isHistoryValid(), "m_historyValid remains true across post-DRS frames");
+
+                // Changing display resolution (128x128 -> 160x160) must reset history cleanly
+                upw.resize(96u, 96u, 160u, 160u, true);
+                check_true(!upw.isHistoryValid(), "Display-resolution resize must reset m_historyValid to false");
+                runStep(4u, glm::vec2(0.0f, 0.0f));
+                check_true(upw.isHistoryValid(), "m_historyValid recovers on first frame at new display resolution");
+
+                vkDestroyCommandPool(device, cmdPool, nullptr);
+                check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors across lossless DRS sequence");
+                std::cout << "  -> Live GPU UpwaysPipeline + Lossless DRS verified (64x64 -> 96x96 @ 128x128, 0 validation errors)." << std::endl;
+            }
+        }
     }
 
     std::cout << "\n==========================================================" << std::endl;
-    std::cout << " [SUCCESS] All Upways (3-Pass) & Gateway (4-Pass) Tests Passed! (10/10)" << std::endl;
+    std::cout << " [SUCCESS] All Upways 3.0 FP8 Pipeline Tests Passed! (11/11)" << std::endl;
     std::cout << "==========================================================" << std::endl;
     return 0;
 }

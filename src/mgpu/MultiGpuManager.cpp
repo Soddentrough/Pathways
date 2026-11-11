@@ -2,6 +2,7 @@
 #include "core/Logger.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <filesystem>
 #include <cstring>
@@ -91,98 +92,20 @@ static void uploadToDeviceBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, c
     vkFreeCommandBuffers(device, secNode.commandPool, 1, &cmd);
 }
 
-static void uploadIndexBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, uint32_t triangleCount) {
-    if (triangleCount == 0) {
-        uint32_t dummy[3] = { 0, 1, 2 };
-        uploadToDeviceBufferSec(secNode, dstBuffer, dummy, sizeof(dummy));
-        return;
-    }
-
-    VkDevice device = secNode.context->getDevice();
-    VkQueue queue = secNode.context->getGraphicsQueue();
-    VmaAllocator allocator = secNode.context->getAllocator();
-
-    const uint32_t chunkTriangles = 1048576; // 1M triangles = 12 MB chunk
-    VkDeviceSize stagingSize = std::min(static_cast<VkDeviceSize>(triangleCount), static_cast<VkDeviceSize>(chunkTriangles)) * 3 * sizeof(uint32_t);
-
-    Buffer stagingBuffer(
-        allocator, stagingSize,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-    );
-
-    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-    allocInfo.commandPool = secNode.commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
-
-    uint32_t* mappedStaging = static_cast<uint32_t*>(stagingBuffer.map());
-
-    uint32_t triOffset = 0;
-    while (triOffset < triangleCount) {
-        uint32_t currentChunkTriangles = std::min(chunkTriangles, triangleCount - triOffset);
-        for (uint32_t i = 0; i < currentChunkTriangles; ++i) {
-            uint32_t k = triOffset + i;
-            mappedStaging[i * 3 + 0] = 3 * k + 0;
-            mappedStaging[i * 3 + 1] = 3 * k + 1;
-            mappedStaging[i * 3 + 2] = 3 * k + 2;
-        }
-        VkDeviceSize currentBytes = currentChunkTriangles * 3 * sizeof(uint32_t);
-        stagingBuffer.flush(0, currentBytes);
-
-        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &beginInfo);
-
-        VkBufferCopy copyRegion{};
-        copyRegion.srcOffset = 0;
-        copyRegion.dstOffset = static_cast<VkDeviceSize>(triOffset) * 3 * sizeof(uint32_t);
-        copyRegion.size = currentBytes;
-        vkCmdCopyBuffer(cmd, stagingBuffer.getBuffer(), dstBuffer.getBuffer(), 1, &copyRegion);
-
-        vkEndCommandBuffer(cmd);
-
-        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-        cmdSubmitInfo.commandBuffer = cmd;
-        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-        submitInfo.commandBufferInfoCount = 1;
-        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-        vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(queue);
-
-        triOffset += currentChunkTriangles;
-    }
-
-    vkFreeCommandBuffers(device, secNode.commandPool, 1, &cmd);
-}
-
-static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const SceneData& scene) {
+static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const SceneData& scene, const std::vector<char>& updateTlasSpv) {
     if (!secNode.context->hasRayTracing()) return;
 
     VkDevice secDevice = secNode.context->getDevice();
     VmaAllocator secAlloc = secNode.context->getAllocator();
 
+    secNode.tlasUpdatePipeline.reset();
     secNode.tlas.reset();
     secNode.blas.reset();
     secNode.blases.clear();
-    secNode.asIndexBuffer.reset();
     secNode.instanceBuffer.reset();
     secNode.asManager.reset();
 
     uint32_t numTriangles = static_cast<uint32_t>(scene.triangles.size());
-    VkDeviceSize indexBufferSize = std::max(static_cast<VkDeviceSize>(sizeof(uint32_t) * 3 * numTriangles), static_cast<VkDeviceSize>(sizeof(uint32_t) * 3));
-    secNode.asIndexBuffer = std::make_unique<Buffer>(
-        secAlloc, indexBufferSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        0
-    );
-    uploadIndexBufferSec(secNode, *secNode.asIndexBuffer, numTriangles);
 
     secNode.asManager = std::make_unique<AccelerationStructureManager>(
         secDevice, secAlloc,
@@ -234,10 +157,11 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     );
     uploadToDeviceBufferSec(secNode, *secNode.instanceBuffer, instanceUpload.data(), instanceBufferSize);
 
-    // 2. Acceleration Structures
+    // 2. Acceleration Structures (Indexless VK_INDEX_TYPE_NONE_KHR + VK_KHR_ray_tracing_position_fetch)
     VkDeviceAddress vertexBaseAddr = secNode.positionBuffer ? secNode.positionBuffer->getDeviceAddress(secDevice) : 0;
-    VkDeviceAddress indexBaseAddr = secNode.asIndexBuffer->getDeviceAddress(secDevice);
+    constexpr VkDeviceSize kTriVertexBytes = 3 * sizeof(glm::vec4);
 
+    std::vector<ASInstanceInput> asInstances;
     if (!scene.blasRanges.empty()) {
         // Multi-BLAS path: Batch all BLAS builds into a single GPU dispatch & compaction pass
         secNode.asManager->resetStats();
@@ -247,35 +171,35 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             std::vector<ASGeometryInput> geoms;
             if (range.numOpaqueTriangles > 0) {
                 ASGeometryInput geomOpaque{};
-                geomOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * 3 * sizeof(uint32_t);
-                geomOpaque.vertexCount = 3 * (range.firstTriangle + range.numOpaqueTriangles);
+                geomOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * kTriVertexBytes;
+                geomOpaque.indexBufferAddress = 0;
+                geomOpaque.vertexCount = 3 * range.numOpaqueTriangles - 1;
                 geomOpaque.triangleCount = range.numOpaqueTriangles;
                 geomOpaque.vertexStride = sizeof(glm::vec4);
-                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomOpaque.isOpaque = true;
                 geoms.push_back(geomOpaque);
             }
             uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
             if (numNonOpaque > 0) {
                 ASGeometryInput geomNonOpaque{};
-                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * 3 * sizeof(uint32_t);
-                geomNonOpaque.vertexCount = 3 * (range.firstTriangle + range.triangleCount);
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * kTriVertexBytes;
+                geomNonOpaque.indexBufferAddress = 0;
+                geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
                 geomNonOpaque.triangleCount = numNonOpaque;
                 geomNonOpaque.vertexStride = sizeof(glm::vec4);
-                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomNonOpaque.isOpaque = false;
                 geoms.push_back(geomNonOpaque);
             }
             if (geoms.empty()) {
                 ASGeometryInput dummyGeom{};
                 dummyGeom.vertexBufferAddress = vertexBaseAddr;
-                dummyGeom.indexBufferAddress = indexBaseAddr;
-                dummyGeom.vertexCount = 3;
+                dummyGeom.indexBufferAddress = 0;
+                dummyGeom.vertexCount = 2;
                 dummyGeom.triangleCount = 1;
                 dummyGeom.vertexStride = sizeof(glm::vec4);
-                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }
@@ -283,7 +207,6 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
         }
         secNode.blases = secNode.asManager->buildBLASBatch(allBlasGeoms);
 
-        std::vector<ASInstanceInput> asInstances;
         asInstances.reserve(scene.instances.size());
         for (const auto& inst : scene.instances) {
             ASInstanceInput asInst{};
@@ -313,28 +236,27 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     } else {
         // Monolithic scene path
         uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
-        std::vector<ASInstanceInput> asInstances;
 
         if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
             std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = indexBaseAddr;
-            geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles;
+            geomOpaque.indexBufferAddress = 0;
+            geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles - 1;
             geomOpaque.triangleCount = scene.numOpaqueTriangles;
             geomOpaque.vertexStride = sizeof(glm::vec4);
-            geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
             geomOpaque.isOpaque = true;
             geomsOpaque.push_back(geomOpaque);
 
             std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles) * 3 * sizeof(uint32_t);
-            geomNonOpaque.vertexCount = 3 * numTriangles;
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles) * kTriVertexBytes;
+            geomNonOpaque.indexBufferAddress = 0;
+            geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
             geomNonOpaque.triangleCount = numNonOpaque;
             geomNonOpaque.vertexStride = sizeof(glm::vec4);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
             geomNonOpaque.isOpaque = false;
             geomsNonOpaque.push_back(geomNonOpaque);
 
@@ -363,31 +285,31 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             if (isPureOpaque) {
                 ASGeometryInput geomOpaque{};
                 geomOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomOpaque.indexBufferAddress = indexBaseAddr;
-                geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles;
+                geomOpaque.indexBufferAddress = 0;
+                geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles - 1;
                 geomOpaque.triangleCount = scene.numOpaqueTriangles;
                 geomOpaque.vertexStride = sizeof(glm::vec4);
-                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomOpaque.isOpaque = true;
                 geoms.push_back(geomOpaque);
             } else if (numNonOpaque > 0) {
                 ASGeometryInput geomNonOpaque{};
                 geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomNonOpaque.indexBufferAddress = indexBaseAddr;
-                geomNonOpaque.vertexCount = 3 * numTriangles;
+                geomNonOpaque.indexBufferAddress = 0;
+                geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
                 geomNonOpaque.triangleCount = numNonOpaque;
                 geomNonOpaque.vertexStride = sizeof(glm::vec4);
-                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomNonOpaque.isOpaque = false;
                 geoms.push_back(geomNonOpaque);
             } else {
                 ASGeometryInput dummyGeom{};
                 dummyGeom.vertexBufferAddress = vertexBaseAddr;
-                dummyGeom.indexBufferAddress = indexBaseAddr;
-                dummyGeom.vertexCount = 3;
+                dummyGeom.indexBufferAddress = 0;
+                dummyGeom.vertexCount = 2;
                 dummyGeom.triangleCount = 1;
                 dummyGeom.vertexStride = sizeof(glm::vec4);
-                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }
@@ -408,6 +330,15 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
         Logger::info("Secondary GPU Acceleration Structures initialized successfully (Monolithic {} BLASes & {} TLAS Instances).",
                      secNode.blases.size(), asInstances.size());
     }
+
+    secNode.tlasUpdatePipeline = std::make_unique<GpuTlasUpdatePipeline>(
+        secDevice, secAlloc, secNode.context->hasSubgroupSizeControl()
+    );
+    secNode.tlasUpdatePipeline->initShaderInstances(secNode.instanceBuffer.get(), instanceUpload);
+    secNode.tlasUpdatePipeline->initBuffers(asInstances, secNode.asManager.get());
+    if (!updateTlasSpv.empty()) {
+        secNode.tlasUpdatePipeline->createPipeline(updateTlasSpv);
+    }
 }
 
 GpuDeviceNode::~GpuDeviceNode() {
@@ -415,6 +346,8 @@ GpuDeviceNode::~GpuDeviceNode() {
     VkDevice device = context->getDevice();
     vkDeviceWaitIdle(device);
 
+    causticsPipeline.reset();
+    tlasUpdatePipeline.reset();
     rtpKhrPipeline.reset();
     wavefrontPipeline.reset();
     if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
@@ -423,6 +356,9 @@ GpuDeviceNode::~GpuDeviceNode() {
         if (renderFences[i]) vkDestroyFence(device, renderFences[i], nullptr);
         if (secSemaphores[i]) vkDestroySemaphore(device, secSemaphores[i], nullptr);
         cameraUBOs[i].reset();
+        lightStaging[i].reset();
+        lightTreeStaging[i].reset();
+        videoStagingBuffers[i].reset();
     }
     if (secTimelineSemaphore) vkDestroySemaphore(device, secTimelineSemaphore, nullptr);
     if (rtDescLayout) vkDestroyDescriptorSetLayout(device, rtDescLayout, nullptr);
@@ -439,9 +375,14 @@ GpuDeviceNode::~GpuDeviceNode() {
     shadeMaterialBuffer.reset();
     lightBuffer.reset();
     lightTreeBuffer.reset();
-    directLightImage.reset();
     normalDepthImage.reset();
+    prevNormalDepthImage.reset();
     motionVectorImage.reset();
+    causticImage.reset();
+    mlDiffuseImage.reset();
+    mlSpecularImage.reset();
+    mlAlbedoRoughnessImage.reset();
+    mlSpecularMotionImage.reset();
     upscaler.reset();
 }
 
@@ -455,21 +396,44 @@ MultiGpuManager::MultiGpuManager(const Config& config, VulkanContext* primaryCon
         vkGetPhysicalDeviceProperties(d, &props);
         if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) {
             hwDevices.push_back(d);
+            if (d != primaryContext->getPhysicalDevice() && m_secondaryDeviceName.empty()) {
+                m_secondaryDeviceName = props.deviceName;
+            }
         }
     }
+    m_hwDeviceCount = std::max<uint32_t>(1u, static_cast<uint32_t>(hwDevices.size()));
     if (hwDevices.size() < 2) {
         Logger::info("Multi-GPU: only {} hardware GPU(s) found (ignoring CPU/software rasterizers). Multi-GPU unavailable.", hwDevices.size());
         m_mode = MultiGpuMode::Off;
         return;
     }
 
-    Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs (Initial State: {})...",
-                 hwDevices.size(), m_mode == MultiGpuMode::Off ? "Standby (Single-GPU)" : "Active");
-    initSecondaryDevice(config, scene);
+    if (m_mode != MultiGpuMode::Off) {
+        Logger::info("Initializing Multi-GPU Manager across {} discrete GPUs (Initial State: Active)...", hwDevices.size());
+        ensureSecondaryInitialized(config, scene);
+    } else {
+        Logger::info("Multi-GPU Manager in lazy standby across {} discrete GPUs ({} unallocated until Multi-GPU is enabled).",
+                     hwDevices.size(), m_secondaryDeviceName.empty() ? "Secondary GPU" : m_secondaryDeviceName);
+    }
+}
 
-    if (m_active) {
+bool MultiGpuManager::ensureSecondaryInitialized(const Config& config, const SceneData& scene) {
+    if (m_hwDeviceCount < 2) {
+        m_mode = MultiGpuMode::Off;
+        return false;
+    }
+    if (isSecondaryInitialized()) {
+        return true;
+    }
+    m_config = config;
+    if (config.mgpu_mode != MultiGpuMode::Off) {
+        m_mode = config.mgpu_mode;
+    }
+    initSecondaryDevice(config, scene);
+    if (m_active && !m_workerThread.joinable()) {
         m_workerThread = std::thread(&MultiGpuManager::workerLoop, this);
     }
+    return isSecondaryInitialized();
 }
 
 MultiGpuManager::~MultiGpuManager() {
@@ -541,9 +505,8 @@ double MultiGpuManager::getSecondaryTransferTimeMs() const {
 }
 
 const std::string& MultiGpuManager::getSecondaryDeviceName() const {
-    static const std::string empty;
-    if (m_devices.empty()) return empty;
-    return m_devices[0]->deviceName;
+    if (!m_devices.empty()) return m_devices[0]->deviceName;
+    return m_secondaryDeviceName;
 }
 
 std::vector<char> MultiGpuManager::loadShaderSPIRV(const std::string& filename) {
@@ -559,10 +522,7 @@ std::vector<char> MultiGpuManager::loadShaderSPIRV(const std::string& filename) 
     if (!ec) exeDir = p.parent_path();
 #endif
 
-    std::vector<std::string> searchPaths = {
-        filename,
-        std::string("shaders/") + filename,
-    };
+    std::vector<std::string> searchPaths;
 
     if (!exeDir.empty()) {
         searchPaths.push_back((exeDir / "shaders" / filename).string());
@@ -571,10 +531,12 @@ std::vector<char> MultiGpuManager::loadShaderSPIRV(const std::string& filename) 
     }
 
     searchPaths.push_back(std::string(SHADER_DIR) + "/" + filename);
-    searchPaths.push_back(std::string("/usr/share/pathways/shaders/") + filename);
-    searchPaths.push_back(std::string("/usr/local/share/pathways/shaders/") + filename);
+    searchPaths.push_back(std::string("shaders/") + filename);
     searchPaths.push_back(std::string("build/shaders/") + filename);
     searchPaths.push_back(std::string("../build/shaders/") + filename);
+    searchPaths.push_back(std::string("/usr/share/pathways/shaders/") + filename);
+    searchPaths.push_back(std::string("/usr/local/share/pathways/shaders/") + filename);
+    searchPaths.push_back(filename);
 
     for (const auto& path : searchPaths) {
         if (std::filesystem::exists(path)) {
@@ -584,6 +546,7 @@ std::vector<char> MultiGpuManager::loadShaderSPIRV(const std::string& filename) 
                 std::vector<char> buffer(fileSize);
                 file.seekg(0);
                 file.read(buffer.data(), fileSize);
+                Logger::debug("MGPU loaded shader SPIR-V from: {}", path);
                 return buffer;
             }
         }
@@ -1147,8 +1110,11 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
 }
 
 VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t height) const {
-    VkDeviceSize displaySize = static_cast<VkDeviceSize>(width) * height * 8;
-    VkDeviceSize displayAligned = (displaySize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    auto align64k = [](VkDeviceSize sz) -> VkDeviceSize {
+        return (sz + 65535) & ~static_cast<VkDeviceSize>(65535);
+    };
+
+    VkDeviceSize displayAligned = align64k(static_cast<VkDeviceSize>(width) * height * 8);
 
     uint32_t maxTileSize = 128u;
     uint32_t numTilesX = (width + maxTileSize - 1u) / maxTileSize;
@@ -1158,17 +1124,17 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
     uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
                    (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
 
-    VkDeviceSize sampleParallelRadSize = static_cast<VkDeviceSize>(width) * height * bpp;
-    VkDeviceSize sampleParallelAligned = (sampleParallelRadSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+    // SampleParallel: radiance + mlDiffuse + mlSpecular (each 64 KiB-aligned)
+    VkDeviceSize sampleParallelAligned = align64k(static_cast<VkDeviceSize>(width) * height * bpp);
+    VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(width) * height * 8);
+    VkDeviceSize sampleParallelTotal = sampleParallelAligned + 2 * spPlaneAligned;
 
-    VkDeviceSize cbRadSize = static_cast<VkDeviceSize>(cbWidth) * height * bpp;
-    VkDeviceSize cbRadOffsetAligned = (cbRadSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-    VkDeviceSize cbMvSize = static_cast<VkDeviceSize>(cbWidth) * height * 8;
-    VkDeviceSize cbMvOffsetAligned = (cbRadOffsetAligned + cbMvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-    VkDeviceSize cbNdSize = static_cast<VkDeviceSize>(cbWidth) * height * 8;
-    VkDeviceSize cbTotalSize = cbMvOffsetAligned + cbNdSize;
+    // CheckerboardTile: radiance + 6 RGBA16F planes (mv, nd, mlDiffuse, mlSpecular, mlAlbedoRoughness, mlSpecularMotion)
+    VkDeviceSize cbRadOffsetAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * height * bpp);
+    VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * height * 8);
+    VkDeviceSize cbTotalSize = cbRadOffsetAligned + 6 * cbPlaneAligned;
 
-    return std::max({ displayAligned, sampleParallelAligned, cbTotalSize });
+    return std::max({ displayAligned, sampleParallelTotal, cbTotalSize });
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
@@ -1196,6 +1162,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secConfig.gpu_index = secondaryGpuIndex; // Explicit secondary hardware GPU
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
+    m_hasDielectrics = scene.hasDielectrics;
+    m_dielectricBoundsMin = scene.dielectricBoundsMin;
+    m_dielectricBoundsMax = scene.dielectricBoundsMax;
 
     auto secNode = std::make_unique<GpuDeviceNode>();
     secNode->deviceIndex = secondaryGpuIndex;
@@ -1402,7 +1371,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->positionBuffer = std::make_unique<Buffer>(
         secAlloc, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
@@ -1485,7 +1453,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     VkDeviceSize lightSize = std::max(sizeof(LightGPU) * scene.lights.size(), sizeof(LightGPU));
     secNode->lightBuffer = std::make_unique<Buffer>(
         secAlloc, lightSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -1493,10 +1461,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         secNode->lightBuffer->copyFrom(scene.lights.data(), sizeof(LightGPU) * scene.lights.size());
     }
 
-    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    VkDeviceSize lightTreeSize = std::max(
+        sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(),
+        sizeof(LightTreeNodeGPU) * std::max<size_t>(1, 2 * scene.lights.size())
+    );
     secNode->lightTreeBuffer = std::make_unique<Buffer>(
         secAlloc, lightTreeSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -1516,7 +1487,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     }
 
     // Hardware Acceleration Structures on secondary device (VK_KHR_ray_query)
-    createSecondaryAccelerationStructures(*secNode, scene);
+    auto updateTlasSpv = loadShaderSPIRV("update_tlas_instances.comp.spv");
+    createSecondaryAccelerationStructures(*secNode, scene, updateTlasSpv);
+    secNode->positionBuffer.reset();
 
     // Textures & HDRI Environment Map on secondary device
     VkQueue secQueue = secNode->context->getGraphicsQueue();
@@ -1533,7 +1506,16 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 
     secNode->sceneTextures.clear();
     for (const auto& texData : scene.textures) {
-        if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+        if (texData.isHdr && !texData.hdrPixels.empty() && texData.width > 0 && texData.height > 0) {
+            bool genMips = (texData.width >= 64 && texData.height >= 64);
+            auto tex = Texture::createFromPixels(
+                secDevice, secAlloc, secQueue, secPool,
+                texData.width, texData.height,
+                VK_FORMAT_R16G16B16A16_SFLOAT, texData.hdrPixels.data(),
+                texData.hdrPixels.size() * sizeof(uint16_t), true, genMips
+            );
+            secNode->sceneTextures.push_back(std::move(tex));
+        } else if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
             VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             bool genMips = (texData.width >= 64 && texData.height >= 64);
             auto tex = Texture::createFromPixels(
@@ -1552,7 +1534,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     std::vector<VkDescriptorPoolSize> poolSizes = {
         { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8 },
-        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 32 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 4 },
         { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096 }
     };
@@ -1575,11 +1557,16 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 28, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 29, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -1597,13 +1584,13 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
 
     // Allocate secondary G-Buffer & scratch images
-    secNode->directLightImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
     secNode->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
+    secNode->prevNormalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
     secNode->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1613,14 +1600,18 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
     VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
+    Buffer* secLightTree = secNode->lightTreeBuffer ? secNode->lightTreeBuffer.get() : secNode->lightBuffer.get();
+    Buffer* secInstances = secNode->instanceBuffer ? secNode->instanceBuffer.get() : secNode->triangleBuffer.get();
+    VkDescriptorBufferInfo lightTreeInfo{ secLightTree->getBuffer(), 0, secLightTree->getSize() };
+    VkDescriptorBufferInfo instanceInfo{ secInstances->getBuffer(), 0, secInstances->getSize() };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -1656,11 +1647,16 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr }
         };
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -1727,8 +1723,26 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             );
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
             if (config.enable_restir && config.mgpu_mode != MultiGpuMode::Off) {
-                secNode->restirManager->resize(initRenderW, initRenderH);
+                secNode->restirManager->resize(std::max(initRenderW, secWidth), initRenderH);
             }
+            GpuDeviceNode* rawNode = secNode.get();
+            secNode->wavefrontPipeline->setPostClassifyCallback([this, rawNode](VkCommandBuffer cb, uint32_t cbSlot) {
+                if (m_config.enable_caustics && rawNode->causticsPipeline && rawNode->normalDepthImage) {
+                    rawNode->causticsPipeline->recordSplatAndFilter(
+                        cb, cbSlot,
+                        rawNode->normalDepthImage.get(),
+                        rawNode->currentCameraFov,
+                        rawNode->currentFrameIndex,
+                        false,
+                        rawNode->currentCameraMoved,
+                        m_hasDielectrics,
+                        m_dielectricBoundsMin,
+                        m_dielectricBoundsMax,
+                        rawNode->currentFullScreenWidth,
+                        rawNode->currentCbTileSize
+                    );
+                }
+            });
             updateSecondaryWavefrontDescriptors(secNode.get());
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
         } catch (const std::exception& e) {
@@ -1740,8 +1754,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     // 7b. Secondary GPU FSR Upscaler (Sample Parallel SampleBlend mode only)
     if (config.upscaler_mode == UpscalerMode::FSR && config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend) {
         try {
-            auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
-            auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
+            auto prepCode = loadShaderSPIRV("ffx_sdk_prep.comp.spv");
             uint32_t renderW = config.getRenderWidth();
             uint32_t renderH = config.getRenderHeight();
             secNode->upscaler = std::make_unique<FsrUpscaler>(
@@ -1752,8 +1765,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 renderH,
                 config.width,
                 config.height,
-                upscaleCode,
-                rcasCode,
+                prepCode,
                 accumFormat,
                 "[GPU 1 Secondary Peer]",
                 config.fsr_version
@@ -1795,16 +1807,17 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
-    secNode->directLightImage->transitionLayout(
-        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
     secNode->normalDepthImage->transitionLayout(
         secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
+    secNode->prevNormalDepthImage->transitionLayout(
+        secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+    vkCmdClearColorImage(secNode->commandBuffers[0], secNode->prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &blackClr, 1, &clearRng);
 
     VkClearColorValue clearColor = { { 0.0f, 0.0f, 0.0f, 0.0f } };
     VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -1834,6 +1847,228 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     initSharedHostBuffer(bufferSize);
 }
 
+bool MultiGpuManager::needSecondaryMlGuides() const {
+    return (m_config.upscaler_mode == UpscalerMode::Upways ||
+            m_config.denoiser_mode == DenoiserMode::Upways ||
+            m_config.denoiser_mode == DenoiserMode::Svgf ||
+            m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+            m_config.upways_superres ||
+            !m_config.capture_training_data_dir.empty());
+}
+
+void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->context || !secNode->accumTargets[0] || !secNode->normalDepthImage) return;
+
+    VkDevice secDevice = secNode->context->getDevice();
+    VmaAllocator secAlloc = secNode->context->getAllocator();
+    uint32_t secW = secNode->accumTargets[0]->getWidth();
+    uint32_t secH = secNode->accumTargets[0]->getHeight();
+    const bool needed = needSecondaryMlGuides();
+
+    if (!needed) {
+        if (secNode->mlDiffuseImage) {
+            vkDeviceWaitIdle(secDevice);
+            secNode->mlDiffuseImage.reset();
+            secNode->mlSpecularImage.reset();
+            secNode->mlAlbedoRoughnessImage.reset();
+            secNode->mlSpecularMotionImage.reset();
+
+            VkDescriptorImageInfo fallbackInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+                VkWriteDescriptorSet writes[4] = {
+                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
+                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
+                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
+                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr }
+                };
+                vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
+            }
+            updateSecondaryWavefrontDescriptors(secNode);
+        }
+        return;
+    }
+
+    if (secNode->mlDiffuseImage &&
+        secNode->mlDiffuseImage->getWidth() == secW &&
+        secNode->mlDiffuseImage->getHeight() == secH) {
+        return;
+    }
+
+    vkDeviceWaitIdle(secDevice);
+    constexpr VkImageUsageFlags mlUsage =
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+    secNode->mlDiffuseImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+    secNode->mlSpecularImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+    secNode->mlAlbedoRoughnessImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+    secNode->mlSpecularMotionImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = secNode->commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer initCmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(secDevice, &allocInfo, &initCmd);
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(initCmd, &beginInfo);
+
+    VkClearColorValue zeroClr{};
+    VkImageSubresourceRange clearRng{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    Image* mlImgs[4] = {
+        secNode->mlDiffuseImage.get(),
+        secNode->mlSpecularImage.get(),
+        secNode->mlAlbedoRoughnessImage.get(),
+        secNode->mlSpecularMotionImage.get()
+    };
+    for (Image* img : mlImgs) {
+        img->transitionLayout(
+            initCmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+        vkCmdClearColorImage(initCmd, img->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClr, 1, &clearRng);
+    }
+    vkEndCommandBuffer(initCmd);
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = initCmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(secNode->context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(secNode->context->getGraphicsQueue());
+    vkFreeCommandBuffers(secDevice, secNode->commandPool, 1, &initCmd);
+
+    VkDescriptorImageInfo albInfo{ VK_NULL_HANDLE, secNode->mlAlbedoRoughnessImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo smvInfo{ VK_NULL_HANDLE, secNode->mlSpecularMotionImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo diffInfo{ VK_NULL_HANDLE, secNode->mlDiffuseImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo specInfo{ VK_NULL_HANDLE, secNode->mlSpecularImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        VkWriteDescriptorSet writes[4] = {
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr }
+        };
+        vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
+    }
+    updateSecondaryWavefrontDescriptors(secNode);
+}
+
+void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->context || !secNode->accumTargets[0] || !secNode->causticImage) return;
+
+    VkDevice secDevice = secNode->context->getDevice();
+    VmaAllocator secAlloc = secNode->context->getAllocator();
+    const bool needed = m_config.enable_caustics && m_hasDielectrics;
+
+    if (!needed) {
+        if (secNode->causticsPipeline) {
+            vkDeviceWaitIdle(secDevice);
+            secNode->causticsPipeline.reset();
+            VkDescriptorImageInfo fallbackCaustic{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+                VkWriteDescriptorSet write{
+                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot],
+                    15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackCaustic, nullptr, nullptr
+                };
+                vkUpdateDescriptorSets(secDevice, 1, &write, 0, nullptr);
+            }
+            updateSecondaryWavefrontDescriptors(secNode);
+        }
+        return;
+    }
+
+    uint32_t secW = secNode->accumTargets[0]->getWidth();
+    uint32_t secH = secNode->accumTargets[0]->getHeight();
+    if (secNode->causticsPipeline &&
+        secNode->causticsPipeline->getFilteredCausticImage() &&
+        secNode->causticsPipeline->getFilteredCausticImage()->getWidth() == secW &&
+        secNode->causticsPipeline->getFilteredCausticImage()->getHeight() == secH) {
+        return;
+    }
+
+    vkDeviceWaitIdle(secDevice);
+    auto immediateSubmitSec = [secNode, secDevice](const std::function<void(VkCommandBuffer)>& recordFn) {
+        VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        allocInfo.commandPool = secNode->commandPool;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocInfo.commandBufferCount = 1;
+        VkCommandBuffer oneShotCmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(secDevice, &allocInfo, &oneShotCmd);
+
+        VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(oneShotCmd, &beginInfo);
+        recordFn(oneShotCmd);
+        vkEndCommandBuffer(oneShotCmd);
+
+        VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+        cmdSubmitInfo.commandBuffer = oneShotCmd;
+        VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+        submitInfo.commandBufferInfoCount = 1;
+        submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+        vkQueueSubmit2(secNode->context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+        vkQueueWaitIdle(secNode->context->getGraphicsQueue());
+        vkFreeCommandBuffers(secDevice, secNode->commandPool, 1, &oneShotCmd);
+    };
+
+    try {
+        if (!secNode->causticsPipeline) {
+            auto traceSpv = loadShaderSPIRV("caustic_photon_trace.comp.spv");
+            auto splatSpv = loadShaderSPIRV("caustic_splat.comp.spv");
+            auto filterSpv = loadShaderSPIRV("caustic_filter.comp.spv");
+            secNode->causticsPipeline = std::make_unique<CausticsPipeline>(
+                secDevice, secAlloc,
+                secNode->context->hasSubgroupSizeControl(),
+                secW, secH, m_config.caustic_photons,
+                traceSpv, splatSpv, filterSpv,
+                immediateSubmitSec
+            );
+        } else {
+            secNode->causticsPipeline->resize(secW, secH, immediateSubmitSec);
+        }
+
+        VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
+        secNode->causticsPipeline->updateDescriptors(
+            secNode->triangleBuffer.get(),
+            secNode->sphereBuffer.get(),
+            secNode->materialBuffer.get(),
+            secNode->lightBuffer.get(),
+            tlasHandle,
+            secNode->sceneTextures,
+            secNode->dummyWhite.get(),
+            secNode->instanceBuffer.get(),
+            secNode->cameraUBOs,
+            secNode->normalDepthImage.get(),
+            secNode->motionVectorImage.get(),
+            secNode->prevNormalDepthImage.get()
+        );
+
+        Image* filteredCaustic = secNode->causticsPipeline->getFilteredCausticImage();
+        VkDescriptorImageInfo causticInfo{
+            VK_NULL_HANDLE,
+            filteredCaustic ? filteredCaustic->getImageView() : secNode->causticImage->getImageView(),
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+        for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+            VkWriteDescriptorSet write{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot],
+                15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr
+            };
+            vkUpdateDescriptorSets(secDevice, 1, &write, 0, nullptr);
+        }
+        updateSecondaryWavefrontDescriptors(secNode);
+    } catch (const std::exception& e) {
+        Logger::warn("Failed to initialize secondary GPU Caustics pipeline: {}", e.what());
+        secNode->causticsPipeline.reset();
+    }
+}
+
 void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
     if (!secNode || !secNode->wavefrontPipeline || !secNode->accumTargets[0] || !secNode->triangleBuffer) return;
 
@@ -1848,6 +2083,10 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             texInfos[i] = secNode->dummyWhite->getDescriptorInfo();
         }
     }
+
+    VkImageView activeCausticView = (secNode->causticsPipeline && secNode->causticsPipeline->getFilteredCausticImage())
+        ? secNode->causticsPipeline->getFilteredCausticImage()->getImageView()
+        : (secNode->causticImage ? secNode->causticImage->getImageView() : VK_NULL_HANDLE);
 
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
         if (!secNode->cameraUBOs[slot]) continue;
@@ -1875,10 +2114,13 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE,
             secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getSize() : 0,
-            VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+            secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSpecularMotionImage ? secNode->mlSpecularMotionImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE,
             secNode->instanceBuffer ? secNode->instanceBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->instanceBuffer ? secNode->instanceBuffer->getSize() : 0,
-            secNode->causticImage ? secNode->causticImage->getImageView() : VK_NULL_HANDLE,
+            activeCausticView,
             restirReservoirBuf,
             secNode->materialArchetypeBuffer ? secNode->materialArchetypeBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->materialArchetypeBuffer ? secNode->materialArchetypeBuffer->getSize() : 0,
@@ -1888,7 +2130,7 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            secNode->positionBuffer ? secNode->positionBuffer->getBuffer() : VK_NULL_HANDLE
+            secNode->prevNormalDepthImage ? secNode->prevNormalDepthImage->getImageView() : VK_NULL_HANDLE
         );
     }
 }
@@ -1967,14 +2209,61 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
     if (m_config.enable_restir && node->restirManager && !node->restirManager->isInitialized()) {
         vkDeviceWaitIdle(device);
-        node->restirManager->resize(m_config.width, m_config.height);
+        uint32_t restirW = std::max(m_config.getRenderWidth(), node->accumTargets[0] ? node->accumTargets[0]->getWidth() : m_config.getRenderWidth());
+        node->restirManager->resize(restirW, m_config.getRenderHeight());
         updateSecondaryWavefrontDescriptors(node);
+    }
+
+    ensureSecondaryMlGuides(node);
+    ensureSecondaryCaustics(node);
+    const bool needMl = needSecondaryMlGuides() &&
+                        node->mlDiffuseImage && node->mlSpecularImage &&
+                        node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage;
+
+    // Drain pending dynamic scene updates staged from the primary GPU before recording RT
+    bool doInstanceSync = false;
+    bool instanceRebuild = false;
+    bool instanceUpdateMode = true;
+    std::vector<InstanceGPU> localShaderInstances;
+    std::vector<ASInstanceGPUData> localInputInstances;
+
+    bool doLightSync = false;
+    std::vector<LightGPU> localLights;
+    std::vector<LightTreeNodeGPU> localLightTree;
+
+    bool doVideoSync = false;
+    std::vector<uint8_t> localVideoPixels;
+
+    {
+        std::lock_guard<std::mutex> syncLock(m_sceneSyncMutex);
+        if (m_pendingInstanceSync) {
+            doInstanceSync = true;
+            instanceRebuild = m_pendingTlasRebuild;
+            instanceUpdateMode = m_pendingTlasUpdateMode;
+            localShaderInstances = std::move(m_stagedShaderInstances);
+            localInputInstances = std::move(m_stagedInputInstances);
+            m_pendingInstanceSync = false;
+            m_pendingTlasRebuild = false;
+        }
+        if (m_pendingLightSync) {
+            doLightSync = true;
+            localLights = std::move(m_stagedLights);
+            localLightTree = std::move(m_stagedLightTree);
+            m_pendingLightSync = false;
+        }
+        if (m_pendingVideoFrame) {
+            doVideoSync = true;
+            localVideoPixels = std::move(m_stagedVideoPixels);
+            m_pendingVideoFrame = false;
+        }
     }
 
     // 2. Update Camera UBO for this slot
     CameraUniform uboSecCopy = packet.cameraUniform;
     uint32_t secSppLoop = packet.cameraUniform.spp;
-    if (m_config.pipeline_type == PipelineType::Wavefront && packet.totalCompositeSpp > 0u) {
+    if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline && node->wavefrontPipeline->getWarmupSppOverride() > 0u) {
+        uboSecCopy.spp = node->wavefrontPipeline->getWarmupSppOverride();
+    } else if (m_config.pipeline_type == PipelineType::Wavefront && packet.totalCompositeSpp > 0u) {
         uboSecCopy.spp = packet.totalCompositeSpp;
     }
     node->cameraUBOs[slot]->copyFrom(&uboSecCopy, sizeof(CameraUniform));
@@ -1990,15 +2279,79 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     // Timestamp 0: RT Start
     vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 0);
 
+    // Apply GPU-timeline dynamic TLAS, dynamic light, and video billboard updates on Secondary GPU
+    if (doInstanceSync && node->tlasUpdatePipeline && node->asManager && node->tlas) {
+        node->tlasUpdatePipeline->syncFromCpuTransforms(localShaderInstances, localInputInstances, instanceRebuild);
+        if (node->tlasUpdatePipeline->needsGpuUpdate()) {
+            node->tlasUpdatePipeline->recordGpuTlasUpdate(cmd, slot, node->asManager.get(), node->tlas.get(), instanceUpdateMode);
+        }
+    }
+    if (doLightSync && node->lightBuffer && !localLights.empty()) {
+        VmaAllocator secAlloc = node->context->getAllocator();
+        VkDeviceSize lightBytes = std::min<VkDeviceSize>(sizeof(LightGPU) * localLights.size(), node->lightBuffer->getSize());
+        if (lightBytes > 0) {
+            if (!node->lightStaging[slot] || node->lightStaging[slot]->getSize() < lightBytes) {
+                node->lightStaging[slot] = std::make_unique<Buffer>(
+                    secAlloc, std::max(lightBytes, node->lightBuffer->getSize()),
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+                );
+            }
+            node->lightStaging[slot]->copyFrom(localLights.data(), lightBytes);
+            VkBufferCopy copyRegion{ 0, 0, lightBytes };
+            vkCmdCopyBuffer(cmd, node->lightStaging[slot]->getBuffer(), node->lightBuffer->getBuffer(), 1, &copyRegion);
+        }
+        if (node->lightTreeBuffer && !localLightTree.empty()) {
+            VkDeviceSize treeBytes = std::min<VkDeviceSize>(sizeof(LightTreeNodeGPU) * localLightTree.size(), node->lightTreeBuffer->getSize());
+            if (treeBytes > 0) {
+                if (!node->lightTreeStaging[slot] || node->lightTreeStaging[slot]->getSize() < treeBytes) {
+                    node->lightTreeStaging[slot] = std::make_unique<Buffer>(
+                        secAlloc, std::max(treeBytes, node->lightTreeBuffer->getSize()),
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+                    );
+                }
+                node->lightTreeStaging[slot]->copyFrom(localLightTree.data(), treeBytes);
+                VkBufferCopy copyRegion{ 0, 0, treeBytes };
+                vkCmdCopyBuffer(cmd, node->lightTreeStaging[slot]->getBuffer(), node->lightTreeBuffer->getBuffer(), 1, &copyRegion);
+            }
+        }
+        VkMemoryBarrier2 lightBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo lightDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        lightDep.memoryBarrierCount = 1;
+        lightDep.pMemoryBarriers = &lightBarrier;
+        vkCmdPipelineBarrier2(cmd, &lightDep);
+    }
+    if (doVideoSync && !localVideoPixels.empty() && !node->sceneTextures.empty() && node->sceneTextures[0]) {
+        VmaAllocator secAlloc = node->context->getAllocator();
+        VkDeviceSize vidBytes = static_cast<VkDeviceSize>(localVideoPixels.size());
+        if (!node->videoStagingBuffers[slot] || node->videoStagingBuffers[slot]->getSize() < vidBytes) {
+            node->videoStagingBuffers[slot] = std::make_unique<Buffer>(
+                secAlloc, vidBytes,
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+            );
+        }
+        node->sceneTextures[0]->updatePixelsAsync(cmd, *node->videoStagingBuffers[slot], localVideoPixels.data(), localVideoPixels.size());
+    }
+
     uint32_t envBits = std::bit_cast<uint32_t>(packet.envMapIntensity);
     uint32_t fracBits = std::bit_cast<uint32_t>(packet.fractionalSpp);
+    const uint32_t rtpAccumFlags = (packet.accumulateHistory & 1u) | (needMl ? 2u : 0u);
     uint32_t rtPushConstants[16] = {
         packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
         packet.tileOffsetX, packet.tileOffsetY, packet.tileWidth, packet.tileHeight,
         packet.useHardwareRT,
         packet.hasEnvMap,
         envBits,
-        packet.accumulateHistory,
+        rtpAccumFlags,
         fracBits,
         packet.totalCompositeSpp,
         packet.numOpaqueTriangles, std::bit_cast<uint32_t>(m_config.indirect_clamp)
@@ -2022,41 +2375,63 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
     }
 
-    bool needNormals = (m_config.upscaler_mode == UpscalerMode::Upways ||
-                        m_config.upscaler_mode == UpscalerMode::Gateway ||
-                        m_config.denoiser_mode == DenoiserMode::Upways ||
-                        m_config.denoiser_mode == DenoiserMode::Gateway ||
-                        m_config.denoiser_mode == DenoiserMode::Svgf ||
-                        m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+    const float projInv11 = std::abs(packet.cameraUniform.projInverse[1][1]);
+    node->currentCameraFov = (projInv11 > 1e-6f) ? glm::degrees(2.0f * std::atan(projInv11)) : 45.0f;
+    node->currentFrameIndex = packet.frameIndex;
+    node->currentCameraMoved = packet.cameraMoved;
+    node->currentFullScreenWidth = packet.tileWidth;
+    node->currentCbTileSize = (packet.tileOffsetX == 2u && packet.tileOffsetY > 0u) ? packet.tileOffsetY : 0u;
+    node->currentNumLights = packet.numLights;
+
+    bool needNormals = (needMl ||
                         m_config.enable_restir ||
                         m_config.enable_caustics);
     bool needMvDepth = needNormals || (m_config.upscaler_mode == UpscalerMode::FSR);
     bool copyMvImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->motionVectorImage &&
                         (needNormals || (needMvDepth && m_config.accum_format == AccumFormat::R11G11B10_UFLOAT)));
     bool copyNdImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->normalDepthImage && needNormals);
+    bool copyCbMlPlanes = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMl);
+    bool copySpMlPlanes = (!packet.enableUpscaler && packet.tileOffsetX == 0u && needMl);
     bool packDepthInAlpha = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMvDepth && !copyMvImage);
     bool earlyGbufferCopy = false;
 
     if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline) {
+        VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+        VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        std::vector<VkImageMemoryBarrier2> clearBarriers;
+        auto clearAndTrack = [&](Image* img) {
+            if (!img) return;
+            vkCmdClearColorImage(cmd, img->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
+            VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+            b.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+            b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.image = img->getImage();
+            b.subresourceRange = clearRange;
+            clearBarriers.push_back(b);
+        };
         if (packet.accumulateHistory == 0u) {
-            VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
-            VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCmdClearColorImage(cmd, node->accumTargets[slot]->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearVal, 1, &clearRange);
-
-            VkImageMemoryBarrier2 clearBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            clearBarrier.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-            clearBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            clearBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            clearBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-            clearBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            clearBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            clearBarrier.image = node->accumTargets[slot]->getImage();
-            clearBarrier.subresourceRange = clearRange;
-
+            clearAndTrack(node->accumTargets[slot].get());
+        }
+        if (needMl) {
+            clearAndTrack(node->mlDiffuseImage.get());
+            clearAndTrack(node->mlSpecularImage.get());
+        }
+        if (!clearBarriers.empty()) {
             VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            clearDep.imageMemoryBarrierCount = 1;
-            clearDep.pImageMemoryBarriers = &clearBarrier;
+            clearDep.imageMemoryBarrierCount = static_cast<uint32_t>(clearBarriers.size());
+            clearDep.pImageMemoryBarriers = clearBarriers.data();
             vkCmdPipelineBarrier2(cmd, &clearDep);
+        }
+
+        uint32_t reqCapacity = dispatchWidth * dispatchHeight;
+        if (node->wavefrontPipeline->getMaxCapacity() < reqCapacity) {
+            vkDeviceWaitIdle(device);
+            node->wavefrontPipeline->resize(dispatchWidth, dispatchHeight, reqCapacity);
+            updateSecondaryWavefrontDescriptors(node);
         }
 
         WavefrontSceneData wfSceneData{};
@@ -2092,12 +2467,21 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
         wfSceneData.fullHeight = packet.tileHeight;
-        wfSceneData.captureMlData = 0u;
+        wfSceneData.captureMlData = needMl ? 3u : 0u;
         wfSceneData.gbufferFlags = (1u << 31) |
                                    (needNormals ? 1u : 0u) |
                                    ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
                                    ((copyMvImage || packet.enableUpscaler) ? 4u : 0u) |
                                    (packDepthInAlpha ? 8u : 0u);
+
+        if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
+            node->causticsPipeline->recordTrace(
+                cmd, slot,
+                packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
+                packet.numOpaqueTriangles, packet.frameIndex,
+                m_hasDielectrics, m_dielectricBoundsMin, m_dielectricBoundsMax
+            );
+        }
 
         if (m_config.enable_restir && node->restirManager) {
             node->restirManager->recordClearIfNeeded(cmd);
@@ -2106,6 +2490,20 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, packet.cameraUniform.maxBounces, wfSceneData);
     } else {
+        if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
+            node->causticsPipeline->recordFullPass(
+                cmd, slot,
+                packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
+                packet.numOpaqueTriangles, packet.frameIndex,
+                node->normalDepthImage.get(),
+                node->currentCameraFov,
+                false,
+                node->currentCameraMoved,
+                m_hasDielectrics, m_dielectricBoundsMin, m_dielectricBoundsMax,
+                node->currentFullScreenWidth,
+                node->currentCbTileSize
+            );
+        }
         // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSets[slot], 0, nullptr);
@@ -2194,7 +2592,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         // Batched transition of images to TRANSFER_SRC_OPTIMAL
         std::vector<VkImageMemoryBarrier2> toTransferBarriers;
-        toTransferBarriers.reserve(1 + ((!earlyGbufferCopy && copyMvImage) ? 1 : 0) + ((!earlyGbufferCopy && copyNdImage) ? 1 : 0));
+        toTransferBarriers.reserve(7);
 
         VkImageSubresourceRange colorRange{};
         colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2225,6 +2623,15 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         if (copyNdImage && !earlyGbufferCopy) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->normalDepthImage->getImage()));
         }
+        if (copyCbMlPlanes) {
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlDiffuseImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlAlbedoRoughnessImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularMotionImage->getImage()));
+        } else if (copySpMlPlanes) {
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlDiffuseImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularImage->getImage()));
+        }
 
         VkDependencyInfo toTransferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         toTransferDep.imageMemoryBarrierCount = static_cast<uint32_t>(toTransferBarriers.size());
@@ -2254,14 +2661,13 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                targetBuffer, 1, &copyRegion);
 
-        if (copyMvImage && !earlyGbufferCopy) {
-            uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
-                           (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
-            VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
-            VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
-            VkDeviceSize mvSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8; // RGBA16F (2.5D motion vectors + depth)
-            VkDeviceSize mvOffsetAligned = (radOffsetAligned + mvSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+        uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
+                       (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
+        VkDeviceSize radSize = static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * bpp;
+        VkDeviceSize radOffsetAligned = (radSize + 65535) & ~static_cast<VkDeviceSize>(65535);
+        VkDeviceSize planeAligned = (static_cast<VkDeviceSize>(dispatchWidth) * dispatchHeight * 8 + 65535) & ~static_cast<VkDeviceSize>(65535);
 
+        if (copyMvImage && !earlyGbufferCopy) {
             // Copy Motion Vectors (+ Primary Depth in .w)
             VkBufferImageCopy copyMv = copyRegion;
             copyMv.bufferOffset = radOffsetAligned;
@@ -2272,11 +2678,39 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             if (copyNdImage) {
                 // Copy Normal & Depth (only needed when normal-guided denoiser is active)
                 VkBufferImageCopy copyNd = copyRegion;
-                copyNd.bufferOffset = mvOffsetAligned;
+                copyNd.bufferOffset = radOffsetAligned + planeAligned;
                 vkCmdCopyImageToBuffer(cmd, node->normalDepthImage->getImage(),
                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        targetBuffer, 1, &copyNd);
             }
+        }
+
+        if (copyCbMlPlanes) {
+            Image* cbMlImgs[4] = {
+                node->mlDiffuseImage.get(),
+                node->mlSpecularImage.get(),
+                node->mlAlbedoRoughnessImage.get(),
+                node->mlSpecularMotionImage.get()
+            };
+            for (uint32_t p = 0; p < 4u; ++p) {
+                VkBufferImageCopy copyMl = copyRegion;
+                copyMl.bufferOffset = radOffsetAligned + static_cast<VkDeviceSize>(2u + p) * planeAligned;
+                vkCmdCopyImageToBuffer(cmd, cbMlImgs[p]->getImage(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       targetBuffer, 1, &copyMl);
+            }
+        } else if (copySpMlPlanes) {
+            VkBufferImageCopy copyDiff = copyRegion;
+            copyDiff.bufferOffset = radOffsetAligned;
+            vkCmdCopyImageToBuffer(cmd, node->mlDiffuseImage->getImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   targetBuffer, 1, &copyDiff);
+
+            VkBufferImageCopy copySpec = copyRegion;
+            copySpec.bufferOffset = radOffsetAligned + planeAligned;
+            vkCmdCopyImageToBuffer(cmd, node->mlSpecularImage->getImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   targetBuffer, 1, &copySpec);
         }
 
         // Timestamp 3: Copy End
@@ -2284,7 +2718,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         // Batched transition of images back to GENERAL
         std::vector<VkImageMemoryBarrier2> toGeneralBarriers;
-        toGeneralBarriers.reserve(1 + (copyMvImage ? 1 : 0) + (copyNdImage ? 1 : 0));
+        toGeneralBarriers.reserve(7);
 
         auto makeToGeneralBarrier = [&](VkImage img) {
             VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -2308,11 +2742,79 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         if (copyNdImage) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->normalDepthImage->getImage()));
         }
+        if (copyCbMlPlanes) {
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlDiffuseImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlAlbedoRoughnessImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularMotionImage->getImage()));
+        } else if (copySpMlPlanes) {
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlDiffuseImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularImage->getImage()));
+        }
+
+        VkMemoryBarrier2 copyFlushBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        copyFlushBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        copyFlushBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        copyFlushBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        copyFlushBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
 
         VkDependencyInfo toGeneralDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toGeneralDep.memoryBarrierCount = 1;
+        toGeneralDep.pMemoryBarriers = &copyFlushBarrier;
         toGeneralDep.imageMemoryBarrierCount = static_cast<uint32_t>(toGeneralBarriers.size());
         toGeneralDep.pImageMemoryBarriers = toGeneralBarriers.data();
         vkCmdPipelineBarrier2(cmd, &toGeneralDep);
+    }
+
+    if ((m_config.enable_restir || m_config.enable_caustics) && node->normalDepthImage && node->prevNormalDepthImage) {
+        VkImageSubresourceRange ndRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageMemoryBarrier2 preCopyBarriers[2]{};
+        preCopyBarriers[0] = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+        preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].image = node->normalDepthImage->getImage();
+        preCopyBarriers[0].subresourceRange = ndRange;
+
+        preCopyBarriers[1] = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        preCopyBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        preCopyBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].image = node->prevNormalDepthImage->getImage();
+        preCopyBarriers[1].subresourceRange = ndRange;
+
+        VkDependencyInfo preCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preCopyDep.imageMemoryBarrierCount = 2;
+        preCopyDep.pImageMemoryBarriers = preCopyBarriers;
+        vkCmdPipelineBarrier2(cmd, &preCopyDep);
+
+        VkImageCopy ndCopy{};
+        ndCopy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        ndCopy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        ndCopy.extent = { node->normalDepthImage->getWidth(), node->normalDepthImage->getHeight(), 1 };
+        vkCmdCopyImage(cmd, node->normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                       node->prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &ndCopy);
+
+        VkImageMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.image = node->prevNormalDepthImage->getImage();
+        postCopyBarrier.subresourceRange = ndRange;
+
+        VkDependencyInfo postCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postCopyDep.imageMemoryBarrierCount = 1;
+        postCopyDep.pImageMemoryBarriers = &postCopyBarrier;
+        vkCmdPipelineBarrier2(cmd, &postCopyDep);
     }
 
     vkEndCommandBuffer(cmd);
@@ -2490,13 +2992,13 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         }
 
         // Recreate secondary G-Buffer resources
-        node->directLightImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
-            VK_FORMAT_R16G16B16A16_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
-
         node->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
+        node->prevNormalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
         node->motionVectorImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -2505,6 +3007,13 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->causticImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
             VK_FORMAT_R16G16B16A16_SFLOAT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
+        // Reset lazy ML guide images (reallocated on demand at new resolution by ensureSecondaryMlGuides)
+        node->mlDiffuseImage.reset();
+        node->mlSpecularImage.reset();
+        node->mlAlbedoRoughnessImage.reset();
+        node->mlSpecularMotionImage.reset();
+        node->causticsPipeline.reset();
 
         // Transition secondary targets to GENERAL layout and clear accumulation
         vkResetCommandBuffer(node->commandBuffers[0], 0);
@@ -2522,16 +3031,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             );
         }
 
-        node->directLightImage->transitionLayout(
+        node->normalDepthImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
-        node->normalDepthImage->transitionLayout(
+        node->prevNormalDepthImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
@@ -2548,6 +3057,8 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             vkCmdClearColorImage(node->commandBuffers[0], node->accumTargets[i]->getImage(),
                                  VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
         }
+        vkCmdClearColorImage(node->commandBuffers[0], node->prevNormalDepthImage->getImage(),
+                             VK_IMAGE_LAYOUT_GENERAL, &clearColor, 1, &clearRange);
 
         node->causticImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
@@ -2575,9 +3086,9 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             initSharedHostBuffer(bufferSize);
         }
 
-        VkDescriptorImageInfo directLightInfo{ VK_NULL_HANDLE, node->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, node->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
             VkDescriptorImageInfo accumImageInfo{};
@@ -2586,9 +3097,13 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
 
             std::vector<VkWriteDescriptorSet> writes = {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr }
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr }
             };
             vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -2605,7 +3120,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 if (!node->restirManager) {
                     node->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
                 }
-                node->restirManager->resize(renderW, renderH);
+                node->restirManager->resize(std::max(renderW, secWidth), renderH);
             }
             updateSecondaryWavefrontDescriptors(node.get());
         }
@@ -2629,7 +3144,9 @@ void MultiGpuManager::setConfig(const Config& config) {
                            (config.render_scale != m_config.render_scale) ||
                            (config.fsr_version != m_config.fsr_version) ||
                            (config.mgpu_upscale_mode != m_config.mgpu_upscale_mode);
-    bool targetLayoutChanged = upscalerChanged ||
+    bool formatChanged = (config.accum_format != m_config.accum_format);
+    bool targetLayoutChanged = upscalerChanged || formatChanged ||
+                               (config.mgpu_mode != m_config.mgpu_mode) ||
                                (config.tile_size != m_config.tile_size) ||
                                (config.spp != m_config.spp && m_mode == MultiGpuMode::Auto);
     m_config = config;
@@ -2650,17 +3167,25 @@ void MultiGpuManager::setConfig(const Config& config) {
             bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off);
             uint32_t secWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
             uint32_t secHeight = renderH;
-            if (secNode->accumTargets[0]->getWidth() != secWidth ||
+            if (formatChanged ||
+                secNode->accumTargets[0]->getWidth() != secWidth ||
                 secNode->accumTargets[0]->getHeight() != secHeight) {
                 resize(m_config.width, m_config.height);
             }
+        }
+        VkDeviceSize reqSharedSize = calculateSharedBufferSize(m_config.width, m_config.height);
+        if (m_sharedBufferSize < reqSharedSize) {
+            waitWorkerIdle();
+            vkDeviceWaitIdle(secNode->context->getDevice());
+            initSharedHostBuffer(reqSharedSize);
         }
         if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
             if (!secNode->restirManager) {
                 secNode->restirManager = std::make_unique<ReSTIRManager>(secNode->context->getDevice(), secNode->context->getAllocator());
             }
             if (!secNode->restirManager->isInitialized()) {
-                secNode->restirManager->resize(m_config.getRenderWidth(), m_config.getRenderHeight());
+                uint32_t secW = secNode->accumTargets[0] ? secNode->accumTargets[0]->getWidth() : m_config.getRenderWidth();
+                secNode->restirManager->resize(std::max(m_config.getRenderWidth(), secW), m_config.getRenderHeight());
                 updateSecondaryWavefrontDescriptors(secNode);
             }
         }
@@ -2670,15 +3195,16 @@ void MultiGpuManager::setConfig(const Config& config) {
                 uint32_t renderH = config.getRenderHeight();
                 if (!secNode->upscaler) {
                     try {
-                        auto upscaleCode = loadShaderSPIRV("fsr3_upscale.comp.spv");
-                        auto rcasCode = loadShaderSPIRV("fsr3_rcas.comp.spv");
-                        VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+                        auto prepCode = loadShaderSPIRV("ffx_sdk_prep.comp.spv");
+                        VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT :
+                                               (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 :
+                                               VK_FORMAT_R16G16B16A16_SFLOAT;
                         secNode->upscaler = std::make_unique<FsrUpscaler>(
                             secNode->context->getDevice(),
                             secNode->context->getPhysicalDevice(),
                             secNode->context->getAllocator(),
                             renderW, renderH, config.width, config.height,
-                            upscaleCode, rcasCode, accumFormat,
+                            prepCode, accumFormat,
                             "[GPU 1 Secondary Peer]",
                             config.fsr_version
                         );
@@ -2704,9 +3230,26 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     }
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
+    m_hasDielectrics = scene.hasDielectrics;
+    m_dielectricBoundsMin = scene.dielectricBoundsMin;
+    m_dielectricBoundsMax = scene.dielectricBoundsMax;
+    {
+        std::lock_guard<std::mutex> syncLock(m_sceneSyncMutex);
+        m_pendingInstanceSync = false;
+        m_pendingTlasRebuild = false;
+        m_stagedShaderInstances.clear();
+        m_stagedInputInstances.clear();
+        m_pendingLightSync = false;
+        m_stagedLights.clear();
+        m_stagedLightTree.clear();
+        m_pendingVideoFrame = false;
+        m_stagedVideoPixels.clear();
+    }
     if (m_devices.empty()) return false;
     auto& secNode = m_devices[0];
     if (!secNode || !secNode->context) return false;
+
+    waitWorkerIdle();
 
     VkDevice secDevice = secNode->context->getDevice();
     VmaAllocator secAlloc = secNode->context->getAllocator();
@@ -2734,7 +3277,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     secNode->positionBuffer = std::make_unique<Buffer>(
         secAlloc, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
@@ -2817,7 +3359,7 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     VkDeviceSize lightSize = std::max(sizeof(LightGPU) * scene.lights.size(), sizeof(LightGPU));
     secNode->lightBuffer = std::make_unique<Buffer>(
         secAlloc, lightSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -2825,10 +3367,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         secNode->lightBuffer->copyFrom(scene.lights.data(), sizeof(LightGPU) * scene.lights.size());
     }
 
-    VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(), sizeof(LightTreeNodeGPU));
+    VkDeviceSize lightTreeSize = std::max(
+        sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size(),
+        sizeof(LightTreeNodeGPU) * std::max<size_t>(1, 2 * scene.lights.size())
+    );
     secNode->lightTreeBuffer = std::make_unique<Buffer>(
         secAlloc, lightTreeSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -2836,13 +3381,30 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         secNode->lightTreeBuffer->copyFrom(scene.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * scene.lightTreeNodes.size());
     }
 
+    for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
+        secNode->lightStaging[i].reset();
+        secNode->lightTreeStaging[i].reset();
+        secNode->videoStagingBuffers[i].reset();
+    }
+
     // 2. Rebuild secondary AS
-    createSecondaryAccelerationStructures(*secNode, scene);
+    auto updateTlasSpv = loadShaderSPIRV("update_tlas_instances.comp.spv");
+    createSecondaryAccelerationStructures(*secNode, scene, updateTlasSpv);
+    secNode->positionBuffer.reset();
 
     // 3. Upload scene textures on secondary device
     secNode->sceneTextures.clear();
     for (const auto& texData : scene.textures) {
-        if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+        if (texData.isHdr && !texData.hdrPixels.empty() && texData.width > 0 && texData.height > 0) {
+            bool genMips = (texData.width >= 64 && texData.height >= 64);
+            auto tex = Texture::createFromPixels(
+                secDevice, secAlloc, secQueue, secPool,
+                texData.width, texData.height,
+                VK_FORMAT_R16G16B16A16_SFLOAT, texData.hdrPixels.data(),
+                texData.hdrPixels.size() * sizeof(uint16_t), true, genMips
+            );
+            secNode->sceneTextures.push_back(std::move(tex));
+        } else if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
             VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             bool genMips = (texData.width >= 64 && texData.height >= 64);
             auto tex = Texture::createFromPixels(
@@ -2868,6 +3430,10 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
     VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
+    Buffer* secLightTree = secNode->lightTreeBuffer ? secNode->lightTreeBuffer.get() : secNode->lightBuffer.get();
+    Buffer* secInstances = secNode->instanceBuffer ? secNode->instanceBuffer.get() : secNode->triangleBuffer.get();
+    VkDescriptorBufferInfo lightTreeInfo{ secLightTree->getBuffer(), 0, secLightTree->getSize() };
+    VkDescriptorBufferInfo instanceInfo{ secInstances->getBuffer(), 0, secInstances->getSize() };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -2886,11 +3452,9 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         }
     }
 
-    VkDescriptorImageInfo directLightInfo{};
     VkDescriptorImageInfo normDepthInfo{};
     VkDescriptorImageInfo mvInfo{};
-    if (secNode->directLightImage && secNode->normalDepthImage) {
-        directLightInfo = { VK_NULL_HANDLE, secNode->directLightImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    if (secNode->normalDepthImage) {
         normDepthInfo = { VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     }
     if (secNode->motionVectorImage) {
@@ -2915,22 +3479,95 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
             VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
             VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
         };
-        if (secNode->directLightImage && secNode->normalDepthImage) {
-            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directLightInfo, nullptr, nullptr });
+        if (secNode->normalDepthImage) {
             writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
         }
         writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr });
         if (secNode->motionVectorImage) {
             writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
         }
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr });
+        VkDescriptorImageInfo causticInfo = (secNode->causticsPipeline && secNode->causticsPipeline->getFilteredCausticImage())
+            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->causticsPipeline->getFilteredCausticImage()->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+            : (secNode->causticImage
+                ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+                : normDepthInfo);
+        VkDescriptorImageInfo albInfo = secNode->mlAlbedoRoughnessImage
+            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlAlbedoRoughnessImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+            : normDepthInfo;
+        VkDescriptorImageInfo smvInfo = secNode->mlSpecularMotionImage
+            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlSpecularMotionImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+            : normDepthInfo;
+        VkDescriptorImageInfo diffInfo = secNode->mlDiffuseImage
+            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlDiffuseImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+            : normDepthInfo;
+        VkDescriptorImageInfo specInfo = secNode->mlSpecularImage
+            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlSpecularImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
+            : normDepthInfo;
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeInfo, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr });
+        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr });
         vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
+    if (secNode->causticsPipeline) {
+        secNode->causticsPipeline->resetHistory();
+        if (!m_hasDielectrics) {
+            secNode->causticsPipeline.reset();
+        } else {
+            VkAccelerationStructureKHR secTlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
+            secNode->causticsPipeline->updateDescriptors(
+                secNode->triangleBuffer.get(),
+                secNode->sphereBuffer.get(),
+                secNode->materialBuffer.get(),
+                secNode->lightBuffer.get(),
+                secTlasHandle,
+                secNode->sceneTextures,
+                secNode->dummyWhite.get(),
+                secNode->instanceBuffer.get(),
+                secNode->cameraUBOs,
+                secNode->normalDepthImage.get(),
+                secNode->motionVectorImage.get(),
+                secNode->prevNormalDepthImage.get()
+            );
+        }
     }
     if (secNode->wavefrontPipeline) {
         updateSecondaryWavefrontDescriptors(secNode.get());
     }
     Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());
     return true;
+}
+
+void MultiGpuManager::syncDynamicInstances(const std::vector<InstanceGPU>& shaderInstances,
+                                           const std::vector<ASInstanceGPUData>& primaryInputInstances,
+                                           bool triggerTlasRebuild,
+                                           bool updateMode) {
+    if (!m_active || m_devices.empty()) return;
+    std::lock_guard<std::mutex> lock(m_sceneSyncMutex);
+    m_stagedShaderInstances = shaderInstances;
+    m_stagedInputInstances = primaryInputInstances;
+    m_pendingTlasRebuild = m_pendingTlasRebuild || triggerTlasRebuild;
+    m_pendingTlasUpdateMode = updateMode;
+    m_pendingInstanceSync = true;
+}
+
+void MultiGpuManager::syncDynamicLights(const std::vector<LightGPU>& lights,
+                                        const std::vector<LightTreeNodeGPU>& lightTree) {
+    if (!m_active || m_devices.empty() || lights.empty()) return;
+    std::lock_guard<std::mutex> lock(m_sceneSyncMutex);
+    m_stagedLights = lights;
+    m_stagedLightTree = lightTree;
+    m_pendingLightSync = true;
+}
+
+void MultiGpuManager::stageVideoFrame(const uint8_t* rgbaPixels, size_t byteSize) {
+    if (!m_active || m_devices.empty() || !rgbaPixels || byteSize == 0) return;
+    std::lock_guard<std::mutex> lock(m_sceneSyncMutex);
+    m_stagedVideoPixels.assign(rgbaPixels, rgbaPixels + byteSize);
+    m_pendingVideoFrame = true;
 }
 
 } // namespace pathways

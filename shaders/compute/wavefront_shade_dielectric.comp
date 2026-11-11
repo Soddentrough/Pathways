@@ -6,35 +6,15 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
-#include "restir_common.glsl"
-
-layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
-    DiReservoir currentReservoirs[];
-};
-
-// ReSTIR GI state (docs/RESTIR_PT_DESIGN.md): these materials neither
-// produce a GI candidate nor an X1 diffuse context; both slots are
-// invalidated so stale history cannot be tapped next frame.
-layout(std430, binding = 37) buffer X1ContextsBuffer {
-    X1Context x1Contexts[];
-};
-
-layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
-    GiReservoir giReservoirs[];
-};
-
-layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
-    GiReservoir giHistoryReservoirs[];
-};
 
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 23, rgba16f) uniform image2D uMotionVectorImage;
 layout(binding = 24, rgba16f) uniform image2D uNormalDepthImage;
+layout(binding = 33, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
 layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
@@ -75,11 +55,31 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 };
 
 #include "mis_common.glsl"
+#include "restir_common.glsl"
+#include "bsdf_standard.glsl"
+
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
+
+layout(std430, binding = 37) buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
+
+layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
+    GiReservoir giHistoryReservoirs[];
+};
+
+#include "restir_gi_reuse.glsl"
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -111,6 +111,192 @@ layout(push_constant) uniform PushConstants {
     WavefrontShadePC pc;
 };
 
+#include "wavefront_shadow_inline.glsl"
+#include "shading_core.glsl"
+
+void accumDielectricInlineRadiance(ivec2 pixelCoord, vec3 contrib, bool toSpecular, uint bounce, inout uint seed) {
+    if (dot(contrib, contrib) <= 1e-12) return;
+    if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, contrib, seed), prev.a));
+    }
+    if (pc.captureMlData != 0u) {
+        if (toSpecular) {
+            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, contrib, seed), prevSpec.a));
+        } else {
+            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, contrib, seed), prevDiff.a));
+        }
+    }
+}
+
+void evalInlineDielectricReflection(
+    vec3 rOrigin,
+    vec3 rDir,
+    vec3 rThroughput,
+    uint bounce,
+    uint pixelIndex,
+    bool toSpecular,
+    bool causticApplied,
+    inout uint seed
+) {
+    if (pc.useHardwareRT == 0u || max(rThroughput.r, max(rThroughput.g, rThroughput.b)) <= 1e-5) {
+        return;
+    }
+    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+    bool enableDirect = (ubo.flags & (1u << 0)) != 0u;
+    bool enableShadows = (ubo.flags & (1u << 4)) != 0u;
+    float effClamp = (!toSpecular && bounce > 0u) ? min(pc.indirectClamp, 3.0) : pc.indirectClamp;
+    vec3 currO = rOrigin;
+    vec3 currD = rDir;
+    vec3 currT = rThroughput;
+
+    for (uint step = 0u; step < 3u; ++step) {
+        float closestT = 10000.0;
+        int closestTri = -1;
+        vec2 closestBary = vec2(0.0);
+        int closestSphere = -1;
+        vec3 spNormDummy = vec3(0.0, 1.0, 0.0);
+        uint hitInstIdxDummy = 0u;
+        uint hitInstMatOffset = 0u;
+        mat4x3 hitO2wDummy = mat4x3(1.0);
+        mat4x3 hitW2o = mat4x3(1.0);
+
+        traceClosestSceneHit(
+            currO, currD, EPSILON, 10000.0, pc.numSpheres,
+            closestT, closestTri, closestSphere, closestBary, spNormDummy,
+            hitInstIdxDummy, hitInstMatOffset, hitO2wDummy, hitW2o
+        );
+
+        if (closestTri < 0 && closestSphere < 0) {
+            vec3 skyColor;
+            if (pc.hasEnvMap == 1u) {
+                vec2 envUv = directionToEquirectangular(currD);
+                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
+            } else {
+                float t = 0.5 * (currD.y + 1.0);
+                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
+            }
+            vec3 skyContrib = clampIndirectRadiance(currT * skyColor, effClamp);
+            accumDielectricInlineRadiance(pixelCoord, skyContrib, toSpecular, bounce, seed);
+            break;
+        }
+
+        vec3 hNormal;
+        vec2 hUv = vec2(0.0);
+        uint hMatId = 0u;
+        if (closestTri >= 0) {
+            Triangle tri = triangles[closestTri];
+            vec3 localNormal = getTriangleNormal(tri, closestBary);
+            hNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
+            hUv = getTriangleUV(tri, closestBary);
+            hMatId = tri.materialId + hitInstMatOffset;
+        } else {
+            hNormal = spNormDummy;
+            hMatId = spheres[closestSphere].materialId;
+        }
+        bool hFront = dot(currD, hNormal) < 0.0;
+        hNormal = hFront ? hNormal : -hNormal;
+        vec3 hPt = currO + closestT * currD;
+
+        Material hMat = materials[min(hMatId, max(pc.numMaterials, 1u) - 1u)];
+        vec3 hEmissive = hMat.emissive.rgb;
+        if (hMat.emissiveTex > 0u && hMat.emissiveTex <= 512u) {
+            hEmissive *= SAMPLE_SCENE_TEXTURE_LOD(hMat.emissiveTex, hUv, 0.0).rgb;
+        }
+        bool suppressInlineCaustic = causticApplied && !toSpecular;
+        if (!suppressInlineCaustic && length(hEmissive) > 1e-3) {
+            vec3 emitContrib = clampIndirectRadiance(currT * hEmissive, effClamp);
+            accumDielectricInlineRadiance(pixelCoord, emitContrib, toSpecular, bounce, seed);
+        }
+        if ((hMat.type & MATERIAL_TYPE_MASK) == 3u) {
+            break;
+        }
+
+        vec3 hAlbedo = hMat.albedo.rgb;
+        if (hMat.albedoTex > 0u && hMat.albedoTex <= 512u) {
+            hAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(hMat.albedoTex, hUv, 0.0).rgb;
+        }
+
+        uint hArch = (hMatId < pc.numMaterials) ? materialArchetypes[hMatId] : MATERIAL_ARCHETYPE_DIFFUSE;
+        if (hArch == MATERIAL_ARCHETYPE_CONDUCTOR || (hMat.metallic > 0.85 && hMat.roughness <= 0.12)) {
+            float ndotv = clamp(dot(-currD, hNormal), 0.0, 1.0);
+            currT *= fresnelSchlickVec(ndotv, hAlbedo);
+            currD = reflect(currD, hNormal);
+            currO = offsetRayOrigin(hPt, hNormal);
+            continue;
+        }
+        if (hArch == MATERIAL_ARCHETYPE_DIELECTRIC) {
+            float hIor = hMat.ior > 0.0 ? hMat.ior : 1.5;
+            float hEta = hFront ? (1.0 / hIor) : hIor;
+            vec3 refrD = refract(currD, hNormal, hEta);
+            if (dot(refrD, refrD) > 1e-6) {
+                float hCos = min(dot(-currD, hNormal), 1.0);
+                float hRefl = fresnelDielectric(hCos, hEta);
+                currT *= (1.0 - hRefl) * hAlbedo;
+                currD = normalize(refrD);
+                currO = offsetRayOrigin(hPt, -hNormal);
+                continue;
+            }
+            break;
+        }
+
+        // Diffuse / rough surface direct illumination (1-tap NEE)
+        if (enableDirect && pc.numLights > 0u) {
+            uint lIdx = (pc.numLights > 1u) ? (min(uint(randFloat(seed) * float(pc.numLights)), pc.numLights - 1u)) : 0u;
+            float lSelPdf = 1.0 / float(pc.numLights);
+            Light light = lights[lIdx];
+            vec3 lDir = vec3(0.0, 1.0, 0.0);
+            float lDist = 0.0;
+            float lPdf = 1.0;
+            vec3 lEmission = light.emission.rgb;
+            bool lValid = false;
+            if (uint(light.position.w) == 0u) {
+                vec2 luv = sampleSobolOwen2D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, 7u + step);
+                vec3 lPt = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                vec3 toL = lPt - hPt;
+                lDist = length(toL);
+                lDir = toL / max(lDist, 1e-4);
+                float cosL = dot(-lDir, light.normal.xyz);
+                if (cosL > 0.0) {
+                    lPdf = (lDist * lDist) / max(light.emission.w * cosL, 1e-6);
+                    lValid = true;
+                }
+            } else if (uint(light.position.w) == 1u) {
+                vec3 toL = light.position.xyz - hPt;
+                lDist = length(toL);
+                lDir = toL / max(lDist, 1e-4);
+                float cosSpot = dot(-lDir, light.normal.xyz);
+                if (cosSpot >= light.v.w) {
+                    float spotFactor = clamp((cosSpot - light.v.w) / max(light.u.w - light.v.w, 1e-4), 0.0, 1.0);
+                    lEmission *= spotFactor / max(lDist * lDist, 1e-4);
+                    lValid = true;
+                }
+            } else if (uint(light.position.w) == 2u) {
+                lDir = normalize(light.normal.xyz);
+                lDist = 10000.0;
+                lValid = true;
+            }
+            float ndotl = max(dot(hNormal, lDir), 0.0);
+            if (lValid && ndotl > 0.0) {
+                bool occluded = false;
+                if (enableShadows) {
+                    occluded = traceShadowRayInline(offsetRayOrigin(hPt, hNormal), lDir, lDist,
+                                                    (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                }
+                if (!occluded) {
+                    vec3 diffColor = hAlbedo * (1.0 - hMat.metallic);
+                    vec3 neeContrib = currT * (diffColor * INV_PI * ndotl) * lEmission / max(lPdf * lSelPdf, 1e-6);
+                    neeContrib = clampIndirectRadiance(neeContrib, effClamp);
+                    accumDielectricInlineRadiance(pixelCoord, neeContrib, toSpecular, bounce, seed);
+                }
+            }
+        }
+        break;
+    }
+}
+
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint activeCount = queueCounters.currentMaterialCounts[2]; // Dielectric queue
@@ -119,6 +305,8 @@ void main() {
     vec3 nextDirection = vec3(0.0);
     RayGeometry nextGeom;
     RayState nextState;
+    bool hasGiShadowRay = false;
+    PackedShadowRay giShadowCandidate;
 
     if (inRange) {
         uint rayIdx = materialIndices[2u * pc.maxQueueCapacity + idx];
@@ -142,16 +330,30 @@ void main() {
         unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
+        bool outIsSpecularPath = (bounce == 0u) ? true : isSpecularPath;
 
-        // ReSTIR DI: dielectric surfaces do not maintain a reservoir; invalidate
-        // this pixel's current-frame slot so stale history cannot be tapped
-        // next frame (review 2026-10-10 §4.8).
-        if ((ubo.flags & (1 << 9)) != 0) {
+        // ReSTIR PT: primary dielectric surfaces invalidate DI/X1/GI; secondary
+        // dielectric hits spawned from diffuse X1 surfaces run GI reuse over
+        // the complementary domain (M = 1, w_self = 0).
+        if ((ubo.flags & (1u << 9)) != 0u) {
             if (bounce == 0u) {
-                currentReservoirs[pixelIndex] = invalidDiReservoir();
                 x1Contexts[pixelIndex] = invalidX1Context();
+                if (pc.sppSampleIndex == 0u) {
+                    currentReservoirs[pixelIndex] = invalidDiReservoir();
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
             } else if (bounce == 1u) {
-                giReservoirs[pixelIndex] = invalidGiReservoir();
+                X1Context giCtx = x1Contexts[pixelIndex];
+                if (x1ContextValid(giCtx)) {
+                    restirGiRunReuse(
+                        pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
+                        pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                        giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
+                        seed, hasGiShadowRay, giShadowCandidate
+                    );
+                } else if (pc.sppSampleIndex == 0u) {
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
             }
         }
 
@@ -176,9 +378,13 @@ void main() {
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             }
             if (pc.captureMlData != 0u) {
-                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
-                accumFfxSignal(pixelCoord, skyContrib, true, bounce == 0u, seed);
+                if (outIsSpecularPath) {
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
+                } else {
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
+                }
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -224,12 +430,16 @@ void main() {
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             }
-            float emitMisW = (bounce == 0u) ? 1.0
-                : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, unpackRayPdfCode(state), pc.numLights);
+            uint inPdfCode = unpackRayPdfCode(state);
+            float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
+                ? 0.0
+                : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, inPdfCode, pc.numLights));
             if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                 vec3 emissiveContrib = throughput * emissive * emitMisW;
                 if (bounce > 0u) {
-                    float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, unpackRayPdfCode(state));
+                    float effClamp = (!outIsSpecularPath && bounce >= 2u)
+                        ? min(pc.indirectClamp, 3.0)
+                        : computeAdaptiveFireflyClamp(pc.indirectClamp, inPdfCode);
                     emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
                 }
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -238,9 +448,13 @@ void main() {
                     imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
                 }
                 if (pc.captureMlData != 0u) {
-                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
-                    accumFfxSignal(pixelCoord, emissiveContrib, true, bounce == 0u, seed);
+                    if (outIsSpecularPath) {
+                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
+                    } else {
+                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                        imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), prevDiff.a));
+                    }
                 }
             }
 
@@ -290,11 +504,29 @@ void main() {
                 nextDirection = vec3(0.0);
                 vec3 nextOrigin;
 
-                float rFlip = (pc.captureMlData != 0u) ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u) : ((pc.secondarySortMode >= 2u)
-                    ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
-                    : randFloat(seed));
-
-                bool reflected0 = (cannotRefract || rFlip < reflectProb);
+                bool useDeterministicSplit = (!cannotRefract && pc.useHardwareRT == 1u && !isThinWalled);
+                bool reflected0 = false;
+                if (useDeterministicSplit) {
+                    if (reflectProb > 1e-4) {
+                        evalInlineDielectricReflection(
+                            offsetRayOrigin(hitPoint, hitNormal),
+                            reflect(rayDir, hitNormal),
+                            throughput * reflectProb,
+                            bounce,
+                            pixelIndex,
+                            outIsSpecularPath,
+                            causticApplied,
+                            seed
+                        );
+                    }
+                    throughput *= (1.0 - reflectProb);
+                    reflected0 = false;
+                } else {
+                    float rFlip = (pc.captureMlData != 0u) ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u) : ((pc.secondarySortMode >= 2u)
+                        ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
+                        : randFloat(seed));
+                    reflected0 = (cannotRefract || rFlip < reflectProb);
+                }
                 if (reflected0) {
                     // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(rayDir, hitNormal);
@@ -304,6 +536,7 @@ void main() {
                         // Thin-walled transmission: direct ray passthrough without refraction deviation
                         nextDirection = rayDir;
                         nextOrigin = offsetRayOrigin(hitPoint, rayDir * 2.0);
+                        throughput *= baseColor.rgb;
                     } else {
                         // Snell's law refraction: entering dispersive medium for the first time
                         if (mat.dispersion > 0.001 && dispersionChannel == 0u) {
@@ -315,10 +548,18 @@ void main() {
                             iorVal += dispDelta;
                             eta = frontFace ? (1.0 / iorVal) : iorVal;
                         }
-                        nextDirection = normalize(refract(rayDir, hitNormal, eta));
-                        nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
+                        vec3 refrVec = refract(rayDir, hitNormal, eta);
+                        if (dot(refrVec, refrVec) > 1e-6) {
+                            nextDirection = normalize(refrVec);
+                            nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
+                            throughput *= baseColor.rgb;
+                        } else {
+                            // Post-dispersion Total Internal Reflection fallback (prevents normalize(0) NaN)
+                            reflected0 = true;
+                            nextDirection = reflect(rayDir, hitNormal);
+                            nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
+                        }
                     }
-                    throughput *= baseColor.rgb;
                 }
 
                 // Volumetric Beer-Lambert absorption (physical ray traversal distance)
@@ -347,7 +588,7 @@ void main() {
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel);
 
                         // Delta-Chain Unrolling: Collapse consecutive smooth dielectric events on-chip
                         // without consuming global Wavefront bounce passes, preserving bounce budget for scene lighting.
@@ -360,7 +601,7 @@ void main() {
                                 ? uvec2(packInteriorSlot(matId, iorVal), 0u)
                                 : uvec2(0u);
                             bool enablePsrGuides = false && (bounce == 0u) &&
-                                (pc.captureMlData != 0u || (ubo.flags & ((1u << 9) | (1u << 24))) != 0u);
+                                (pc.captureMlData != 0u || (ubo.flags & (1u << 9)) != 0u);
                             float psrPathLength = hitT;
                             mat3 psrXform = enablePsrGuides
                                 ? (reflected0 ? buildReflectionMatrix(hitNormal) : buildRotationMatrixFromTo(nextDirection, rayDir))
@@ -371,40 +612,17 @@ void main() {
                                 int closestTri = -1;
                                 vec2 closestBary = vec2(0.0);
                                 int closestSphere = -1;
+                                vec3 spNormDummy = vec3(0.0, 1.0, 0.0);
                                 mat4x3 hitW2o = mat4x3(1.0);
                                 mat4x3 hitO2w = mat4x3(1.0);
                                 uint hitInstMatOffset = 0u;
                                 uint hitInstIdx = 0u;
 
-                                rayQueryEXT rq;
-                                rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, currOrigin, EPSILON, currDirection, closestT);
-                                rayQueryProceedEXT(rq);
-
-                                if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-                                    closestT = rayQueryGetIntersectionTEXT(rq, true);
-                                    uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-                                    uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
-                                    uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-                                    InstanceGPU inst = instances[instIdx];
-                                    closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
-                                    closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-                                    hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-                                    hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-                                    hitInstMatOffset = inst.materialOffset;
-                                    hitInstIdx = instIdx;
-                                }
-
-                                if (pc.numSpheres > 0u) {
-                                    for (uint s = 0u; s < pc.numSpheres; ++s) {
-                                        float spT;
-                                        vec3 spNorm;
-                                        if (intersectSphere(currOrigin, currDirection, spheres[s], EPSILON, closestT, spT, spNorm)) {
-                                            closestT = spT;
-                                            closestSphere = int(s);
-                                            closestTri = -1;
-                                        }
-                                    }
-                                }
+                                traceClosestSceneHit(
+                                    currOrigin, currDirection, EPSILON, 10000.0, pc.numSpheres,
+                                    closestT, closestTri, closestSphere, closestBary, spNormDummy,
+                                    hitInstIdx, hitInstMatOffset, hitO2w, hitW2o
+                                );
 
                                 psrPathLength += closestT;
 
@@ -425,9 +643,13 @@ void main() {
                                         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
                                     }
                                     if (pc.captureMlData != 0u) {
-                                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
-                                        accumFfxSignal(pixelCoord, skyContrib, true, false, seed);
+                                        if (outIsSpecularPath) {
+                                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
+                                        } else {
+                                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
+                                        }
                                     }
                                     if (enablePsrGuides) {
                                         vec3 skyVirtPos = ubo.position.xyz + rayDir * 1000.0;
@@ -478,6 +700,26 @@ void main() {
                                 // If non-dielectric, rough, textured, or emissive, emit ray for specialized downstream microkernels
                                 // and perform Primary Surface Replacement (PSR) of G-buffer guides via the 3x3 imageXform.
                                 if (isNonSmoothDielectric) {
+                                    if (bounce == 0u && !reflected0 && pc.captureMlData != 0u && dMatId < pc.numMaterials) {
+                                        Material repMat = (dArchetype == MATERIAL_ARCHETYPE_DIELECTRIC) ? dMat : materials[dMatId];
+                                        float repRough = repMat.roughness;
+                                        float repMetallic = repMat.metallic;
+                                        if (repMat.mrTex > 0u && repMat.mrTex <= 512u) {
+                                            vec2 mrSample = SAMPLE_SCENE_TEXTURE_LOD(repMat.mrTex, dHitUv, 0.0).gb;
+                                            repRough *= mrSample.x;
+                                            repMetallic *= mrSample.y;
+                                        }
+                                        if (dArchetype == MATERIAL_ARCHETYPE_DIFFUSE && repRough >= 0.50 && repMetallic < 0.10) {
+                                            vec3 repAlbedo = repMat.albedo.rgb;
+                                            if (repMat.albedoTex > 0u && repMat.albedoTex <= 512u) {
+                                                repAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(repMat.albedoTex, dHitUv, 0.0).rgb;
+                                            }
+                                            repAlbedo = clamp(throughput * repAlbedo, vec3(0.05), vec3(1.0));
+                                            ivec2 psrCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                            imageStore(uMlAlbedoRoughnessImage, psrCoord, vec4(repAlbedo, 0.35));
+                                            outIsSpecularPath = false;
+                                        }
+                                    }
                                     if (enablePsrGuides) {
                                         ivec2 psrCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                         vec3 virtWorldPos = ubo.position.xyz + rayDir * psrPathLength;
@@ -515,13 +757,25 @@ void main() {
                                                 repAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(repMat.albedoTex, dHitUv, 0.0).rgb;
                                             }
                                             repAlbedo = clamp(throughput * repAlbedo, vec3(0.05), vec3(1.0));
-                                            float repRough = clamp(repMat.roughness, 0.085, 1.0);
+                                            float repRough = repMat.roughness;
+                                            if (repMat.mrTex > 0u && repMat.mrTex <= 512u) {
+                                                repRough *= SAMPLE_SCENE_TEXTURE_LOD(repMat.mrTex, dHitUv, 0.0).g;
+                                            }
+                                            float repCc = clamp(repMat.clearcoat, 0.0, 1.0);
+                                            if (repMat.clearcoatTex > 0u && repMat.clearcoatTex <= 512u) {
+                                                repCc *= SAMPLE_SCENE_TEXTURE_LOD(repMat.clearcoatTex, dHitUv, 0.0).r;
+                                            }
+                                            float repCcRough = clamp(repMat.clearcoatRoughness, 0.0, 1.0);
+                                            if (repMat.clearcoatRoughnessTex > 0u && repMat.clearcoatRoughnessTex <= 512u) {
+                                                repCcRough *= SAMPLE_SCENE_TEXTURE_LOD(repMat.clearcoatRoughnessTex, dHitUv, 0.0).g;
+                                            }
+                                            repRough = clamp(mix(repRough, repCcRough, repCc), 0.0, 1.0);
                                             imageStore(uMlAlbedoRoughnessImage, psrCoord, vec4(repAlbedo, repRough));
                                             imageStore(uMlSpecularMotionImage, psrCoord, vec4(vPsr, 1.0 / (1.0 + virtDepth), psrPathLength));
                                         }
                                     }
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
-                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel);
                                     nextDirection = currDirection;
                                     survivesToNext = true;
                                     break;
@@ -564,7 +818,7 @@ void main() {
                                     commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                     currOrigin = offsetRayOrigin(dHitPoint, currDirection);
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
-                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                    nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel);
                                     nextDirection = currDirection;
                                     survivesToNext = true;
                                     continue;
@@ -589,10 +843,30 @@ void main() {
                                     }
                                 }
 
-                                float rFlipD = (pc.captureMlData != 0u)
-                                    ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + deltaEvents + 1u)
-                                    : randFloat(seed);
-                                if (dCannotRefract || rFlipD < dReflectProb) {
+                                bool useDetInternal = (!dCannotRefract && !isThinWalledD && deltaEvents <= 2u);
+                                bool dReflected = false;
+                                if (useDetInternal) {
+                                    if (dReflectProb > 1e-4) {
+                                        evalInlineDielectricReflection(
+                                            offsetRayOrigin(dHitPoint, dHitNormal),
+                                            reflect(currDirection, dHitNormal),
+                                            throughput * dReflectProb,
+                                            bounce,
+                                            pixelIndex,
+                                            outIsSpecularPath,
+                                            causticApplied,
+                                            seed
+                                        );
+                                    }
+                                    throughput *= (1.0 - dReflectProb);
+                                    dReflected = false;
+                                } else {
+                                    float rFlipD = (pc.captureMlData != 0u)
+                                        ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + deltaEvents + 1u)
+                                        : randFloat(seed);
+                                    dReflected = (dCannotRefract || rFlipD < dReflectProb);
+                                }
+                                if (dReflected) {
                                     if (enablePsrGuides) {
                                         psrXform = psrXform * buildReflectionMatrix(dHitNormal);
                                     }
@@ -601,6 +875,7 @@ void main() {
                                 } else {
                                     if (isThinWalledD) {
                                         currOrigin = offsetRayOrigin(dHitPoint, currDirection * 2.0);
+                                        throughput *= dMat.albedo.rgb;
                                     } else {
                                         if (dMat.dispersion > 0.001 && dispersionChannel == 0u) {
                                             uint channel = min(uint(randFloat(seed) * 3.0), 2u);
@@ -613,15 +888,25 @@ void main() {
                                             else extIor = dIorVal;
                                             dEta = extIor / max(intIor, 1e-4);
                                         }
-                                        vec3 nextD = normalize(refract(currDirection, dHitNormal, dEta));
-                                        if (enablePsrGuides) {
-                                            psrXform = psrXform * buildRotationMatrixFromTo(nextD, currDirection);
+                                        vec3 refrVec = refract(currDirection, dHitNormal, dEta);
+                                        if (dot(refrVec, refrVec) > 1e-6) {
+                                            vec3 nextD = normalize(refrVec);
+                                            if (enablePsrGuides) {
+                                                psrXform = psrXform * buildRotationMatrixFromTo(nextD, currDirection);
+                                            }
+                                            currDirection = nextD;
+                                            currOrigin = offsetRayOrigin(dHitPoint, -dHitNormal);
+                                            commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
+                                            throughput *= dMat.albedo.rgb;
+                                        } else {
+                                            // Post-dispersion Total Internal Reflection fallback
+                                            if (enablePsrGuides) {
+                                                psrXform = psrXform * buildReflectionMatrix(dHitNormal);
+                                            }
+                                            currDirection = reflect(currDirection, dHitNormal);
+                                            currOrigin = offsetRayOrigin(dHitPoint, dHitNormal);
                                         }
-                                        currDirection = nextD;
-                                        currOrigin = offsetRayOrigin(dHitPoint, -dHitNormal);
-                                        commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                     }
-                                    throughput *= dMat.albedo.rgb;
                                 }
 
                                 float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
@@ -635,7 +920,7 @@ void main() {
                                 }
 
                                 nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
-                                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, true, causticApplied, dispersionChannel);
+                                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel);
                                 nextDirection = currDirection;
                                 survivesToNext = true;
                             }
@@ -693,6 +978,26 @@ void main() {
             activeBallot.y &= ~octBallot.y;
             activeBallot.z &= ~octBallot.z;
             activeBallot.w &= ~octBallot.w;
+        }
+    }
+
+    // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
+    uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
+    uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
+    uint giShadowWaveCount = subgroupBallotBitCount(giShadowBallot);
+
+    uint giShadowGlobalOffset = 0u;
+    if (giShadowWaveCount > 0u) {
+        if (subgroupElect()) {
+            giShadowGlobalOffset = atomicAdd(queueCounters.shadowRayCount, giShadowWaveCount);
+        }
+        giShadowGlobalOffset = subgroupBroadcastFirst(giShadowGlobalOffset);
+    }
+
+    if (hasGiShadowRay) {
+        uint targetIdxGiShadow = giShadowGlobalOffset + giShadowLaneSlot;
+        if (targetIdxGiShadow < pc.maxQueueCapacity) {
+            shadowRays[targetIdxGiShadow] = giShadowCandidate;
         }
     }
 

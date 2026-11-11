@@ -1,4 +1,6 @@
 #include "core/Config.hpp"
+#include "mgpu/MultiGpuManager.hpp"
+#include "mgpu/MultiGpuCoordinator.hpp"
 #include <vulkan/vulkan.h>
 #include <iostream>
 #include <vector>
@@ -122,8 +124,25 @@ int main() {
             return 0;
         }
 
-        std::vector<VkPhysicalDevice> gpus(gpuCount);
-        vkEnumeratePhysicalDevices(instance, &gpuCount, gpus.data());
+        std::vector<VkPhysicalDevice> allDevs(gpuCount);
+        vkEnumeratePhysicalDevices(instance, &gpuCount, allDevs.data());
+        std::vector<VkPhysicalDevice> gpus;
+        for (VkPhysicalDevice pd : allDevs) {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(pd, &props);
+            if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                gpus.push_back(pd);
+            }
+        }
+        if (gpus.size() < 2) {
+            std::cout << "  -> Less than 2 hardware Vulkan 1.4 GPUs found (" << gpus.size()
+                      << "). Gracefully skipping dual-GPU hardware test." << std::endl;
+            vkDestroyInstance(instance, nullptr);
+            std::cout << "==========================================================" << std::endl;
+            std::cout << "  ALL MULTI-GPU FRAME PACING TESTS PASSED!" << std::endl;
+            std::cout << "==========================================================" << std::endl;
+            return 0;
+        }
 
         // Check if both devices support VK_EXT_external_memory_host
         auto checkExt = [](VkPhysicalDevice physDev, const char* extName) -> bool {
@@ -282,6 +301,56 @@ int main() {
         vkDestroyDevice(dev0, nullptr);
         vkDestroyDevice(dev1, nullptr);
         vkDestroyInstance(instance, nullptr);
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. Real MultiGpuManager Lazy Standby Init, Timeline Sync & 6-Plane Buffer Sizing
+    // -------------------------------------------------------------------------
+    std::cout << "[TEST 3] Real MultiGpuManager Lazy Standby Init & 6-Plane Shared Buffer..." << std::endl;
+    {
+        Config cfgOff;
+        cfgOff.headless = true;
+        cfgOff.validation_layers = true;
+        cfgOff.width = 320;
+        cfgOff.height = 180;
+        cfgOff.mgpu_mode = MultiGpuMode::Off;
+
+        VulkanContext primaryCtx(cfgOff, VK_NULL_HANDLE, "Primary GPU mGPU Test");
+        SceneData cornellScene = ProceduralScene::createCornellBox();
+
+        MultiGpuManager mgpu(cfgOff, &primaryCtx, cornellScene);
+        check_true(mgpu.getDeviceCount() >= 2, "MultiGpuManager must detect >= 2 hardware GPUs");
+        check_true(!mgpu.isSecondaryInitialized(),
+                   "Secondary GPU must NOT initialize lazily when mgpu_mode == MultiGpuMode::Off");
+
+        Config cfgOn = cfgOff;
+        cfgOn.mgpu_mode = MultiGpuMode::CheckerboardTile;
+        cfgOn.denoiser_mode = DenoiserMode::Svgf;
+        check_true(mgpu.ensureSecondaryInitialized(cfgOn, cornellScene),
+                   "ensureSecondaryInitialized must initialize GPU 1 on demand");
+        check_true(mgpu.isSecondaryInitialized() && mgpu.isMultiGpuActive(),
+                   "MultiGpuManager must become active after on-demand init");
+        check_true(mgpu.isCrossGpuSyncActive(),
+                   "Cross-GPU hardware semaphore sync must be active");
+        check_true(mgpu.getPrimaryImportedTimelineSemaphore() != VK_NULL_HANDLE,
+                   "Primary imported timeline semaphore must be valid");
+
+        // Verify shared buffer reserves space for GPU 1's compacted checkerboard grid (radiance + 6x RGBA16F guide planes)
+        const uint32_t tileSize = (cfgOn.tile_size == 0u) ? 64u : cfgOn.tile_size;
+        const uint32_t numTilesX = (cfgOn.width + tileSize - 1u) / tileSize;
+        const uint32_t secTileCols = (numTilesX + 1u) / 2u;
+        const VkDeviceSize secPixelCount = static_cast<VkDeviceSize>(secTileCols * tileSize) * cfgOn.height;
+        const VkDeviceSize minExpectedBytes = secPixelCount * 8u + 6u * secPixelCount * 8u; // FP16 radiance + 6x RGBA16F planes
+        check_true(mgpu.getSharedBufferSize() >= minExpectedBytes,
+                   "Shared inter-GPU buffer must fit radiance + all 6 demodulated denoiser/ML guide planes");
+
+        VulkanContext* secCtx = mgpu.getSecondaryContext();
+        check_true(secCtx != nullptr && secCtx->getValidationErrors() == 0,
+                   "Secondary GPU context must have zero Vulkan validation errors");
+        check_true(primaryCtx.getValidationErrors() == 0,
+                   "Primary GPU context must have zero Vulkan validation errors");
+        std::cout << "  -> Real MultiGpuManager lazy init, timeline sync, and "
+                  << (mgpu.getSharedBufferSize() / 1024) << " KiB 6-plane buffer verified (0 validation errors)." << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

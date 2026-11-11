@@ -9,8 +9,10 @@
 #include "rt/AccelerationStructure.hpp"
 #include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
-#include "rt/Fsr3Upscaler.hpp"
+#include "rt/FsrUpscaler.hpp"
 #include "rt/ReSTIRManager.hpp"
+#include "rt/GpuTlasUpdatePipeline.hpp"
+#include "rt/CausticsPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -62,7 +64,6 @@ struct GpuDeviceNode {
 
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)
     std::unique_ptr<Buffer> positionBuffer;
-    std::unique_ptr<Buffer> asIndexBuffer;
     std::unique_ptr<Buffer> instanceBuffer;
     std::unique_ptr<AccelerationStructureManager> asManager;
     std::unique_ptr<AccelerationStructure> blas;
@@ -85,13 +86,34 @@ struct GpuDeviceNode {
     std::unique_ptr<RTPipeline> rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> wavefrontPipeline;
 
-    // G-Buffer Resources (used by ray tracer, direct lighting, and FSR / Upways)
-    std::unique_ptr<Image> directLightImage;
+    // G-Buffer Resources (used by ray tracer, ReSTIR temporal validation, and FSR / Upways)
     std::unique_ptr<Image> normalDepthImage;
+    std::unique_ptr<Image> prevNormalDepthImage;
 
     // Screen-Space Motion Vectors (used by ray tracer and denoisers / future FSR)
     std::unique_ptr<Image> motionVectorImage;
     std::unique_ptr<Image> causticImage;
+
+    // Lazy Demodulated ML & Denoiser Guide Images (allocated only when E-SVGF / Upways / training capture is active)
+    std::unique_ptr<Image> mlDiffuseImage;
+    std::unique_ptr<Image> mlSpecularImage;
+    std::unique_ptr<Image> mlAlbedoRoughnessImage;
+    std::unique_ptr<Image> mlSpecularMotionImage;
+
+    // Secondary GPU Dynamic Scene & Caustics Subsystems
+    std::unique_ptr<GpuTlasUpdatePipeline> tlasUpdatePipeline;
+    std::unique_ptr<CausticsPipeline> causticsPipeline;
+    std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> lightStaging;
+    std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> lightTreeStaging;
+    std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> videoStagingBuffers;
+
+    // Frame-local state read by Wavefront post-classify caustics callback on worker thread
+    float currentCameraFov = 45.0f;
+    uint32_t currentFrameIndex = 0u;
+    bool currentCameraMoved = false;
+    uint32_t currentFullScreenWidth = 0u;
+    uint32_t currentCbTileSize = 0u;
+    uint32_t currentNumLights = 0u;
 
     // Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
     std::unique_ptr<Fsr3Upscaler> upscaler;
@@ -110,7 +132,8 @@ public:
 
     bool isMultiGpuActive() const { return m_active && m_mode != MultiGpuMode::Off; }
     bool isSecondaryInitialized() const { return m_active && !m_devices.empty(); }
-    uint32_t getDeviceCount() const { return static_cast<uint32_t>(m_devices.size() + 1); }
+    bool ensureSecondaryInitialized(const Config& config, const SceneData& scene);
+    uint32_t getDeviceCount() const { return m_hwDeviceCount; }
     MultiGpuMode getMode() const { return m_mode; }
     void setMode(MultiGpuMode mode) { m_mode = mode; m_config.mgpu_mode = mode; }
     void setFormat(AccumFormat format) { m_config.accum_format = format; }
@@ -124,6 +147,15 @@ public:
     AccelerationStructureManager* getSecondaryAsManager() const { return m_devices.empty() ? nullptr : m_devices[0]->asManager.get(); }
     void resize(uint32_t width, uint32_t height);
     bool loadScene(const SceneData& scene, const std::string& scenePath = "");
+
+    // Thread-safe dynamic scene synchronization from primary GPU before secondary launch
+    void syncDynamicInstances(const std::vector<InstanceGPU>& shaderInstances,
+                              const std::vector<ASInstanceGPUData>& primaryInputInstances,
+                              bool triggerTlasRebuild,
+                              bool updateMode = true);
+    void syncDynamicLights(const std::vector<LightGPU>& lights,
+                           const std::vector<LightTreeNodeGPU>& lightTree);
+    void stageVideoFrame(const uint8_t* rgbaPixels, size_t byteSize);
 
     // Launch secondary GPU raytracing asynchronously via persistent dedicated worker thread
     void launchSecondaryWork(const CameraUniform& cameraUniform,
@@ -254,6 +286,9 @@ private:
 
     void initSecondaryDevice(const Config& config, const SceneData& scene);
     void updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode);
+    void ensureSecondaryMlGuides(GpuDeviceNode* secNode);
+    void ensureSecondaryCaustics(GpuDeviceNode* secNode);
+    bool needSecondaryMlGuides() const;
 
     bool initSharedP2PBuffer(VkDeviceSize bufferSize);
     void destroySharedP2PBuffer();
@@ -264,6 +299,8 @@ private:
     VkShaderModule createShaderModule(VkDevice device, const std::vector<char>& code);
 
     VulkanContext* m_primaryContext = nullptr;
+    uint32_t m_hwDeviceCount = 1;
+    std::string m_secondaryDeviceName;
     std::vector<std::unique_ptr<GpuDeviceNode>> m_devices;
     MultiGpuMode m_mode = MultiGpuMode::Off;
     bool m_active = false;
@@ -301,6 +338,21 @@ private:
     std::atomic<uint64_t> m_currentTimelineValue{ 0 };
     glm::vec3 m_boundsMin = glm::vec3(-1000.0f);
     glm::vec3 m_boundsMax = glm::vec3(1000.0f);
+    bool m_hasDielectrics = false;
+    glm::vec3 m_dielectricBoundsMin = glm::vec3(-1000.0f);
+    glm::vec3 m_dielectricBoundsMax = glm::vec3(1000.0f);
+
+    std::mutex m_sceneSyncMutex;
+    bool m_pendingInstanceSync = false;
+    bool m_pendingTlasRebuild = false;
+    bool m_pendingTlasUpdateMode = true;
+    std::vector<InstanceGPU> m_stagedShaderInstances;
+    std::vector<ASInstanceGPUData> m_stagedInputInstances;
+    bool m_pendingLightSync = false;
+    std::vector<LightGPU> m_stagedLights;
+    std::vector<LightTreeNodeGPU> m_stagedLightTree;
+    bool m_pendingVideoFrame = false;
+    std::vector<uint8_t> m_stagedVideoPixels;
 };
 
 } // namespace pathways

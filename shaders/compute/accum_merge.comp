@@ -23,12 +23,12 @@ layout(binding = 3) uniform image2D uPrimaryMotionVectors;
 // Binding 4: Primary GPU Normal & Linear Depth image (RGBA16F)
 layout(binding = 4) uniform image2D uPrimaryNormalDepth;
 
-// Binding 5: Secondary GPU Motion Vectors buffer (RGBA16F packed as uvec2)
+// Binding 5: Secondary GPU unified FP16 transfer buffer (64 KiB-aligned planes packed as uvec2)
 layout(std430, binding = 5) readonly buffer SecondaryMvBuffer {
-    uvec2 secondaryMv16[];
+    uvec2 secondaryWords16[];
 };
 
-// Binding 6: Secondary GPU Normal & Linear Depth buffer (RGBA16F packed as uvec2)
+// Binding 6: Reserved alias for unified secondary transfer buffer
 layout(std430, binding = 6) readonly buffer SecondaryNormDepthBuffer {
     uvec2 secondaryNormDepth16[];
 };
@@ -37,6 +37,12 @@ layout(std430, binding = 6) readonly buffer SecondaryNormDepthBuffer {
 layout(std430, binding = 7) readonly buffer SecondaryAccumBufferPacked {
     uint secondaryRadiancePacked[];
 };
+
+// Bindings 8..11: Primary GPU Demodulated Denoiser / Upscaler ML Guides (RGBA16F)
+layout(binding = 8) uniform image2D uPrimaryMlDiffuse;
+layout(binding = 9) uniform image2D uPrimaryMlSpecular;
+layout(binding = 10) uniform image2D uPrimaryMlAlbedoRoughness;
+layout(binding = 11) uniform image2D uPrimaryMlSpecularMotion;
 
 layout(push_constant) uniform PushConstants {
     uint width;
@@ -133,7 +139,13 @@ void main() {
 
         imageStore(uPrimaryAccum, pixelCoord, vec4(secVal.rgb, (secVal.a > 0.5) ? secVal.a : 0.0));
 
-        if (pc.mergeGbuffers == 3u) {
+        uint bpp = (pc.formatMode == 0u) ? 8u : ((pc.formatMode == 1u) ? 16u : 4u);
+        uint radAligned = (secPitch * pc.height * bpp + 65535u) & ~65535u;
+        uint planeAligned = (secPitch * pc.height * 8u + 65535u) & ~65535u;
+        uint baseGbufMode = pc.mergeGbuffers & 15u;
+        bool mergeMl = (pc.mergeGbuffers & 16u) != 0u;
+
+        if (baseGbufMode == 3u) {
             float primaryDepth = (secVal.a < 0.0) ? (-secVal.a) : 10000.0;
             vec2 vSurface = vec2(0.0);
             float vLinearDepthDelta = 0.0;
@@ -153,21 +165,32 @@ void main() {
             }
             imageStore(uPrimaryMotionVectors, pixelCoord, vec4(vSurface, vLinearDepthDelta, primaryDepth));
             imageStore(uPrimaryNormalDepth, pixelCoord, vec4(0.0, 0.0, 1.0, primaryDepth));
-        } else if (pc.mergeGbuffers != 0u) {
+        } else if (baseGbufMode != 0u) {
             // Merge Motion Vectors (RGBA16F: rg = 2D UV motion, b = depth delta, a = primaryDepth)
-            uvec2 rawMv = secondaryMv16[linearIndex];
+            uvec2 rawMv = secondaryWords16[(radAligned >> 3u) + linearIndex];
             vec4 secMv = vec4(unpackHalf2x16(rawMv.x), unpackHalf2x16(rawMv.y));
             imageStore(uPrimaryMotionVectors, pixelCoord, secMv);
 
-            if (pc.mergeGbuffers == 1u) {
+            if (baseGbufMode == 1u) {
                 // Full Normal & Depth merge (RGBA16F)
-                uvec2 rawNd = secondaryNormDepth16[linearIndex];
+                uvec2 rawNd = secondaryWords16[((radAligned + planeAligned) >> 3u) + linearIndex];
                 vec4 secNd = vec4(unpackHalf2x16(rawNd.x), unpackHalf2x16(rawNd.y));
                 imageStore(uPrimaryNormalDepth, pixelCoord, secNd);
             } else {
                 // Fast Depth-only merge from secMv.w when normal vectors are not needed (e.g. Pure MC + FSR)
                 imageStore(uPrimaryNormalDepth, pixelCoord, vec4(0.0, 0.0, 1.0, secMv.w));
             }
+        }
+
+        if (mergeMl) {
+            uvec2 rawDiff = secondaryWords16[((radAligned + 2u * planeAligned) >> 3u) + linearIndex];
+            uvec2 rawSpec = secondaryWords16[((radAligned + 3u * planeAligned) >> 3u) + linearIndex];
+            uvec2 rawAlb  = secondaryWords16[((radAligned + 4u * planeAligned) >> 3u) + linearIndex];
+            uvec2 rawSmv  = secondaryWords16[((radAligned + 5u * planeAligned) >> 3u) + linearIndex];
+            imageStore(uPrimaryMlDiffuse, pixelCoord, vec4(unpackHalf2x16(rawDiff.x), unpackHalf2x16(rawDiff.y)));
+            imageStore(uPrimaryMlSpecular, pixelCoord, vec4(unpackHalf2x16(rawSpec.x), unpackHalf2x16(rawSpec.y)));
+            imageStore(uPrimaryMlAlbedoRoughness, pixelCoord, vec4(unpackHalf2x16(rawAlb.x), unpackHalf2x16(rawAlb.y)));
+            imageStore(uPrimaryMlSpecularMotion, pixelCoord, vec4(unpackHalf2x16(rawSmv.x), unpackHalf2x16(rawSmv.y)));
         }
     } else {
         // --- Mode 2: Sample Parallelism (Temporal Sample Accumulation) ---
@@ -192,5 +215,21 @@ void main() {
         vec4 primVal = imageLoad(uPrimaryAccum, pixelCoord);
         vec3 combined = primVal.rgb + secVal.rgb;
         imageStore(uPrimaryAccum, pixelCoord, vec4(combined, primVal.a));
+
+        if ((pc.mergeGbuffers & 16u) != 0u) {
+            uint bpp = (pc.formatMode == 0u) ? 8u : ((pc.formatMode == 1u) ? 16u : 4u);
+            uint radAligned = (pc.width * pc.height * bpp + 65535u) & ~65535u;
+            uint planeAligned = (pc.width * pc.height * 8u + 65535u) & ~65535u;
+
+            uvec2 rawDiff = secondaryWords16[(radAligned >> 3u) + linearIndex];
+            vec4 secDiff = vec4(unpackHalf2x16(rawDiff.x), unpackHalf2x16(rawDiff.y));
+            vec4 primDiff = imageLoad(uPrimaryMlDiffuse, pixelCoord);
+            imageStore(uPrimaryMlDiffuse, pixelCoord, vec4(primDiff.rgb + secDiff.rgb, primDiff.a));
+
+            uvec2 rawSpec = secondaryWords16[((radAligned + planeAligned) >> 3u) + linearIndex];
+            vec4 secSpec = vec4(unpackHalf2x16(rawSpec.x), unpackHalf2x16(rawSpec.y));
+            vec4 primSpec = imageLoad(uPrimaryMlSpecular, pixelCoord);
+            imageStore(uPrimaryMlSpecular, pixelCoord, vec4(primSpec.rgb + secSpec.rgb, primSpec.a));
+        }
     }
 }

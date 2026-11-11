@@ -2,6 +2,7 @@
 #include "rt/FfxSdkRuntime.hpp"
 #include "core/Logger.hpp"
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <stdexcept>
@@ -17,8 +18,7 @@ FsrUpscaler::FsrUpscaler(
     uint32_t renderHeight,
     uint32_t displayWidth,
     uint32_t displayHeight,
-    const std::vector<char>& upscaleSpv,
-    const std::vector<char>& rcasSpv,
+    const std::vector<char>& sdkPrepSpv,
     VkFormat format,
     const std::string& instanceName,
     FsrVersion targetVersion
@@ -39,45 +39,28 @@ FsrUpscaler::FsrUpscaler(
     initImages();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
-    createPipelines(upscaleSpv, rcasSpv);
+    createPipelines(sdkPrepSpv);
     initFfxSdkContext();
 
-    Logger::info("FsrUpscaler [{}] initializing: Render {}x{}, Display {}x{}, Format: {}, Target: {}, Active: {} (HW ML CoopMatrix: {})",
+    Logger::info("FsrUpscaler [{}] initialized: Render {}x{}, Display {}x{}, Active: {} (VRAM: {:.2f} MB)",
                  m_instanceName, m_renderWidth, m_renderHeight, m_displayWidth, m_displayHeight,
-                 static_cast<int>(m_format), static_cast<uint32_t>(m_targetVersion),
-                 getActiveVersionName(), m_hwMlSupported ? "YES" : "NO");
-
-    Logger::info("FsrUpscaler [{}] successfully initialized ({}, VRAM: {:.2f} MB).",
-                 m_instanceName, getActiveVersionName(),
-                 static_cast<double>(m_vramUsageBytes) / (1024.0 * 1024.0));
+                 getActiveVersionName(), static_cast<double>(m_vramUsageBytes) / (1024.0 * 1024.0));
 }
 
 FsrUpscaler::~FsrUpscaler() {
     destroyFfxSdkContext();
     if (m_device != VK_NULL_HANDLE) {
-        if (m_upscalePipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(m_device, m_upscalePipeline, nullptr);
-            m_upscalePipeline = VK_NULL_HANDLE;
+        if (m_sdkPrepPipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(m_device, m_sdkPrepPipeline, nullptr);
+            m_sdkPrepPipeline = VK_NULL_HANDLE;
         }
-        if (m_upscalePipelineLayout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(m_device, m_upscalePipelineLayout, nullptr);
-            m_upscalePipelineLayout = VK_NULL_HANDLE;
+        if (m_sdkPrepPipelineLayout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(m_device, m_sdkPrepPipelineLayout, nullptr);
+            m_sdkPrepPipelineLayout = VK_NULL_HANDLE;
         }
-        if (m_upscaleDescLayout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(m_device, m_upscaleDescLayout, nullptr);
-            m_upscaleDescLayout = VK_NULL_HANDLE;
-        }
-        if (m_rcasPipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(m_device, m_rcasPipeline, nullptr);
-            m_rcasPipeline = VK_NULL_HANDLE;
-        }
-        if (m_rcasPipelineLayout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(m_device, m_rcasPipelineLayout, nullptr);
-            m_rcasPipelineLayout = VK_NULL_HANDLE;
-        }
-        if (m_rcasDescLayout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(m_device, m_rcasDescLayout, nullptr);
-            m_rcasDescLayout = VK_NULL_HANDLE;
+        if (m_sdkPrepDescLayout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(m_device, m_sdkPrepDescLayout, nullptr);
+            m_sdkPrepDescLayout = VK_NULL_HANDLE;
         }
         if (m_descPool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(m_device, m_descPool, nullptr);
@@ -89,14 +72,14 @@ FsrUpscaler::~FsrUpscaler() {
 void FsrUpscaler::probeHardwareCapabilities() {
     m_sdkFsr3Supported = FfxSdkRuntime::instance().isUpscalerVersionSupported(m_physDevice, m_device, 3u);
     m_sdkFsr4Supported = FfxSdkRuntime::instance().isUpscalerVersionSupported(m_physDevice, m_device, 4u);
-    m_hwMlSupported = m_sdkFsr4Supported;
+    m_hwMlSupported = FfxSdkRuntime::supportsHardwareMl(m_physDevice);
 }
 
 void FsrUpscaler::resolveActiveVersion() {
     FsrVersion prevActive = m_activeVersion;
     if (m_targetVersion == FsrVersion::Fsr3) {
         m_activeVersion = FsrVersion::Fsr3;
-    } else if (m_targetVersion == FsrVersion::Fsr4 || m_targetVersion == FsrVersion::Fsr5) {
+    } else if (m_targetVersion == FsrVersion::Fsr4) {
         m_activeVersion = FsrVersion::Fsr4;
     } else {
         m_activeVersion = m_sdkFsr4Supported ? FsrVersion::Fsr4 : FsrVersion::Fsr3;
@@ -129,21 +112,26 @@ const char* FsrUpscaler::getActiveVersionName() const {
         }
         return "AMD FSR 3.1.6 (SDK Super-Resolution)";
     }
+    if (m_activeVersion == FsrVersion::Fsr4) {
+        return "Stub (No Native Vulkan FSR 4 Provider)";
+    }
     return "Disabled (Unsupported)";
 }
 
 void FsrUpscaler::initFfxSdkContext() {
     destroyFfxSdkContext();
 
-    // Calculate baseline VRAM footprint from internal RGBA16F history + upscaled + sharpened targets (8 bytes/pixel * 4 targets)
-    m_vramUsageBytes = static_cast<uint64_t>(m_displayWidth) * static_cast<uint64_t>(m_displayHeight) * 8ull * 4ull;
+    // Baseline VRAM of Pathways-side output + SDK input prep targets
+    const uint64_t outBytes = static_cast<uint64_t>(m_displayWidth) * static_cast<uint64_t>(m_displayHeight) * 8ull;
+    const uint64_t prepBytes = static_cast<uint64_t>(m_renderWidth) * static_cast<uint64_t>(m_renderHeight) * (8ull + 4ull + 4ull);
+    m_vramUsageBytes = outBytes + prepBytes;
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
     if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler)) {
         return;
     }
     if (m_activeVersion == FsrVersion::Fsr4 && !m_sdkFsr4Supported) {
-        Logger::error("FsrUpscaler [{}]: FSR 4 ML Upscaler is not supported on this device/OS; context creation aborted.",
+        Logger::error("FsrUpscaler [{}]: FSR 4 ML Upscaler has no native Vulkan provider on this runtime; context creation skipped.",
                       m_instanceName);
         return;
     }
@@ -200,7 +188,7 @@ void FsrUpscaler::initFfxSdkContext() {
     memQuery.flags = createUpscale.flags;
     memQuery.gpuMemoryUsageUpscaler = &gpuMem;
     if (ffx::Query(memQuery, versionOpt) == ffx::ReturnCode::Ok && gpuMem.totalUsageInBytes > 0) {
-        m_vramUsageBytes = gpuMem.totalUsageInBytes;
+        m_vramUsageBytes += gpuMem.totalUsageInBytes;
     }
 
     ffxContext ctx = nullptr;
@@ -210,24 +198,22 @@ void FsrUpscaler::initFfxSdkContext() {
                       m_instanceName, selectedVersionName, static_cast<uint32_t>(createRet));
         return;
     }
-    if (createRet == ffx::ReturnCode::Ok && ctx != nullptr) {
-        m_ffxContext = ctx;
-        m_providerVersionId = selectedVersionId;
-        m_providerVersionName = selectedVersionName;
+    m_ffxContext = ctx;
+    m_providerVersionId = selectedVersionId;
+    m_providerVersionName = selectedVersionName;
 
-        ffxQueryGetProviderVersion providerVerQuery{};
-        providerVerQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-        providerVerQuery.header.pNext = nullptr;
-        if (ffxQuery(&m_ffxContext, &providerVerQuery.header) == FFX_API_RETURN_OK && providerVerQuery.versionName) {
-            m_providerVersionId = providerVerQuery.versionId;
-            m_providerVersionName = providerVerQuery.versionName;
-        }
+    ffxQueryGetProviderVersion providerVerQuery{};
+    providerVerQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+    providerVerQuery.header.pNext = nullptr;
+    if (ffxQuery(&m_ffxContext, &providerVerQuery.header) == FFX_API_RETURN_OK && providerVerQuery.versionName) {
+        m_providerVersionId = providerVerQuery.versionId;
+        m_providerVersionName = providerVerQuery.versionName;
+    }
 
-        if (m_activeVersion == FsrVersion::Fsr4) {
-            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("4.1.2") : m_providerVersionName) + " (SDK ML Super-Resolution)";
-        } else {
-            m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("3.1.6") : m_providerVersionName) + " (SDK Super-Resolution)";
-        }
+    if (m_activeVersion == FsrVersion::Fsr4) {
+        m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("4.1.2") : m_providerVersionName) + " (SDK ML Super-Resolution)";
+    } else {
+        m_activeVersionLabel = "AMD FSR " + (m_providerVersionName.empty() ? std::string("3.1.6") : m_providerVersionName) + " (SDK Super-Resolution)";
     }
 #endif
 }
@@ -251,28 +237,12 @@ void FsrUpscaler::initImages() {
     VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
-    m_upscaledImage = std::make_unique<Image>(
-        m_device, m_allocator,
-        m_displayWidth, m_displayHeight,
-        m_format,
-        usage
-    );
-
     m_sharpenedImage = std::make_unique<Image>(
         m_device, m_allocator,
         m_displayWidth, m_displayHeight,
         m_format,
         usage
     );
-
-    for (int i = 0; i < 2; ++i) {
-        m_historyImages[i] = std::make_unique<Image>(
-            m_device, m_allocator,
-            m_displayWidth, m_displayHeight,
-            m_format,
-            usage
-        );
-    }
 
     m_sdkColorInput = std::make_unique<Image>(
         m_device, m_allocator,
@@ -295,7 +265,6 @@ void FsrUpscaler::initImages() {
         usage
     );
 
-    m_historyIndex = 0;
     m_historyValid = false;
     for (int i = 0; i < 2; ++i) {
         m_lastBoundInputViews[i] = VK_NULL_HANDLE;
@@ -306,59 +275,30 @@ void FsrUpscaler::initImages() {
 }
 
 void FsrUpscaler::createDescriptorSetLayouts() {
-    // 1. Upscale & Temporal Accumulation Descriptor Layout:
-    // Binding 0: Input Render-Resolution Radiance (image2D)
-    // Binding 1: Input Render-Resolution Motion Vectors (image2D)
-    // Binding 2: Input Render-Resolution Normal & Depth (image2D)
-    // Binding 3: Input Display-Resolution Previous History (image2D)
-    // Binding 4: Output Display-Resolution Next History (writeonly image2D)
-    // Binding 5: Output Display-Resolution Upscaled Radiance for RCAS (writeonly image2D)
-    VkDescriptorSetLayoutBinding upscaleBindings[6]{};
+    VkDescriptorSetLayoutBinding bindings[6]{};
     for (uint32_t b = 0; b < 6; ++b) {
-        upscaleBindings[b].binding = b;
-        upscaleBindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        upscaleBindings[b].descriptorCount = 1;
-        upscaleBindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[b].binding = b;
+        bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[b].descriptorCount = 1;
+        bindings[b].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     }
 
-    VkDescriptorSetLayoutCreateInfo upscaleLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    upscaleLayoutInfo.bindingCount = 6;
-    upscaleLayoutInfo.pBindings = upscaleBindings;
+    VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    layoutInfo.bindingCount = 6;
+    layoutInfo.pBindings = bindings;
 
-    if (vkCreateDescriptorSetLayout(m_device, &upscaleLayoutInfo, nullptr, &m_upscaleDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to create upscale descriptor set layout!");
-    }
-
-    // 2. RCAS Descriptor Layout:
-    // Binding 0: Input Display-Resolution Upscaled Radiance (readonly image2D)
-    // Binding 1: Output Display-Resolution Sharpened Radiance (writeonly image2D)
-    VkDescriptorSetLayoutBinding rcasBindings[2]{};
-    rcasBindings[0].binding = 0;
-    rcasBindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    rcasBindings[0].descriptorCount = 1;
-    rcasBindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    rcasBindings[1].binding = 1;
-    rcasBindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    rcasBindings[1].descriptorCount = 1;
-    rcasBindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-
-    VkDescriptorSetLayoutCreateInfo rcasLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    rcasLayoutInfo.bindingCount = 2;
-    rcasLayoutInfo.pBindings = rcasBindings;
-
-    if (vkCreateDescriptorSetLayout(m_device, &rcasLayoutInfo, nullptr, &m_rcasDescLayout) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to create RCAS descriptor set layout!");
+    if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_sdkPrepDescLayout) != VK_SUCCESS) {
+        throw std::runtime_error("FsrUpscaler: Failed to create SDK prep descriptor set layout!");
     }
 }
 
 void FsrUpscaler::allocateDescriptorSets() {
     VkDescriptorPoolSize poolSizes[1]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 32; // 3 sets * 6 bindings + 1 set * 2 bindings + headroom
+    poolSizes[0].descriptorCount = 16;
 
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 6;
+    poolInfo.maxSets = 2;
     poolInfo.poolSizeCount = 1;
     poolInfo.pPoolSizes = poolSizes;
 
@@ -366,35 +306,19 @@ void FsrUpscaler::allocateDescriptorSets() {
         throw std::runtime_error("FsrUpscaler: Failed to create descriptor pool!");
     }
 
-    VkDescriptorSetLayout upscaleLayouts[2] = { m_upscaleDescLayout, m_upscaleDescLayout };
-    VkDescriptorSetAllocateInfo upscaleAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    upscaleAlloc.descriptorPool = m_descPool;
-    upscaleAlloc.descriptorSetCount = 2;
-    upscaleAlloc.pSetLayouts = upscaleLayouts;
-    if (vkAllocateDescriptorSets(m_device, &upscaleAlloc, m_upscaleDescSets) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to allocate upscale descriptor sets!");
-    }
-
+    VkDescriptorSetLayout layouts[2] = { m_sdkPrepDescLayout, m_sdkPrepDescLayout };
     VkDescriptorSetAllocateInfo sdkPrepAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     sdkPrepAlloc.descriptorPool = m_descPool;
     sdkPrepAlloc.descriptorSetCount = 2;
-    sdkPrepAlloc.pSetLayouts = upscaleLayouts;
+    sdkPrepAlloc.pSetLayouts = layouts;
     if (vkAllocateDescriptorSets(m_device, &sdkPrepAlloc, m_sdkPrepDescSets) != VK_SUCCESS) {
         throw std::runtime_error("FsrUpscaler: Failed to allocate SDK prep descriptor sets!");
-    }
-
-    VkDescriptorSetAllocateInfo rcasAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    rcasAlloc.descriptorPool = m_descPool;
-    rcasAlloc.descriptorSetCount = 1;
-    rcasAlloc.pSetLayouts = &m_rcasDescLayout;
-    if (vkAllocateDescriptorSets(m_device, &rcasAlloc, &m_rcasDescSet) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to allocate RCAS descriptor set!");
     }
 }
 
 void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
     slot &= 1u;
-    if (inputColorView == VK_NULL_HANDLE || !m_upscaledImage || !m_sharpenedImage || !m_historyImages[0] || !m_historyImages[1] ||
+    if (inputColorView == VK_NULL_HANDLE || !m_sharpenedImage ||
         !m_sdkColorInput || !m_sdkDepthInput || !m_sdkMotionVectorsInput) {
         return;
     }
@@ -405,53 +329,19 @@ void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView
     VkDescriptorImageInfo inInfo{ VK_NULL_HANDLE, inputColorView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo dInfo{ VK_NULL_HANDLE, dView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo histReadInfo{ VK_NULL_HANDLE, m_historyImages[slot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo histWriteInfo{ VK_NULL_HANDLE, m_historyImages[1u - slot]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo upscaledInfo{ VK_NULL_HANDLE, m_upscaledImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo sharpenedInfo{ VK_NULL_HANDLE, m_sharpenedImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkColorInfo{ VK_NULL_HANDLE, m_sdkColorInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkDepthInfo{ VK_NULL_HANDLE, m_sdkDepthInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkMvInfo{ VK_NULL_HANDLE, m_sdkMotionVectorsInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
-    VkWriteDescriptorSet writes[14]{};
-    uint32_t writeCount = 0;
+    VkWriteDescriptorSet writes[6]{};
+    writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
+    writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
+    writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
+    writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkColorInfo, nullptr, nullptr };
+    writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkDepthInfo, nullptr, nullptr };
+    writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkMvInfo, nullptr, nullptr };
 
-    // Upscale Set [slot]
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histReadInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &histWriteInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_upscaleDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &upscaledInfo, nullptr, nullptr };
-    writeCount++;
-
-    // SDK Prep Set [slot]
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkColorInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkDepthInfo, nullptr, nullptr };
-    writeCount++;
-    writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkMvInfo, nullptr, nullptr };
-    writeCount++;
-
-    if (slot == 0u) {
-        writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rcasDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &upscaledInfo, nullptr, nullptr };
-        writeCount++;
-        writes[writeCount] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rcasDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sharpenedInfo, nullptr, nullptr };
-        writeCount++;
-    }
-
-    vkUpdateDescriptorSets(m_device, writeCount, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
     m_lastBoundInputViews[slot] = inputColorView;
     m_lastBoundMvViews[slot] = mvView;
     m_lastBoundDepthViews[slot] = dView;
@@ -469,73 +359,41 @@ VkShaderModule FsrUpscaler::createShaderModule(const std::vector<char>& code) {
     return shaderModule;
 }
 
-void FsrUpscaler::createPipelines(const std::vector<char>& upscaleSpv, const std::vector<char>& rcasSpv) {
-    // 1. Upscale Pipeline Layout
-    VkPushConstantRange upscalePcRange{};
-    upscalePcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    upscalePcRange.offset = 0;
-    upscalePcRange.size = sizeof(Fsr3UpscalePushConstants);
+void FsrUpscaler::createPipelines(const std::vector<char>& sdkPrepSpv) {
+    VkPushConstantRange pcRange{};
+    pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcRange.offset = 0;
+    pcRange.size = sizeof(FfxSdkPrepPushConstants);
 
-    VkPipelineLayoutCreateInfo upscaleLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    upscaleLayoutInfo.setLayoutCount = 1;
-    upscaleLayoutInfo.pSetLayouts = &m_upscaleDescLayout;
-    upscaleLayoutInfo.pushConstantRangeCount = 1;
-    upscaleLayoutInfo.pPushConstantRanges = &upscalePcRange;
+    VkPipelineLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &m_sdkPrepDescLayout;
+    layoutInfo.pushConstantRangeCount = 1;
+    layoutInfo.pPushConstantRanges = &pcRange;
 
-    if (vkCreatePipelineLayout(m_device, &upscaleLayoutInfo, nullptr, &m_upscalePipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to create upscale pipeline layout!");
+    if (vkCreatePipelineLayout(m_device, &layoutInfo, nullptr, &m_sdkPrepPipelineLayout) != VK_SUCCESS) {
+        throw std::runtime_error("FsrUpscaler: Failed to create SDK prep pipeline layout!");
     }
 
-    VkShaderModule upscaleModule = createShaderModule(upscaleSpv);
-    VkComputePipelineCreateInfo upscaleInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    upscaleInfo.layout = m_upscalePipelineLayout;
-    upscaleInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    upscaleInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    upscaleInfo.stage.module = upscaleModule;
-    upscaleInfo.stage.pName = "main";
+    VkShaderModule shaderModule = createShaderModule(sdkPrepSpv);
+    VkComputePipelineCreateInfo pipeInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+    pipeInfo.layout = m_sdkPrepPipelineLayout;
+    pipeInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipeInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipeInfo.stage.module = shaderModule;
+    pipeInfo.stage.pName = "main";
 
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &upscaleInfo, nullptr, &m_upscalePipeline) != VK_SUCCESS) {
-        vkDestroyShaderModule(m_device, upscaleModule, nullptr);
-        throw std::runtime_error("FsrUpscaler: Failed to create upscale compute pipeline!");
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_sdkPrepPipeline) != VK_SUCCESS) {
+        vkDestroyShaderModule(m_device, shaderModule, nullptr);
+        throw std::runtime_error("FsrUpscaler: Failed to create SDK prep compute pipeline!");
     }
-    vkDestroyShaderModule(m_device, upscaleModule, nullptr);
-
-    // 2. RCAS Pipeline Layout
-    VkPushConstantRange rcasPcRange{};
-    rcasPcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    rcasPcRange.offset = 0;
-    rcasPcRange.size = sizeof(Fsr3RcasPushConstants);
-
-    VkPipelineLayoutCreateInfo rcasLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    rcasLayoutInfo.setLayoutCount = 1;
-    rcasLayoutInfo.pSetLayouts = &m_rcasDescLayout;
-    rcasLayoutInfo.pushConstantRangeCount = 1;
-    rcasLayoutInfo.pPushConstantRanges = &rcasPcRange;
-
-    if (vkCreatePipelineLayout(m_device, &rcasLayoutInfo, nullptr, &m_rcasPipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("FsrUpscaler: Failed to create RCAS pipeline layout!");
-    }
-
-    VkShaderModule rcasModule = createShaderModule(rcasSpv);
-    VkComputePipelineCreateInfo rcasInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    rcasInfo.layout = m_rcasPipelineLayout;
-    rcasInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    rcasInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    rcasInfo.stage.module = rcasModule;
-    rcasInfo.stage.pName = "main";
-
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &rcasInfo, nullptr, &m_rcasPipeline) != VK_SUCCESS) {
-        vkDestroyShaderModule(m_device, rcasModule, nullptr);
-        throw std::runtime_error("FsrUpscaler: Failed to create RCAS compute pipeline!");
-    }
-    vkDestroyShaderModule(m_device, rcasModule, nullptr);
+    vkDestroyShaderModule(m_device, shaderModule, nullptr);
 }
 
 void FsrUpscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, uint32_t displayH) {
     if (m_renderWidth == renderW && m_renderHeight == renderH &&
         m_displayWidth == displayW && m_displayHeight == displayH &&
-        m_upscaledImage != nullptr && m_sharpenedImage != nullptr &&
-        m_ffxContext != nullptr) {
+        m_sharpenedImage != nullptr && m_ffxContext != nullptr) {
         return;
     }
 
@@ -551,8 +409,7 @@ void FsrUpscaler::resize(uint32_t renderW, uint32_t renderH, uint32_t displayW, 
 }
 
 void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
-    if (!m_upscalePipeline || !m_rcasPipeline || !m_upscaledImage || !m_sharpenedImage ||
-        !m_historyImages[0] || !m_historyImages[1]) {
+    if (!m_sdkPrepPipeline || !m_sharpenedImage) {
         return;
     }
 
@@ -574,14 +431,6 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
         updateDescriptorSets(prepSlot, desc.colorIn, desc.motionVectorsIn, desc.depthIn);
     }
 
-    // Transition initial layouts if needed
-    if (m_upscaledImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
-        m_upscaledImage->transitionLayout(
-            desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-        );
-    }
     if (m_sharpenedImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
         m_sharpenedImage->transitionLayout(
             desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
@@ -614,35 +463,20 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
             );
         }
 
-        // Prepare render-resolution SDK input textures (RGBA16F Color, R32F Inverted Device Depth, RG16F Motion Vectors)
-        vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipeline);
-        vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_upscalePipelineLayout, 0, 1, &m_sdkPrepDescSets[prepSlot], 0, nullptr);
+        vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sdkPrepPipeline);
+        vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sdkPrepPipelineLayout, 0, 1, &m_sdkPrepDescSets[prepSlot], 0, nullptr);
 
-        Fsr3UpscalePushConstants prepPC{};
+        FfxSdkPrepPushConstants prepPC{};
         prepPC.renderWidth = m_renderWidth;
         prepPC.renderHeight = m_renderHeight;
-        prepPC.displayWidth = m_displayWidth;
-        prepPC.displayHeight = m_displayHeight;
-        prepPC.invRenderWidth = 1.0f / static_cast<float>(m_renderWidth);
-        prepPC.invRenderHeight = 1.0f / static_cast<float>(m_renderHeight);
-        prepPC.invDisplayWidth = 1.0f / static_cast<float>(m_displayWidth);
-        prepPC.invDisplayHeight = 1.0f / static_cast<float>(m_displayHeight);
-        prepPC.invTotalSamples = desc.inputIsNormalized ? 1.0f : (1.0f / static_cast<float>(std::max(1u, desc.totalSamples)));
-        prepPC.temporalWeight = std::max(desc.cameraNear, 0.001f); // Passed as cameraNear for inverted device depth conversion
-        prepPC.jitterX = desc.jitterX;
-        prepPC.jitterY = desc.jitterY;
-        prepPC.frameIndex = desc.frameIndex;
-        prepPC.resetHistory = (desc.resetHistory || !m_historyValid) ? 1u : 0u;
-        prepPC.cameraMoved = desc.cameraMoved ? 1u : 0u;
-        prepPC.isInputNormalized = desc.inputIsNormalized ? 1u : 0u;
-        prepPC.fsrVersion = 0xFF00u;
+        prepPC.sampleScale = desc.inputIsNormalized ? 1.0f : (1.0f / static_cast<float>(std::max(1u, desc.totalSamples)));
+        prepPC.nearZ = std::max(desc.cameraNear, 0.001f);
 
-        vkCmdPushConstants(desc.cmd, m_upscalePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(prepPC), &prepPC);
+        vkCmdPushConstants(desc.cmd, m_sdkPrepPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(prepPC), &prepPC);
         uint32_t renderGroupsX = (m_renderWidth + 15) / 16;
         uint32_t renderGroupsY = (m_renderHeight + 15) / 16;
         vkCmdDispatch(desc.cmd, renderGroupsX, renderGroupsY, 1);
 
-        // Transition SDK input textures to SHADER_READ_ONLY_OPTIMAL (FFX_API_RESOURCE_STATE_COMPUTE_READ)
         m_sdkColorInput->transitionLayout(
             desc.cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,

@@ -130,7 +130,7 @@ Pathways delivers high-throughput real-time path tracing across diverse geometri
   - Alpha MASK and BLEND transparency modes
 - **Real-Time Forward Ray-Traced Caustics (`--caustics`)**: Forward photon injection using Vulkan 1.4 hardware `rayQueryEXT` for crisp real-time refractive caustics.
 - **Hierarchical 3D Light Tree (`--light-tree`)**: Spatial octree importance sampling for scenes with dozens or hundreds of analytical and emissive light sources.
-- **Online Running-Mean Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`, `x̄_N = mix(x̄_{N-1}, x_N, 1/N)`) eliminating numeric overflow and preventing highlight blowout up to the 2048-frame accumulation ceiling (FP16 history; convergence resolution saturates near N ≈ 1024 — see `docs/reports/codebase_review_2026_10_07.md` B13 for the FP32 promotion plan).
+- **Online Running-Mean Accumulation**: Progressive online sample normalization (`accum_running_avg.comp`, `x̄_N = mix(x̄_{N-1}, x_N, 1/N)`) in `RGBA16F` (interactive default), full `RGBA32F` (`--accum-format rgba32f` / `--reference` for deep static convergence without FP16 saturation), or bandwidth-compact `R11G11B10_UFLOAT` (`--accum-format r11g11b10` with bitwise stochastic rounding).
 - **HDR Display Output & ACES Tonemapping**: Auto-negotiates scRGB Linear and HDR10 PQ (ST 2084) via `VK_EXT_hdr_metadata`, paired with compute-based filmic ACES tonemapping for standard SDR displays.
 
 ### 4. Dynamic Quality Regulation & Telemetry
@@ -208,31 +208,31 @@ sudo apt-get install git g++ cmake ninja-build libvulkan-dev vulkan-tools libsdl
 
 #### 2. Configure & Build
 ```bash
-# Configure with Ninja in Release mode
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_NATIVE_OPTIMIZATION=ON
+# Configure with the Linux Release CMake preset (Ninja, -O3 -march=native)
+cmake --preset linux-release
 
 # Compile (capped to your core count, e.g. -j16)
-ninja -C build -j16
+ninja -C build/linux-release -j16
 ```
 
 #### 3. Run Unit Tests
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --preset linux-test
 ```
 
 #### 4. Launch Pathways
 ```bash
 # Launch interactive Cornell Box (default: fullscreen, 4K/native, dual-binning wavefront)
-./build/bin/pathways
+./build/linux-release/bin/pathways
 
 # Launch OpenUSD scene with Multi-GPU load balancing enabled
-./build/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
+./build/linux-release/bin/pathways --scene scenes/PointInstancedMedCity/PointInstancedMedCity.usd --mgpu
 
 # Launch glTF scene with real-time forward caustics
-./build/bin/pathways --scene scenes/cornell-caustic/cornell_caustic_extended.glb --caustics
+./build/linux-release/bin/pathways --scene scenes/cornell-caustic/cornell_caustic_extended.glb --caustics
 
 # Launch in windowed mode with target frame pacing at 1440p
-./build/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
+./build/linux-release/bin/pathways --scene scenes/coffee-maker/coffee_maker.usda --windowed --res 1440p --target-fps 120
 ```
 
 For complete Linux toolchain configuration, CMake presets, and multi-GPU setup, see [BUILD_LINUX.md](docs/BUILD_LINUX.md).
@@ -291,7 +291,10 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--restir` | *(flag)* | Enable ReSTIR PT: unified spatiotemporal path-space reservoir resampling in wavefront shading | Disabled |
 | `--restir-m-cap` | `<int>` | ReSTIR PT temporal reuse M-cap (spatial taps additionally capped at 8 in-shader) | `60` |
 | `--debug-view` | `<name>` | Overwrite the frame with per-pixel reservoir state (bypasses accumulation & tonemap; requires `--restir`): `restir-m` / `restir-w` / `restir-light` / `restir-indirect-m` / `restir-indirect-w` / `restir-coverage` / `none` | `none` |
-| `--denoiser` | `svgf` \| `relax` \| `none` | Real-time spatiotemporal denoiser (or shortcut `--svgf` / `--relax` / `--asvgf` for In-House ReLAX/A-SVGF) | `none` |
+| `--denoiser` | `none` \| `svgf` \| `upways` \| `rayregen` | Real-time spatiotemporal denoiser: Pure MC (`none`), E-SVGF (`svgf` / `--svgf`), Upways WMMA Neural U-Net (`upways`, in development), or FFX Ray Regeneration provider slot (`rayregen`) | `none` |
+| `--upscaler` | `none` \| `fsr` \| `fsr3` \| `fsr4` \| `upways` | Super-resolution mode (or `--scaler <fsr3\|fsr4\|upways> <native\|quality\|balanced\|performance\|ultraperf>`) | `none` |
+| `--render-scale` | `<float>` | Internal render resolution scale factor in `[0.25, 1.0]` when upscaling is active | `1.0` (`0.67` when upscaler enabled) |
+| `--upways-heuristic` | *(flag)* | Debug toggle: bypass Upways trained neural weights with analytical bilateral fallback | Disabled (trained neural active) |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |

@@ -45,11 +45,14 @@ public:
     // [0] classify, [1] intersect, [2] shade, [3] shadow, [4] resolve
     void initExecutionSet(const std::vector<VkPipeline>& pipelines);
 
-    static constexpr uint32_t NUM_SLICES = 32;
+    static constexpr uint32_t NUM_SLICES = 128;
     static inline uint32_t getSliceIndex(uint32_t frameSlot, uint32_t bounce, uint32_t passIndex = 0) {
-        // Double-buffered frameSlot (0..1) with up to 4 bounces, partitioned per pass
-        // 2 frame slots * 4 bounces * 3 passes = 24 slices <= 32 slices
+        // Double-buffered frameSlot (0..1) partitioned per bounce and pass
         return ((frameSlot * 4 + (bounce % 4)) * PassCount + (passIndex % PassCount)) % NUM_SLICES;
+    }
+    static inline uint32_t getFrameSliceIndex(uint32_t frameSlot, uint32_t dispatchOrdinal) {
+        constexpr uint32_t kHalf = NUM_SLICES / 2u;
+        return (frameSlot % 2u) * kHalf + (dispatchOrdinal % kHalf);
     }
 
     // Dynamic multi-slice ring buffer controls

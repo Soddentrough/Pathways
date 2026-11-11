@@ -403,13 +403,21 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     m_positionBuffer = std::make_unique<Buffer>(
         m_allocator, posSize,
         VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         0
     );
-    if (!positions.empty() && geomPipeline) {
-        geomPipeline->uploadToDeviceBuffer(*m_positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+    if (geomPipeline) {
+        if (!positions.empty()) {
+            geomPipeline->uploadToDeviceBuffer(*m_positionBuffer, positions.data(), sizeof(glm::vec4) * positions.size());
+        } else {
+            glm::vec4 dummyVerts[3] = {
+                glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                glm::vec4(0.0f, 0.0f, 0.0f, 1.0f),
+                glm::vec4(0.0f, 0.0f, 0.0f, 1.0f)
+            };
+            geomPipeline->uploadToDeviceBuffer(*m_positionBuffer, dummyVerts, sizeof(dummyVerts));
+        }
     }
 
     VkDeviceSize triSize = std::max(sizeof(TriangleShadeGPU) * shadeTriangles.size(), sizeof(TriangleShadeGPU));
@@ -478,7 +486,7 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     VkDeviceSize lightSize = std::max(sizeof(LightGPU) * m_sceneData.lights.size(), sizeof(LightGPU));
     m_lightBuffer = std::make_unique<Buffer>(
         m_allocator, lightSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -495,32 +503,95 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
                                           sizeof(LightTreeNodeGPU) * std::max<size_t>(1, 2 * m_sceneData.lights.size()));
     m_lightTreeBuffer = std::make_unique<Buffer>(
         m_allocator, lightTreeSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
     if (!m_sceneData.lightTreeNodes.empty()) {
         m_lightTreeBuffer->copyFrom(m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size());
     }
+    m_lightStaging = {};
+    m_lightTreeStaging = {};
+    m_cpuDynamicLights.clear();
+    m_cpuDynamicLightTree.clear();
+    m_dynamicLightsDirty = false;
 }
 
-void SceneManager::updateDynamicLights(SceneData& sceneData) {
+void SceneManager::updateDynamicLights(SceneData& sceneData, bool immediateHostCopy) {
     if (sceneData.lights.empty() || !m_lightBuffer) return;
     buildLightAliasTable(sceneData.lights);
     buildLightTree(sceneData.lights, sceneData.lightTreeNodes);
     computeLightTreePaths(sceneData.lightTreeNodes, sceneData.lights);
     m_numLights = static_cast<uint32_t>(sceneData.lights.size());
 
-    VkDeviceSize lightBytes = sizeof(LightGPU) * sceneData.lights.size();
-    if (lightBytes <= m_lightBuffer->getSize()) {
-        m_lightBuffer->copyFrom(sceneData.lights.data(), lightBytes);
+    if (immediateHostCopy) {
+        VkDeviceSize lightBytes = sizeof(LightGPU) * sceneData.lights.size();
+        if (lightBytes <= m_lightBuffer->getSize()) {
+            m_lightBuffer->copyFrom(sceneData.lights.data(), lightBytes);
+        }
+        if (m_lightTreeBuffer && !sceneData.lightTreeNodes.empty()) {
+            VkDeviceSize treeBytes = sizeof(LightTreeNodeGPU) * sceneData.lightTreeNodes.size();
+            if (treeBytes <= m_lightTreeBuffer->getSize()) {
+                m_lightTreeBuffer->copyFrom(sceneData.lightTreeNodes.data(), treeBytes);
+            }
+        }
+        m_dynamicLightsDirty = false;
+    } else {
+        m_cpuDynamicLights = sceneData.lights;
+        m_cpuDynamicLightTree = sceneData.lightTreeNodes;
+        m_dynamicLightsDirty = true;
     }
-    if (m_lightTreeBuffer && !sceneData.lightTreeNodes.empty()) {
-        VkDeviceSize treeBytes = sizeof(LightTreeNodeGPU) * sceneData.lightTreeNodes.size();
-        if (treeBytes <= m_lightTreeBuffer->getSize()) {
-            m_lightTreeBuffer->copyFrom(sceneData.lightTreeNodes.data(), treeBytes);
+}
+
+void SceneManager::recordDynamicLightUpload(VkCommandBuffer cmd, uint32_t frameSlot) {
+    if (!m_dynamicLightsDirty || !m_lightBuffer || m_cpuDynamicLights.empty()) return;
+    uint32_t slot = frameSlot % 2u;
+
+    VkDeviceSize lightBytes = std::min<VkDeviceSize>(
+        sizeof(LightGPU) * m_cpuDynamicLights.size(), m_lightBuffer->getSize());
+    if (lightBytes > 0) {
+        if (!m_lightStaging[slot] || m_lightStaging[slot]->getSize() < lightBytes) {
+            m_lightStaging[slot] = std::make_unique<Buffer>(
+                m_allocator, std::max(lightBytes, m_lightBuffer->getSize()),
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+            );
+        }
+        m_lightStaging[slot]->copyFrom(m_cpuDynamicLights.data(), lightBytes);
+        VkBufferCopy copyRegion{ 0, 0, lightBytes };
+        vkCmdCopyBuffer(cmd, m_lightStaging[slot]->getBuffer(), m_lightBuffer->getBuffer(), 1, &copyRegion);
+    }
+
+    if (m_lightTreeBuffer && !m_cpuDynamicLightTree.empty()) {
+        VkDeviceSize treeBytes = std::min<VkDeviceSize>(
+            sizeof(LightTreeNodeGPU) * m_cpuDynamicLightTree.size(), m_lightTreeBuffer->getSize());
+        if (treeBytes > 0) {
+            if (!m_lightTreeStaging[slot] || m_lightTreeStaging[slot]->getSize() < treeBytes) {
+                m_lightTreeStaging[slot] = std::make_unique<Buffer>(
+                    m_allocator, std::max(treeBytes, m_lightTreeBuffer->getSize()),
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+                );
+            }
+            m_lightTreeStaging[slot]->copyFrom(m_cpuDynamicLightTree.data(), treeBytes);
+            VkBufferCopy copyRegion{ 0, 0, treeBytes };
+            vkCmdCopyBuffer(cmd, m_lightTreeStaging[slot]->getBuffer(), m_lightTreeBuffer->getBuffer(), 1, &copyRegion);
         }
     }
+
+    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    m_dynamicLightsDirty = false;
 }
 
 void SceneManager::loadTextures(const std::string& hdriPath, const std::string& scenePath) {
@@ -541,7 +612,16 @@ void SceneManager::loadTextures(const std::string& hdriPath, const std::string& 
 
     m_sceneTextures.clear();
     for (const auto& texData : m_sceneData.textures) {
-        if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
+        if (texData.isHdr && !texData.hdrPixels.empty() && texData.width > 0 && texData.height > 0) {
+            bool genMips = (texData.width >= 64 && texData.height >= 64);
+            auto tex = Texture::createFromPixels(
+                m_device, m_allocator, m_queue, m_commandPool,
+                texData.width, texData.height,
+                VK_FORMAT_R16G16B16A16_SFLOAT, texData.hdrPixels.data(),
+                texData.hdrPixels.size() * sizeof(uint16_t), true, genMips
+            );
+            m_sceneTextures.push_back(std::move(tex));
+        } else if (!texData.pixels.empty() && texData.width > 0 && texData.height > 0) {
             VkFormat fmt = texData.isSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
             bool genMips = (texData.width >= 64 && texData.height >= 64);
             auto tex = Texture::createFromPixels(
@@ -600,6 +680,44 @@ void SceneManager::updateCamera(Camera* camera, const Config& config) {
                      camFov,
                      hasOverride ? " [CLI Override]" : "");
     }
+}
+
+SceneData SceneManager::reloadPreparedSceneData(const std::string& filepath, const Config& config,
+                                                SceneGeometryPipeline* geomPipeline) const {
+    UsdLoadOptions usdOptions{};
+    usdOptions.instanceDensity = config.instance_density;
+    usdOptions.cullDistance = config.cull_distance;
+    usdOptions.cameraPosOverride = config.camera_pos;
+    usdOptions.viewportAspect = (config.height > 0)
+        ? (static_cast<float>(config.width) / static_cast<float>(config.height))
+        : (16.0f / 9.0f);
+
+    std::string resolvedPath = resolveScenePath(filepath);
+    SceneData prepared = loadRawSceneData(resolvedPath, usdOptions);
+    if (prepared.triangles.empty() && prepared.spheres.empty()) {
+        prepared = ProceduralScene::createCornellBox();
+    }
+    if (config.enable_macro_blas && geomPipeline) {
+        geomPipeline->clusterInstancesToMacroBlas(prepared, config);
+    }
+    if (geomPipeline) {
+        bool hasNonOpaque = false;
+        bool hasAlphaMask = false;
+        uint32_t numOpaque = 0;
+        geomPipeline->updateSceneTransparency(prepared.materials, hasNonOpaque, hasAlphaMask);
+        geomPipeline->partitionSceneGeometry(prepared, numOpaque);
+    }
+    std::vector<uint32_t> triLightMap;
+    buildEmissiveLightMapping(prepared, triLightMap);
+    for (size_t t = 0; t < prepared.triangles.size() && t < triLightMap.size(); ++t) {
+        prepared.triangles[t].padding[0] = triLightMap[t];
+    }
+    if (!prepared.lights.empty()) {
+        buildLightAliasTable(prepared.lights);
+        buildLightTree(prepared.lights, prepared.lightTreeNodes);
+        computeLightTreePaths(prepared.lightTreeNodes, prepared.lights);
+    }
+    return prepared;
 }
 
 } // namespace pathways

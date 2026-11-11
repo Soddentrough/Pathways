@@ -9,15 +9,8 @@
 
 #define TINYEXR_USE_MINIZ 0
 #include <zlib.h>
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wstringop-overflow"
-#endif
 #define TINYEXR_IMPLEMENTATION
 #include "tinyexr.h"
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
 
 #include <fstream>
 #include <filesystem>
@@ -566,13 +559,6 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
                     << std::format("          \"upways_neural_guide_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
                     << std::format("          \"upways_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
                     << std::format("          \"upways_history_copy_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3]);
-            } else if (c.pipeline_stages.denoiser_mode == "gateway") {
-                out << std::format("          \"gateway_temporal_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[0])
-                    << std::format("          \"gateway_neural_guide_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
-                    << std::format("          \"gateway_atrous_step2_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
-                    << std::format("          \"gateway_atrous_step6_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3])
-                    << std::format("          \"gateway_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[4])
-                    << std::format("          \"gateway_history_copy_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[5]);
             }
         }
         out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
@@ -611,7 +597,8 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
                            uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,
                            const void* payloadData, size_t payloadBytes,
                            float fovDeg, float aspectRatio,
-                           const float camPos[3]) {
+                           const float camPos[3],
+                           const float jitterXY[2]) {
     if (!payloadData || width == 0 || height == 0 || channels == 0 || payloadBytes == 0) {
         Logger::error("Invalid tensor payload passed to savePTTD");
         return false;
@@ -622,8 +609,38 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
         std::filesystem::create_directories(p.parent_path());
     }
 
+    auto floatToHalfLe = [](float value) -> uint16_t {
+        if (!std::isfinite(value)) {
+            return 0u;
+        }
+        uint32_t bits = 0u;
+        std::memcpy(&bits, &value, sizeof(float));
+        uint32_t sign = (bits >> 16u) & 0x8000u;
+        int32_t exp = static_cast<int32_t>((bits >> 23u) & 0xFFu) - 127 + 15;
+        uint32_t mant = bits & 0x007FFFFFu;
+        if (exp <= 0) {
+            if (exp < -10) {
+                return static_cast<uint16_t>(sign);
+            }
+            mant = (mant | 0x00800000u) >> static_cast<uint32_t>(1 - exp);
+            return static_cast<uint16_t>(sign | ((mant + 0x00001000u) >> 13u));
+        }
+        if (exp >= 31) {
+            return static_cast<uint16_t>(sign | 0x7BFFu);
+        }
+        uint32_t roundedMant = mant + 0x00001000u;
+        if (roundedMant & 0x00800000u) {
+            roundedMant = 0u;
+            ++exp;
+            if (exp >= 31) {
+                return static_cast<uint16_t>(sign | 0x7BFFu);
+            }
+        }
+        return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10u) | (roundedMant >> 13u));
+    };
+
     PTTDHeader header;
-    header.version = (channels == 20) ? 2 : 1;
+    header.version = (channels >= 23 || jitterXY != nullptr) ? 3 : ((channels == 20) ? 2 : 1);
     header.width = width;
     header.height = height;
     header.channels = channels;
@@ -638,6 +655,14 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
         header.cam_pos[1] = camPos[1];
         header.cam_pos[2] = camPos[2];
     }
+    if (jitterXY) {
+        const uint16_t hx = floatToHalfLe(jitterXY[0]);
+        const uint16_t hy = floatToHalfLe(jitterXY[1]);
+        header.padding[0] = static_cast<char>(hx & 0xFFu);
+        header.padding[1] = static_cast<char>((hx >> 8u) & 0xFFu);
+        header.padding[2] = static_cast<char>(hy & 0xFFu);
+        header.padding[3] = static_cast<char>((hy >> 8u) & 0xFFu);
+    }
 
     std::ofstream out(filepath, std::ios::binary);
     if (!out.is_open()) {
@@ -649,8 +674,8 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
     out.write(reinterpret_cast<const char*>(payloadData), payloadBytes);
     out.close();
 
-    Logger::info("Dumped PTTD tensor ({}x{}x{}, ch={}, {} SPP, {:.2f} MB) to: {}",
-                 width, height, channels, (dataType == 0 ? "FP16" : "FP32"), spp,
+    Logger::info("Dumped PTTD v{} tensor ({}x{}x{}, ch={}, {} SPP, {:.2f} MB) to: {}",
+                 header.version, width, height, channels, (dataType == 0 ? "FP16" : "FP32"), spp,
                  payloadBytes / (1024.0 * 1024.0), filepath);
     return true;
 }

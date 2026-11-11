@@ -1,6 +1,11 @@
 #include "core/Config.hpp"
 #include "scene/Camera.hpp"
+#include "rt/SuperResolutionManager.hpp"
+#include "rt/FfxSdkRuntime.hpp"
+#include "vulkan/VulkanContext.hpp"
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <cassert>
 #include <cmath>
 #include <vector>
@@ -68,11 +73,16 @@ int main() {
         check_true(cFsr4.fsr_version == FsrVersion::Fsr4, "--scaler fsr4 sets FsrVersion::Fsr4");
         assert_near(cFsr4.render_scale, 0.6666667f, 1e-3f, "--scaler fsr4 quality sets 0.667 render_scale");
 
-        const char* argvFsr5[] = { "pathways", "--scaler", "fsr5", "performance" };
-        Config cFsr5 = Config::parse(4, const_cast<char**>(argvFsr5));
-        check_true(cFsr5.upscaler_mode == UpscalerMode::FSR, "--scaler fsr5 sets UpscalerMode::FSR");
-        check_true(cFsr5.fsr_version == FsrVersion::Fsr5, "--scaler fsr5 sets FsrVersion::Fsr5");
-        assert_near(cFsr5.render_scale, 0.5f, 1e-3f, "--scaler fsr5 performance sets 0.5 render_scale");
+        const char* argvFsr3[] = { "pathways", "--scaler", "fsr3", "performance" };
+        Config cFsr3 = Config::parse(4, const_cast<char**>(argvFsr3));
+        check_true(cFsr3.upscaler_mode == UpscalerMode::FSR, "--scaler fsr3 sets UpscalerMode::FSR");
+        check_true(cFsr3.fsr_version == FsrVersion::Fsr3, "--scaler fsr3 sets FsrVersion::Fsr3");
+        assert_near(cFsr3.render_scale, 0.5f, 1e-3f, "--scaler fsr3 performance sets 0.5 render_scale");
+
+        const char* argvRg11[] = { "pathways", "--accum-format", "rg11", "--upways-heuristic" };
+        Config cRg11 = Config::parse(4, const_cast<char**>(argvRg11));
+        check_true(cRg11.accum_format == AccumFormat::R11G11B10_UFLOAT, "--accum-format rg11 sets R11G11B10_UFLOAT");
+        check_true(cRg11.upways_heuristic_fallback, "--upways-heuristic sets upways_heuristic_fallback");
 
         // Verify FidelityFX recommended Halton jitter phase count scaling: max(8, floor(8 * (displayW / renderW)^2))
         check_true(getFsrJitterPhaseCount(1920, 1920) == 8u, "FSR 1.0x native jitter phase count = 8");
@@ -270,6 +280,102 @@ int main() {
         std::cout << "  -> Symmetric distributed tile partitioning verified: "
                   << primaryTiles << " primary (even) tiles, "
                   << secondaryTiles << " secondary (odd) tiles." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Real SuperResolutionManager Lazy Allocation & Honest FFX Stub Reporting
+    // -------------------------------------------------------------------------
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount > 0) {
+            std::cout << "[TEST 7] SuperResolutionManager Lazy Allocation & Honest FFX Stub Status..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+            cfg.width = 640;
+            cfg.height = 360;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "SuperResolutionManager Test");
+            FfxSdkRuntime::instance().initialize();
+
+            auto loadShader = [](const std::string& name) -> std::vector<char> {
+                std::vector<std::filesystem::path> candidates = {
+#ifdef SHADER_DIR
+                    std::filesystem::path(SHADER_DIR) / name,
+#endif
+                    std::filesystem::current_path() / "shaders" / name,
+                    std::filesystem::current_path() / "build" / "shaders" / name
+                };
+                for (const auto& p : candidates) {
+                    std::ifstream f(p, std::ios::binary | std::ios::ate);
+                    if (f.is_open()) {
+                        size_t sz = static_cast<size_t>(f.tellg());
+                        std::vector<char> buf(sz);
+                        f.seekg(0);
+                        f.read(buf.data(), static_cast<std::streamsize>(sz));
+                        return buf;
+                    }
+                }
+                return {};
+            };
+
+            SuperResolutionManager srMgr(
+                vkCtx.getDevice(),
+                vkCtx.getPhysicalDevice(),
+                vkCtx.getAllocator(),
+                vkCtx.getGraphicsQueue(),
+                loadShader
+            );
+            srMgr.createDescPool();
+
+            // Pure MC default: both Upways and FSR upscalers must remain lazily unallocated (0 B VRAM)
+            check_true(srMgr.getUpwaysPipeline() == nullptr, "UpwaysPipeline must be lazily null in Pure MC mode");
+            check_true(srMgr.getFsrUpscaler() == nullptr, "FsrUpscaler must be lazily null in Pure MC mode");
+
+            // On-demand Upways pipeline creation & lazy reclamation
+            Config cfgUpways = cfg;
+            cfgUpways.upscaler_mode = UpscalerMode::Upways;
+            cfgUpways.upways_superres = true;
+            cfgUpways.render_scale = 2.0f / 3.0f;
+            srMgr.createUpwaysPipelines(cfgUpways);
+            check_true(srMgr.getUpwaysPipeline() != nullptr, "UpwaysPipeline allocated on demand");
+
+            srMgr.releaseInactivePipelines(cfg);
+            check_true(srMgr.getUpwaysPipeline() == nullptr, "Inactive UpwaysPipeline reclaimed cleanly");
+
+#if defined(__linux__)
+            // Verify honest FSR 4 stub reporting when no native Linux FSR 4 Vulkan .so exists
+            if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::UpscalerFsr4)) {
+                check_true(!FfxSdkRuntime::instance().isUpscalerVersionSupported(
+                               vkCtx.getPhysicalDevice(), vkCtx.getDevice(), 4),
+                           "FSR 4 must report unavailable on Linux without a native FSR 4 Vulkan provider");
+            }
+#endif
+            srMgr.destroy();
+            check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors in SuperResolutionManager test");
+            std::cout << "  -> Lazy VRAM lifecycle and honest FSR 4 stub status verified." << std::endl;
+        }
     }
 
     std::cout << "\n>>> All TAA Engine unit tests PASSED successfully! <<<\n" << std::endl;

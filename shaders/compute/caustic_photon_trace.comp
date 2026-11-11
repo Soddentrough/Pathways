@@ -10,7 +10,7 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
@@ -75,12 +75,9 @@ void main() {
 
     if (light.position.w == 0.0 /* Area Quad Light */) {
         vec2 uv = randVec2(seed);
-        if (uv.x + uv.y > 1.0) {
-            uv = vec2(1.0 - uv.x, 1.0 - uv.y);
-        }
         lightPos = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
         if (lightArea <= 0.0) {
-            lightArea = 0.5 * length(cross(light.u.xyz, light.v.xyz));
+            lightArea = length(cross(light.u.xyz, light.v.xyz));
         }
     } else if (uint(light.position.w) == 1u /* Spot Light */) {
         lightPos = light.position.xyz;
@@ -93,7 +90,7 @@ void main() {
 
     // 2. Sample photon emission direction targeted toward dielectric geometry
     vec3 dir;
-    float coneSolidAngle;
+    float dirFluxWeight;
 
     if (pc.targetBBoxMin.w > 0.5) {
         vec3 bMin = pc.targetBBoxMin.xyz;
@@ -108,7 +105,7 @@ void main() {
         float sinThetaMax = clamp(bRadius / max(distToCenter, bRadius * 1.01), 0.05, 0.999);
         float cosThetaMax = sqrt(max(0.0, 1.0 - sinThetaMax * sinThetaMax));
 
-        // Sample uniform cone
+        // Sample uniform cone: pdf(omega) = 1 / coneSolidAngle
         float u1 = randFloat(seed);
         float u2 = randFloat(seed);
         float cosTheta = mix(cosThetaMax, 1.0, u1);
@@ -120,34 +117,59 @@ void main() {
         vec3 forward = cross(coneAxis, right);
 
         dir = normalize(right * (cos(phi) * sinTheta) + forward * (sin(phi) * sinTheta) + coneAxis * cosTheta);
-        coneSolidAngle = TWO_PI * (1.0 - cosThetaMax);
+        float coneSolidAngle = TWO_PI * (1.0 - cosThetaMax);
+        float cosLight = (light.position.w == 0.0) ? max(0.0, dot(lightNormal, dir)) : 1.0;
+        if (cosLight <= 0.0 && light.position.w == 0.0) {
+            return; // Emitted away from area light forward face
+        }
+        dirFluxWeight = cosLight * coneSolidAngle;
     } else {
-        // Cosine hemisphere emission from area light
-        vec3 localDir = sampleCosineHemisphere(lightNormal, seed);
-        dir = localDir;
-        coneSolidAngle = PI;
+        // Cosine hemisphere emission from area light: pdf(omega) = cosLight / PI, so cosLight cancels!
+        dir = sampleCosineHemisphere(lightNormal, seed);
+        float cosLight = (light.position.w == 0.0) ? max(0.0, dot(lightNormal, dir)) : 1.0;
+        if (cosLight <= 0.0 && light.position.w == 0.0) {
+            return;
+        }
+        dirFluxWeight = PI;
     }
 
-    float cosLight = max(0.0, dot(lightNormal, dir));
-    if (cosLight <= 0.0 && light.position.w == 0.0) {
-        return; // Emitted away from area light forward face
-    }
-    if (light.position.w != 0.0) cosLight = 1.0;
-
-    // Initial photon radiant flux
-    vec3 photonFlux = (emission * cosLight * lightArea * coneSolidAngle) / (float(pc.photonCount) * lightPickPdf);
+    // Initial photon radiant flux: dPhi = (Le * cosLight * dA * dOmega) / pdf
+    vec3 photonFlux = (emission * lightArea * dirFluxWeight) / (float(pc.photonCount) * lightPickPdf);
 
     vec3 rayOrigin = lightPos + lightNormal * EPSILON;
     vec3 rayDir = dir;
     vec3 throughput = vec3(1.0);
     bool hasHitDielectric = false;
+    uint dispersionChannel = 0u;
     uint maxBounces = pc.maxBounces > 0u ? pc.maxBounces : 4u;
 
     // 3. Trace photon forward through specular/dielectric refractive boundaries
     for (uint bounce = 0; bounce < maxBounces; ++bounce) {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, EPSILON, rayDir, 10000.0);
-        rayQueryProceedEXT(rq);
+        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsNoneEXT, 0xFF, rayOrigin, EPSILON, rayDir, 10000.0);
+        while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                uint cInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+                uint cGeomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, false);
+                uint cPrimIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                InstanceGPU cInst = instances[cInstIdx];
+                uint cTriIdx = cInst.firstTriangle + ((cGeomIdx == 0u) ? cPrimIdx : (cPrimIdx + cInst.numOpaqueTriangles));
+                Triangle cTri = triangles[cTriIdx];
+                Material cMat = materials[cTri.materialId + cInst.materialOffset];
+                if (cMat.alphaMode == 1u) {
+                    vec2 cBary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                    vec2 cUv = getTriangleUV(cTri, cBary);
+                    float cAlpha = cMat.albedo.a;
+                    if (cMat.albedoTex > 0u && cMat.albedoTex <= 512u) {
+                        cAlpha *= SAMPLE_SCENE_TEXTURE(cMat.albedoTex, cUv).a;
+                    }
+                    if (cAlpha < cMat.alphaCutoff) {
+                        continue;
+                    }
+                }
+                rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
 
         if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             break; // Flew into empty sky
@@ -181,6 +203,9 @@ void main() {
             vec3 geomN = frontFace ? hitNormal : -hitNormal;
 
             float iorVal = mat.ior > 0.0 ? mat.ior : 1.5;
+            if (mat.dispersion > 0.001 && dispersionChannel != 0u) {
+                iorVal += (float(dispersionChannel - 1u) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+            }
             float eta = frontFace ? (1.0 / iorVal) : iorVal;
 
             float cosTheta = min(dot(-rayDir, geomN), 1.0);
@@ -189,21 +214,35 @@ void main() {
             bool cannotRefract = eta * sinTheta > 1.0;
             float reflectProb = fresnelDielectric(cosTheta, eta);
 
+            // Volumetric Beer-Lambert absorption for interior segment before interface scattering
+            if (!frontFace && mat.attenuationColor.w > 0.0 && hitT > 0.0) {
+                vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
+                throughput *= exp(-sigma_a * hitT);
+            }
+
             // Refract vs Reflect
             if (cannotRefract || randFloat(seed) < reflectProb) {
                 // Fresnel reflection
                 rayDir = reflect(rayDir, geomN);
                 rayOrigin = hitPoint + geomN * EPSILON;
             } else {
-                // Snell's Law refraction
-                rayDir = normalize(refract(rayDir, geomN, eta));
-                rayOrigin = hitPoint - geomN * EPSILON;
-                throughput *= mat.albedo.rgb;
-
-                // Volumetric Beer-Lambert absorption on exit
-                if (!frontFace && mat.attenuationColor.w > 0.0) {
-                    vec3 sigma_a = -log(max(mat.attenuationColor.rgb, vec3(0.0001))) / mat.attenuationColor.w;
-                    throughput *= exp(-sigma_a * hitT);
+                // Snell's Law refraction (with spectral dispersion support & TIR NaN guard)
+                if (mat.dispersion > 0.001 && dispersionChannel == 0u) {
+                    uint channel = min(uint(randFloat(seed) * 3.0), 2u);
+                    dispersionChannel = channel + 1u;
+                    vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                    throughput *= mask;
+                    iorVal += (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+                    eta = frontFace ? (1.0 / iorVal) : iorVal;
+                }
+                vec3 refrVec = refract(rayDir, geomN, eta);
+                if (dot(refrVec, refrVec) > 1e-6) {
+                    rayDir = normalize(refrVec);
+                    rayOrigin = hitPoint - geomN * EPSILON;
+                    throughput *= mat.albedo.rgb;
+                } else {
+                    rayDir = reflect(rayDir, geomN);
+                    rayOrigin = hitPoint + geomN * EPSILON;
                 }
             }
         } else {

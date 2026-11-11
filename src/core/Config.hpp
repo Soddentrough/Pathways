@@ -49,35 +49,25 @@ enum class DenoiserMode {
     None,               // Raw stochastic path traced output (unfiltered progressive)
     Upways,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
     Svgf,               // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
-                        //         (docs/design/adaptive_svgf_denoiser_proposal.md)
-    Gateway,            // Gateway 4-pass E-SVGF + 2x2 Quad WMMA Guide & Continuous Upscaler
-    FfxRayRegeneration  // AMD FidelityFX Ray Regeneration (ML Denoiser, 4-signal decoupled)
+    FfxRayRegeneration  // AMD FidelityFX Ray Regeneration (stub until native Vulkan provider is available)
 };
 
 enum class FsrVersion : uint32_t {
-    Auto = 0, // Highest supported FidelityFX FSR version on the device (FSR 4 on RDNA 4+, FSR 3 fallback)
-    Fsr3 = 3, // AMD FSR 3 (analytical temporal super-resolution)
-    Fsr4 = 4, // AMD FSR 4 (ML cooperative-matrix super-resolution)
-    Fsr5 = 5  // Future AMD FSR 5 target
+    Auto = 0, // Highest supported FidelityFX FSR version on the device/runtime
+    Fsr3 = 3, // AMD FSR 3.1 (analytical temporal super-resolution)
+    Fsr4 = 4  // AMD FSR 4 (ML cooperative-matrix super-resolution; stub unless native Vulkan provider loaded)
 };
 
 enum class NrcBackend : uint32_t {
-    Auto = 0,             // Automatically use AMD FSR Radiance Cache (0.9.0) or Wave32 WMMA NRC
-    NativeWave32 = 1,     // Native Wave32 Cooperative Matrix MLP + Multi-Res Hash Grid
-    FfxRadianceCache = 2  // AMD FidelityFX Radiance Caching (0.9.0)
+    Auto = 0,             // Automatically use loaded native SDK provider or Wave32 WMMA NRC
+    NativeWave32 = 1,     // Native Wave32 Cooperative Matrix MLP + Positional Encoding
+    FfxRadianceCache = 2  // AMD FidelityFX Radiance Caching (stub until native Vulkan provider is available)
 };
 
-// EXPERIMENTAL / UNDOCUMENTED (owner decision, Oct 8 2026): all non-None reconstruction and
-// super-resolution modes below are experimental. They are intentionally absent from the README,
-// --help, and the GUI, and are reachable only via hidden CLI flags (--scaler/--denoiser/--upways*).
-// NOTE: the 'FSR'/'FSR1' passes are Pathways-authored custom filters until the Vulkan FidelityFX
-// SDK backend is linked (see docs/reports/codebase_review_2026_10_07.md findings A3/A5).
 enum class UpscalerMode {
-    None,    // Native resolution or direct linear blit [Default]
-    FSR,     // EXPERIMENTAL: AMD FSR temporal/ML upscaler (FSR 3 / FSR 4 / future FSR 5)
-    Upways,  // EXPERIMENTAL: neural denoiser/SR via Wave32 WMMA (hidden)
-    FSR1,    // EXPERIMENTAL: custom spatial upscaler (hidden)
-    Gateway, // EXPERIMENTAL: Gateway 4-pass E-SVGF + WMMA Guide SR
+    None,    // Native resolution [Default]
+    FSR,     // AMD FidelityFX Super Resolution (FSR 3.1 / FSR 4 stub)
+    Upways,  // Upways Neural Super-Resolution via Wave32 WMMA
     // Legacy alias
     FSR3 = FSR
 };
@@ -153,14 +143,14 @@ struct Config {
 
     uint32_t getRenderWidth() const {
         if (render_width > 0) return render_width;
-        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
             return std::max(1u, static_cast<uint32_t>(std::round(width * normalizeRenderScale(render_scale))));
         }
         return width;
     }
     uint32_t getRenderHeight() const {
         if (render_height > 0) return render_height;
-        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres || gateway_superres)) {
+        if (render_scale < 1.0f && (upscaler_mode != UpscalerMode::None || upways_superres)) {
             return std::max(1u, static_cast<uint32_t>(std::round(height * normalizeRenderScale(render_scale))));
         }
         return height;
@@ -201,12 +191,11 @@ struct Config {
     // IMPORTANT: Default is Pure Monte Carlo (DenoiserMode::None).
     // Keeping Pure Monte Carlo as default ensures unbiased, perfectly isotropic 1-SPP noise
     // with zero motion trails during interactive navigation, and seamless progressive convergence (up to 2048 spp)
-    // when stationary. Real-time reconstruction is provided via Upways, Gateway, or FSR 3.1.
+    // when stationary. Real-time reconstruction is provided via Upways, E-SVGF, or FSR 3.1.
     DenoiserMode denoiser_mode = DenoiserMode::None;     // Default: Pure Monte Carlo
-    bool upways_superres = false;         // Upways 2x Continuous Super-Resolution (e.g. 1080p -> 4K)
+    bool upways_superres = false;         // Upways Continuous Super-Resolution (e.g. 1080p -> 4K)
+    bool upways_heuristic_fallback = false; // Debug bypass: force analytical temporal/spatial heuristic instead of WMMA U-Net + KPN
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
-    bool gateway_superres = false;        // Gateway Continuous Super-Resolution (e.g. 1080p -> 4K)
-    std::string gateway_weights_path = ""; // Custom path to gateway_weights.bin
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
     FsrVersion fsr_version = FsrVersion::Auto;       // Target FSR version when UpscalerMode::FSR is active [Default: Auto]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]
@@ -275,12 +264,13 @@ struct Config {
     std::string dump_stats_path = "";
     bool dump_8bit_png = false; // Save dumped PNG frames as 8-bit instead of default 10/16-bit (conforms to single-negation rule)
 
-    // ML Neural Reconstruction Dataset Capture (Upways PTTD)
+    // ML Neural Reconstruction Dataset Capture (Upways PTTD v3)
     std::string capture_training_data_dir = "";
     uint32_t capture_frames = 0;
+    uint32_t capture_input_spp = 1;
     uint32_t capture_reference_spp = 256;
     bool capture_normals = true;
-    uint32_t capture_channels = 20; // 16, 19, 20, or 23 (PTTD v3 default)
+    uint32_t capture_channels = 24; // 16, 19, 20, 23, or 24 (PTTD v3 default)
     CaptureCameraMode capture_camera_mode = CaptureCameraMode::Gaming;
     uint32_t capture_input_width = 0;   // 0 = inherit config.width * render_scale
     uint32_t capture_input_height = 0;  // 0 = inherit config.height * render_scale

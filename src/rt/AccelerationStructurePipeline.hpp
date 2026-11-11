@@ -39,7 +39,8 @@ public:
     }
     [[nodiscard]] AccelerationStructureManager* getAsManager() const noexcept { return m_asManager.get(); }
     [[nodiscard]] Buffer* getInstanceBuffer() const noexcept { return m_instanceBuffer.get(); }
-    [[nodiscard]] Buffer* getIndexBuffer() const noexcept { return m_asIndexBuffer.get(); }
+    [[nodiscard]] Buffer* getIndexBuffer() const noexcept { return nullptr; }
+    [[nodiscard]] const std::vector<InstanceGPU>& getInitialShaderInstances() const noexcept { return m_initialShaderInstances; }
     [[nodiscard]] const std::vector<std::unique_ptr<AccelerationStructure>>& getBlases() const noexcept { return m_blases; }
     [[nodiscard]] const std::vector<ASInstanceInput>& getAsInstances() const noexcept { return m_asInstances; }
     [[nodiscard]] VkDeviceAddress getDefaultBlasAddress() const noexcept {
@@ -55,12 +56,12 @@ private:
     VkQueue m_queue = VK_NULL_HANDLE;
     uint32_t m_queueFamily = 0;
 
-    std::unique_ptr<Buffer> m_asIndexBuffer;
     std::unique_ptr<Buffer> m_instanceBuffer;
     std::unique_ptr<AccelerationStructureManager> m_asManager;
     std::vector<std::unique_ptr<AccelerationStructure>> m_blases;
     std::unique_ptr<AccelerationStructure> m_tlas;
     std::vector<ASInstanceInput> m_asInstances;
+    std::vector<InstanceGPU> m_initialShaderInstances;
 };
 
 } // namespace pathways

@@ -23,6 +23,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # Compiler options and warnings
 option(ENABLE_NATIVE_OPTIMIZATION "Enable CPU native architecture instruction optimizations (-march=native)" OFF)
+option(PATHWAYS_PORTABLE_CPU "Build portable x86-64-v3 binaries for distribution and CI" OFF)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(
@@ -44,6 +45,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 
     if(ENABLE_NATIVE_OPTIMIZATION)
         add_compile_options(-march=native -mtune=native)
+    elseif(PATHWAYS_PORTABLE_CPU AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        add_compile_options(-march=x86-64-v3)
     endif()
 
     # Release optimizations
@@ -60,7 +63,7 @@ if(MSVC)
         /MP
         /EHsc
     )
-    if(ENABLE_NATIVE_OPTIMIZATION)
+    if(ENABLE_NATIVE_OPTIMIZATION OR PATHWAYS_PORTABLE_CPU)
         add_compile_options(/arch:AVX2)
     endif()
     if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
@@ -158,26 +161,16 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/compute/nrc_resolve.comp
-    ${SHADER_DIR}/compute/dgc_compact.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/upways_temporal.comp
     ${SHADER_DIR}/compute/upways_neural_guide.comp
     ${SHADER_DIR}/compute/upways_upscale_resolve.comp
-    ${SHADER_DIR}/compute/gateway_temporal.comp
-    ${SHADER_DIR}/compute/gateway_neural_guide.comp
-    ${SHADER_DIR}/compute/gateway_atrous.comp
-    ${SHADER_DIR}/compute/gateway_upscale_resolve.comp
-    ${SHADER_DIR}/compute/fsr3_upscale.comp
-    ${SHADER_DIR}/compute/fsr3_rcas.comp
+    ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
     ${SHADER_DIR}/compute/restir_debug_view.comp
-    ${SHADER_DIR}/compute/denoise_temporal.comp
-    ${SHADER_DIR}/compute/denoise_variance.comp
-    ${SHADER_DIR}/compute/denoise_atrous.comp
-    ${SHADER_DIR}/compute/denoise_remodulate.comp
     ${SHADER_DIR}/compute/denoise_fused_temporal.comp
     ${SHADER_DIR}/compute/denoise_atrous_step1.comp
     ${SHADER_DIR}/compute/denoise_atrous_step2.comp
@@ -187,6 +180,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/rt/raytrace.rmiss
     ${SHADER_DIR}/rt/shadow.rmiss
     ${SHADER_DIR}/rt/raytrace.rchit
+    ${SHADER_DIR}/ui/imgui_hdr.frag
 )
 
 set(SPV_FILES "")
@@ -249,17 +243,19 @@ if(WIN32)
     )
 endif()
 
-# Executable target
-add_executable(pathways
-    ${SRC_FILES}
+# Engine core static library (shared across pathways executable and all CTests)
+set(ENGINE_CORE_SOURCES ${SRC_FILES})
+list(REMOVE_ITEM ENGINE_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+add_library(pathways_engine_core STATIC
+    ${ENGINE_CORE_SOURCES}
     ${IMGUI_SOURCES}
-    ${WINDOWS_RESOURCE_FILES}
 )
 
-add_dependencies(pathways compile_shaders)
+add_dependencies(pathways_engine_core compile_shaders)
 
-target_link_libraries(pathways
-    PRIVATE
+target_link_libraries(pathways_engine_core
+    PUBLIC
     Vulkan::Vulkan
     SDL3::SDL3
     Threads::Threads
@@ -267,27 +263,35 @@ target_link_libraries(pathways
 )
 
 if(FFMPEG_FOUND)
-    target_link_libraries(pathways PRIVATE PkgConfig::FFMPEG)
+    target_link_libraries(pathways_engine_core PUBLIC PkgConfig::FFMPEG)
 endif()
 
 if(WIN32)
-    target_link_libraries(pathways PRIVATE dxgi)
+    target_link_libraries(pathways_engine_core PUBLIC dxgi)
 endif()
 
 if(UNIX)
-    target_link_libraries(pathways PRIVATE m ${CMAKE_DL_LIBS})
+    target_link_libraries(pathways_engine_core PUBLIC m ${CMAKE_DL_LIBS})
 endif()
 
-target_include_directories(pathways PRIVATE
+target_include_directories(pathways_engine_core PUBLIC
     ${Vulkan_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${SPV_OUTPUT_DIR}
     ${BIN_SPV_DIR}
 )
 
-target_compile_definitions(pathways PRIVATE
+target_compile_definitions(pathways_engine_core PUBLIC
     SHADER_DIR="${SPV_OUTPUT_DIR}"
 )
+
+# Executable target
+add_executable(pathways
+    src/main.cpp
+    ${WINDOWS_RESOURCE_FILES}
+)
+
+target_link_libraries(pathways PRIVATE pathways_engine_core)
 
 # AMD FidelityFX SDK 2.4.0+ Support
 set(PATHWAYS_DEFAULT_FFX_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../FidelityFX-SDK")
@@ -326,11 +330,24 @@ if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
         "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/radiancecache/include"
         "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/framegeneration/include"
     )
-    target_include_directories(pathways SYSTEM PRIVATE ${FFX_SDK_INCLUDE_DIRS})
-    target_compile_definitions(pathways PRIVATE
+    target_include_directories(pathways_engine_core SYSTEM PUBLIC ${FFX_SDK_INCLUDE_DIRS})
+    target_compile_definitions(pathways_engine_core PUBLIC
         PATHWAYS_HAS_FFX_SDK=1
         PATHWAYS_FFX_SDK_ROOT_DIR="${PATHWAYS_FFX_SDK_DIR}"
     )
+    if(UNIX AND NOT APPLE AND EXISTS "/usr/bin/python3")
+        if(NOT DEFINED Python3_EXECUTABLE OR NOT Python3_EXECUTABLE MATCHES "^/usr/bin/")
+            foreach(_py_var
+                    Python3_EXECUTABLE Python3_INCLUDE_DIR Python3_LIBRARY Python3_LIBRARY_RELEASE Python3_LIBRARY_DEBUG
+                    _Python3_EXECUTABLE _Python3_INCLUDE_DIR _Python3_LIBRARY_RELEASE _Python3_LIBRARY_DEBUG
+                    _Python3_INTERPRETER_PROPERTIES _Python3_DEVELOPMENT_MODULE_SIGNATURE _Python3_DEVELOPMENT_EMBED_SIGNATURE)
+                unset(${_py_var} CACHE)
+                unset(${_py_var})
+            endforeach()
+            set(Python3_EXECUTABLE "/usr/bin/python3" CACHE FILEPATH "System Python3 executable" FORCE)
+            set(Python3_FIND_VIRTUALENV STANDARD)
+        endif()
+    endif()
     if(UNIX AND EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll")
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
         set(FFX_UPSCALER_VK_SO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libamd_fidelityfx_upscaler_vk.so")
@@ -348,22 +365,7 @@ if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/api/include/ffx_api.h")
             COMMENT "Building native Linux FidelityFX Upscaler 3.1.6 Vulkan provider (libamd_fidelityfx_upscaler_vk.so)"
         )
         add_custom_target(ffx_upscaler_vk_linux ALL DEPENDS "${FFX_UPSCALER_VK_SO}")
-        add_dependencies(pathways ffx_upscaler_vk_linux)
-
-        set(FFX_UPSCALER_FSR4_VK_SO "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/libamd_fidelityfx_upscaler_fsr4_vk.so")
-        add_custom_command(
-            OUTPUT "${FFX_UPSCALER_FSR4_VK_SO}"
-            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_ffx_upscaler_fsr4_vk_linux.py"
-                    "${PATHWAYS_FFX_SDK_DIR}"
-                    "${CMAKE_BINARY_DIR}/ffx_sdk_generated_fsr4"
-                    "${FFX_UPSCALER_FSR4_VK_SO}"
-                    "${CMAKE_CXX_COMPILER}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/build_ffx_upscaler_fsr4_vk_linux.py"
-                    "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll"
-            COMMENT "Building Linux FidelityFX Upscaler 4.1.2 ML Vulkan provider (libamd_fidelityfx_upscaler_fsr4_vk.so)"
-        )
-        add_custom_target(ffx_upscaler_fsr4_vk_linux ALL DEPENDS "${FFX_UPSCALER_FSR4_VK_SO}")
-        add_dependencies(pathways ffx_upscaler_fsr4_vk_linux)
+        add_dependencies(pathways_engine_core ffx_upscaler_vk_linux)
     endif()
 else()
     message(FATAL_ERROR "AMD FidelityFX SDK 2.4.0+ is mandatory for FSR 3.1 / FSR 4.1 ML support, but was not found at ${PATHWAYS_FFX_SDK_DIR}.")
@@ -380,7 +382,18 @@ if(UNIX AND (EXISTS "${USD_FALLBACK_DEPS}/include/tbb/concurrent_queue.h" OR EXI
     endif()
 endif()
 
-if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/usr/lib64/cmake/pxr/pxrConfig.cmake"))
+find_package(Python3 COMPONENTS Interpreter Development QUIET)
+set(PATHWAYS_HAS_PYTHON_MATERIALX FALSE)
+if(Python3_FOUND)
+    if((DEFINED Python3_SITELIB AND EXISTS "${Python3_SITELIB}/materialx") OR
+       (DEFINED Python3_STDARCH AND EXISTS "${Python3_STDARCH}/materialx") OR
+       EXISTS "/usr/lib/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages/materialx" OR
+       EXISTS "/usr/lib64/python${Python3_VERSION_MAJOR}.${Python3_VERSION_MINOR}/site-packages/materialx")
+        set(PATHWAYS_HAS_PYTHON_MATERIALX TRUE)
+    endif()
+endif()
+
+if(WIN32 OR PATHWAYS_HAS_PYTHON_MATERIALX)
     find_package(OpenGL QUIET)
     find_package(X11 QUIET COMPONENTS Xt)
     find_package(pxr QUIET HINTS "$ENV{USD_ROOT}" "$ENV{PXR_ROOT}" "${CMAKE_CURRENT_SOURCE_DIR}/../USD" "C:/Users/naoki/Development/USD" "/usr/lib64/cmake/pxr")
@@ -412,40 +425,35 @@ if(WIN32 OR (EXISTS "/usr/lib/python3.14/site-packages/materialx" AND EXISTS "/u
                 list(FILTER _usd_dirs EXCLUDE REGEX "rav1e|svt-av1|libvmaf")
                 set_target_properties(usd_m PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "${_usd_dirs}")
             endif()
+            set(PATHWAYS_USD_LIBS usd_m)
+        else()
+            set(PATHWAYS_USD_LIBS arch tf gf plug vt ar sdf pcp usd usdGeom usdShade usdLux)
         endif()
         find_package(Python3 COMPONENTS Development QUIET)
-        target_compile_definitions(pathways PRIVATE
+        target_compile_definitions(pathways_engine_core PUBLIC
             PATHWAYS_ENABLE_USD=1
             TBB_SUPPRESS_DEPRECATED_MESSAGES=1
             TBB_INTERFACE_VERSION_MAJOR=12
         )
-        target_link_libraries(pathways PRIVATE ${PXR_LIBRARIES})
+        target_link_libraries(pathways_engine_core PUBLIC ${PATHWAYS_USD_LIBS})
         if(TARGET TBB::tbb)
-            target_link_libraries(pathways PRIVATE TBB::tbb)
+            target_link_libraries(pathways_engine_core PUBLIC TBB::tbb)
         elseif(EXISTS "/usr/lib64/libtbb.so.12")
-            target_link_libraries(pathways PRIVATE /usr/lib64/libtbb.so.12)
+            target_link_libraries(pathways_engine_core PUBLIC /usr/lib64/libtbb.so.12)
         elseif(EXISTS "/usr/lib64/libtbb.so")
-            target_link_libraries(pathways PRIVATE /usr/lib64/libtbb.so)
+            target_link_libraries(pathways_engine_core PUBLIC /usr/lib64/libtbb.so)
         endif()
         if(TARGET Python3::Python)
-            target_link_libraries(pathways PRIVATE Python3::Python)
-            target_include_directories(pathways SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
+            target_link_libraries(pathways_engine_core PUBLIC Python3::Python)
+            target_include_directories(pathways_engine_core SYSTEM PUBLIC ${Python3_INCLUDE_DIRS})
         endif()
         if(UNIX AND EXISTS "${USD_FALLBACK_DEPS}/include")
-            target_include_directories(pathways SYSTEM BEFORE PRIVATE "${USD_FALLBACK_DEPS}/include")
+            target_include_directories(pathways_engine_core SYSTEM BEFORE PUBLIC "${USD_FALLBACK_DEPS}/include")
         endif()
-        target_include_directories(pathways SYSTEM PRIVATE ${PXR_INCLUDE_DIRS})
-        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-            set_source_files_properties(src/scene/UsdLoader.cpp PROPERTIES COMPILE_OPTIONS "-Wno-deprecated")
-        endif()
+        target_include_directories(pathways_engine_core SYSTEM PUBLIC ${PXR_INCLUDE_DIRS})
     endif()
 else()
     message(STATUS "OpenUSD prerequisites not fully installed (requires usd-devel, imath-devel, python3-materialx, libXt-devel). Building without native OpenUSD support.")
-endif()
-
-# Scoped warning suppression for third-party header tinyexr inlined into ImageDumper.cpp
-if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    set_source_files_properties(src/utils/ImageDumper.cpp PROPERTIES COMPILE_OPTIONS "-Wno-array-bounds")
 endif()
 
 # Windows runtime DLL deployment
@@ -532,7 +540,7 @@ add_custom_target(package_upways_weights
     COMMENT "Checking and packaging updated Upways neural weights"
 )
 
-add_dependencies(pathways package_upways_weights)
+add_dependencies(pathways_engine_core package_upways_weights)
 
 # Deploy default neural reconstruction weights to build tree
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
@@ -553,410 +561,121 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
     )
 endif()
 
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
-    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
-         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
-    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
-        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
-        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
-             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
-    endif()
-    add_custom_command(TARGET pathways POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin"
-            "$<TARGET_FILE_DIR:pathways>/data/models/gateway_weights.bin"
-        COMMENT "Deploying Gateway neural weights to build tree"
-    )
-endif()
-
 # Testing
 option(BUILD_TESTING "Build unit test executables" ON)
 if(BUILD_TESTING)
 enable_testing()
 
 # Camera & FPS Controls Unit Test Target
-add_executable(test_camera_controls
-    tests/test_camera_controls.cpp
-    src/scene/Camera.cpp
-    src/scene/ProceduralScene.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_camera_controls PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-
-if(UNIX)
-    target_link_libraries(test_camera_controls PRIVATE m)
-endif()
-
+add_executable(test_camera_controls tests/test_camera_controls.cpp)
+target_link_libraries(test_camera_controls PRIVATE pathways_engine_core)
 add_test(NAME CameraControls COMMAND test_camera_controls)
 
 # Camera Paths & Trajectories Unit Test Target
-add_executable(test_camera_paths
-    tests/test_camera_paths.cpp
-    src/scene/CameraPath.cpp
-    src/scene/Camera.cpp
-    src/scene/ProceduralScene.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_camera_paths PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-if(UNIX)
-    target_link_libraries(test_camera_paths PRIVATE m)
-endif()
+add_executable(test_camera_paths tests/test_camera_paths.cpp)
+target_link_libraries(test_camera_paths PRIVATE pathways_engine_core)
 add_test(NAME CameraPaths COMMAND test_camera_paths)
 
-
-# GUI Mouse Wheel & Scroll Indicator Unit Test Target
-add_executable(test_gui_scroll
-    tests/test_gui_scroll.cpp
-    ${THIRD_PARTY_DIR}/imgui/imgui.cpp
-    ${THIRD_PARTY_DIR}/imgui/imgui_draw.cpp
-    ${THIRD_PARTY_DIR}/imgui/imgui_tables.cpp
-    ${THIRD_PARTY_DIR}/imgui/imgui_widgets.cpp
-    ${THIRD_PARTY_DIR}/imgui/backends/imgui_impl_sdl3.cpp
-)
-target_include_directories(test_gui_scroll PRIVATE
-    ${THIRD_PARTY_DIR}/imgui
-    ${THIRD_PARTY_DIR}/imgui/backends
-)
-if(UNIX)
-    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3 m)
-else()
-    target_link_libraries(test_gui_scroll PRIVATE SDL3::SDL3)
-endif()
+# GUI Mouse Wheel, Scroll Indicator & GuiManager Unit Test Target
+add_executable(test_gui_scroll tests/test_gui_scroll.cpp)
+target_link_libraries(test_gui_scroll PRIVATE pathways_engine_core)
 add_test(NAME GuiScroll COMMAND test_gui_scroll)
 
-
-
-
-# Temporal Anti-Aliasing (TAA) Unit Test Target
-add_executable(test_taa
-    tests/test_taa.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-    src/scene/Camera.cpp
-)
-target_include_directories(test_taa PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-if(UNIX)
-    target_link_libraries(test_taa PRIVATE m)
-endif()
+# Temporal Anti-Aliasing (TAA) & SuperResolutionManager Unit Test Target
+add_executable(test_taa tests/test_taa.cpp)
+target_link_libraries(test_taa PRIVATE pathways_engine_core)
 add_test(NAME TemporalAntiAliasing COMMAND test_taa)
 
 if(UNIX)
-    # P2P Direct BAR DMA-BUF Unit Test Target
-    add_executable(test_p2p_direct_bar
-        tests/test_p2p_direct_bar.cpp
-    )
-    target_link_libraries(test_p2p_direct_bar PRIVATE Vulkan::Vulkan)
+    # P2P Direct BAR DMA-BUF Cross-GPU Copy Unit Test Target
+    add_executable(test_p2p_direct_bar tests/test_p2p_direct_bar.cpp)
+    target_link_libraries(test_p2p_direct_bar PRIVATE pathways_engine_core)
     add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
 
-    # Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd) Unit Test Target
-    add_executable(test_cross_gpu_sync
-        tests/test_cross_gpu_sync.cpp
-    )
-    target_link_libraries(test_cross_gpu_sync PRIVATE Vulkan::Vulkan)
+    # Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd + Timeline) Unit Test Target
+    add_executable(test_cross_gpu_sync tests/test_cross_gpu_sync.cpp)
+    target_link_libraries(test_cross_gpu_sync PRIVATE pathways_engine_core)
     add_test(NAME CrossGpuSync COMMAND test_cross_gpu_sync)
 endif()
 
-# Pipeline Comparison & Telemetry Unit Test Target
-add_executable(test_pipeline_comparison
-    tests/test_pipeline_comparison.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-    src/utils/ImageDumper.cpp
-)
-target_include_directories(test_pipeline_comparison PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_pipeline_comparison PRIVATE Threads::Threads ZLIB::ZLIB)
-if(UNIX)
-    target_link_libraries(test_pipeline_comparison PRIVATE m)
-endif()
+# Pipeline Comparison, CLI Validation & Telemetry Unit Test Target
+add_executable(test_pipeline_comparison tests/test_pipeline_comparison.cpp)
+target_link_libraries(test_pipeline_comparison PRIVATE pathways_engine_core)
 add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
 
-# Multi-GPU Frame Pacing & Host Zero-Copy Unit Test Target
-add_executable(test_mgpu_frame_pacing
-    tests/test_mgpu_frame_pacing.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_mgpu_frame_pacing PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_mgpu_frame_pacing PRIVATE Vulkan::Vulkan)
-if(UNIX)
-    target_link_libraries(test_mgpu_frame_pacing PRIVATE m Threads::Threads)
-endif()
+# Multi-GPU Frame Pacing, Coordinator & Shared Buffer Unit Test Target
+add_executable(test_mgpu_frame_pacing tests/test_mgpu_frame_pacing.cpp)
+target_link_libraries(test_mgpu_frame_pacing PRIVATE pathways_engine_core)
 add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing)
 
-# Tier 3 GPU TLAS Refit & Structure Layout Unit Test Target
-add_executable(test_tlas_gpu_refit
-    tests/test_tlas_gpu_refit.cpp
-)
-target_include_directories(test_tlas_gpu_refit PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_tlas_gpu_refit PRIVATE Vulkan::Vulkan)
+# Tier 3 GPU TLAS Refit & GpuTlasUpdatePipeline Unit Test Target
+add_executable(test_tlas_gpu_refit tests/test_tlas_gpu_refit.cpp)
+target_link_libraries(test_tlas_gpu_refit PRIVATE pathways_engine_core)
 add_test(NAME TlasGpuRefit COMMAND test_tlas_gpu_refit)
 
 # Tier 4 Neural Radiance Caching (NRC) Wave32 WMMA Unit Test Target
-add_executable(test_nrc_wmma
-    tests/test_nrc_wmma.cpp
-)
-target_include_directories(test_nrc_wmma PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_nrc_wmma PRIVATE Vulkan::Vulkan)
+add_executable(test_nrc_wmma tests/test_nrc_wmma.cpp)
+target_link_libraries(test_nrc_wmma PRIVATE pathways_engine_core)
 add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 
 # Upways Neural Denoiser & Super-Resolution Wave32 WMMA Unit Test Target
-add_executable(test_upways_pipeline
-    tests/test_upways_pipeline.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_upways_pipeline PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_upways_pipeline PRIVATE Vulkan::Vulkan)
-add_dependencies(test_upways_pipeline package_upways_weights)
+add_executable(test_upways_pipeline tests/test_upways_pipeline.cpp)
+target_link_libraries(test_upways_pipeline PRIVATE pathways_engine_core)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
 
-
-# Adaptive E-SVGF Denoiser Pipeline Contract Test (5-Dispatch Dilated Architecture)
-add_executable(test_denoiser_pipeline
-    tests/test_denoiser_pipeline.cpp
-)
+# Adaptive E-SVGF Denoiser Pipeline (5-Dispatch Dilated GPU Execution) Test Target
+add_executable(test_denoiser_pipeline tests/test_denoiser_pipeline.cpp)
 target_compile_definitions(test_denoiser_pipeline PRIVATE
     PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
 )
-target_include_directories(test_denoiser_pipeline PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_denoiser_pipeline PRIVATE Vulkan::Vulkan)
+target_link_libraries(test_denoiser_pipeline PRIVATE pathways_engine_core)
 add_test(NAME DenoiserPipeline COMMAND test_denoiser_pipeline)
 
 # ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
-add_executable(test_restir_pt_math
-    tests/test_restir_pt_math.cpp
-)
-target_include_directories(test_restir_pt_math PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-if(UNIX)
-    target_link_libraries(test_restir_pt_math PRIVATE m)
-endif()
+add_executable(test_restir_pt_math tests/test_restir_pt_math.cpp)
+target_link_libraries(test_restir_pt_math PRIVATE pathways_engine_core)
 add_test(NAME RestirPtMath COMMAND test_restir_pt_math)
 
-
-
 # DGC Multi-Slice Ring Buffer & Dedicated Compute Queue Unit Test Target
-add_executable(test_dgc_async_queue
-    tests/test_dgc_async_queue.cpp
-)
-target_include_directories(test_dgc_async_queue PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_dgc_async_queue PRIVATE Vulkan::Vulkan)
+add_executable(test_dgc_async_queue tests/test_dgc_async_queue.cpp)
+target_link_libraries(test_dgc_async_queue PRIVATE pathways_engine_core)
 add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue)
 
-# DGC Stream Compaction GPU Unit Test Target
-add_executable(test_dgc_compact
-    tests/test_dgc_compact.cpp
-)
-target_include_directories(test_dgc_compact PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_dgc_compact PRIVATE Vulkan::Vulkan)
-add_test(NAME DgcCompact COMMAND test_dgc_compact)
-
 # Batched BLAS Builds & Compaction Unit Test Target
-add_executable(test_blas_batch
-    tests/test_blas_batch.cpp
-    src/rt/AccelerationStructure.cpp
-    src/vulkan/VulkanContext.cpp
-    src/vulkan/Buffer.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_blas_batch PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-    ${THIRD_PARTY_DIR}/vma
-)
-target_link_libraries(test_blas_batch PRIVATE Vulkan::Vulkan Threads::Threads)
-if(UNIX)
-    target_link_libraries(test_blas_batch PRIVATE m)
-endif()
+add_executable(test_blas_batch tests/test_blas_batch.cpp)
+target_link_libraries(test_blas_batch PRIVATE pathways_engine_core)
 add_test(NAME BlasBatch COMMAND test_blas_batch)
 
-add_executable(test_light_tree
-    tests/test_light_tree.cpp
-)
-target_include_directories(test_light_tree PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
+# Hierarchical Light Tree & Emissive Geometry Pipeline Unit Test Target
+add_executable(test_light_tree tests/test_light_tree.cpp)
+target_link_libraries(test_light_tree PRIVATE pathways_engine_core)
 add_test(NAME LightTree COMMAND test_light_tree)
 
-# glTF KHR_mesh_quantization & Fast Ingestion Unit Test Target
-add_executable(test_mesh_quantization
-    tests/test_mesh_quantization.cpp
-    src/scene/GltfLoader.cpp
-    src/scene/ProceduralScene.cpp
-    src/scene/Camera.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_mesh_quantization PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-    ${THIRD_PARTY_DIR}/cgltf
-    ${THIRD_PARTY_DIR}/stb
-)
-target_link_libraries(test_mesh_quantization PRIVATE Threads::Threads)
-if(UNIX)
-    target_link_libraries(test_mesh_quantization PRIVATE m)
-endif()
+# glTF KHR_mesh_quantization, KHR_materials_specular & MiniJson Unit Test Target
+add_executable(test_mesh_quantization tests/test_mesh_quantization.cpp)
+target_link_libraries(test_mesh_quantization PRIVATE pathways_engine_core)
 add_test(NAME MeshQuantization COMMAND test_mesh_quantization)
 
 # Procedural Cyber City Megastructure Unit Test Target
-add_executable(test_procedural_cyber_city
-    tests/test_procedural_cyber_city.cpp
-    src/scene/ProceduralScene.cpp
-    src/scene/Camera.cpp
-    src/core/Logger.cpp
-)
-target_include_directories(test_procedural_cyber_city PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-)
-target_link_libraries(test_procedural_cyber_city PRIVATE Threads::Threads)
-if(UNIX)
-    target_link_libraries(test_procedural_cyber_city PRIVATE m)
-endif()
+add_executable(test_procedural_cyber_city tests/test_procedural_cyber_city.cpp)
+target_link_libraries(test_procedural_cyber_city PRIVATE pathways_engine_core)
 add_test(NAME ProceduralCyberCity COMMAND test_procedural_cyber_city)
 
 # Real-Time Caustics Dielectric Target & Bounding Volume Unit Test Target
-add_executable(test_caustics_detection
-    tests/test_caustics_detection.cpp
-    src/scene/SceneGeometryPipeline.cpp
-    src/scene/ProceduralScene.cpp
-    src/scene/GltfLoader.cpp
-    src/scene/Camera.cpp
-    src/core/Logger.cpp
-    src/core/Config.cpp
-    src/vulkan/Buffer.cpp
-    src/vulkan/VulkanContext.cpp
-)
-target_include_directories(test_caustics_detection PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-    ${THIRD_PARTY_DIR}/cgltf
-    ${THIRD_PARTY_DIR}/stb
-    ${THIRD_PARTY_DIR}/vma
-)
-target_link_libraries(test_caustics_detection PRIVATE Vulkan::Vulkan Threads::Threads)
-if(UNIX)
-    target_link_libraries(test_caustics_detection PRIVATE m)
-endif()
+add_executable(test_caustics_detection tests/test_caustics_detection.cpp)
+target_link_libraries(test_caustics_detection PRIVATE pathways_engine_core)
 add_test(NAME CausticsDetection COMMAND test_caustics_detection)
 
 # AMD FidelityFX SDK 2.4 Feature, Performance & Visual Assessment Test Target
-add_executable(test_fidelityfx_features
-    tests/test_fidelityfx_features.cpp
-    src/rt/FfxSdkRuntime.cpp
-    src/core/Config.cpp
-    src/core/Logger.cpp
-    src/utils/ImageDumper.cpp
-    src/vulkan/Buffer.cpp
-    src/vulkan/Image.cpp
-    src/vulkan/VulkanContext.cpp
-)
-target_include_directories(test_fidelityfx_features PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${THIRD_PARTY_DIR}/glm
-    ${THIRD_PARTY_DIR}/stb
-    ${THIRD_PARTY_DIR}/vma
-    ${THIRD_PARTY_DIR}/tinyexr
-)
-if(DEFINED FFX_SDK_INCLUDE_DIRS)
-    target_include_directories(test_fidelityfx_features SYSTEM PRIVATE ${FFX_SDK_INCLUDE_DIRS})
-    target_compile_definitions(test_fidelityfx_features PRIVATE
-        PATHWAYS_HAS_FFX_SDK=1
-        PATHWAYS_FFX_SDK_ROOT_DIR="${PATHWAYS_FFX_SDK_DIR}"
-    )
-endif()
-target_link_libraries(test_fidelityfx_features PRIVATE Vulkan::Vulkan Threads::Threads ZLIB::ZLIB)
-if(UNIX)
-    target_link_libraries(test_fidelityfx_features PRIVATE m ${CMAKE_DL_LIBS})
-endif()
+add_executable(test_fidelityfx_features tests/test_fidelityfx_features.cpp)
+target_link_libraries(test_fidelityfx_features PRIVATE pathways_engine_core)
 add_dependencies(test_fidelityfx_features pathways)
 add_test(NAME FidelityFxFeatures COMMAND test_fidelityfx_features)
 
 # OpenUSD Native Scene Ingestion Unit Test Target
 if(pxr_FOUND)
-    add_executable(test_usd_loader
-        tests/test_usd_loader.cpp
-        src/scene/UsdLoader.cpp
-        src/scene/ProceduralScene.cpp
-        src/core/Logger.cpp
-        src/utils/ImageDumper.cpp
-    )
-    target_include_directories(test_usd_loader PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${THIRD_PARTY_DIR}/glm
-        ${THIRD_PARTY_DIR}/stb
-        ${THIRD_PARTY_DIR}/tinyexr
-    )
-    if(UNIX AND EXISTS "${USD_FALLBACK_DEPS}/include")
-        target_include_directories(test_usd_loader SYSTEM BEFORE PRIVATE "${USD_FALLBACK_DEPS}/include")
-    endif()
-    target_include_directories(test_usd_loader SYSTEM PRIVATE
-        ${PXR_INCLUDE_DIRS}
-    )
-    target_compile_definitions(test_usd_loader PRIVATE
-        PATHWAYS_ENABLE_USD=1
-        TBB_SUPPRESS_DEPRECATED_MESSAGES=1
-        TBB_INTERFACE_VERSION_MAJOR=12
-    )
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options(test_usd_loader PRIVATE "-Wno-deprecated")
-    endif()
-    target_link_libraries(test_usd_loader PRIVATE ${PXR_LIBRARIES} ZLIB::ZLIB)
-    if(TARGET TBB::tbb)
-        target_link_libraries(test_usd_loader PRIVATE TBB::tbb)
-    elseif(EXISTS "/usr/lib64/libtbb.so.12")
-        target_link_libraries(test_usd_loader PRIVATE /usr/lib64/libtbb.so.12)
-    elseif(EXISTS "/usr/lib64/libtbb.so")
-        target_link_libraries(test_usd_loader PRIVATE /usr/lib64/libtbb.so)
-    endif()
-    if(TARGET Python3::Python)
-        target_include_directories(test_usd_loader SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
-        target_link_libraries(test_usd_loader PRIVATE Python3::Python)
-    endif()
-    if(UNIX)
-        target_link_libraries(test_usd_loader PRIVATE m)
-    endif()
+    add_executable(test_usd_loader tests/test_usd_loader.cpp)
+    target_link_libraries(test_usd_loader PRIVATE pathways_engine_core)
     add_test(NAME UsdLoader COMMAND test_usd_loader)
 endif()
 endif() # BUILD_TESTING
@@ -981,6 +700,7 @@ set(CURATED_SCENE_DIRS
     classroom
     coffee-maker
     cornell-caustic
+    cyber_city
     glass-of-water
     living-room
     modern-hall
@@ -1020,6 +740,9 @@ if(WIN32)
                     DESTINATION "scenes/${SCENE_DIR}"
                     FILES_MATCHING
                     PATTERN "*_extended.glb"
+                    PATTERN "*.glb"
+                    PATTERN "*.gltf"
+                    PATTERN "*.bin"
                     PATTERN "*.usd"
                     PATTERN "*.usda"
                     PATTERN "*.usdc"
@@ -1027,17 +750,20 @@ if(WIN32)
                     PATTERN "*.jpg"
                     PATTERN "*.jpeg"
                     PATTERN "*.exr"
+                    PATTERN "*.hdr"
+                    PATTERN "*.mp4"
                     PATTERN "LICENSE.txt"
                     PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
         endif()
     endforeach()
+    file(GLOB ROOT_HDR_MP4_SCENES "${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.hdr" "${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.mp4")
+    if(ROOT_HDR_MP4_SCENES)
+        install(FILES ${ROOT_HDR_MP4_SCENES} DESTINATION scenes)
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION data/models)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin" DESTINATION data/models)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico" DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -1048,16 +774,13 @@ if(WIN32)
     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md DESTINATION . OPTIONAL)
 else()
     # Standard Linux FHS installation
+    set_target_properties(pathways PROPERTIES
+        INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}/pathways"
+    )
     install(TARGETS pathways DESTINATION ${CMAKE_INSTALL_BINDIR})
     install(DIRECTORY ${SPV_OUTPUT_DIR}/ DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/shaders FILES_MATCHING PATTERN "*.spv")
     if(DEFINED FFX_UPSCALER_VK_SO)
         install(PROGRAMS "${FFX_UPSCALER_VK_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pathways)
-    endif()
-    if(DEFINED FFX_UPSCALER_FSR4_VK_SO)
-        install(PROGRAMS "${FFX_UPSCALER_FSR4_VK_SO}" DESTINATION ${CMAKE_INSTALL_LIBDIR}/pathways)
-    endif()
-    if(EXISTS "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll")
-        install(FILES "${PATHWAYS_FFX_SDK_DIR}/Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_vk.dll" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways)
     endif()
 
     foreach(SCENE_FILE ${CURATED_SCENE_FILES})
@@ -1072,6 +795,9 @@ else()
                     DESTINATION "${CMAKE_INSTALL_DATADIR}/pathways/scenes/${SCENE_DIR}"
                     FILES_MATCHING
                     PATTERN "*_extended.glb"
+                    PATTERN "*.glb"
+                    PATTERN "*.gltf"
+                    PATTERN "*.bin"
                     PATTERN "*.usd"
                     PATTERN "*.usda"
                     PATTERN "*.usdc"
@@ -1079,11 +805,17 @@ else()
                     PATTERN "*.jpg"
                     PATTERN "*.jpeg"
                     PATTERN "*.exr"
+                    PATTERN "*.hdr"
+                    PATTERN "*.mp4"
                     PATTERN "LICENSE.txt"
                     PATTERN "VERSION.txt"
                     PATTERN "conversion.yaml")
         endif()
     endforeach()
+    file(GLOB ROOT_HDR_MP4_SCENES "${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.hdr" "${CMAKE_CURRENT_SOURCE_DIR}/scenes/*.mp4")
+    if(ROOT_HDR_MP4_SCENES)
+        install(FILES ${ROOT_HDR_MP4_SCENES} DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/scenes)
+    endif()
 
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.desktop DESTINATION ${CMAKE_INSTALL_DATADIR}/applications)
@@ -1097,9 +829,6 @@ else()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
-    endif()
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin")
-        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/gateway_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)
@@ -1152,10 +881,10 @@ else()
     set(CPACK_RPM_PACKAGE_AUTOPROV "yes")
     set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")
     if(NOT CPACK_RPM_PACKAGE_RELEASE)
-        set(CPACK_RPM_PACKAGE_RELEASE "1.fc44")
+        set(CPACK_RPM_PACKAGE_RELEASE "1.fc45")
     endif()
     set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
-    set(CPACK_RPM_PACKAGE_DESCRIPTION "Pathways is a high-performance, real-time Vulkan 1.4 path tracer optimized for modern AMD RDNA architectures (e.g. Dual Radeon AI PRO R9700). Features include pure Wave32 wavefront dispatch via Device Generated Commands (DGC), hardware ray tracing, multi-GPU scaling (interleaved scanlines and sample parallelism), and canonical Tier 1 PBR research assets.")
+    set(CPACK_RPM_PACKAGE_DESCRIPTION "Pathways is a high-performance, real-time Vulkan 1.4 path tracer optimized for modern AMD RDNA architectures (e.g. Dual Radeon AI PRO R9700). Features include pure Wave32 wavefront dispatch via Device Generated Commands (DGC), hardware ray tracing, unified Wavefront ReSTIR PT, Upways 3.0 FP8 WMMA neural reconstruction, multi-GPU scaling (checkerboard tiling and sample parallelism), and canonical Tier 1 PBR research assets.")
 
     # Default generators
     set(CPACK_GENERATOR "RPM;TGZ")

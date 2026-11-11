@@ -63,9 +63,35 @@ int main(int argc, char** argv) {
     // -------------------------------------------------------------------------
     std::cout << "[TEST 2] Live Hardware BLAS Batch Build on GPU..." << std::endl;
     {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+        if (hwGpuCount == 0) {
+            std::cout << "  -> [SKIP] No hardware Vulkan 1.4 GPU detected (CPU-only runner)." << std::endl;
+            return 0;
+        }
+
         Config config;
         config.headless = true;
-        config.validation_layers = false;
+        config.validation_layers = true;
+        config.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
 
         VulkanContext context(config, VK_NULL_HANDLE, "BLAS Batch Test");
         VkDevice device = context.getDevice();
@@ -208,7 +234,8 @@ int main(int argc, char** argv) {
         check_true(multiBlases.size() == 2, "multi-geometry batch must return 2 BLASes");
         check_true(multiBlases[0]->getDeviceAddress() != 0, "Multi-geom BLAS 0 address must be non-zero");
         check_true(multiBlases[1]->getDeviceAddress() != 0, "Multi-geom BLAS 1 address must be non-zero");
-        std::cout << "  -> Multi-geometry BLAS batching verified successfully." << std::endl;
+        check_true(context.getValidationErrors() == 0, "Zero Vulkan validation errors during batched BLAS builds");
+        std::cout << "  -> Multi-geometry BLAS batching verified successfully (0 validation errors)." << std::endl;
     }
 
     std::cout << "\n[SUCCESS] All Batched BLAS build (buildBLASBatch) tests passed!" << std::endl;

@@ -119,7 +119,8 @@ void RayTracingOrchestrator::initNRC(
     m_nrcManager = std::make_unique<NRCManager>(
         m_device, m_allocator,
         width, height,
-        inferCode, trainCode, resolveCode
+        inferCode, trainCode, resolveCode,
+        m_physicalDevice
     );
     Logger::info("Neural Direct-Light Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized. Note: caches unshadowed direct light only — see docs/NRC.md.");
 }
@@ -180,7 +181,7 @@ uint32_t RayTracingOrchestrator::getEffectiveBatchCount(uint32_t renderW, uint32
     }
     uint32_t count = (totalPixels + targetBatch - 1) / targetBatch;
     uint32_t maxAutoBatches = (m_deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) ? 8u : 4u;
-    if (config.max_bounces > 2 && count > maxAutoBatches) {
+    if (config.max_bounces >= 2 && count > maxAutoBatches) {
         count = maxAutoBatches;
     }
     return count;
@@ -348,21 +349,16 @@ void RayTracingOrchestrator::recordRayTracing(
         bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::Svgf ||
                                   config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                                   config.denoiser_mode == DenoiserMode::Upways ||
-                                  config.denoiser_mode == DenoiserMode::Gateway ||
                                   config.upscaler_mode == UpscalerMode::Upways ||
-                                  config.upscaler_mode == UpscalerMode::Gateway ||
-                                  config.upways_superres ||
-                                  config.gateway_superres);
+                                  config.upways_superres);
         bool keepAccumWithMl = (!config.capture_training_data_dir.empty() || params.isMultiGpu);
         bool needFrameImage = !isDenoisingActive || keepAccumWithMl;
         if (frameImage && needFrameImage) {
             vkCmdClearColorImage(cmd, frameImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
         }
 
-        // uMlDiffuseImage and uMlSpecularImage already capture the full decoupled diffuse and specular
-        // radiance signals for both E-SVGF and AMD FSR Ray Regeneration compute passes; avoid redundant
-        // 4-image clear and RMW traffic unless an external 4-signal consumer is explicitly active.
-        bool isFfxDenoisingActive = false;
+        // uMlDiffuseImage and uMlSpecularImage capture the full decoupled diffuse and specular
+        // radiance signals for active compute denoisers and upscalers.
         bool needMlBuffers = isDenoisingActive || !config.capture_training_data_dir.empty();
         if (needMlBuffers) {
             if (mlDiffuseImage) {
@@ -370,20 +366,6 @@ void RayTracingOrchestrator::recordRayTracing(
             }
             if (mlSpecularImage) {
                 vkCmdClearColorImage(cmd, mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            }
-            if (isFfxDenoisingActive) {
-                if (params.ffxDirectDiffuseImage) {
-                    vkCmdClearColorImage(cmd, params.ffxDirectDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-                }
-                if (params.ffxDirectSpecularImage) {
-                    vkCmdClearColorImage(cmd, params.ffxDirectSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-                }
-                if (params.ffxIndirectDiffuseImage) {
-                    vkCmdClearColorImage(cmd, params.ffxIndirectDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-                }
-                if (params.ffxIndirectSpecularImage) {
-                    vkCmdClearColorImage(cmd, params.ffxIndirectSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-                }
             }
         }
 
@@ -407,12 +389,6 @@ void RayTracingOrchestrator::recordRayTracing(
         if (needMlBuffers) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
-            if (isFfxDenoisingActive) {
-                addClearBarrier(params.ffxDirectDiffuseImage);
-                addClearBarrier(params.ffxDirectSpecularImage);
-                addClearBarrier(params.ffxIndirectDiffuseImage);
-                addClearBarrier(params.ffxIndirectSpecularImage);
-            }
         }
 
         if (!clearBarriers.empty()) {
@@ -439,8 +415,8 @@ void RayTracingOrchestrator::recordRayTracing(
         wfSceneData.cameraFlags = params.cameraFlags;
 
         bool enableNrcThisFrame = config.enable_nrc;
-        if (params.isMultiGpu && params.mgpuMode == MultiGpuMode::CheckerboardTile) {
-            enableNrcThisFrame = false; // Secondary GPU has no NRC inference network; disable to maintain tile parity
+        if (params.isMultiGpu) {
+            enableNrcThisFrame = false; // Secondary GPU has no NRC inference network; disable to maintain dual-GPU radiometric parity
         }
         wfSceneData.enableNrc = enableNrcThisFrame;
         wfSceneData.nrcBounce = config.nrc_bounce;
@@ -485,9 +461,7 @@ void RayTracingOrchestrator::recordRayTracing(
         }
 
         bool needNormals = (config.upscaler_mode == UpscalerMode::Upways ||
-                            config.upscaler_mode == UpscalerMode::Gateway ||
                             config.denoiser_mode == DenoiserMode::Upways ||
-                            config.denoiser_mode == DenoiserMode::Gateway ||
                             config.denoiser_mode == DenoiserMode::Svgf ||
                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                             params.isRestirActive ||
@@ -495,15 +469,12 @@ void RayTracingOrchestrator::recordRayTracing(
                             !config.capture_training_data_dir.empty());
         bool needGbuffers = needNormals || (config.upscaler_mode == UpscalerMode::FSR);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
-                          config.denoiser_mode == DenoiserMode::Gateway ||
                           config.denoiser_mode == DenoiserMode::Svgf ||
                           config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                           config.upscaler_mode == UpscalerMode::Upways ||
-                          config.upscaler_mode == UpscalerMode::Gateway ||
                           config.upways_superres ||
-                          config.gateway_superres ||
                           !config.capture_training_data_dir.empty());
-        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | ((captureMl && keepAccumWithMl) ? 2u : 0u) | (isFfxDenoisingActive ? 4u : 0u);
+        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | ((captureMl && keepAccumWithMl) ? 2u : 0u);
         wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (needGbuffers ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
@@ -545,7 +516,8 @@ void RayTracingOrchestrator::recordRayTracing(
             m_nrcManager->recordTraining(cmd, params.frameIndex, sceneData.boundsMin, sceneData.boundsMax, nrcLr, 1024);
         }
 
-        if (params.isRestirActive && normalDepthImage && prevNormalDepthImage) {
+        const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile);
+        if ((params.isRestirActive || config.enable_caustics) && !deferNdHistoryToMgpuMerge && normalDepthImage && prevNormalDepthImage) {
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -586,20 +558,30 @@ void RayTracingOrchestrator::recordRayTracing(
                            prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
                            1, &copyRegion);
 
-            VkImageMemoryBarrier2 postBarrier{};
-            postBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-            postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-            postBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-            postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-            postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-            postBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarrier.image = prevNormalDepthImage->getImage();
-            postBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            VkImageMemoryBarrier2 postBarriers[2]{};
+            postBarriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            postBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            postBarriers[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            postBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            postBarriers[0].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            postBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postBarriers[0].image = prevNormalDepthImage->getImage();
+            postBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+            postBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            postBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            postBarriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+            postBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            postBarriers[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            postBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            postBarriers[1].image = normalDepthImage->getImage();
+            postBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
             VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-            postDep.imageMemoryBarrierCount = 1;
-            postDep.pImageMemoryBarriers = &postBarrier;
+            postDep.imageMemoryBarrierCount = 2;
+            postDep.pImageMemoryBarriers = postBarriers;
             vkCmdPipelineBarrier2(cmd, &postDep);
         }
     } else {
@@ -620,6 +602,17 @@ void RayTracingOrchestrator::recordRayTracing(
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpKhrPipeline->getPipeline());
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, m_rtpPipelineLayout, 0, 1, &rtDescSet, 0, nullptr);
 
+        const bool rtpCaptureMl = (config.denoiser_mode == DenoiserMode::Upways ||
+                                   config.denoiser_mode == DenoiserMode::Svgf ||
+                                   config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                   config.upscaler_mode == UpscalerMode::Upways ||
+                                   config.upways_superres ||
+                                   !config.capture_training_data_dir.empty()) &&
+                                  mlDiffuseImage && mlSpecularImage;
+        // Primary m_rtDescSets binds per-frame scratch m_frameImages[slot] to binding 0, which PostProcessPipeline
+        // then accumulates into m_accumImage. Keep bit 0 (in-shader history sum) 0u to avoid double accumulation;
+        // bit 1 signals decoupled diffuse/specular/albedo/specMotion export for active denoisers/upscalers.
+        const uint32_t rtpAccumFlags = rtpCaptureMl ? 2u : 0u;
         uint32_t fracSppBits = std::bit_cast<uint32_t>(params.fractionalSpp);
         uint32_t rtPushConstants[16] = {
             numTriangles, numSpheres, numMaterials, numLights,
@@ -629,7 +622,7 @@ void RayTracingOrchestrator::recordRayTracing(
             useHwRT,
             hasEnvMap,
             std::bit_cast<uint32_t>(envIntensity),
-            (config.progressive_accumulation && !params.accumReset) ? 1u : 0u,
+            rtpAccumFlags,
             fracSppBits,
             params.totalCompositeSpp,
             numOpaqueTriangles,
@@ -649,14 +642,39 @@ void RayTracingOrchestrator::recordRayTracing(
         memBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         memBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_COPY_BIT;
         memBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        memBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        memBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
 
         VkDependencyInfo depInfo{};
         depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
         depInfo.memoryBarrierCount = 1;
         depInfo.pMemoryBarriers = &memBarrier;
         vkCmdPipelineBarrier2(cmd, &depInfo);
+
+        if (config.enable_caustics && normalDepthImage && prevNormalDepthImage) {
+            VkImageCopy ndCopy{};
+            ndCopy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            ndCopy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            ndCopy.extent = {
+                params.isMultiGpu ? params.fullWidth : params.dispatchWidth,
+                params.isMultiGpu ? params.fullHeight : params.dispatchHeight,
+                1
+            };
+            vkCmdCopyImage(cmd,
+                           normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                           prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                           1, &ndCopy);
+
+            VkMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+            postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            VkDependencyInfo postCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            postCopyDep.memoryBarrierCount = 1;
+            postCopyDep.pMemoryBarriers = &postCopyBarrier;
+            vkCmdPipelineBarrier2(cmd, &postCopyDep);
+        }
     }
 
     if (!params.isMultiGpu && normalDepthImage && centerDepthBuffer) {

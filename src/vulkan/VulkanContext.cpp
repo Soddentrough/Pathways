@@ -29,48 +29,13 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
         const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
-        // AMD FidelityFX SDK 2.4.0 signed binary (amd_fidelityfx_upscaler_vk.dll) compiles HLSL
-        // RWTexture2D<float3> UAVs (rw_reprojected_color, rw_history_color, rw_mlsr_output_color)
-        // via DXC (-spirv -fspv-use-unknown-image-format) into 3-component OpImageWrite instructions
-        // bound to VK_FORMAT_R16G16B16A16_SFLOAT (since Vulkan has no 3-component R16G16B16_SFLOAT UAV format).
-        // Log these third-party SDK shader messages as warnings (matching AMD Cauldron device_vk.cpp).
-        const bool isFfxSdkDxcFloat3Uav =
-            (std::strstr(msg, "VUID-vkCmdDispatch-OpImageWrite-08795") != nullptr &&
-             (std::strstr(msg, "\"rw_reprojected_color\"") != nullptr ||
-              std::strstr(msg, "\"rw_history_color\"") != nullptr ||
-              std::strstr(msg, "\"rw_mlsr_output_color\"") != nullptr)) ||
-            (std::strstr(msg, "vkCreateShaderModule()") != nullptr &&
-             (std::strstr(msg, "CooperativeMatrixConversionsNV") != nullptr ||
-              std::strstr(msg, "SPV_NV_cooperative_matrix2") != nullptr ||
-              std::strstr(msg, "OpFConvert %spirvIntrinsicType") != nullptr ||
-              std::strstr(msg, "VUID-StandaloneSpirv-OpTypeImage-06924") != nullptr));
-        if (isFfxSdkDxcFloat3Uav) {
-            Logger::debug("[Vulkan Validation (FidelityFX SDK DXC SPIR-V)] {}", msg);
-        } else {
-            Logger::error("[Vulkan Validation] {}", msg);
-            s_validationErrors++;
-        }
+        Logger::error("[Vulkan Validation] {}", msg);
+        s_validationErrors++;
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
-        const bool isFfxSdkInternalFormatWarn =
-            (std::strstr(msg, "textures-format-validation") != nullptr ||
-             std::strstr(msg, "VUID-vkCmdDispatch-OpTypeImage-07027") != nullptr ||
-             std::strstr(msg, "UNASSIGNED-Descriptor index out of bounds") != nullptr) &&
-            (std::strstr(msg, "\"rw_dilated_motion_vectors\"") != nullptr ||
-             std::strstr(msg, "\"rw_farthest_depth") != nullptr ||
-             std::strstr(msg, "\"rw_current_luma\"") != nullptr ||
-             std::strstr(msg, "\"rw_spd_mip") != nullptr ||
-             std::strstr(msg, "\"rw_lock_input_luma\"") != nullptr ||
-             std::strstr(msg, "\"rw_internal_upscaled_color\"") != nullptr ||
-             std::strstr(msg, "\"rw_upscaled_output\"") != nullptr ||
-             std::strstr(msg, "\"rw_recurrent_") != nullptr);
-        if (isFfxSdkInternalFormatWarn) {
-            Logger::debug("[Vulkan Validation (FidelityFX SDK internal UAV)] {}", msg);
-        } else {
-            Logger::warn("[Vulkan Validation] {}", msg);
-        }
+        Logger::warn("[Vulkan Validation] {}", msg);
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
-        Logger::debug("[Vulkan Validation Info] {}", pCallbackData->pMessage);
+        Logger::debug("[Vulkan Validation Info] {}", pCallbackData ? pCallbackData->pMessage : "");
     }
     return VK_FALSE;
 }
@@ -582,12 +547,32 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 
     // Core-feature structs: authoritative source for BDA / timeline semaphores /
     // dynamic rendering / sync2 capability reporting (no hardcoded assumptions).
-    VkPhysicalDeviceVulkan12Features vk12Features{};
-    vk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    VkPhysicalDeviceVulkan13Features vk13Features{};
-    vk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceVulkan11Features vk11Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+    VkPhysicalDeviceVulkan12Features vk12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceVulkan13Features vk13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceVulkan14Features vk14Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES };
+    vk11Features.pNext = &vk12Features;
     vk12Features.pNext = &vk13Features;
-    void** featQueryNext = &vk13Features.pNext;
+    vk13Features.pNext = &vk14Features;
+    void** featQueryNext = &vk14Features.pNext;
+
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipeFeaturesQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
+    if (m_hasRayTracing) {
+        *featQueryNext = &rtPipeFeaturesQuery;
+        featQueryNext = &rtPipeFeaturesQuery.pNext;
+    }
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posFetchQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
+    if (m_hasPositionFetch) {
+        *featQueryNext = &posFetchQuery;
+        featQueryNext = &posFetchQuery.pNext;
+    }
+#ifdef VK_KHR_compute_shader_derivatives
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR compDerivQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR };
+    if (m_hasComputeShaderDerivatives) {
+        *featQueryNext = &compDerivQuery;
+        featQueryNext = &compDerivQuery.pNext;
+    }
+#endif
 #ifdef VK_KHR_unified_image_layouts
     VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR unifiedLayoutsFeatures{};
     unifiedLayoutsFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR;
@@ -620,9 +605,21 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 #endif
 
     VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    feat2.pNext = &vk12Features;
+    feat2.pNext = &vk11Features;
     vkGetPhysicalDeviceFeatures2(m_physicalDevice, &feat2);
 
+    if (m_hasPositionFetch && !posFetchQuery.rayTracingPositionFetch) {
+        m_hasPositionFetch = false;
+    }
+#ifdef VK_KHR_compute_shader_derivatives
+    if (m_hasComputeShaderDerivatives) {
+        m_hasComputeDerivativeQuads = (compDerivQuery.computeDerivativeGroupQuads == VK_TRUE);
+        m_hasComputeDerivativeLinear = (compDerivQuery.computeDerivativeGroupLinear == VK_TRUE);
+        if (!m_hasComputeDerivativeQuads && !m_hasComputeDerivativeLinear) {
+            m_hasComputeShaderDerivatives = false;
+        }
+    }
+#endif
     if (m_hasCooperativeMatrix && !coopMatFeaturesQuery.cooperativeMatrix) {
         m_hasCooperativeMatrix = false;
     }
@@ -644,8 +641,12 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     }
 #endif
 
+    m_coreFeatures = feat2.features;
+    m_vk11Features = vk11Features;
     m_vk12Features = vk12Features;
     m_vk13Features = vk13Features;
+    m_vk14Features = vk14Features;
+    m_rtPipelineFeatures = rtPipeFeaturesQuery;
     m_dgcProperties = dgcProps;
 
     if (m_hasCooperativeMatrix) {
@@ -753,6 +754,9 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     if (!m_hasRayTracing) {
         missingRequirements.push_back("Hardware Ray Tracing (VK_KHR_acceleration_structure, VK_KHR_ray_tracing_pipeline, VK_KHR_ray_query, VK_KHR_deferred_host_operations)");
     }
+    if (!m_hasPositionFetch) {
+        missingRequirements.push_back("Ray Tracing Position Fetch (VK_KHR_ray_tracing_position_fetch)");
+    }
     if (!m_hasDGC) {
         missingRequirements.push_back("Device Generated Commands (VK_EXT_device_generated_commands)");
     }
@@ -765,6 +769,7 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR featRTP{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
     VkPhysicalDeviceAccelerationStructureFeaturesKHR featAS{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
     VkPhysicalDeviceRayQueryFeaturesKHR featRQ{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
+    VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featPosFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
     VkPhysicalDeviceDeviceGeneratedCommandsFeaturesEXT featDGC{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT };
 
     feat14.pNext = &feat13;
@@ -773,7 +778,8 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     feat11.pNext = &featRTP;
     featRTP.pNext = &featAS;
     featAS.pNext = &featRQ;
-    featRQ.pNext = &featDGC;
+    featRQ.pNext = &featPosFetch;
+    featPosFetch.pNext = &featDGC;
 
     VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     feat2.pNext = &feat14;
@@ -831,6 +837,7 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     requireFeat(featAS.accelerationStructure, "Ray Tracing: accelerationStructure");
     requireFeat(featRTP.rayTracingPipeline, "Ray Tracing: rayTracingPipeline");
     requireFeat(featRQ.rayQuery, "Ray Tracing: rayQuery");
+    requireFeat(featPosFetch.rayTracingPositionFetch, "Ray Tracing: rayTracingPositionFetch");
 
     // DGC Features
     requireFeat(featDGC.deviceGeneratedCommands, "DGC: deviceGeneratedCommands");
@@ -1004,7 +1011,7 @@ void VulkanContext::refreshPciLinkInfo() {
             reason += "; " + speedMsg;
         }
     }
-    m_pciLinkInfo.isDegraded = false; // Link width is intentional platform bifurcation / lane allocation
+    m_pciLinkInfo.isDegraded = !reason.empty();
     m_pciLinkInfo.degradationReason = reason;
 
     if (m_pciLinkInfo.currentWidth > 0 && !m_pciLinkInfo.currentSpeed.empty()) {
@@ -1112,9 +1119,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasPositionFetch) {
         deviceExtensions.push_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME);
     }
-    if (m_hasDescriptorHeap) {
-        deviceExtensions.push_back(VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
-    }
 #ifdef VK_KHR_unified_image_layouts
     if (m_hasUnifiedImageLayouts) {
         deviceExtensions.push_back(VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
@@ -1158,13 +1162,13 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features14.dynamicRenderingLocalRead = VK_TRUE;
     features14.maintenance5 = VK_TRUE;
     features14.maintenance6 = VK_TRUE;
-    features14.pushDescriptor = VK_TRUE;
+    features14.pushDescriptor = m_vk14Features.pushDescriptor;
 
     VkPhysicalDeviceVulkan13Features features13{};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
     features13.dynamicRendering = VK_TRUE;
     features13.synchronization2 = VK_TRUE;
-    features13.maintenance4 = VK_TRUE;
+    features13.maintenance4 = m_vk13Features.maintenance4;
     features13.shaderIntegerDotProduct = m_vk13Features.shaderIntegerDotProduct;
     features13.shaderDemoteToHelperInvocation = m_vk13Features.shaderDemoteToHelperInvocation;
     features13.shaderZeroInitializeWorkgroupMemory = m_vk13Features.shaderZeroInitializeWorkgroupMemory;
@@ -1202,7 +1206,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features11.storageBuffer16BitAccess = VK_TRUE;
     features11.uniformAndStorageBuffer16BitAccess = VK_TRUE;
-    features11.storagePushConstant16 = VK_TRUE;
+    features11.storagePushConstant16 = m_vk11Features.storagePushConstant16;
     features11.variablePointersStorageBuffer = VK_TRUE;
     features11.variablePointers = VK_TRUE;
     features11.pNext = &features12;
@@ -1210,7 +1214,7 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
     rtPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
     rtPipelineFeatures.rayTracingPipeline = VK_TRUE;
-    rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect = VK_TRUE;
+    rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect = m_rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect;
 
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
@@ -1272,8 +1276,8 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 #endif
 #ifdef VK_KHR_compute_shader_derivatives
     if (m_hasComputeShaderDerivatives) {
-        computeDerivativesFeatures.computeDerivativeGroupQuads = VK_TRUE;
-        computeDerivativesFeatures.computeDerivativeGroupLinear = VK_TRUE;
+        computeDerivativesFeatures.computeDerivativeGroupQuads = m_hasComputeDerivativeQuads ? VK_TRUE : VK_FALSE;
+        computeDerivativesFeatures.computeDerivativeGroupLinear = m_hasComputeDerivativeLinear ? VK_TRUE : VK_FALSE;
         appendFeature(computeDerivativesFeatures);
     }
 #endif
@@ -1282,8 +1286,8 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     deviceFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     deviceFeatures2.features.samplerAnisotropy = VK_TRUE;
     deviceFeatures2.features.shaderInt64 = VK_TRUE;
-    deviceFeatures2.features.shaderInt16 = VK_TRUE;
-    deviceFeatures2.features.shaderImageGatherExtended = VK_TRUE;
+    deviceFeatures2.features.shaderInt16 = m_coreFeatures.shaderInt16;
+    deviceFeatures2.features.shaderImageGatherExtended = m_coreFeatures.shaderImageGatherExtended;
     deviceFeatures2.features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
     deviceFeatures2.features.shaderStorageImageReadWithoutFormat = VK_TRUE;
     // E-SVGF denoiser writes dual-channel edge density to VK_FORMAT_R8G8_UNORM storage images

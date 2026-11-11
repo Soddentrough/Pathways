@@ -50,8 +50,11 @@ public:
         Buffer* instanceBuffer,
         const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs,
         Image* normalDepthImage,
-        Image* motionVectorImage
+        Image* motionVectorImage,
+        Image* prevNormalDepthImage = nullptr
     );
+
+    void resetHistory() noexcept { m_hasHistory = false; }
 
     void recordTrace(
         VkCommandBuffer cmd,
@@ -77,7 +80,9 @@ public:
         bool cameraMovedLastFrame,
         bool hasDielectrics,
         const glm::vec3& dielectricBoundsMin,
-        const glm::vec3& dielectricBoundsMax
+        const glm::vec3& dielectricBoundsMax,
+        uint32_t fullScreenWidth = 0,
+        uint32_t checkerboardTileSize = 0
     );
 
     void recordFullPass(
@@ -95,7 +100,9 @@ public:
         bool cameraMovedLastFrame,
         bool hasDielectrics,
         const glm::vec3& dielectricBoundsMin,
-        const glm::vec3& dielectricBoundsMax
+        const glm::vec3& dielectricBoundsMax,
+        uint32_t fullScreenWidth = 0,
+        uint32_t checkerboardTileSize = 0
     );
 
     Image* getFilteredCausticImage() const { return m_filteredCausticImage.get(); }
@@ -119,6 +126,7 @@ private:
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_photonCount = 65536;
+    bool m_hasHistory = false;
 
     // Buffers and Images
     std::unique_ptr<Buffer> m_causticPhotonBuffer;

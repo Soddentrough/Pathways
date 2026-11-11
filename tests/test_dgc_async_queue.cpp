@@ -1,7 +1,13 @@
 #include "rt/DGCManager.hpp"
 #include "vulkan/VulkanContext.hpp"
+#include "vulkan/Image.hpp"
+#include <glm/glm.hpp>
+#include <glm/gtc/packing.hpp>
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <vulkan/vulkan.h>
 
@@ -136,6 +142,236 @@ int main() {
         }
     }
     std::cout << "  -> DGCPassType 24-slice orthogonal partitioning verified across all bounces." << std::endl;
+
+    // 7. Live Hardware DGC Preprocess + Execute & Async Compute Queue Verification
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount > 0) {
+            std::cout << "[TEST 7] Live Hardware DGC Preprocess + Indirect Execute on GPU..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "DGC GPU Test");
+            check_true(vkCtx.getAsyncComputeQueue() != VK_NULL_HANDLE, "Async compute queue handle must be valid");
+
+            if (vkCtx.hasDGC()) {
+                VkDevice device = vkCtx.getDevice();
+                VmaAllocator allocator = vkCtx.getAllocator();
+                VkQueue queue = vkCtx.getGraphicsQueue();
+
+                auto loadSpv = [](const std::string& name) -> std::vector<char> {
+                    std::vector<std::filesystem::path> cands = {
+#ifdef SHADER_DIR
+                        std::filesystem::path(SHADER_DIR) / name,
+#endif
+                        std::filesystem::current_path() / "shaders" / name,
+                        std::filesystem::current_path() / "build" / "shaders" / name
+                    };
+                    for (const auto& p : cands) {
+                        std::ifstream f(p, std::ios::binary | std::ios::ate);
+                        if (f.is_open()) {
+                            size_t sz = static_cast<size_t>(f.tellg());
+                            std::vector<char> buf(sz);
+                            f.seekg(0);
+                            f.read(buf.data(), static_cast<std::streamsize>(sz));
+                            return buf;
+                        }
+                    }
+                    return {};
+                };
+
+                auto spv = loadSpv("accum_running_avg.comp.spv");
+                check_true(!spv.empty(), "accum_running_avg.comp.spv must exist");
+
+                VkDescriptorSetLayoutBinding bindings[2]{};
+                bindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+                bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+                VkDescriptorSetLayoutCreateInfo dslInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+                dslInfo.bindingCount = 2;
+                dslInfo.pBindings = bindings;
+                VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+                check_true(vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &dsl) == VK_SUCCESS, "Create DGC DSL");
+
+                VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 };
+                VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                plInfo.setLayoutCount = 1;
+                plInfo.pSetLayouts = &dsl;
+                plInfo.pushConstantRangeCount = 1;
+                plInfo.pPushConstantRanges = &pcRange;
+                VkPipelineLayout pipeLayout = VK_NULL_HANDLE;
+                check_true(vkCreatePipelineLayout(device, &plInfo, nullptr, &pipeLayout) == VK_SUCCESS, "Create DGC pipelineLayout");
+
+                VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+                smInfo.codeSize = spv.size();
+                smInfo.pCode = reinterpret_cast<const uint32_t*>(spv.data());
+                VkShaderModule shaderMod = VK_NULL_HANDLE;
+                check_true(vkCreateShaderModule(device, &smInfo, nullptr, &shaderMod) == VK_SUCCESS, "Create DGC shaderModule");
+
+                VkPipelineCreateFlags2CreateInfo flags2Info{ VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
+                flags2Info.flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+
+                VkComputePipelineCreateInfo cpCreate{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                cpCreate.pNext = &flags2Info;
+                cpCreate.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+                cpCreate.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                cpCreate.stage.module = shaderMod;
+                cpCreate.stage.pName = "main";
+                cpCreate.layout = pipeLayout;
+                VkPipeline compPipe = VK_NULL_HANDLE;
+                check_true(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpCreate, nullptr, &compPipe) == VK_SUCCESS,
+                           "Create VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT compute pipeline");
+                vkDestroyShaderModule(device, shaderMod, nullptr);
+
+                DGCManager dgc(device, allocator, pipeLayout, /*supportsExecutionSet=*/false, /*enableExplicitPreprocess=*/true);
+                check_true(dgc.isSupported(), "DGCManager must initialize successfully on DGC hardware");
+
+                const uint32_t W = 16, H = 16;
+                const VkImageUsageFlags imgUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                Image currImg(device, allocator, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, imgUsage);
+                Image histImg(device, allocator, W, H, VK_FORMAT_R16G16B16A16_SFLOAT, imgUsage);
+
+                VkDescriptorPoolSize poolSz{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 };
+                VkDescriptorPoolCreateInfo dpInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+                dpInfo.maxSets = 1;
+                dpInfo.poolSizeCount = 1;
+                dpInfo.pPoolSizes = &poolSz;
+                VkDescriptorPool dPool = VK_NULL_HANDLE;
+                check_true(vkCreateDescriptorPool(device, &dpInfo, nullptr, &dPool) == VK_SUCCESS, "Create DGC descriptor pool");
+
+                VkDescriptorSetAllocateInfo dsAlloc{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+                dsAlloc.descriptorPool = dPool;
+                dsAlloc.descriptorSetCount = 1;
+                dsAlloc.pSetLayouts = &dsl;
+                VkDescriptorSet descSet = VK_NULL_HANDLE;
+                check_true(vkAllocateDescriptorSets(device, &dsAlloc, &descSet) == VK_SUCCESS, "Allocate DGC descriptor set");
+
+                VkDescriptorImageInfo i0{ VK_NULL_HANDLE, currImg.getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+                VkDescriptorImageInfo i1{ VK_NULL_HANDLE, histImg.getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+                VkWriteDescriptorSet writes[2]{};
+                writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i0, nullptr, nullptr };
+                writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &i1, nullptr, nullptr };
+                vkUpdateDescriptorSets(device, 2, writes, 0, nullptr);
+
+                DGCDispatchCommand indirectCmd{ 1u, 1u, 1u, 0u };
+                Buffer argBuf(allocator, sizeof(DGCDispatchCommand),
+                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                              VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                argBuf.copyFrom(&indirectCmd, sizeof(indirectCmd));
+
+                const VkDeviceSize imgBytes = W * H * 4 * sizeof(uint16_t);
+                Buffer readback(allocator, imgBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+                VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+                cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
+                VkCommandPool cmdPool = VK_NULL_HANDLE;
+                check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "Create DGC cmdPool");
+
+                VkCommandBufferAllocateInfo cbAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+                cbAlloc.commandPool = cmdPool;
+                cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbAlloc.commandBufferCount = 1;
+                VkCommandBuffer cmd = VK_NULL_HANDLE;
+                check_true(vkAllocateCommandBuffers(device, &cbAlloc, &cmd) == VK_SUCCESS, "Allocate DGC cmd");
+
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+
+                currImg.transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                         VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                histImg.transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                         VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkClearColorValue clearTwo{};
+                clearTwo.float32[0] = 2.0f; clearTwo.float32[1] = 2.0f; clearTwo.float32[2] = 2.0f; clearTwo.float32[3] = 0.0f;
+                VkClearColorValue clearZero{};
+                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(cmd, currImg.getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearTwo, 1, &range);
+                vkCmdClearColorImage(cmd, histImg.getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &range);
+
+                VkMemoryBarrier2 clrBar{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                clrBar.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+                clrBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+                clrBar.dstStageMask = VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT |
+                                      VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                clrBar.dstAccessMask = VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+                VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &clrBar;
+                vkCmdPipelineBarrier2(cmd, &dep);
+
+                const uint32_t sliceIdx = DGCManager::getFrameSliceIndex(0, 0);
+                dgc.recordPreprocess(cmd, compPipe, &argBuf, 0, sliceIdx, 1);
+                dgc.recordPreprocessBarrier(cmd, sliceIdx, 1);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compPipe);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &descSet, 0, nullptr);
+                struct { uint32_t w, h, sampleCount; float invSpp; } pc{ W, H, 2u, 1.0f }; // sampleCount=2 -> mix(0.0, 2.0, 0.5) = 1.0
+                vkCmdPushConstants(cmd, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                dgc.recordExecute(cmd, compPipe, &argBuf, 0, sliceIdx, 1, /*isPreprocessed=*/true);
+
+                VkMemoryBarrier2 outBar{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                outBar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                outBar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+                outBar.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                outBar.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                dep.pMemoryBarriers = &outBar;
+                vkCmdPipelineBarrier2(cmd, &dep);
+
+                VkBufferImageCopy outRegion{};
+                outRegion.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                outRegion.imageExtent = { W, H, 1 };
+                vkCmdCopyImageToBuffer(cmd, histImg.getImage(), VK_IMAGE_LAYOUT_GENERAL, readback.getBuffer(), 1, &outRegion);
+
+                vkEndCommandBuffer(cmd);
+                VkSubmitInfo sub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                sub.commandBufferCount = 1;
+                sub.pCommandBuffers = &cmd;
+                check_true(vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE) == VK_SUCCESS, "Submit DGC preprocess + execute");
+                vkQueueWaitIdle(queue);
+
+                const uint16_t* px = static_cast<const uint16_t*>(readback.map());
+                check_true(px != nullptr, "Map DGC readback buffer");
+                float r0 = glm::unpackHalf1x16(px[0]);
+                readback.unmap();
+                check_true(std::abs(r0 - 1.0f) < 0.02f, "DGC-dispatched accum_running_avg must compute mix(0.0, 2.0, 0.5) == 1.0");
+                check_true(dgc.getPreprocessBuffer() != nullptr, "DGC preprocess buffer allocated");
+
+                vkDestroyCommandPool(device, cmdPool, nullptr);
+                vkDestroyDescriptorPool(device, dPool, nullptr);
+                vkDestroyPipeline(device, compPipe, nullptr);
+                vkDestroyPipelineLayout(device, pipeLayout, nullptr);
+                vkDestroyDescriptorSetLayout(device, dsl, nullptr);
+
+                check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors during DGC preprocess + execute");
+                std::cout << "  -> Live GPU DGC explicit preprocess + indirect execute verified (output=" << r0 << ", 0 validation errors)." << std::endl;
+            }
+        }
+    }
 
     std::cout << "\n[SUCCESS] All DGC multi-slice ring buffer & queue invariant tests passed!" << std::endl;
     return 0;

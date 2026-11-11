@@ -1,816 +1,975 @@
 #version 460
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_cooperative_matrix : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : enable
-#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_control_flow_attributes : require
 
 #include "upways_common.glsl"
 
-// Eight Wave32 subgroups per workgroup (256 threads), processing a 16x16 2x2-quad tile (256 quads = 1024 render pixels)
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+// 128 threads = 4 Wave32 subgroups per workgroup covering a 16x8 pixel tile (128 pixels = 8 x 16 WMMA rows, 2 M-tiles/wave)
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 
-layout(std430, set = 0, binding = 0) readonly buffer NeuralFeaturesInBuffer {
-    uvec4 features4[];
-} uNeuralFeaturesIn;
+// Specialization constant 0 selects stage 0..5 at pipeline creation time (6u = dynamic fallback via pc.stageId)
+layout(constant_id = 0) const uint SPEC_STAGE_ID = 6u;
 
-// 100%-Active 2D Halo-WMMA Weight Buffer Layout (40,256 float16_t elements = 80,512 bytes):
-// - enc1           (Conv1d(16, 32, k=5)):     weights [0..2559],     bias [2560..2591]
-// - rec_proj       (Linear(16, 32)):          weights [2592..3103]
-// - enc2           (Conv2d(32, 32, k=(1,3))): weights [3104..6175],  bias [6176..6207]
-// - bottleneck1    (Conv2d(32, 64, k=(1,3))): weights [6208..12351], bias [12352..12415]
-// - bottleneck2    (Conv2d(64, 64, k=(3,1))): weights [12416..24703], bias [24704..24767]
-// - bottleneck3    (Conv2d(64, 32, k=(1,3))): weights [24768..30911], bias [30912..30943]
-// - dec2           (Conv2d(32, 32, k=(3,1))): weights [30944..34015], bias [34016..34047]
-// - dec1           (Conv1d(32, 32, k=5)):     weights [34048..39167], bias [39168..39199]
-// - head_out       (Linear(32, 16)):          weights [39200..39711], bias [39712..39727]
-// - head_recurrent (Linear(32, 16)):          weights [39728..40239], bias [39728..40255]
-layout(std430, set = 0, binding = 1) readonly buffer WeightsBuffer {
-    float16_t weights[];
-} uWeights;
+layout(set = 0, binding = 0, std430) readonly buffer WeightFp8Buf {
+    fe4m3vec4 w_fp8_4[];
+};
 
-layout(set = 0, binding = 2, rgba32ui) uniform uimage2D uTemporalDiffuseInOut;
-layout(set = 0, binding = 3, rgba32ui) uniform uimage2D uTemporalSpecularInOut;
-layout(set = 0, binding = 4, rgba16f)  uniform readonly image2D uReprojDiffuseIn;
-layout(set = 0, binding = 5, rgba16f)  uniform readonly image2D uReprojSpecularIn;
-layout(set = 0, binding = 6, rg32ui)   uniform writeonly uimage2D uHistoryDiffuseOut;
-layout(set = 0, binding = 7, rg32ui)   uniform writeonly uimage2D uHistorySpecularOut;
+layout(set = 0, binding = 1, std430) readonly buffer WeightFp32Buf {
+    float w_f32[];
+};
 
-layout(std430, set = 0, binding = 8) buffer UpscaleKernelOutBuffer {
-    uvec4 kernelVec4[];
-} uUpscaleKernelOut;
+layout(set = 0, binding = 2, std430) buffer PyramidFp8Buf {
+    fe4m3vec4 pyr4[];
+};
 
-layout(push_constant) uniform NeuralGuidePushConstants {
-    uint renderWidth;
-    uint renderHeight;
-    uint resetHistory;
-    float minAlphaDiffuse;
-    float minAlphaSpecular;
-    float basePhiDepth;
-    float basePhiNormal;
-    float basePhiLumaDiffuse;
-    float basePhiLumaSpecular;
-} pc;
+layout(set = 0, binding = 3, std430) writeonly buffer SubpixelParamsBuf {
+    f16vec4 uSubpixelParams[];
+};
 
-const uint ENC1_W_OFFSET        = 0u;
-const uint ENC1_B_OFFSET        = 2560u;
-const uint REC_PROJ_W_OFFSET    = 2592u;
-const uint ENC2_W_OFFSET        = 3104u;
-const uint ENC2_B_OFFSET        = 6176u;
-const uint BOTTLENECK1_W_OFFSET = 6208u;
-const uint BOTTLENECK1_B_OFFSET = 12352u;
-const uint BOTTLENECK2_W_OFFSET = 12416u;
-const uint BOTTLENECK2_B_OFFSET = 24704u;
-const uint BOTTLENECK3_W_OFFSET = 24768u;
-const uint BOTTLENECK3_B_OFFSET = 30912u;
-const uint DEC2_W_OFFSET        = 30944u;
-const uint DEC2_B_OFFSET        = 34016u;
-const uint DEC1_W_OFFSET        = 34048u;
-const uint DEC1_B_OFFSET        = 39168u;
-const uint HEAD_OUT_W_OFFSET    = 39200u;
-const uint HEAD_OUT_B_OFFSET    = 39712u;
-const uint HEAD_REC_W_OFFSET    = 39728u;
-const uint HEAD_REC_B_OFFSET    = 40240u;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray uNextNeuralHidden;
 
-// In an 18x18 2D halo quad tile, row ly (0..15) has center at hy = ly + 1, hx = 1..16 -> (ly + 1)*18 + 1 = ly*18 + 19.
-// The 5 cross taps (dy, dx) in {(0,0), (0,-1), (0,+1), (-1,0), (+1,0)} start at ly*18 + SCALE1_HALO_TAP_OFFSET[tap]:
-const uint SCALE1_HALO_TAP_OFFSET[5] = uint[5](19u, 18u, 20u, 1u, 37u);
+const uint LDS_A_VEC4 = (SPEC_STAGE_ID == 0u) ? 1024u :
+                        ((SPEC_STAGE_ID == 1u || SPEC_STAGE_ID == 2u || SPEC_STAGE_ID == 5u) ? 2048u : 4096u);
+const uint LDS_B_VEC4 = (SPEC_STAGE_ID == 0u) ? 1536u :
+                        ((SPEC_STAGE_ID == 1u || SPEC_STAGE_ID == 5u) ? 2048u :
+                        ((SPEC_STAGE_ID == 4u) ? 2880u : 4096u));
 
-// 16.0 KB total LDS -> doubles occupancy from 8 to 16 Subgroups/SIMD on RDNA 3.5
-shared float16_t s_buf[8192];
+shared fe4m3vec4 s_act_a[LDS_A_VEC4];
+shared fe4m3vec4 s_act_b[LDS_B_VEC4];
 
-float16_t leakyRelu16(float16_t x) {
-    return (x > float16_t(0.0)) ? x : (x * float16_t(0.1));
+floate4m3_t toFp8E4M3(float v) {
+    if (isnan(v) || v == 0.0) return floate4m3_t(0.0);
+    if (isinf(v)) return floate4m3_t(v > 0.0 ? FP8_E4M3_MAX : -FP8_E4M3_MAX);
+    return floate4m3_t(clamp(v, -FP8_E4M3_MAX, FP8_E4M3_MAX));
 }
 
-float readHeadOut(uint localIdx, uint c) {
-    float v = float(s_buf[localIdx * 16u + c]) + float(uWeights.weights[HEAD_OUT_B_OFFSET + c]);
-    return float(float16_t((isnan(v) || isinf(v)) ? 0.0 : v));
+fe4m3vec4 packFp8Vec4(float v0, float v1, float v2, float v3) {
+    return fe4m3vec4(toFp8E4M3(v0), toFp8E4M3(v1), toFp8E4M3(v2), toFp8E4M3(v3));
 }
 
-float readHeadRec(uint localIdx, uint c) {
-    float v = float(s_buf[4096u + localIdx * 16u + c]) + float(uWeights.weights[HEAD_REC_B_OFFSET + c]);
-    return (isnan(v) || isinf(v)) ? 0.0 : v;
+fe4m3vec4 quadPackClusterFp8(float val, uint lane) {
+    floate4m3_t q = toFp8E4M3(val);
+    uint u8 = uint(floate4m3BitsToUintEXT(q));
+    uint packed4 = subgroupClusteredOr(u8 << ((lane & 3u) * 8u), 4u);
+    return uintBitsToFloate4m3EXT(unpack8(packed4));
 }
 
-void writeQuad16(uint base, uvec4 u0, uvec4 u1) {
-    f16vec2 v0 = unpackFloat2x16(u0.x); f16vec2 v1 = unpackFloat2x16(u0.y);
-    f16vec2 v2 = unpackFloat2x16(u0.z); f16vec2 v3 = unpackFloat2x16(u0.w);
-    f16vec2 v4 = unpackFloat2x16(u1.x); f16vec2 v5 = unpackFloat2x16(u1.y);
-    f16vec2 v6 = unpackFloat2x16(u1.z); f16vec2 v7 = unpackFloat2x16(u1.w);
-    s_buf[base + 0u]  = v0.x; s_buf[base + 1u]  = v0.y;
-    s_buf[base + 2u]  = v1.x; s_buf[base + 3u]  = v1.y;
-    s_buf[base + 4u]  = v2.x; s_buf[base + 5u]  = v2.y;
-    s_buf[base + 6u]  = v3.x; s_buf[base + 7u]  = v3.y;
-    s_buf[base + 8u]  = v4.x; s_buf[base + 9u]  = v4.y;
-    s_buf[base + 10u] = v5.x; s_buf[base + 11u] = v5.y;
-    s_buf[base + 12u] = v6.x; s_buf[base + 13u] = v6.y;
-    s_buf[base + 14u] = v7.x; s_buf[base + 15u] = v7.y;
+float fp8Comp(fe4m3vec4 v, uint comp) {
+    return (comp == 0u) ? float(v.x) : ((comp == 1u) ? float(v.y) : ((comp == 2u) ? float(v.z) : float(v.w)));
 }
 
-void writeHaloQuad18(uint lx, uint ly, uvec4 u0, uvec4 u1) {
-    uint hx = lx + 1u;
-    uint hy = ly + 1u;
-    writeQuad16((hy * 18u + hx) * 16u, u0, u1);
-    if (ly == 0u) {
-        writeQuad16((0u * 18u + hx) * 16u, u0, u1);
-    }
-    if (ly == 15u) {
-        writeQuad16((17u * 18u + hx) * 16u, u0, u1);
-    }
-    if (lx == 0u) {
-        writeQuad16((hy * 18u + 0u) * 16u, u0, u1);
-    }
-    if (lx == 15u) {
-        writeQuad16((hy * 18u + 17u) * 16u, u0, u1);
+float clampHeadOut(float v) {
+    if (isnan(v)) return 0.0;
+    if (isinf(v)) return (v > 0.0) ? 32.0 : -32.0;
+    return v;
+}
+
+float clampHeadRec(float v) {
+    if (isnan(v)) return 0.0;
+    if (isinf(v)) return (v > 0.0) ? 16.0 : -16.0;
+    return v;
+}
+
+ivec2 pixelOffset16x8(uint pIdx) {
+    return ivec2(int(pIdx & 15u), int(pIdx >> 4u));
+}
+
+void wmmaDualFromActA(
+    uint sg,
+    uint srcBase4,
+    uint cIn4,
+    uint wFp8OffsetBytes,
+    uint numIb,
+    uint ob,
+    out coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0,
+    out coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1
+) {
+    acc0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    uint row0Base4 = srcBase4 + (sg * 32u) * cIn4;
+    uint row1Base4 = row0Base4 + 16u * cIn4;
+    uint wBase4 = (wFp8OffsetBytes >> 2u) + (ob * numIb) * 64u;
+    [[unroll]] for (uint ib = 0u; ib < numIb; ++ib) {
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA0, s_act_a, row0Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_act_a, row1Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
     }
 }
 
-uint packU1Pair(uint packedE1, uint d2Idx) {
-    f16vec2 e = unpackFloat2x16(packedE1);
-    f16vec2 d = f16vec2(s_buf[d2Idx], s_buf[d2Idx + 1u]);
-    return packFloat2x16((e + d) * float16_t(0.5));
+void wmmaDualFromActB(
+    uint sg,
+    uint srcBase4,
+    uint cIn4,
+    uint wFp8OffsetBytes,
+    uint numIb,
+    uint ob,
+    out coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0,
+    out coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1
+) {
+    acc0 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    acc1 = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    uint row0Base4 = srcBase4 + (sg * 32u) * cIn4;
+    uint row1Base4 = row0Base4 + 16u * cIn4;
+    uint wBase4 = (wFp8OffsetBytes >> 2u) + (ob * numIb) * 64u;
+    [[unroll]] for (uint ib = 0u; ib < numIb; ++ib) {
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+        coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA0, s_act_b, row0Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_act_b, row1Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
 }
 
 void main() {
-    uint lane     = gl_LocalInvocationID.x;                        // 0..31 within Wave32 subgroup
-    uint sg       = subgroupBroadcastFirst(gl_LocalInvocationID.y); // 0..7 subgroup-uniform SGPR
-    uint localIdx = sg * 32u + lane;                               // 0..255 quad index within 16x16 workgroup tile
-    uint lx       = localIdx & 15u;
-    uint ly       = localIdx >> 4u;
-    uint qW       = (pc.renderWidth + 1u) >> 1u;
-    uint qH       = (pc.renderHeight + 1u) >> 1u;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint tid = sg * 32u + lane;
+    uint col = lane & 15u;
+    uint col4 = col >> 2u;
+    uint comp = lane & 3u;
+    uint mBase = (lane >> 4u) << 3u;
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * ivec2(16, 8);
 
-    ivec2 wgOrigin = ivec2(gl_WorkGroupID.xy) * 16 - ivec2(1, 1);
-    ivec2 qp       = ivec2(int(gl_WorkGroupID.x * 16u + lx), int(gl_WorkGroupID.y * 16u + ly));
-    ivec2 qClamped = clamp(qp, ivec2(0), ivec2(int(qW) - 1, int(qH) - 1));
+    PyramidLayout pl = computePyramidLayout(pc.renderWidth, pc.renderHeight);
+    uint stage = (SPEC_STAGE_ID < 6u) ? SPEC_STAGE_ID : pc.stageId;
 
-    uint lyA   = sg * 2u;
-    uint lyB   = sg * 2u + 1u;
-    uint qOff0 = lyA * 16u;
-    uint qOff1 = lyB * 16u;
+    if (stage == 0u) {
+        // =========================================================================
+        // Stage 0: L0 Full-Render-Res Stem & Encoder (W0 x H0, C=32) + 2x2 Pool -> L1
+        // =========================================================================
+        ivec2 max0 = ivec2(int(pl.w0) - 1, int(pl.h0) - 1);
+        uint x0Off4  = pl.offX0  >> 2u;
+        uint hw0Off4 = pl.offHw0 >> 2u;
+        uint s0Off4  = pl.offS0  >> 2u;
+        uint l1Off4  = pl.offL1In >> 2u;
 
-    uint qGlobalClamped = uint(qClamped.y) * qW + uint(qClamped.x);
-    uvec4 prefKv2 = ((pc.resetHistory & 1u) == 0u)
-        ? uUpscaleKernelOut.kernelVec4[qGlobalClamped * 3u + 2u]
-        : uvec4(0u);
-
-    // Cooperatively load true 18x18 2D cross-workgroup halo quad tile (324 quads = 648 uvec4 = 5184 float16_t) into s_buf[0..5183]
-    {
-        uint hy0 = localIdx / 18u;
-        uint hx0 = localIdx - hy0 * 18u;
-        ivec2 gq0 = clamp(wgOrigin + ivec2(int(hx0), int(hy0)), ivec2(0), ivec2(int(qW) - 1, int(qH) - 1));
-        uint qLin0 = (uint(gq0.y) * qW + uint(gq0.x)) * 2u;
-        writeQuad16(localIdx * 16u, uNeuralFeaturesIn.features4[qLin0 + 0u], uNeuralFeaturesIn.features4[qLin0 + 1u]);
-
-        if (localIdx < 68u) {
-            uint qTile1 = localIdx + 256u;
-            uint hy1 = qTile1 / 18u;
-            uint hx1 = qTile1 - hy1 * 18u;
-            ivec2 gq1 = clamp(wgOrigin + ivec2(int(hx1), int(hy1)), ivec2(0), ivec2(int(qW) - 1, int(qH) - 1));
-            uint qLin1 = (uint(gq1.y) * qW + uint(gq1.x)) * 2u;
-            writeQuad16(qTile1 * 16u, uNeuralFeaturesIn.features4[qLin1 + 0u], uNeuralFeaturesIn.features4[qLin1 + 1u]);
+        // 0a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of x0 (1,440 = 11*128 + 32)
+        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
+            s_act_b[idx4] = pyr4[x0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg];
         }
-    }
-    barrier();
-
-    // =========================================================================
-    // 1. Scale 1 Encoder (16x16 Quads from 18x18 Cross-Workgroup 2D Halo Tile):
-    //    E1 = LeakyReLU(rec_proj(H_prev) + enc1(X_halo_18))
-    // =========================================================================
-    {
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        // 5-tap 2D cross convolution on 18x18 halo tile in s_buf[0..5183]
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 5u; ++tap) {
-            uint tapOff = SCALE1_HALO_TAP_OFFSET[tap];
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-
-            coopMatLoad(act0, s_buf, (lyA * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(act1, s_buf, (lyB * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(w, uWeights.weights, ENC1_W_OFFSET + (tap * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc00 = coopMatMulAdd(act0, w, acc00);
-            acc10 = coopMatMulAdd(act1, w, acc10);
-            coopMatLoad(w, uWeights.weights, ENC1_W_OFFSET + (tap * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc01 = coopMatMulAdd(act0, w, acc01);
-            acc11 = coopMatMulAdd(act1, w, acc11);
+        if (tid < 32u) {
+            uint idx4 = tid + 1408u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
+            s_act_b[idx4] = pyr4[x0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg];
         }
         barrier();
 
-        // Recurrent projection from s_buf[0..4095] when history is active
-        if ((pc.resetHistory & 1u) == 0u) {
-            uint hBase = localIdx * 16u;
-            vec2 h01 = unpackHalf2x16(prefKv2.x);
-            vec2 h23 = unpackHalf2x16(prefKv2.y);
-            vec2 h45 = unpackHalf2x16(prefKv2.z);
-            vec2 h67 = unpackHalf2x16(prefKv2.w);
-            float16_t h0 = float16_t(isnan(h01.x) || isinf(h01.x) ? 0.0 : clamp(h01.x, -1.0, 1.0));
-            float16_t h1 = float16_t(isnan(h01.y) || isinf(h01.y) ? 0.0 : clamp(h01.y, -1.0, 1.0));
-            float16_t h2 = float16_t(isnan(h23.x) || isinf(h23.x) ? 0.0 : clamp(h23.x, -1.0, 1.0));
-            float16_t h3 = float16_t(isnan(h23.y) || isinf(h23.y) ? 0.0 : clamp(h23.y, -1.0, 1.0));
-            float16_t h4 = float16_t(isnan(h45.x) || isinf(h45.x) ? 0.0 : clamp(h45.x, -1.0, 1.0));
-            float16_t h5 = float16_t(isnan(h45.y) || isinf(h45.y) ? 0.0 : clamp(h45.y, -1.0, 1.0));
-            float16_t h6 = float16_t(isnan(h67.x) || isinf(h67.x) ? 0.0 : clamp(h67.x, -1.0, 1.0));
-            float16_t h7 = float16_t(isnan(h67.y) || isinf(h67.y) ? 0.0 : clamp(h67.y, -1.0, 1.0));
-            s_buf[hBase + 0u]  = h0; s_buf[hBase + 1u]  = h1; s_buf[hBase + 2u]  = h2; s_buf[hBase + 3u]  = h3;
-            s_buf[hBase + 4u]  = h4; s_buf[hBase + 5u]  = h5; s_buf[hBase + 6u]  = h6; s_buf[hBase + 7u]  = h7;
-            s_buf[hBase + 8u]  = h0; s_buf[hBase + 9u]  = h1; s_buf[hBase + 10u] = h2; s_buf[hBase + 11u] = h3;
-            s_buf[hBase + 12u] = h4; s_buf[hBase + 13u] = h5; s_buf[hBase + 14u] = h6; s_buf[hBase + 15u] = h7;
-            subgroupMemoryBarrierShared();
-
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> hMat;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec0;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec1;
-            coopMatLoad(wRec0, uWeights.weights, REC_PROJ_W_OFFSET + 0u,   16u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(wRec1, uWeights.weights, REC_PROJ_W_OFFSET + 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(hMat, s_buf, qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc00 = coopMatMulAdd(hMat, wRec0, acc00);
-            acc01 = coopMatMulAdd(hMat, wRec1, acc01);
-            coopMatLoad(hMat, s_buf, qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc10 = coopMatMulAdd(hMat, wRec0, acc10);
-            acc11 = coopMatMulAdd(hMat, wRec1, acc11);
-        }
-
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b0Mat;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b1Mat;
-        coopMatLoad(b0Mat, uWeights.weights, ENC1_B_OFFSET,       0u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(b1Mat, uWeights.weights, ENC1_B_OFFSET + 16u, 0u, gl_CooperativeMatrixLayoutRowMajor);
-        acc00 = acc00 + b0Mat;
-        acc10 = acc10 + b0Mat;
-        acc01 = acc01 + b1Mat;
-        acc11 = acc11 + b1Mat;
-        for (int i = 0; i < acc00.length(); ++i) {
-            acc00[i] = leakyRelu16(acc00[i]);
-            acc10[i] = leakyRelu16(acc10[i]);
-            acc01[i] = leakyRelu16(acc01[i]);
-            acc11[i] = leakyRelu16(acc11[i]);
-        }
-
-        coopMatStore(acc00, s_buf, qOff0 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc10, s_buf, qOff1 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc01, s_buf, 4096u + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc11, s_buf, 4096u + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Pack this thread's quad E1 (32 float16_t) into 4 uvec4 registers (16 VGPRs) for Scale 1 skip connection
-    uint myQBase0 = localIdx * 16u;
-    uint myQBase1 = 4096u + localIdx * 16u;
-    uvec4 packedE1_0 = uvec4(
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 0u],  s_buf[myQBase0 + 1u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 2u],  s_buf[myQBase0 + 3u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 4u],  s_buf[myQBase0 + 5u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 6u],  s_buf[myQBase0 + 7u]))
-    );
-    uvec4 packedE1_1 = uvec4(
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 8u],  s_buf[myQBase0 + 9u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 10u], s_buf[myQBase0 + 11u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 12u], s_buf[myQBase0 + 13u])),
-        packFloat2x16(f16vec2(s_buf[myQBase0 + 14u], s_buf[myQBase0 + 15u]))
-    );
-    uvec4 packedE1_2 = uvec4(
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 0u],  s_buf[myQBase1 + 1u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 2u],  s_buf[myQBase1 + 3u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 4u],  s_buf[myQBase1 + 5u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 6u],  s_buf[myQBase1 + 7u]))
-    );
-    uvec4 packedE1_3 = uvec4(
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 8u],  s_buf[myQBase1 + 9u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 10u], s_buf[myQBase1 + 11u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 12u], s_buf[myQBase1 + 13u])),
-        packFloat2x16(f16vec2(s_buf[myQBase1 + 14u], s_buf[myQBase1 + 15u]))
-    );
-
-    // =========================================================================
-    // 2. Scale 2 Encoder (8x8 Cells):
-    //    P2 = AvgPool2x2(E1), E2 = LeakyReLU(enc2_1x3_horiz(P2) + P2)
-    //    Compute 8 P2 elements per thread before overwriting s_buf[0..2559].
-    // =========================================================================
-    {
-        float16_t p2Tmp[8];
-        [[dont_unroll]]
-        for (uint k = 0u; k < 8u; ++k) {
-            uint elemIdx = localIdx + k * 256u;
-            uint c    = elemIdx & 15u;
-            uint cell = (elemIdx >> 4u) & 63u;
-            uint ob   = elemIdx >> 10u;
-            uint cy   = cell >> 3u;
-            uint cx   = cell & 7u;
-            uint e1Off = ob * 4096u + c;
-            uint q00 = ((cy * 2u + 0u) * 16u + (cx * 2u + 0u)) * 16u;
-            uint q01 = ((cy * 2u + 0u) * 16u + (cx * 2u + 1u)) * 16u;
-            uint q10 = ((cy * 2u + 1u) * 16u + (cx * 2u + 0u)) * 16u;
-            uint q11 = ((cy * 2u + 1u) * 16u + (cx * 2u + 1u)) * 16u;
-            float sum4 = float(s_buf[e1Off + q00]) + float(s_buf[e1Off + q01])
-                       + float(s_buf[e1Off + q10]) + float(s_buf[e1Off + q11]);
-            p2Tmp[k] = float16_t(sum4 * 0.25);
-        }
-        barrier();
-
-        [[dont_unroll]]
-        for (uint k = 0u; k < 8u; ++k) {
-            uint elemIdx = localIdx + k * 256u;
-            uint c    = elemIdx & 15u;
-            uint cell = (elemIdx >> 4u) & 63u;
-            uint ob   = elemIdx >> 10u;
-            uint cy   = cell >> 3u;
-            uint cx   = cell & 7u;
-            uint dstOff = ob * 1280u + c;
-            float16_t v = p2Tmp[k];
-            uint rowMid = (cx + 1u) * 8u + cy;
-            s_buf[dstOff + rowMid * 16u] = v;
-            if (cx == 0u) {
-                s_buf[dstOff + cy * 16u] = v;
-            }
-            if (cx == 7u) {
-                s_buf[dstOff + (9u * 8u + cy) * 16u] = v;
-            }
-        }
-    }
-    barrier();
-
-    {
-        uint sTile = sg >> 1u; // 0..3 (pair of columns cx = 2*sTile, 2*sTile+1)
-        uint ob    = sg & 1u;  // 0..1
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 3u; ++tap) {
-            uint rowStart = (2u * sTile + tap) * 8u;
-            for (uint ib = 0u; ib < 2u; ++ib) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                uint wIdx = ((tap * 2u + ob) * 2u + ib) * 256u;
-                coopMatLoad(act, s_buf, ib * 1280u + rowStart * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(w, uWeights.weights, ENC2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-                acc = coopMatMulAdd(act, w, acc);
-            }
-        }
-        coopMatStore(acc, s_buf, 2560u + ob * 1024u + sTile * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Activate E2 with P2 residual and store E2 in standard row-major (cy * 8 + cx) order at s_buf[6144..8191]
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
-        uint c      = elemIdx & 15u;
-        uint cellCM = (elemIdx >> 4u) & 63u;
-        uint ob     = elemIdx >> 10u;
-        uint cx     = cellCM >> 3u;
-        uint cy     = cellCM & 7u;
-        uint cellRM = cy * 8u + cx;
-        uint rowPad = (cx + 1u) * 8u + cy;
-        float16_t raw = s_buf[2560u + ob * 1024u + cellCM * 16u + c];
-        float16_t b   = uWeights.weights[ENC2_B_OFFSET + ob * 16u + c];
-        float16_t res = s_buf[ob * 1280u + rowPad * 16u + c];
-        s_buf[6144u + ob * 1024u + cellRM * 16u + c] = leakyRelu16((raw + b) + res);
-    }
-    barrier();
-
-    // =========================================================================
-    // 3. Scale 3 Bottleneck (4x4 Cells):
-    //    P3 = AvgPool2x2(E2)
-    //    B1 = LeakyReLU(bottleneck1_1x3_horiz(P3))
-    //    B2 = LeakyReLU(bottleneck2_3x1_vert(B1) + B1)
-    //    B3 = LeakyReLU(bottleneck3_1x3_horiz(B2) + P3)
-    //    Note: E2 in s_buf[6144..8191] remains untouched throughout Step 3.
-    // =========================================================================
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 512u; elemIdx += 256u) {
-        uint c     = elemIdx & 15u;
-        uint cell3 = (elemIdx >> 4u) & 15u;
-        uint ob    = elemIdx >> 8u;
-        uint cy3   = cell3 >> 2u;
-        uint cx3   = cell3 & 3u;
-        uint e2Off  = 6144u + ob * 1024u + c;
-        uint padOff = ob * 384u + c;
-        uint p3Off  = 5632u + ob * 256u + cell3 * 16u + c;
-        uint c00 = ((cy3 * 2u + 0u) * 8u + (cx3 * 2u + 0u)) * 16u;
-        uint c01 = ((cy3 * 2u + 0u) * 8u + (cx3 * 2u + 1u)) * 16u;
-        uint c10 = ((cy3 * 2u + 1u) * 8u + (cx3 * 2u + 0u)) * 16u;
-        uint c11 = ((cy3 * 2u + 1u) * 8u + (cx3 * 2u + 1u)) * 16u;
-        float sum4 = float(s_buf[e2Off + c00]) + float(s_buf[e2Off + c01])
-                   + float(s_buf[e2Off + c10]) + float(s_buf[e2Off + c11]);
-        float16_t v = float16_t(sum4 * 0.25);
-        uint rowColMaj = (cx3 + 1u) * 4u + cy3;
-        s_buf[p3Off] = v;
-        s_buf[padOff + rowColMaj * 16u] = v;
-        if (cx3 == 0u) {
-            s_buf[padOff + cy3 * 16u] = v;
-        }
-        if (cx3 == 3u) {
-            s_buf[padOff + (5u * 4u + cy3) * 16u] = v;
-        }
-    }
-    barrier();
-
-    // 3a. bottleneck1 (32 -> 64, horizontal 1x3 on 4x4 cells in column-major (cx3_pad, cy3) order)
-    {
-        uint ob = sg >> 1u; // 0..3
-        uint ib = sg & 1u;  // 0..1
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 3u; ++tap) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-            uint wIdx = ((tap * 4u + ob) * 2u + ib) * 256u;
-            coopMatLoad(act, s_buf, ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(w, uWeights.weights, BOTTLENECK1_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc = coopMatMulAdd(act, w, acc);
-        }
-        coopMatStore(acc, s_buf, 768u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Reduce ib=0,1 of bottleneck1 and write B1 in row-major (cy3_pad, cx3) order into s_buf[0..1535] for vertical 3x1 bottleneck2
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 1024u; elemIdx += 256u) {
-        uint c   = elemIdx & 15u;
-        uint m   = (elemIdx >> 4u) & 15u;
-        uint ob  = elemIdx >> 8u;
-        uint cx3 = m >> 2u;
-        uint cy3 = m & 3u;
-        uint rowRowMaj = (cy3 + 1u) * 4u + cx3;
-        uint padOff    = ob * 384u + c;
-        uint s0Base    = 768u + (ob * 2u + 0u) * 256u + m * 16u + c;
-        uint s1Base    = 768u + (ob * 2u + 1u) * 256u + m * 16u + c;
-        float16_t sumIB = s_buf[s0Base] + s_buf[s1Base];
-        float16_t b     = uWeights.weights[BOTTLENECK1_B_OFFSET + ob * 16u + c];
-        float16_t v     = leakyRelu16(sumIB + b);
-        s_buf[padOff + rowRowMaj * 16u] = v;
-        if (cy3 == 0u) {
-            s_buf[padOff + cx3 * 16u] = v;
-        }
-        if (cy3 == 3u) {
-            s_buf[padOff + (5u * 4u + cx3) * 16u] = v;
-        }
-    }
-    barrier();
-
-    // 3b. bottleneck2 (64 -> 64, vertical 3x1 on 4x4 cells in row-major (cy3_pad, cx3) order)
-    {
-        uint ob = sg >> 1u; // 0..3
-        uint sp = sg & 1u;  // 0..1 (each split accumulates 2 input blocks)
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 3u; ++tap) {
-            for (uint sub = 0u; sub < 2u; ++sub) {
-                uint ib = sp * 2u + sub;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                uint wIdx = ((tap * 4u + ob) * 4u + ib) * 256u;
-                coopMatLoad(act, s_buf, ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(w, uWeights.weights, BOTTLENECK2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-                acc = coopMatMulAdd(act, w, acc);
-            }
-        }
-        coopMatStore(acc, s_buf, 1536u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Reduce sp=0,1 of bottleneck2, add B1 residual from s_buf[0..1535], and write B2 in column-major (cx3_pad, cy3) order into s_buf[3584..5119]
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 1024u; elemIdx += 256u) {
-        uint c       = elemIdx & 15u;
-        uint m       = (elemIdx >> 4u) & 15u;
-        uint ob      = elemIdx >> 8u;
-        uint cy3     = m >> 2u;
-        uint cx3     = m & 3u;
-        uint resBase = ob * 384u + (m + 4u) * 16u + c;
-        uint s0Base  = 1536u + (ob * 2u + 0u) * 256u + m * 16u + c;
-        uint s1Base  = 1536u + (ob * 2u + 1u) * 256u + m * 16u + c;
-        float16_t sumSP = s_buf[s0Base] + s_buf[s1Base];
-        float16_t b     = uWeights.weights[BOTTLENECK2_B_OFFSET + ob * 16u + c];
-        float16_t res   = s_buf[resBase];
-        float16_t v     = leakyRelu16((sumSP + b) + res);
-        uint rowColMaj  = (cx3 + 1u) * 4u + cy3;
-        uint padOff     = 3584u + ob * 384u + c;
-        s_buf[padOff + rowColMaj * 16u] = v;
-        if (cx3 == 0u) {
-            s_buf[padOff + cy3 * 16u] = v;
-        }
-        if (cx3 == 3u) {
-            s_buf[padOff + (5u * 4u + cy3) * 16u] = v;
-        }
-    }
-    barrier();
-
-    // 3c. bottleneck3 (64 -> 32, horizontal 1x3 on 4x4 cells in column-major (cx3_pad, cy3) order from s_buf[3584..5119])
-    {
-        uint ob = sg >> 2u; // 0..1
-        uint ib = sg & 3u;  // 0..3
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 3u; ++tap) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-            uint wIdx = ((tap * 2u + ob) * 4u + ib) * 256u;
-            coopMatLoad(act, s_buf, 3584u + ib * 384u + tap * 64u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(w, uWeights.weights, BOTTLENECK3_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc = coopMatMulAdd(act, w, acc);
-        }
-        coopMatStore(acc, s_buf, 1536u + sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Reduce ib=0..3 of bottleneck3, add P3 residual (from s_buf[5632..6143]), and write B3 in row-major (cy3*4 + cx3) to s_buf[3584..4095]
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 512u; elemIdx += 256u) {
-        uint c     = elemIdx & 15u;
-        uint m     = (elemIdx >> 4u) & 15u;
-        uint ob    = elemIdx >> 8u;
-        uint cx3   = m >> 2u;
-        uint cy3   = m & 3u;
-        uint cell3 = cy3 * 4u + cx3;
-        uint s0Base = 1536u + (ob * 4u + 0u) * 256u + m * 16u + c;
-        uint s1Base = 1536u + (ob * 4u + 1u) * 256u + m * 16u + c;
-        uint s2Base = 1536u + (ob * 4u + 2u) * 256u + m * 16u + c;
-        uint s3Base = 1536u + (ob * 4u + 3u) * 256u + m * 16u + c;
-        uint p3Base = 5632u + ob * 256u + cell3 * 16u + c;
-        uint b3Base = 3584u + ob * 256u + cell3 * 16u + c;
-        float16_t s01 = s_buf[s0Base] + s_buf[s1Base];
-        float16_t s23 = s_buf[s2Base] + s_buf[s3Base];
-        float16_t b   = uWeights.weights[BOTTLENECK3_B_OFFSET + ob * 16u + c];
-        float16_t res = s_buf[p3Base];
-        s_buf[b3Base] = leakyRelu16(((s01 + s23) + b) + res);
-    }
-    barrier();
-
-    // =========================================================================
-    // 4. Scale 2 Decoder (8x8 Cells):
-    //    U2 = 0.5 * (E2 + Upsample2x2(B3)), D2 = LeakyReLU(dec2_3x1_vert(U2) + U2)
-    //    Store U2 vertically padded (cy2_pad in 0..9, cx2 in 0..7) in row-major
-    //    (cy2_pad * 8 + cx2) order at s_buf[0..2559].
-    // =========================================================================
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
-        uint c      = elemIdx & 15u;
-        uint cell2  = (elemIdx >> 4u) & 63u;
-        uint ob     = elemIdx >> 10u;
-        uint cy2    = cell2 >> 3u;
-        uint cx2    = cell2 & 7u;
-        uint cell3  = (cy2 >> 1u) * 4u + (cx2 >> 1u);
-        uint rowMid = (cy2 + 1u) * 8u + cx2;
-        uint e2Base = 6144u + ob * 1024u + cell2 * 16u + c;
-        uint b3Base = 3584u + ob * 256u + cell3 * 16u + c;
-        uint dstOff = ob * 1280u + c;
-        float16_t u2 = (s_buf[e2Base] + s_buf[b3Base]) * float16_t(0.5);
-        s_buf[dstOff + rowMid * 16u] = u2;
-        if (cy2 == 0u) {
-            s_buf[dstOff + cx2 * 16u] = u2;
-        }
-        if (cy2 == 7u) {
-            s_buf[dstOff + (9u * 8u + cx2) * 16u] = u2;
-        }
-    }
-    barrier();
-
-    {
-        uint sTile = sg >> 1u; // 0..3 (pair of rows cy2 = 2*sTile, 2*sTile+1)
-        uint ob    = sg & 1u;  // 0..1
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 3u; ++tap) {
-            uint rowStart = (2u * sTile + tap) * 8u;
-            for (uint ib = 0u; ib < 2u; ++ib) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-                uint wIdx = ((tap * 2u + ob) * 2u + ib) * 256u;
-                coopMatLoad(act, s_buf, ib * 1280u + rowStart * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-                coopMatLoad(w, uWeights.weights, DEC2_W_OFFSET + wIdx, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-                acc = coopMatMulAdd(act, w, acc);
-            }
-        }
-        coopMatStore(acc, s_buf, 2560u + ob * 1024u + sTile * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-
-    // Activate D2 with U2 residual and store in row-major (cy2 * 8 + cx2) order at s_buf[6144..8191]
-    [[dont_unroll]]
-    for (uint elemIdx = localIdx; elemIdx < 2048u; elemIdx += 256u) {
-        uint c      = elemIdx & 15u;
-        uint cell2  = (elemIdx >> 4u) & 63u;
-        uint ob     = elemIdx >> 10u;
-        uint rowPad = cell2 + 8u; // (cy2 + 1) * 8 + cx2
-        float16_t raw = s_buf[2560u + ob * 1024u + cell2 * 16u + c];
-        float16_t b   = uWeights.weights[DEC2_B_OFFSET + ob * 16u + c];
-        float16_t res = s_buf[ob * 1280u + rowPad * 16u + c];
-        s_buf[6144u + ob * 1024u + cell2 * 16u + c] = leakyRelu16((raw + b) + res);
-    }
-    barrier();
-
-    // =========================================================================
-    // 5. Scale 1 Decoder (16x16 Quads):
-    //    U1 = 0.5 * (E1 + Upsample2x2(D2)), D1 = LeakyReLU(dec1_cross5(U1) + U1)
-    //    Compute U1 in packedE1_0..3, pad each 16-ch block into s_buf[0..5183].
-    // =========================================================================
-    {
-        uint cell2 = (ly >> 1u) * 8u + (lx >> 1u);
-        uint d2Base0 = 6144u + cell2 * 16u;
-        uint d2Base1 = 7168u + cell2 * 16u;
-
-        packedE1_0 = uvec4(
-            packU1Pair(packedE1_0.x, d2Base0 + 0u),
-            packU1Pair(packedE1_0.y, d2Base0 + 2u),
-            packU1Pair(packedE1_0.z, d2Base0 + 4u),
-            packU1Pair(packedE1_0.w, d2Base0 + 6u)
-        );
-        packedE1_1 = uvec4(
-            packU1Pair(packedE1_1.x, d2Base0 + 8u),
-            packU1Pair(packedE1_1.y, d2Base0 + 10u),
-            packU1Pair(packedE1_1.z, d2Base0 + 12u),
-            packU1Pair(packedE1_1.w, d2Base0 + 14u)
-        );
-        packedE1_2 = uvec4(
-            packU1Pair(packedE1_2.x, d2Base1 + 0u),
-            packU1Pair(packedE1_2.y, d2Base1 + 2u),
-            packU1Pair(packedE1_2.z, d2Base1 + 4u),
-            packU1Pair(packedE1_2.w, d2Base1 + 6u)
-        );
-        packedE1_3 = uvec4(
-            packU1Pair(packedE1_3.x, d2Base1 + 8u),
-            packU1Pair(packedE1_3.y, d2Base1 + 10u),
-            packU1Pair(packedE1_3.z, d2Base1 + 12u),
-            packU1Pair(packedE1_3.w, d2Base1 + 14u)
-        );
-    }
-
-    {
-        // Block ib = 0: write U1_0 (packedE1_0, packedE1_1) into 18x18 halo and release those 8 VGPRs immediately
-        writeHaloQuad18(lx, ly, packedE1_0, packedE1_1);
-        barrier();
-
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc00;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        coopMatLoad(acc00, s_buf, (lyA * 18u + 19u) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(acc10, s_buf, (lyB * 18u + 19u) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 5u; ++tap) {
-            uint tapOff = SCALE1_HALO_TAP_OFFSET[tap];
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-
-            coopMatLoad(act0, s_buf, (lyA * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(act1, s_buf, (lyB * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(w, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 0u) * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc00 = coopMatMulAdd(act0, w, acc00);
-            acc10 = coopMatMulAdd(act1, w, acc10);
-            coopMatLoad(w, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 1u) * 2u + 0u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc01 = coopMatMulAdd(act0, w, acc01);
-            acc11 = coopMatMulAdd(act1, w, acc11);
-        }
-        barrier();
-
-        // Block ib = 1: write U1_1 (packedE1_2, packedE1_3) into 18x18 halo and release the remaining 8 VGPRs
-        writeHaloQuad18(lx, ly, packedE1_2, packedE1_3);
-        barrier();
-
+        // 0b. Unrolled vectorized z0 = enc0_dw(x0) -> s_act_a[0..1023]
         {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> u1Mat;
-            coopMatLoad(u1Mat, s_buf, (lyA * 18u + 19u) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc01 = acc01 + u1Mat;
-            coopMatLoad(u1Mat, s_buf, (lyB * 18u + 19u) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            acc11 = acc11 + u1Mat;
-        }
-
-        [[dont_unroll]]
-        for (uint tap = 0u; tap < 5u; ++tap) {
-            uint tapOff = SCALE1_HALO_TAP_OFFSET[tap];
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w;
-
-            coopMatLoad(act0, s_buf, (lyA * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(act1, s_buf, (lyB * 18u + tapOff) * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(w, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 0u) * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc00 = coopMatMulAdd(act0, w, acc00);
-            acc10 = coopMatMulAdd(act1, w, acc10);
-            coopMatLoad(w, uWeights.weights, DEC1_W_OFFSET + ((tap * 2u + 1u) * 2u + 1u) * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            acc01 = coopMatMulAdd(act0, w, acc01);
-            acc11 = coopMatMulAdd(act1, w, acc11);
+            uint cg = tid & 7u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = ENC0_DW_W_F32_OFFSET + t * 32u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 3u;
+                uint lx = p & 15u;
+                uint ly = p >> 4u;
+                vec4 sum = vec4(0.0);
+                [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
+                    uint rowOff = (ly + dy) * 18u + lx;
+                    [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
+                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                    }
+                }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+            }
         }
         barrier();
 
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b0Mat;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b1Mat;
-        coopMatLoad(b0Mat, uWeights.weights, DEC1_B_OFFSET,       0u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(b1Mat, uWeights.weights, DEC1_B_OFFSET + 16u, 0u, gl_CooperativeMatrixLayoutRowMajor);
-        acc00 = acc00 + b0Mat;
-        acc10 = acc10 + b0Mat;
-        acc01 = acc01 + b1Mat;
-        acc11 = acc11 + b1Mat;
-        for (int i = 0; i < acc00.length(); ++i) {
-            acc00[i] = leakyRelu16(acc00[i]);
-            acc10[i] = leakyRelu16(acc10[i]);
-            acc01[i] = leakyRelu16(acc01[i]);
-            acc11[i] = leakyRelu16(acc11[i]);
+        // 0c. Pipelined load of 16x8 center of hw0 (512 = 4*128) into s_act_b[0..511]
+        [[unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint p = idx4 >> 2u;
+            uint cg = idx4 & 3u;
+            ivec2 gp = clamp(tileOrigin + pixelOffset16x8(p), ivec2(0), max0);
+            s_act_b[idx4] = pyr4[hw0Off4 + (uint(gp.y) * pl.w0 + uint(gp.x)) * 4u + cg];
+        }
+        barrier();
+
+        // 0d. m0 = lrelu(enc0_pw1(z0) + rec_proj(hw0)) -> s_act_b[512..1535]
+        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accZ0, accZ1;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accH0, accH1;
+            wmmaDualFromActA(sg, 0u, 8u, ENC0_PW1_W_FP8_OFFSET, 2u, ob, accZ0, accZ1);
+            wmmaDualFromActB(sg, 0u, 4u, REC_PROJ_W_FP8_OFFSET, 1u, ob, accH0, accH1);
+
+            uint c = ob * 16u + col;
+            float sZ = w_f32[ENC0_PW1_S_F32_OFFSET + c];
+            float bZ = w_f32[ENC0_PW1_B_F32_OFFSET + c];
+            float sH = w_f32[REC_PROJ_S_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint m = mBase + i;
+                float v0 = leakyRelu01(accZ0[i] * sZ + bZ + accH0[i] * sH);
+                float v1 = leakyRelu01(accZ1[i] * sZ + bZ + accH1[i] * sH);
+                fe4m3vec4 q0 = quadPackClusterFp8(v0, lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(v1, lane);
+                if (comp == 0u) {
+                    s_act_b[512u + (sg * 32u + m) * 8u + outCol4] = q0;
+                    s_act_b[512u + (sg * 32u + 16u + m) * 8u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 0e. s0 = lrelu(m0 + enc0_pw2(m0)) -> s_act_a[0..1023]
+        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 512u, 8u, ENC0_PW2_W_FP8_OFFSET, 2u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[ENC0_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[ENC0_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_b[512u + p0 * 8u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_b[512u + p1 * 8u + outCol4], comp);
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_a[p0 * 8u + outCol4] = q0;
+                    s_act_a[p1 * 8u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 0f. Coalesced fe4m3vec4 store s0 -> pyr4[s0Off4] and 2x2 box-pool s0 -> pyr4[l1Off4]
+        [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint p = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            ivec2 gp = tileOrigin + pixelOffset16x8(p);
+            if (gp.x < int(pl.w0) && gp.y < int(pl.h0)) {
+                pyr4[s0Off4 + (uint(gp.y) * pl.w0 + uint(gp.x)) * 8u + cg] = s_act_a[idx4];
+            }
         }
 
-        coopMatStore(acc00, s_buf, qOff0 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc10, s_buf, qOff1 * 16u,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc01, s_buf, 4096u + qOff0 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(acc11, s_buf, 4096u + qOff1 * 16u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupMemoryBarrierShared();
-
-    // =========================================================================
-    // 6. Dual Output Heads (16x16 Quads):
-    //    out = head_out(D1), rec = head_recurrent(D1)
-    // =========================================================================
-    {
-        uint rOff0 = qOff0 * 16u;
-        uint rOff1 = qOff1 * 16u;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accOut0 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accOut1 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accRec0 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accRec1 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
-
-        for (uint ib = 0u; ib < 2u; ++ib) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act0;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act1;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wOut;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> wRec;
-
-            coopMatLoad(wOut, uWeights.weights, HEAD_OUT_W_OFFSET + ib * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(wRec, uWeights.weights, HEAD_REC_W_OFFSET + ib * 256u, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(act0, s_buf, ib * 4096u + rOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(act1, s_buf, ib * 4096u + rOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-            accOut0 = coopMatMulAdd(act0, wOut, accOut0);
-            accOut1 = coopMatMulAdd(act1, wOut, accOut1);
-            accRec0 = coopMatMulAdd(act0, wRec, accRec0);
-            accRec1 = coopMatMulAdd(act1, wRec, accRec1);
+        ivec2 l1Origin = ivec2(gl_WorkGroupID.xy) * ivec2(8, 4);
+        [[unroll]] for (uint iter = 0u; iter < 2u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint qp = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            uint qlx = qp & 7u;
+            uint qly = qp >> 3u;
+            ivec2 gq = l1Origin + ivec2(int(qlx), int(qly));
+            if (gq.x < int(pl.w1) && gq.y < int(pl.h1)) {
+                uint lx0 = qlx * 2u;
+                uint ly0 = qly * 2u;
+                uint lx1 = uint(min(tileOrigin.x + int(lx0) + 1, max0.x) - tileOrigin.x);
+                uint ly1 = uint(min(tileOrigin.y + int(ly0) + 1, max0.y) - tileOrigin.y);
+                vec4 v00 = vec4(s_act_a[(ly0 * 16u + lx0) * 8u + cg]);
+                vec4 v01 = vec4(s_act_a[(ly0 * 16u + lx1) * 8u + cg]);
+                vec4 v10 = vec4(s_act_a[(ly1 * 16u + lx0) * 8u + cg]);
+                vec4 v11 = vec4(s_act_a[(ly1 * 16u + lx1) * 8u + cg]);
+                vec4 avg = 0.25 * (v00 + v01 + v10 + v11);
+                pyr4[l1Off4 + (uint(gq.y) * pl.w1 + uint(gq.x)) * 8u + cg] =
+                    packFp8Vec4(avg.x, avg.y, avg.z, avg.w);
+            }
         }
 
-        subgroupMemoryBarrierShared();
-        coopMatStore(accOut0, s_buf, rOff0,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(accOut1, s_buf, rOff1,         16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(accRec0, s_buf, 4096u + rOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(accRec1, s_buf, 4096u + rOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupMemoryBarrierShared();
+    } else if (stage == 1u) {
+        // =========================================================================
+        // Stage 1: L1 Half-Res Encoder (W1 x H1, 32 -> 64) + 2x2 Pool -> L2
+        // =========================================================================
+        ivec2 max1 = ivec2(int(pl.w1) - 1, int(pl.h1) - 1);
+        uint l1Off4 = pl.offL1In >> 2u;
+        uint s1Off4 = pl.offS1   >> 2u;
+        uint l2Off4 = pl.offL2In >> 2u;
 
-    if (qp.x < int(qW) && qp.y < int(qH)) {
-        uint qGlobal = uint(qp.y) * qW + uint(qp.x);
-        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 0u] = uvec4(
-            packHalf2x16(vec2(readHeadOut(localIdx, 0u), readHeadOut(localIdx, 1u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 2u), readHeadOut(localIdx, 3u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 4u), readHeadOut(localIdx, 5u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 6u), readHeadOut(localIdx, 7u)))
-        );
-        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 1u] = uvec4(
-            packHalf2x16(vec2(readHeadOut(localIdx, 8u),  readHeadOut(localIdx, 9u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 10u), readHeadOut(localIdx, 11u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 12u), readHeadOut(localIdx, 13u))),
-            packHalf2x16(vec2(readHeadOut(localIdx, 14u), readHeadOut(localIdx, 15u)))
-        );
+        // 1a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of l1_in (1,440 = 11*128 + 32)
+        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
+            s_act_b[idx4] = pyr4[l1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 8u + cg];
+        }
+        if (tid < 32u) {
+            uint idx4 = tid + 1408u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
+            s_act_b[idx4] = pyr4[l1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 8u + cg];
+        }
+        barrier();
 
-        float hNew0 = tanh(readHeadRec(localIdx, 0u) + readHeadRec(localIdx, 8u));
-        float hNew1 = tanh(readHeadRec(localIdx, 1u) + readHeadRec(localIdx, 9u));
-        float hNew2 = tanh(readHeadRec(localIdx, 2u) + readHeadRec(localIdx, 10u));
-        float hNew3 = tanh(readHeadRec(localIdx, 3u) + readHeadRec(localIdx, 11u));
-        float hNew4 = tanh(readHeadRec(localIdx, 4u) + readHeadRec(localIdx, 12u));
-        float hNew5 = tanh(readHeadRec(localIdx, 5u) + readHeadRec(localIdx, 13u));
-        float hNew6 = tanh(readHeadRec(localIdx, 6u) + readHeadRec(localIdx, 14u));
-        float hNew7 = tanh(readHeadRec(localIdx, 7u) + readHeadRec(localIdx, 15u));
+        // 1b. Unrolled vectorized z1 = enc1_dw(l1_in) -> s_act_a[0..1023]
+        {
+            uint cg = tid & 7u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = ENC1_DW_W_F32_OFFSET + t * 32u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 3u;
+                uint lx = p & 15u;
+                uint ly = p >> 4u;
+                vec4 sum = vec4(0.0);
+                [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
+                    uint rowOff = (ly + dy) * 18u + lx;
+                    [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
+                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                    }
+                }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+            }
+        }
+        barrier();
 
-        uUpscaleKernelOut.kernelVec4[qGlobal * 3u + 2u] = uvec4(
-            packHalf2x16(vec2(hNew0, hNew1)),
-            packHalf2x16(vec2(hNew2, hNew3)),
-            packHalf2x16(vec2(hNew4, hNew5)),
-            packHalf2x16(vec2(hNew6, hNew7))
-        );
+        // 1c. m1 = lrelu(enc1_pw1(z1)) (32 -> 64) -> s_act_b[0..2047]
+        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 8u, ENC1_PW1_W_FP8_OFFSET, 2u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[ENC1_PW1_S_F32_OFFSET + c];
+            float bc = w_f32[ENC1_PW1_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_b[p0 * 16u + outCol4] = q0;
+                    s_act_b[(p0 + 16u) * 16u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 1d. s1 = lrelu(m1 + enc1_pw2(m1)) (64 -> 64) -> s_act_a[0..2047]
+        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 0u, 16u, ENC1_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[ENC1_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[ENC1_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_b[p0 * 16u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_b[p1 * 16u + outCol4], comp);
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_a[p0 * 16u + outCol4] = q0;
+                    s_act_a[p1 * 16u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 1e. Coalesced fe4m3vec4 store s1 -> pyr4[s1Off4] and 2x2 box-pool s1 -> pyr4[l2Off4]
+        [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint p = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            ivec2 gp = tileOrigin + pixelOffset16x8(p);
+            if (gp.x < int(pl.w1) && gp.y < int(pl.h1)) {
+                pyr4[s1Off4 + (uint(gp.y) * pl.w1 + uint(gp.x)) * 16u + cg] = s_act_a[idx4];
+            }
+        }
+
+        ivec2 l2Origin = ivec2(gl_WorkGroupID.xy) * ivec2(8, 4);
+        [[unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint qp = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            uint qlx = qp & 7u;
+            uint qly = qp >> 3u;
+            ivec2 gq = l2Origin + ivec2(int(qlx), int(qly));
+            if (gq.x < int(pl.w2) && gq.y < int(pl.h2)) {
+                uint lx0 = qlx * 2u;
+                uint ly0 = qly * 2u;
+                uint lx1 = uint(min(tileOrigin.x + int(lx0) + 1, max1.x) - tileOrigin.x);
+                uint ly1 = uint(min(tileOrigin.y + int(ly0) + 1, max1.y) - tileOrigin.y);
+                vec4 v00 = vec4(s_act_a[(ly0 * 16u + lx0) * 16u + cg]);
+                vec4 v01 = vec4(s_act_a[(ly0 * 16u + lx1) * 16u + cg]);
+                vec4 v10 = vec4(s_act_a[(ly1 * 16u + lx0) * 16u + cg]);
+                vec4 v11 = vec4(s_act_a[(ly1 * 16u + lx1) * 16u + cg]);
+                vec4 avg = 0.25 * (v00 + v01 + v10 + v11);
+                pyr4[l2Off4 + (uint(gq.y) * pl.w2 + uint(gq.x)) * 16u + cg] =
+                    packFp8Vec4(avg.x, avg.y, avg.z, avg.w);
+            }
+        }
+
+    } else if (stage == 2u) {
+        // =========================================================================
+        // Stage 2: L2 Quarter-Res Bottleneck Block 1 (W2 x H2, 64 -> 128, d=1)
+        // =========================================================================
+        ivec2 max2 = ivec2(int(pl.w2) - 1, int(pl.h2) - 1);
+        uint l2Off4 = pl.offL2In >> 2u;
+        uint b1Off4 = pl.offB1   >> 2u;
+
+        // 2a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of l2_in (2,880 = 22*128 + 64)
+        [[unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint pix = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max2);
+            s_act_b[idx4] = pyr4[l2Off4 + (uint(np.y) * pl.w2 + uint(np.x)) * 16u + cg];
+        }
+        if (tid < 64u) {
+            uint idx4 = tid + 2816u;
+            uint pix = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max2);
+            s_act_b[idx4] = pyr4[l2Off4 + (uint(np.y) * pl.w2 + uint(np.x)) * 16u + cg];
+        }
+        barrier();
+
+        // 2b. Unrolled vectorized z2 = bot1_dw(l2_in) -> s_act_a[0..2047]
+        {
+            uint cg = tid & 15u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = BOT1_DW_W_F32_OFFSET + t * 64u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 4u;
+                uint lx = p & 15u;
+                uint ly = p >> 4u;
+                vec4 sum = vec4(0.0);
+                [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
+                    uint rowOff = (ly + dy) * 18u + lx;
+                    [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
+                        sum += vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dw[dy * 3u + dx];
+                    }
+                }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+            }
+        }
+        barrier();
+
+        // 2c. m2 = lrelu(bot1_pw1(z2)) (64 -> 128) -> s_act_b[0..4095]
+        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
+            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
+                uint ob = obOuter * 4u + obInner;
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+                wmmaDualFromActA(sg, 0u, 16u, BOT1_PW1_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+
+                uint c = ob * 16u + col;
+                float sc = w_f32[BOT1_PW1_S_F32_OFFSET + c];
+                float bc = w_f32[BOT1_PW1_B_F32_OFFSET + c];
+                uint outCol4 = ob * 4u + col4;
+
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    uint p0 = sg * 32u + mBase + i;
+                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                    if (comp == 0u) {
+                        s_act_b[p0 * 32u + outCol4] = q0;
+                        s_act_b[(p0 + 16u) * 32u + outCol4] = q1;
+                    }
+                }
+            }
+        }
+        barrier();
+
+        // 2d. b1 = lrelu(m2 + bot1_pw2(m2)) (128 -> 128) -> pyr4[b1Off4]
+        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
+            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
+                uint ob = obOuter * 4u + obInner;
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+                wmmaDualFromActB(sg, 0u, 32u, BOT1_PW2_W_FP8_OFFSET, 8u, ob, acc0, acc1);
+
+                uint c = ob * 16u + col;
+                float sc = w_f32[BOT1_PW2_S_F32_OFFSET + c];
+                float bc = w_f32[BOT1_PW2_B_F32_OFFSET + c];
+                uint outCol4 = ob * 4u + col4;
+
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    uint p0 = sg * 32u + mBase + i;
+                    uint p1 = p0 + 16u;
+                    float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
+                    float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
+                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                    if (comp == 0u) {
+                        ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                        if (gp0.x < int(pl.w2) && gp0.y < int(pl.h2)) {
+                            pyr4[b1Off4 + (uint(gp0.y) * pl.w2 + uint(gp0.x)) * 32u + outCol4] = q0;
+                        }
+                        ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                        if (gp1.x < int(pl.w2) && gp1.y < int(pl.h2)) {
+                            pyr4[b1Off4 + (uint(gp1.y) * pl.w2 + uint(gp1.x)) * 32u + outCol4] = q1;
+                        }
+                    }
+                }
+            }
+        }
+
+    } else if (stage == 3u) {
+        // =========================================================================
+        // Stage 3: L2 Quarter-Res Dilated Bottleneck Block 2 (W2 x H2, 128 -> 64, d=3)
+        // =========================================================================
+        ivec2 max2 = ivec2(int(pl.w2) - 1, int(pl.h2) - 1);
+        uint l2Off4 = pl.offL2In >> 2u;
+        uint b1Off4 = pl.offB1   >> 2u;
+        uint b2Off4 = pl.offB2   >> 2u;
+
+        // 3a. Pipelined 4x8 z3 = bot2_dw(b1, d=3) -> s_act_a[0..4095], center b1 -> s_act_b[0..4095]
+        {
+            uint cg = tid & 31u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = BOT2_DW_W_F32_OFFSET + t * 128u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            for (uint blk = 0u; blk < 4u; ++blk) {
+                [[unroll]] for (uint sub = 0u; sub < 8u; ++sub) {
+                    uint idx4 = tid + (blk * 8u + sub) * 128u;
+                    uint p = idx4 >> 5u;
+                    ivec2 gp = tileOrigin + pixelOffset16x8(p);
+                    vec4 sum = vec4(0.0);
+                    fe4m3vec4 cB = fe4m3vec4(floate4m3_t(0.0));
+                    [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+                        [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+                            ivec2 np = clamp(gp + ivec2(dx * 3, dy * 3), ivec2(0), max2);
+                            fe4m3vec4 v = pyr4[b1Off4 + (uint(np.y) * pl.w2 + uint(np.x)) * 32u + cg];
+                            if (dx == 0 && dy == 0) {
+                                cB = v;
+                            }
+                            sum += vec4(v) * dw[uint(dy + 1) * 3u + uint(dx + 1)];
+                        }
+                    }
+                    s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+                    s_act_b[idx4] = cB;
+                }
+            }
+        }
+        barrier();
+
+        // 3b. m3 = lrelu(b1 + bot2_pw1(z3)) (128 -> 128) -> s_act_b[0..4095]
+        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
+            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
+                uint ob = obOuter * 4u + obInner;
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+                wmmaDualFromActA(sg, 0u, 32u, BOT2_PW1_W_FP8_OFFSET, 8u, ob, acc0, acc1);
+
+                uint c = ob * 16u + col;
+                float sc = w_f32[BOT2_PW1_S_F32_OFFSET + c];
+                float bc = w_f32[BOT2_PW1_B_F32_OFFSET + c];
+                uint outCol4 = ob * 4u + col4;
+
+                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                    uint p0 = sg * 32u + mBase + i;
+                    uint p1 = p0 + 16u;
+                    float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
+                    float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
+                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                    if (comp == 0u) {
+                        s_act_b[p0 * 32u + outCol4] = q0;
+                        s_act_b[p1 * 32u + outCol4] = q1;
+                    }
+                }
+            }
+        }
+        barrier();
+
+        // 3c. b2 = lrelu(l2_in + bot2_pw2(m3)) (128 -> 64) -> pyr4[b2Off4]
+        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 0u, 32u, BOT2_PW2_W_FP8_OFFSET, 8u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[BOT2_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[BOT2_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                bool ok0 = (gp0.x < int(pl.w2) && gp0.y < int(pl.h2));
+                bool ok1 = (gp1.x < int(pl.w2) && gp1.y < int(pl.h2));
+                uint gOff0 = (uint(gp0.y) * pl.w2 + uint(gp0.x)) * 16u + outCol4;
+                uint gOff1 = (uint(gp1.y) * pl.w2 + uint(gp1.x)) * 16u + outCol4;
+                float sk0 = ok0 ? fp8Comp(pyr4[l2Off4 + gOff0], comp) : 0.0;
+                float sk1 = ok1 ? fp8Comp(pyr4[l2Off4 + gOff1], comp) : 0.0;
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    if (ok0) pyr4[b2Off4 + gOff0] = q0;
+                    if (ok1) pyr4[b2Off4 + gOff1] = q1;
+                }
+            }
+        }
+
+    } else if (stage == 4u) {
+        // =========================================================================
+        // Stage 4: L1 Half-Res Decoder (W1 x H1, 64 -> 32)
+        // =========================================================================
+        ivec2 max1 = ivec2(int(pl.w1) - 1, int(pl.h1) - 1);
+        uint s1Off4 = pl.offS1 >> 2u;
+        uint b2Off4 = pl.offB2 >> 2u;
+        uint d1Off4 = pl.offD1 >> 2u;
+
+        // 4a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of u1 (2,880 = 22*128 + 64)
+        [[unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint pix = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
+            vec4 vs = vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
+            vec4 vb = vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
+            vec4 u1 = 0.5 * (vs + vb);
+            s_act_b[idx4] = packFp8Vec4(u1.x, u1.y, u1.z, u1.w);
+        }
+        if (tid < 64u) {
+            uint idx4 = tid + 2816u;
+            uint pix = idx4 >> 4u;
+            uint cg = idx4 & 15u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
+            vec4 vs = vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
+            vec4 vb = vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
+            vec4 u1 = 0.5 * (vs + vb);
+            s_act_b[idx4] = packFp8Vec4(u1.x, u1.y, u1.z, u1.w);
+        }
+        barrier();
+
+        // 4b. Unrolled vectorized z4 = dec1_dw(u1) -> s_act_a[0..2047], center u1 -> s_act_a[2048..4095]
+        {
+            uint cg = tid & 15u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = DEC1_DW_W_F32_OFFSET + t * 64u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 4u;
+                uint lx = p & 15u;
+                uint ly = p >> 4u;
+                vec4 sum = vec4(0.0);
+                [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
+                    uint rowOff = (ly + dy) * 18u + lx;
+                    [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
+                        sum += vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dw[dy * 3u + dx];
+                    }
+                }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+                s_act_a[2048u + idx4] = s_act_b[((ly + 1u) * 18u + (lx + 1u)) * 16u + cg];
+            }
+        }
+        barrier();
+
+        // 4c. m4 = lrelu(u1 + dec1_pw1(z4)) (64 -> 64) -> s_act_b[0..2047]
+        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 16u, DEC1_PW1_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[DEC1_PW1_S_F32_OFFSET + c];
+            float bc = w_f32[DEC1_PW1_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_a[2048u + p0 * 16u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_a[2048u + p1 * 16u + outCol4], comp);
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_b[p0 * 16u + outCol4] = q0;
+                    s_act_b[p1 * 16u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 4d. d1 = lrelu(dec1_pw2(m4)) (64 -> 32) -> pyr4[d1Off4]
+        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 0u, 16u, DEC1_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[DEC1_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[DEC1_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                    if (gp0.x < int(pl.w1) && gp0.y < int(pl.h1)) {
+                        pyr4[d1Off4 + (uint(gp0.y) * pl.w1 + uint(gp0.x)) * 8u + outCol4] = q0;
+                    }
+                    ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                    if (gp1.x < int(pl.w1) && gp1.y < int(pl.h1)) {
+                        pyr4[d1Off4 + (uint(gp1.y) * pl.w1 + uint(gp1.x)) * 8u + outCol4] = q1;
+                    }
+                }
+            }
+        }
+
+    } else {
+        // =========================================================================
+        // Stage 5: L0 Full-Res Decoder & Dual Heads (W0 x H0, 32 -> 32 -> 16 & 32 -> 32)
+        // =========================================================================
+        ivec2 max0 = ivec2(int(pl.w0) - 1, int(pl.h0) - 1);
+        uint s0Off4  = pl.offS0  >> 2u;
+        uint d1Off4  = pl.offD1  >> 2u;
+        uint hw0Off4 = pl.offHw0 >> 2u;
+
+        // 5a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of u0 (1,440 = 11*128 + 32)
+        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+            uint idx4 = tid + iter * 128u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
+            vec4 vs = vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
+            vec4 vd = vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
+            vec4 u0 = 0.5 * (vs + vd);
+            s_act_b[idx4] = packFp8Vec4(u0.x, u0.y, u0.z, u0.w);
+        }
+        if (tid < 32u) {
+            uint idx4 = tid + 1408u;
+            uint pix = idx4 >> 3u;
+            uint cg = idx4 & 7u;
+            int hy = int(pix / 18u);
+            int hx = int(pix - uint(hy) * 18u);
+            ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
+            vec4 vs = vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
+            vec4 vd = vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
+            vec4 u0 = 0.5 * (vs + vd);
+            s_act_b[idx4] = packFp8Vec4(u0.x, u0.y, u0.z, u0.w);
+        }
+        barrier();
+
+        // 5b. Unrolled vectorized z5 = dec0_dw(u0) -> s_act_a[0..1023], center u0 -> s_act_a[1024..2047]
+        {
+            uint cg = tid & 7u;
+            uint c4 = cg << 2u;
+            vec4 dw[9];
+            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
+                uint wBase = DEC0_DW_W_F32_OFFSET + t * 32u + c4;
+                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+            }
+            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 3u;
+                uint lx = p & 15u;
+                uint ly = p >> 4u;
+                vec4 sum = vec4(0.0);
+                [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
+                    uint rowOff = (ly + dy) * 18u + lx;
+                    [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
+                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                    }
+                }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+                s_act_a[1024u + idx4] = s_act_b[((ly + 1u) * 18u + (lx + 1u)) * 8u + cg];
+            }
+        }
+        barrier();
+
+        // 5c. m5 = lrelu(dec0_pw1(z5)) (32 -> 64) -> s_act_b[0..2047]
+        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 8u, DEC0_PW1_W_FP8_OFFSET, 2u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[DEC0_PW1_S_F32_OFFSET + c];
+            float bc = w_f32[DEC0_PW1_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_b[p0 * 16u + outCol4] = q0;
+                    s_act_b[(p0 + 16u) * 16u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        // 5d. d0 = lrelu(u0 + dec0_pw2(m5)) (64 -> 32) -> s_act_a[0..1023]
+        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 0u, 16u, DEC0_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+
+            uint c = ob * 16u + col;
+            float sc = w_f32[DEC0_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[DEC0_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_a[1024u + p0 * 8u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_a[1024u + p1 * 8u + outCol4], comp);
+                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_a[p0 * 8u + outCol4] = q0;
+                    s_act_a[p1 * 8u + outCol4] = q1;
+                }
+            }
+        }
+        barrier();
+
+        uint cBase = lane & ~3u;
+
+        // 5e. head_out (32 -> 16) -> uSubpixelParams[pixIdx * 4 + 0..3] via register quad-shuffle
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 8u, HEAD_OUT_W_FP8_OFFSET, 2u, 0u, acc0, acc1);
+            float sc = w_f32[HEAD_OUT_S_F32_OFFSET + col];
+            float bc = w_f32[HEAD_OUT_B_F32_OFFSET + col];
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float v0 = clampHeadOut(acc0[i] * sc + bc);
+                float v1 = clampHeadOut(acc1[i] * sc + bc);
+
+                float v0x = subgroupShuffle(v0, cBase + 0u);
+                float v0y = subgroupShuffle(v0, cBase + 1u);
+                float v0z = subgroupShuffle(v0, cBase + 2u);
+                float v0w = subgroupShuffle(v0, cBase + 3u);
+
+                float v1x = subgroupShuffle(v1, cBase + 0u);
+                float v1y = subgroupShuffle(v1, cBase + 1u);
+                float v1z = subgroupShuffle(v1, cBase + 2u);
+                float v1w = subgroupShuffle(v1, cBase + 3u);
+
+                if (comp == 0u) {
+                    ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                    if (gp0.x < int(pl.w0) && gp0.y < int(pl.h0)) {
+                        uSubpixelParams[(uint(gp0.y) * pl.w0 + uint(gp0.x)) * 4u + col4] =
+                            f16vec4(float16_t(v0x), float16_t(v0y), float16_t(v0z), float16_t(v0w));
+                    }
+                    ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                    if (gp1.x < int(pl.w0) && gp1.y < int(pl.h0)) {
+                        uSubpixelParams[(uint(gp1.y) * pl.w0 + uint(gp1.x)) * 4u + col4] =
+                            f16vec4(float16_t(v1x), float16_t(v1y), float16_t(v1z), float16_t(v1w));
+                    }
+                }
+            }
+        }
+
+        // 5f. head_recurrent (32 -> 32): ob=0 -> cand = tanh, ob=1 -> gate = sigmoid -> uNextNeuralHidden
+        {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accC0, accC1;
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accG0, accG1;
+            wmmaDualFromActA(sg, 0u, 8u, HEAD_REC_W_FP8_OFFSET, 2u, 0u, accC0, accC1);
+            wmmaDualFromActA(sg, 0u, 8u, HEAD_REC_W_FP8_OFFSET, 2u, 1u, accG0, accG1);
+
+            float sC = w_f32[HEAD_REC_S_F32_OFFSET + col];
+            float bC = w_f32[HEAD_REC_B_F32_OFFSET + col];
+            float sG = w_f32[HEAD_REC_S_F32_OFFSET + 16u + col];
+            float bG = w_f32[HEAD_REC_B_F32_OFFSET + 16u + col];
+
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                bool ok0 = (gp0.x < int(pl.w0) && gp0.y < int(pl.h0));
+                bool ok1 = (gp1.x < int(pl.w0) && gp1.y < int(pl.h0));
+
+                float hw0Val = ok0
+                    ? (fp8Comp(pyr4[hw0Off4 + (uint(gp0.y) * pl.w0 + uint(gp0.x)) * 4u + col4], comp) * FP8_ACT_INV_SCALE)
+                    : 0.0;
+                float hw1Val = ok1
+                    ? (fp8Comp(pyr4[hw0Off4 + (uint(gp1.y) * pl.w0 + uint(gp1.x)) * 4u + col4], comp) * FP8_ACT_INV_SCALE)
+                    : 0.0;
+
+                float cand0 = safeTanh(clampHeadRec(accC0[i] * sC + bC));
+                float gate0 = safeSigmoid(clampHeadRec(accG0[i] * sG + bG));
+                float nh0 = float(float16_t(clamp((1.0 - gate0) * hw0Val + gate0 * cand0, -1.0, 1.0)));
+
+                float cand1 = safeTanh(clampHeadRec(accC1[i] * sC + bC));
+                float gate1 = safeSigmoid(clampHeadRec(accG1[i] * sG + bG));
+                float nh1 = float(float16_t(clamp((1.0 - gate1) * hw1Val + gate1 * cand1, -1.0, 1.0)));
+
+                float h0x = subgroupShuffle(nh0, cBase + 0u);
+                float h0y = subgroupShuffle(nh0, cBase + 1u);
+                float h0z = subgroupShuffle(nh0, cBase + 2u);
+                float h0w = subgroupShuffle(nh0, cBase + 3u);
+
+                float h1x = subgroupShuffle(nh1, cBase + 0u);
+                float h1y = subgroupShuffle(nh1, cBase + 1u);
+                float h1z = subgroupShuffle(nh1, cBase + 2u);
+                float h1w = subgroupShuffle(nh1, cBase + 3u);
+
+                if (comp == 0u) {
+                    if (ok0) {
+                        imageStore(uNextNeuralHidden, ivec3(gp0.x, gp0.y, int(col4)), vec4(h0x, h0y, h0z, h0w));
+                    }
+                    if (ok1) {
+                        imageStore(uNextNeuralHidden, ivec3(gp1.x, gp1.y, int(col4)), vec4(h1x, h1y, h1z, h1w));
+                    }
+                }
+            }
+        }
     }
 }

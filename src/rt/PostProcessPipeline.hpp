@@ -112,7 +112,7 @@ public:
     // grid (null buffers fall back to a dummy — callers should skip the
     // dispatch when ReSTIR is inactive) and the output image to overwrite.
     void updateDebugViewDescriptors(uint32_t slot, Buffer* diReservoirs, Buffer* giReservoirs, Buffer* x1Contexts, Image* outputImage);
-    void updateMergeDescriptors(uint32_t slot, VkBuffer secBuffer, VkDeviceSize curSize, Image* frameImage, Image* mvImage, Image* normDepthImage, uint32_t width, uint32_t height, AccumFormat format);
+    void updateMergeDescriptors(uint32_t slot, VkBuffer secBuffer, VkDeviceSize curSize, Image* frameImage, Image* mvImage, Image* normDepthImage, uint32_t width, uint32_t height, AccumFormat format, Image* mlDiffuseImage = nullptr, Image* mlSpecularImage = nullptr, Image* mlAlbedoRoughnessImage = nullptr, Image* mlSpecularMotionImage = nullptr);
 
     // Recording commands
     void recordTonemap(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height, const TonemapPushConstants& pc);

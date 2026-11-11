@@ -3,14 +3,14 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(binding = 0) readonly uniform image2D uCurrentFrame;   // Per-frame FP16 radiance
-layout(binding = 1) uniform image2D uHistoryAccum;            // Persistent FP16/FP32 history buffer (default: RGBA16F)
+layout(binding = 0) readonly uniform image2D uCurrentFrame;   // Per-frame FP16/FP32 radiance
+layout(binding = 1) uniform image2D uHistoryAccum;            // Persistent RGBA16F / RGBA32F / B10G11R11 history buffer
 layout(binding = 2) writeonly uniform image2D uOutputImage;   // Tonemapped output (10-bit UNORM / 16-bit Float)
 
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
-    uint sampleCount;    // Current accumulated frame count N (>= 1)
+    uint sampleCount;    // Bits [0..29]: accumulated frame count N (>= 1); Bits [30..31]: AccumFormat
     float invSpp;        // 1.0 / activeSpp
     float exposure;      // Exposure compensation factor
     uint applyACES;      // 1 = Filmic ACES, 0 = Reinhard
@@ -19,6 +19,44 @@ layout(push_constant) uniform PushConstants {
     float paperWhiteNits;// Reference paper white luminance in nits
     uint pad;            // 40-byte alignment
 } pc;
+
+uint pcgHash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+float stochasticRoundBits(float x, uint dropBits, uint rng) {
+    if (x <= 6.103515625e-5 || x >= 65504.0) {
+        return clamp(x, 0.0, 65504.0);
+    }
+    uint mask = (1u << dropBits) - 1u;
+    uint bits = floatBitsToUint(x);
+    bits = (bits + (rng & mask)) & ~mask;
+    return min(uintBitsToFloat(bits), 65504.0);
+}
+
+vec3 stochasticRoundAccum(vec3 c, uint fmt, uvec2 px, uint sampleIdx) {
+    if (fmt == 1u) {
+        return c;
+    }
+    uint seedBase = px.x * 1973u + px.y * 9277u + sampleIdx * 26699u;
+    uint r0 = pcgHash(seedBase ^ 0x68bc21ebu);
+    uint r1 = pcgHash(seedBase ^ 0x02e5be93u);
+    uint r2 = pcgHash(seedBase ^ 0x967a889bu);
+    if (fmt == 2u) {
+        return vec3(
+            stochasticRoundBits(c.r, 17u, r0),
+            stochasticRoundBits(c.g, 17u, r1),
+            stochasticRoundBits(c.b, 18u, r2)
+        );
+    }
+    return vec3(
+        stochasticRoundBits(c.r, 13u, r0),
+        stochasticRoundBits(c.g, 13u, r1),
+        stochasticRoundBits(c.b, 13u, r2)
+    );
+}
 
 // ACES Filmic Tone Mapping Curve (Narkowicz / Stephen Hill fit)
 vec3 ACESFilm(vec3 x) {
@@ -38,12 +76,8 @@ const mat3 REC709_TO_REC2020 = mat3(
 );
 
 // SMPTE ST 2084 (PQ) Fast Rational Polynomial Approximation
-// Eliminates double transcendental pow evaluations (pow(L, m1) and pow(num/den, m2))
-// Validated error bound: max error across [0, 1] is < 0.0242 10-bit code values (< 0.5 target)
-// Strictly monotonic non-decreasing, zero poles (den >= 1.0)
 vec3 LinearToST2084(vec3 L) {
     L = max(L, vec3(0.0));
-    // u = L^(0.25) = sqrt(sqrt(L)) via fast hardware sqrt ALU instructions
     vec3 u = sqrt(sqrt(L));
 
     const float c_a1 = 0.00233850f;
@@ -56,7 +90,6 @@ vec3 LinearToST2084(vec3 L) {
     const float c_b3 = 2060.99079800f;
     const float c_b4 = 1072.71014201f;
 
-    // Horner's scheme using hardware FMA
     vec3 num = u * (c_a1 + u * (c_a2 + u * (c_a3 + u * c_a4)));
     vec3 den = vec3(1.0) + u * (c_b1 + u * (c_b2 + u * (c_b3 + u * c_b4)));
 
@@ -66,7 +99,6 @@ vec3 LinearToST2084(vec3 L) {
 // Filmic HDR S-Curve Luminance Mapping
 float FilmicHdrLuminance(float x, float paperWhite, float peakNits) {
     if (x <= 1e-6) return 0.0;
-    // Strength reduction: x^1.25 == x * pow(x, 0.25) == x * sqrt(sqrt(x)) (mathematically exact)
     float k = max((peakNits / max(paperWhite, 50.0)) - 1.0, 0.1);
     float xp = x * sqrt(sqrt(x));
     return peakNits * (xp / (xp + k));
@@ -86,10 +118,12 @@ void main() {
         return;
     }
 
+    uint sampleCount = pc.sampleCount & 0x3FFFFFFFu;
+    uint accumFmt    = pc.sampleCount >> 30u;
+
     vec4 frameVal = imageLoad(uCurrentFrame, pixelCoord);
     vec3 frameColor = frameVal.rgb * pc.invSpp;
 
-    // Fast vector NaN/Inf/Negative sanitization
     if (any(isnan(frameColor)) || any(isinf(frameColor))) {
         frameColor = vec3(0.0);
     }
@@ -97,9 +131,10 @@ void main() {
     bool isDynamicVideo = (frameVal.a > 0.5);
 
     vec3 accumVal;
-    if (pc.sampleCount <= 1u || isDynamicVideo) {
+    if (sampleCount <= 1u || isDynamicVideo) {
         accumVal = frameColor;
-        imageStore(uHistoryAccum, pixelCoord, vec4(accumVal, 1.0));
+        vec3 storedVal = stochasticRoundAccum(accumVal, accumFmt, uvec2(pixelCoord), 1u);
+        imageStore(uHistoryAccum, pixelCoord, vec4(storedVal, 1.0));
     } else {
         vec4 histVal = imageLoad(uHistoryAccum, pixelCoord);
         vec3 history = histVal.rgb;
@@ -108,9 +143,10 @@ void main() {
         }
         history = max(history, vec3(0.0));
 
-        float alpha = 1.0 / float(pc.sampleCount);
-        accumVal = fma(vec3(alpha), frameColor - history, history);
-        imageStore(uHistoryAccum, pixelCoord, vec4(accumVal, 1.0));
+        float alpha = 1.0 / float(sampleCount);
+        accumVal = max(fma(vec3(alpha), frameColor - history, history), vec3(0.0));
+        vec3 storedVal = stochasticRoundAccum(accumVal, accumFmt, uvec2(pixelCoord), sampleCount);
+        imageStore(uHistoryAccum, pixelCoord, vec4(storedVal, 1.0));
     }
 
     // Direct in-register ACES tonemapping (zero VRAM re-read hazard)
@@ -122,11 +158,9 @@ void main() {
 
     vec3 finalColor;
     if (pc.displayMode == 0u) {
-        // --- SDR Fallback (sRGB ~2.2 Gamma, [0.0, 1.0]) ---
         vec3 mapped = (pc.applyACES != 0u) ? ACESFilm(linearColor) : (linearColor / (linearColor + vec3(1.0)));
         finalColor = pow(mapped, vec3(1.0 / 2.2));
     } else if (pc.displayMode == 1u) {
-        // --- HDR scRGB Linear (16-bit Float, 1.0 = 80 nits) ---
         if (pc.applyACES != 0u) {
             finalColor = TonemapHDR(linearColor, pc.paperWhiteNits, pc.peakNits);
         } else {
@@ -135,7 +169,6 @@ void main() {
             finalColor = clamp(linearColor * sWhite, vec3(0.0), vec3(sPeak));
         }
     } else {
-        // --- HDR10 (10-bit Rec.2020 SMPTE ST 2084 PQ) ---
         vec3 scRgbColor;
         if (pc.applyACES != 0u) {
             scRgbColor = TonemapHDR(linearColor, pc.paperWhiteNits, pc.peakNits);

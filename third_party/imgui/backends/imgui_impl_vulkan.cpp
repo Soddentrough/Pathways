@@ -1010,6 +1010,7 @@ static VkPipeline ImGui_ImplVulkan_CreatePipeline(VkDevice device, const VkAlloc
     stage[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stage[1].module = bd->ShaderModuleFrag;
     stage[1].pName = "main";
+    stage[1].pSpecializationInfo = info->FragSpecializationInfo;
 
     VkVertexInputBindingDescription binding_desc[1] = {};
     binding_desc[0].stride = sizeof(ImDrawVert);

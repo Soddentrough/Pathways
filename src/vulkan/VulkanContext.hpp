@@ -212,8 +212,12 @@ private:
     bool m_hasDgcExecutionSet = false;
     bool m_hasRayQuery = false;
     bool m_hasDeferredOps = false;
+    VkPhysicalDeviceFeatures m_coreFeatures{};
+    VkPhysicalDeviceVulkan11Features m_vk11Features{};
     VkPhysicalDeviceVulkan12Features m_vk12Features{};
     VkPhysicalDeviceVulkan13Features m_vk13Features{};
+    VkPhysicalDeviceVulkan14Features m_vk14Features{};
+    VkPhysicalDeviceRayTracingPipelineFeaturesKHR m_rtPipelineFeatures{};
     VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT m_dgcProperties{};
     uint32_t m_subgroupSize = 0;
     bool m_hasCooperativeMatrix = false;
@@ -233,6 +237,8 @@ private:
     bool m_hasDescriptorHeap = false;
     bool m_hasUnifiedImageLayouts = false;
     bool m_hasComputeShaderDerivatives = false;
+    bool m_hasComputeDerivativeQuads = false;
+    bool m_hasComputeDerivativeLinear = false;
 #ifdef _WIN32
     bool m_hasExternalMemoryWin32 = false;
     bool m_hasExternalSemaphoreWin32 = false;

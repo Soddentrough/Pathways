@@ -1,7 +1,7 @@
 #include "scene/GltfLoader.hpp"
+#include "utils/MiniJson.hpp"
 #include "core/Logger.hpp"
 
-#define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
 #include <iostream>
@@ -378,6 +378,65 @@ int main() {
                   << " vertices, " << helmetScene.meshes[0].primitives[0].indices.size()
                   << " indices." << std::endl;
         check_true(!helmetScene.hasMeshQuantization, "DamagedHelmet does not use KHR_mesh_quantization");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 6: MiniJsonParser Malformed / Unterminated Input O(N) Termination
+    // -------------------------------------------------------------------------
+    std::cout << "[Step 8] Validating MiniJsonParser malformed input safety..." << std::endl;
+    {
+        const char* malformedInputs[] = {
+            "{broken",
+            "[1, 2, tru",
+            "{\"a\": @@@ }",
+            "\"unterminated_string",
+            "[1, 2, ---, +++]",
+            "{\"nested\": [1, {\"bad\": ???}]}"
+        };
+        for (const char* bad : malformedInputs) {
+            MiniJsonParser parser(bad);
+            JsonVal v = parser.parseVal();
+            (void)v;
+        }
+        MiniJsonParser goodParser("{\"ok\": true, \"num\": 42.5}");
+        JsonVal good = goodParser.parseVal();
+        check_true(good.is_object() && good["ok"].as_bool() && std::abs(good["num"].as_float() - 42.5f) < 1e-3f,
+                   "Valid MiniJson object parses accurately");
+    }
+
+    // -------------------------------------------------------------------------
+    // Test 7: GltfLoader KHR_materials_specular Factor Preservation
+    // -------------------------------------------------------------------------
+    std::cout << "[Step 9] Validating KHR_materials_specular factor preservation..." << std::endl;
+    {
+        std::vector<float> pos = { -1.0f, -1.0f, 0.0f,  1.0f, -1.0f, 0.0f,  0.0f, 1.0f, 0.0f };
+        std::string b64 = base64_encode(reinterpret_cast<const uint8_t*>(pos.data()), pos.size() * sizeof(float));
+        std::string specGltf = R"({
+  "asset": { "version": "2.0" },
+  "extensionsUsed": [ "KHR_materials_specular" ],
+  "buffers": [ { "uri": "data:application/octet-stream;base64,)" + b64 + R"(", "byteLength": 36 } ],
+  "bufferViews": [ { "buffer": 0, "byteOffset": 0, "byteLength": 36 } ],
+  "accessors": [ { "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [-1,-1,0], "max": [1,1,0] } ],
+  "materials": [ {
+    "name": "LowSpecularDielectric",
+    "pbrMetallicRoughness": { "baseColorFactor": [0.8, 0.8, 0.8, 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.2 },
+    "extensions": { "KHR_materials_specular": { "specularFactor": 0.25 } }
+  } ],
+  "meshes": [ { "primitives": [ { "attributes": { "POSITION": 0 }, "material": 0 } ] } ],
+  "nodes": [ { "mesh": 0 } ],
+  "scenes": [ { "nodes": [0] } ],
+  "scene": 0
+})";
+        std::filesystem::path specPath = std::filesystem::temp_directory_path() / "test_khr_specular_factor.gltf";
+        {
+            std::ofstream out(specPath);
+            out << specGltf;
+        }
+        SceneData specScene = GltfLoader::loadSceneData(specPath.string());
+        std::filesystem::remove(specPath, ec);
+        check_true(!specScene.materials.empty(), "KHR_materials_specular test scene must produce material");
+        assert_near(specScene.materials[0].specularFactor, 0.25f, 0.005f,
+                    "KHR_materials_specular specularFactor=0.25 must be preserved (not zeroed)");
     }
 
     std::cout << "==========================================================" << std::endl;

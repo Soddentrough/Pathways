@@ -58,16 +58,45 @@ def verify_mgpu_fsr3_motion(png_path, stats_path, expected_w=2560, expected_h=14
 
     # 3. Check for Checkerboard Tile Seam Discontinuities
     # At 2560x1440 upscaled from 1706x960 (1.5x scale), 64px tiles are ~96px wide on display.
-    # Check vertical and horizontal seam transitions across the frame.
+    # Compare vertical & horizontal tile-boundary gradients against interior non-seam gradients.
     seam_steps = []
-    step_size = int(round(64.0 * (float(w) / 1706.0)))
+    non_seam_steps = []
+    step_size = max(8, int(round(64.0 * (float(w) / 1706.0))))
+    half_step = max(2, step_size // 2)
     for x in range(step_size, w - step_size, step_size):
-        col_diff = np.mean(np.abs(arr[:, x, :3].astype(float) - arr[:, x-1, :3].astype(float)))
+        col_diff = np.mean(np.abs(arr[:, x, :3].astype(float) - arr[:, x - 1, :3].astype(float)))
         seam_steps.append(col_diff)
-    
-    mean_seam_step = np.mean(seam_steps) if seam_steps else 0.0
-    print(f"[INFO] Average tile boundary transition gradient: {mean_seam_step:.2f} / 255")
-    print(f"\033[32m[PASS]\033[0m Checkerboard tile boundary continuity verified (seamless spatial reconstruction)")
+        mid_x = x + half_step
+        if mid_x < w:
+            mid_diff = np.mean(np.abs(arr[:, mid_x, :3].astype(float) - arr[:, mid_x - 1, :3].astype(float)))
+            non_seam_steps.append(mid_diff)
+
+    row_seam_steps = []
+    row_non_seam_steps = []
+    row_step = max(8, int(round(64.0 * (float(h) / 960.0))))
+    half_row = max(2, row_step // 2)
+    for y in range(row_step, h - row_step, row_step):
+        row_diff = np.mean(np.abs(arr[y, :, :3].astype(float) - arr[y - 1, :, :3].astype(float)))
+        row_seam_steps.append(row_diff)
+        mid_y = y + half_row
+        if mid_y < h:
+            mid_row_diff = np.mean(np.abs(arr[mid_y, :, :3].astype(float) - arr[mid_y - 1, :, :3].astype(float)))
+            row_non_seam_steps.append(mid_row_diff)
+
+    mean_seam_step = float(np.mean(seam_steps)) if seam_steps else 0.0
+    mean_non_seam_step = float(np.mean(non_seam_steps)) if non_seam_steps else mean_seam_step
+    mean_row_seam = float(np.mean(row_seam_steps)) if row_seam_steps else 0.0
+    mean_row_non_seam = float(np.mean(row_non_seam_steps)) if row_non_seam_steps else mean_row_seam
+
+    col_limit = max(mean_non_seam_step * 1.75, mean_non_seam_step + 6.0)
+    row_limit = max(mean_row_non_seam * 1.75, mean_row_non_seam + 6.0)
+    print(f"[INFO] Vertical tile seam gradient:   {mean_seam_step:.2f} / 255 (interior baseline: {mean_non_seam_step:.2f}, limit: {col_limit:.2f})")
+    print(f"[INFO] Horizontal tile seam gradient: {mean_row_seam:.2f} / 255 (interior baseline: {mean_row_non_seam:.2f}, limit: {row_limit:.2f})")
+    if mean_seam_step > col_limit or mean_row_seam > row_limit:
+        print("\033[31m[FAIL]\033[0m Checkerboard tile seam discontinuity detected relative to interior pixel gradients!")
+        success = False
+    else:
+        print("\033[32m[PASS]\033[0m Checkerboard tile boundary continuity verified (seamless spatial reconstruction)")
 
     # 4. Multi-GPU Performance Telemetry & Validation Errors
     try:

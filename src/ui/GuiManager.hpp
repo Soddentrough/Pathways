@@ -4,6 +4,7 @@
 #include <SDL3/SDL.h>
 #include "core/Config.hpp"
 #include "utils/ImageDumper.hpp"
+#include "vulkan/Swapchain.hpp"
 
 #include "scene/SceneRegistry.hpp"
 
@@ -34,13 +35,16 @@ struct GuiActions {
     bool sceneChanged = false;
     std::string newScenePath = "";
     int newSceneIndex = -1;
+    bool cameraModeChanged = false;
+    bool newCameraMode = false;
 };
 
 class GuiManager {
 public:
     GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice physicalDevice,
                VkDevice device, uint32_t queueFamily, VkQueue queue,
-               VkFormat colorFormat, uint32_t minImageCount, uint32_t imageCount);
+               VkFormat colorFormat, uint32_t minImageCount, uint32_t imageCount,
+               HdrDisplayMode hdrMode = HdrDisplayMode::SDR, float paperWhiteNits = 200.0f);
     ~GuiManager();
 
     bool processEvent(const SDL_Event& event);
@@ -51,9 +55,14 @@ public:
                 GuiActions* actions = nullptr,
                 const std::vector<SceneEntry>& availableScenes = {}, int currentSceneIndex = -1);
 
+    void updateSwapchainFormat(VkFormat colorFormat, HdrDisplayMode hdrMode, float paperWhiteNits, uint32_t imageCount);
+    bool needsPipelineUpdate(VkFormat colorFormat, HdrDisplayMode hdrMode, float paperWhiteNits) const;
+
     bool wantCaptureMouse() const;
     bool wantCaptureKeyboard() const;
     bool wantTextInput() const;
+    bool hasOpenPopupOrActiveItem() const;
+    bool closeOpenPopupOrActiveItem();
     void resetHistory();
     float getUiScale() const { return m_uiScale; }
 
@@ -63,6 +72,10 @@ private:
 
     SDL_Window* m_window = nullptr;
     VkDevice m_device = VK_NULL_HANDLE;
+    VkFormat m_colorFormat = VK_FORMAT_UNDEFINED;
+    HdrDisplayMode m_hdrMode = HdrDisplayMode::SDR;
+    float m_paperWhiteNits = 200.0f;
+    uint32_t m_imageCount = 2;
     bool m_initialized = false;
     bool m_layoutInitialized = false;
     bool m_lastWasPortrait = false;

@@ -122,7 +122,8 @@ void PresentationManager::beginFrame(uint32_t frameSlot, uint64_t totalFramesRen
         // Bounded wait: a wedged GPU must not deadlock the render loop forever.
         VkResult fenceRes = vkWaitForFences(m_context->getDevice(), 1, &m_inFlightFences[frameSlot], VK_TRUE, 10'000'000'000ull /* 10 s */);
         if (fenceRes == VK_TIMEOUT) {
-            Logger::error("In-flight fence timeout ({}s) for frame slot {} — GPU may be hung or validation-stalled. Continuing; further Vulkan calls may fail.", 10, frameSlot);
+            Logger::error("In-flight fence timeout ({}s) for frame slot {} — GPU may be hung or validation-stalled; waiting for device idle before recycling command buffers.", 10, frameSlot);
+            vkDeviceWaitIdle(m_context->getDevice());
         } else if (fenceRes != VK_SUCCESS) {
             Logger::error("vkWaitForFences failed for frame slot {} (VkResult: {})", frameSlot, static_cast<int>(fenceRes));
         }
@@ -280,6 +281,10 @@ bool PresentationManager::recordPresentation(
                         outGuiActions,
                         availableScenes, currentSceneIndex)) {
             resetAccum = true;
+        }
+        if (camMode != isCameraActive && outGuiActions) {
+            outGuiActions->cameraModeChanged = true;
+            outGuiActions->newCameraMode = camMode;
         }
     }
 

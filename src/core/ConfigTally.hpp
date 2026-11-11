@@ -75,10 +75,8 @@ struct ConfigKey {
             denoiserStr = " [Pure MC]";
         } else if (denoiser == DenoiserMode::Upways) {
             denoiserStr = " [Upways]";
-        } else if (denoiser == DenoiserMode::Gateway) {
-            denoiserStr = " [Gateway]";
         } else if (denoiser == DenoiserMode::Svgf) {
-            denoiserStr = " [SVGF]";
+            denoiserStr = " [E-SVGF]";
         } else if (denoiser == DenoiserMode::FfxRayRegeneration) {
             denoiserStr = " [FFX Ray Regeneration]";
         }
@@ -88,16 +86,11 @@ struct ConfigKey {
             mgpuUpscaleStr = (mgpu_upscale_mode == MgpuUpscaleMode::PostMerge) ? " [Post-Merge SR]" : " [Sample-Blend SR]";
         }
         if (upscaler == UpscalerMode::FSR) {
-            const char* fsrLabel = (fsr_version == FsrVersion::Fsr5) ? " [FSR 5]" :
-                                   (fsr_version == FsrVersion::Fsr4) ? " [FSR 4.1 ML]" :
-                                   (fsr_version == FsrVersion::Fsr3) ? " [FSR 3.1]" : " [FSR 4.1 ML]";
+            const char* fsrLabel = (fsr_version == FsrVersion::Fsr4) ? " [FSR 4.1 ML]" :
+                                   (fsr_version == FsrVersion::Fsr3) ? " [FSR 3.1]" : " [FSR]";
             upscalerStr = std::string(fsrLabel) + mgpuUpscaleStr;
         } else if (upscaler == UpscalerMode::Upways) {
             upscalerStr = " [Upways SR]" + mgpuUpscaleStr;
-        } else if (upscaler == UpscalerMode::Gateway) {
-            upscalerStr = " [Gateway SR]" + mgpuUpscaleStr;
-        } else if (upscaler == UpscalerMode::FSR1) {
-            upscalerStr = " [FSR 1.0]" + mgpuUpscaleStr;
         }
         std::string nrcStr = enable_nrc ? " [NRC]" : "";
         return std::format("[{}]{}{}{} [{}] [{}] {}x{} | {} SPP | {} Bounces | {}", scene_name, denoiserStr, upscalerStr, nrcStr, pipeStr, modeStr, width, height, spp, max_bounces, fmtStr);

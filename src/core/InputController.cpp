@@ -186,10 +186,15 @@ bool InputController::handleEvent(const SDL_Event& e) {
         return true; // Consume event so ImGui navigation does not swallow TAB
     }
 
-    // 4. ESC key: if in camera mode, return to UI mode; if already in UI mode, exit the application
+    // 4. ESC key: if in camera mode, return to UI mode; if in UI mode with an open ImGui popup
+    //    or active input widget, forward ESC to ImGui to dismiss it; otherwise exit the application.
     if (e.type == SDL_EVENT_KEY_DOWN && e.key.key == SDLK_ESCAPE) {
         if (m_cameraMode) {
             setCameraMode(false);
+            return true;
+        }
+        if (m_gui && m_config.enable_gui && m_gui->hasOpenPopupOrActiveItem()) {
+            m_gui->processEvent(e);
             return true;
         }
         Logger::info("ESC pressed in UI mode -> exiting application.");
@@ -197,6 +202,12 @@ bool InputController::handleEvent(const SDL_Event& e) {
             m_window->close();
         }
         return true;
+    }
+    if (e.type == SDL_EVENT_KEY_UP && e.key.key == SDLK_ESCAPE) {
+        if (!m_cameraMode && m_gui && m_config.enable_gui) {
+            m_gui->processEvent(e);
+            return true;
+        }
     }
 
     // 6. Gamepad Hotplug Events (Universal across UI and Camera modes)
@@ -238,7 +249,13 @@ bool InputController::handleEvent(const SDL_Event& e) {
         if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
             if (e.key.key == SDLK_F) {
                 if (m_camera) {
-                    m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+                    if (m_hasGpuCenterDepth && m_lastGpuCenterDepth > 0.05f) {
+                        glm::vec3 hitTarget = m_camera->getPosition() + m_camera->getFront() * m_lastGpuCenterDepth;
+                        float hitRadius = std::clamp(m_lastGpuCenterDepth * 0.45f, 0.25f, std::max(m_focalRadius, 0.25f));
+                        m_camera->focusOnTarget(hitTarget, hitRadius);
+                    } else {
+                        m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+                    }
                 }
                 return true;
             }
@@ -319,7 +336,13 @@ bool InputController::handleEvent(const SDL_Event& e) {
                 rumble(0x3000, 0x4000, 80);
             } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK) {
                 if (m_camera) {
-                    m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+                    if (m_hasGpuCenterDepth && m_lastGpuCenterDepth > 0.05f) {
+                        glm::vec3 hitTarget = m_camera->getPosition() + m_camera->getFront() * m_lastGpuCenterDepth;
+                        float hitRadius = std::clamp(m_lastGpuCenterDepth * 0.45f, 0.25f, std::max(m_focalRadius, 0.25f));
+                        m_camera->focusOnTarget(hitTarget, hitRadius);
+                    } else {
+                        m_camera->focusOnTarget(m_centralTarget, m_focalRadius);
+                    }
                     rumble(0x4000, 0x6000, 100);
                 }
             } else if (e.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER ||
@@ -525,6 +548,8 @@ bool InputController::handleEvent(const SDL_Event& e) {
 }
 
 void InputController::update(float dt, float gpuCenterDepth, bool hasGpuCenterDepth) {
+    m_lastGpuCenterDepth = gpuCenterDepth;
+    m_hasGpuCenterDepth = hasGpuCenterDepth;
     if (!m_cameraMode || m_config.headless || !m_camera) {
         return;
     }

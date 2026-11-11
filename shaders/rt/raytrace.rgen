@@ -19,10 +19,13 @@ struct HitPayload {
 layout(location = 0) rayPayloadEXT HitPayload prd;
 
 layout(binding = 0) uniform image2D uAccumImage;
-layout(binding = 11, rgba16f) uniform image2D uDirectLightImage;
 layout(binding = 12, rgba16f) uniform image2D uNormalDepthImage;
 layout(binding = 13) uniform sampler2D uBlueNoiseTexture;
 layout(binding = 14, rgba16f) uniform image2D uMotionVectorImage;
+layout(binding = 26, rgba16f) uniform writeonly image2D uMlAlbedoRoughnessImage;
+layout(binding = 27, rgba16f) uniform writeonly image2D uMlSpecularMotionImage;
+layout(binding = 28, rgba16f) uniform writeonly image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform writeonly image2D uMlSpecularImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -130,11 +133,7 @@ void main() {
         return;
     }
 
-    bool enableShadowDenoiser = (ubo.flags & (1u << 20)) != 0u;
     bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
-    if (enableShadowDenoiser) {
-        imageStore(uDirectLightImage, pixelCoord, vec4(0.0, 0.0, 0.0, 1.0));
-    }
     ivec2 ndStoreCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
     imageStore(uNormalDepthImage, ndStoreCoord, vec4(0.0, 0.0, 0.0, 10000.0));
 
@@ -149,6 +148,8 @@ void main() {
     uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + ubo.frameIndex * 26699) | 1u;
     seed ^= uint(stNoise.b * 4294967295.0);
     vec3 pixelRadiance = vec3(0.0);
+    vec3 pixelDiff = vec3(0.0);
+    vec3 pixelSpec = vec3(0.0);
     vec3 primaryAlbedo = vec3(0.0);
     float primaryRoughness = 0.0;
     vec2 vSurface = vec2(0.0);
@@ -157,6 +158,7 @@ void main() {
     float specularHitDist = 1000.0;
     float primaryDepth = 10000.0;
     bool primaryHit = false;
+    bool primaryDynamicVideo = false;
 
     for (uint s = 0; s < pixelSpp; ++s) {
         vec2 subpixelOffset;
@@ -185,11 +187,20 @@ void main() {
         vec3 accumSpec = vec3(0.0);
 
         uint maxBounces = ((ubo.flags & (1u << 1)) != 0u) ? ubo.maxBounces : 1u;
+        bool causticApplied = false;
+        uint dispersionChannel = 0u;
+        uint passthroughCount = 0u;
         for (uint bounce = 0; bounce < maxBounces; ++bounce) {
             prd.diffuseRadiance = vec3(0.0);
             prd.specularRadiance = vec3(0.0);
             prd.packedThroughputRG = 0u;
-            uint prdFlags = (isDelta ? 2u : 0u) | (bounce == 0u ? 4u : 0u);
+            uint prdFlags = (isDelta ? 2u : 0u)
+                          | (bounce == 0u ? 4u : 0u)
+                          | (causticApplied ? 16u : 0u)
+                          | (primaryIsSpecular ? 32u : 0u)
+                          | (bounce >= 2u ? 64u : 0u)
+                          | ((bounce + 1u < maxBounces) ? 256u : 0u)
+                          | ((dispersionChannel & 3u) << 10u);
             prd.packedThroughputB_Flags = prdFlags << 16u;
             prd.seed = seed;
             prd.lastBsdfPdf = lastBsdfPdf;
@@ -204,17 +215,33 @@ void main() {
                         0 /* sbtRecordStride */,
                         0 /* missIndex 0 */,
                         rayOrigin,
-                        0.001,
+                        0.0005,
                         rayDir,
                         10000.0,
                         0 /* payload location 0 */);
 
             seed = prd.seed;
-            lastBsdfPdf = prd.lastBsdfPdf;
 
             uint flags = prd.packedThroughputB_Flags >> 16u;
+            if ((flags & 128u) != 0u) {
+                // Alpha cutout / stochastic blend passthrough: advance ray without consuming a bounce
+                rayOrigin = prd.nextOrigin;
+                passthroughCount++;
+                if (passthroughCount > 16u) {
+                    break;
+                }
+                bounce--; // counteracts loop increment (wraps safely in uint32 two's complement)
+                continue;
+            }
+
+            lastBsdfPdf = prd.lastBsdfPdf;
             bool hit = (flags & 1u) != 0u;
             isDelta = (flags & 2u) != 0u;
+            causticApplied = causticApplied || ((flags & 16u) != 0u);
+            dispersionChannel = (flags >> 10u) & 3u;
+            if (bounce == 0u && (flags & 512u) != 0u) {
+                primaryDynamicVideo = true;
+            }
 
             vec3 stepRadiance = prd.diffuseRadiance + prd.specularRadiance;
             if (bounce > 0u && pc.indirectClamp > 0.0) {
@@ -301,16 +328,16 @@ void main() {
             vec3 throughputMod = vec3(tpRG, tpB);
             throughput *= throughputMod;
 
-            // Early-out if path has negligible remaining energy (< 0.1% luminance)
-            float lum = dot(throughput, vec3(0.2126, 0.7152, 0.0722));
-            if (lum < 0.001) {
+            // Unbiased progressive depth-aware Russian Roulette (aligned with applyRussianRoulette in wavefront_common.glsl)
+            float pathLum = dot(throughput * float(max(ubo.spp, 1u)), vec3(0.2126, 0.7152, 0.0722));
+            float maxThresh = max(pathLum, max(throughput.x, max(throughput.y, throughput.z)));
+            if (!(maxThresh > 0.0)) {
                 break;
             }
-
-            // Adaptive progressive depth-attenuated Russian Roulette
             if (bounce >= 1u) {
+                float minP = (bounce == 1u) ? 0.25 : 0.10;
                 float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
-                float p = clamp(lum * depthDecay, 0.05, 0.95);
+                float p = clamp(maxThresh * depthDecay, minP, 0.95);
                 if (randFloat(seed) > p) {
                     break;
                 }
@@ -322,26 +349,46 @@ void main() {
         }
 
         pixelRadiance += radiance;
+        pixelDiff += accumDiff;
+        pixelSpec += accumSpec;
     }
 
     uint compositeDivisor = (pc.totalCompositeSpp > 0u) ? pc.totalCompositeSpp : pixelSpp;
     if (compositeDivisor > 1u) {
-        pixelRadiance /= float(compositeDivisor);
+        float invDiv = 1.0 / float(compositeDivisor);
+        pixelRadiance *= invDiv;
+        pixelDiff *= invDiv;
+        pixelSpec *= invDiv;
     }
 
     if (isnan(pixelRadiance.r) || isnan(pixelRadiance.g) || isnan(pixelRadiance.b) ||
         isinf(pixelRadiance.r) || isinf(pixelRadiance.g) || isinf(pixelRadiance.b)) {
         pixelRadiance = vec3(0.0);
     }
+    if (isnan(pixelDiff.r) || isnan(pixelDiff.g) || isnan(pixelDiff.b) ||
+        isinf(pixelDiff.r) || isinf(pixelDiff.g) || isinf(pixelDiff.b)) {
+        pixelDiff = vec3(0.0);
+    }
+    if (isnan(pixelSpec.r) || isnan(pixelSpec.g) || isnan(pixelSpec.b) ||
+        isinf(pixelSpec.r) || isinf(pixelSpec.g) || isinf(pixelSpec.b)) {
+        pixelSpec = vec3(0.0);
+    }
     pixelRadiance = clamp(pixelRadiance, vec3(0.0), vec3(65000.0));
+    pixelDiff = clamp(pixelDiff, vec3(0.0), vec3(65000.0));
+    pixelSpec = clamp(pixelSpec, vec3(0.0), vec3(65000.0));
 
     ivec2 storeCoord = (pc.tileOffsetX == 2u) ? launchID : pixelCoord;
+    bool accumInShader = (pc.accumulateHistory & 1u) != 0u;
+    bool captureMl = (pc.accumulateHistory & 2u) != 0u;
 
-    // Consolidated 4-Texture G-Buffer Layout Export:
-    // Tex 0: Composite Radiance RGB + Surface Roughness Alpha
+    // uAccumImage.a semantics for accum_tonemap_fused / accum_running_avg / merge_frames:
+    // - GPU 1 Checkerboard (pc.tileOffsetX == 2u): negative primary depth for PCIe tile merge
+    // - Single-GPU / Primary GPU: 1.0 ONLY for live holographic video billboard pixels, 0.0 otherwise
     vec4 newAccum;
-    if (pc.accumulateHistory == 0u || ubo.frameIndex == 0u) {
-        float accumAlpha = (pc.tileOffsetX == 2u) ? (primaryHit ? -min(primaryDepth, 65000.0) : -10000.0) : primaryRoughness;
+    if (!accumInShader || ubo.frameIndex == 0u) {
+        float accumAlpha = (pc.tileOffsetX == 2u)
+            ? (primaryHit ? -min(primaryDepth, 65000.0) : -10000.0)
+            : (primaryDynamicVideo ? 1.0 : 0.0);
         newAccum = vec4(pixelRadiance, accumAlpha);
     } else {
         vec4 prevAccum = imageLoad(uAccumImage, storeCoord);
@@ -349,10 +396,13 @@ void main() {
     }
     imageStore(uAccumImage, storeCoord, newAccum);
 
-    // Tex 1: Base color albedo RGB + specular disparity D_spec = 1 / (1 + d_hit)
-    float dSpec = 1.0 / (1.0 + max(specularHitDist, 0.0));
-    imageStore(uDirectLightImage, storeCoord, vec4(primaryAlbedo, dSpec));
+    if (captureMl) {
+        imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(primaryAlbedo, primaryHit ? primaryRoughness : 1.0));
+        imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSpecular, clamp(specularHitDist, 0.0, 65000.0), primaryRoughness));
+        imageStore(uMlDiffuseImage, storeCoord, vec4(pixelDiff, 1.0));
+        imageStore(uMlSpecularImage, storeCoord, vec4(pixelSpec, 1.0));
+    }
 
-    // Tex 3: 2.5D Surface MV (rg = 2D UV motion, b = PrevLinearZ - CurrLinearZ, a = primaryDepth)
+    // 2.5D Surface MV (rg = 2D UV motion, b = PrevLinearZ - CurrLinearZ, a = primaryDepth)
     imageStore(uMotionVectorImage, storeCoord, vec4(vSurface, vLinearDepthDelta, primaryHit ? primaryDepth : 10000.0));
 }

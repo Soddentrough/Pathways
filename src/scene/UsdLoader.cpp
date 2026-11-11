@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/packing.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
 #include <thread>
@@ -23,6 +24,14 @@
 #include "tinyexr.h"
 
 #if defined(PATHWAYS_ENABLE_USD) && PATHWAYS_ENABLE_USD
+
+// OpenUSD's <pxr/base/tf/hashset.h> unconditionally includes <ext/hash_set> on
+// Linux/GCC to preserve libusd_tf ABI (ARCH_HAS_GNU_STL_EXTENSIONS). Guard only
+// libstdc++'s preprocessor #warning banner here rather than passing -Wno-deprecated,
+// so all deprecation diagnostics remain enabled across UsdLoader.cpp itself.
+#ifndef _BACKWARD_BACKWARD_WARNING_H
+#define _BACKWARD_BACKWARD_WARNING_H 1
+#endif
 
 #include <tbb/version.h>
 #include <pxr/pxr.h>
@@ -246,9 +255,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
             if (ret == TINYEXR_SUCCESS && rgba && w > 0 && h > 0) {
                 outTex.width = static_cast<uint32_t>(w);
                 outTex.height = static_cast<uint32_t>(h);
-                outTex.pixels.resize(w * h * 4);
-                for (int i = 0; i < w * h * 4; ++i) {
-                    outTex.pixels[i] = static_cast<uint8_t>(std::clamp(rgba[i] * 255.0f, 0.0f, 255.0f));
+                outTex.isHdr = true;
+                outTex.isSrgb = false;
+                const size_t numVals = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+                outTex.hdrPixels.resize(numVals);
+                for (size_t i = 0; i < numVals; ++i) {
+                    float v = std::isfinite(rgba[i]) ? std::clamp(rgba[i], -65504.0f, 65504.0f) : 0.0f;
+                    outTex.hdrPixels[i] = glm::packHalf1x16(v);
                 }
                 free(rgba);
                 return true;
@@ -259,13 +272,31 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                 }
                 return false;
             }
+        } else if (ext == ".hdr") {
+            int w = 0, h = 0, comp = 0;
+            float* rgba = stbi_loadf(imgPath.string().c_str(), &w, &h, &comp, 4);
+            if (rgba && w > 0 && h > 0) {
+                outTex.width = static_cast<uint32_t>(w);
+                outTex.height = static_cast<uint32_t>(h);
+                outTex.isHdr = true;
+                outTex.isSrgb = false;
+                const size_t numVals = static_cast<size_t>(w) * static_cast<size_t>(h) * 4u;
+                outTex.hdrPixels.resize(numVals);
+                for (size_t i = 0; i < numVals; ++i) {
+                    float v = std::isfinite(rgba[i]) ? std::clamp(rgba[i], -65504.0f, 65504.0f) : 0.0f;
+                    outTex.hdrPixels[i] = glm::packHalf1x16(v);
+                }
+                stbi_image_free(rgba);
+                return true;
+            }
+            if (rgba) stbi_image_free(rgba);
         } else {
             int w = 0, h = 0, comp = 0;
             stbi_uc* rawPixels = stbi_load(imgPath.string().c_str(), &w, &h, &comp, 4);
             if (rawPixels && w > 0 && h > 0) {
                 outTex.width = static_cast<uint32_t>(w);
                 outTex.height = static_cast<uint32_t>(h);
-                outTex.pixels.assign(rawPixels, rawPixels + (w * h * 4));
+                outTex.pixels.assign(rawPixels, rawPixels + (static_cast<size_t>(w) * static_cast<size_t>(h) * 4u));
                 stbi_image_free(rawPixels);
                 return true;
             }
@@ -1108,6 +1139,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                 gpuLight.normal = glm::vec4(-glm::normalize(glm::vec3(M[2])), 0.0f);
                 fluxScale = intensity * std::pow(2.0f, exposure);
                 gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, area);
+                data.lights.push_back(gpuLight);
             } else if (prim.IsA<UsdLuxDistantLight>()) {
                 UsdLuxDistantLight dl(prim);
                 dl.GetColorAttr().Get(&color);
@@ -1119,13 +1151,130 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                 gpuLight.normal = glm::vec4(dirToLight, 0.0f);
                 fluxScale = intensity * std::pow(2.0f, exposure);
                 gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
-            } else {
-                gpuLight.position = glm::vec4(pos, LIGHT_AREA_QUAD);
+                data.lights.push_back(gpuLight);
+            } else if (prim.IsA<UsdLuxDiskLight>()) {
+                UsdLuxDiskLight dkl(prim);
+                dkl.GetColorAttr().Get(&color);
+                dkl.GetIntensityAttr().Get(&intensity);
+                dkl.GetExposureAttr().Get(&exposure);
+                float radius = 0.5f;
+                dkl.GetRadiusAttr().Get(&radius);
+                radius = std::max(radius, 1e-3f);
                 fluxScale = intensity * std::pow(2.0f, exposure);
-                gpuLight.emission = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
-            }
 
-            data.lights.push_back(gpuLight);
+                MaterialGPU emMat{};
+                emMat.albedo = glm::vec4(color[0], color[1], color[2], 1.0f);
+                emMat.emissive = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
+                emMat.roughness = 1.0f;
+                emMat.type = MATERIAL_EMISSIVE;
+                uint32_t matId = static_cast<uint32_t>(data.materials.size());
+                data.materials.push_back(emMat);
+
+                constexpr int kSegments = 16;
+                constexpr float kTwoPi = 6.28318530718f;
+                const float rPoly = radius * std::sqrt(kTwoPi / (static_cast<float>(kSegments) * std::sin(kTwoPi / static_cast<float>(kSegments))));
+                const bool flipWinding = (glm::determinant(glm::mat3(M)) < 0.0f);
+                const glm::vec3 worldN = glm::normalize(glm::mat3(glm::transpose(glm::inverse(M))) * glm::vec3(0.0f, 0.0f, -1.0f));
+                const glm::vec3 worldT = glm::normalize(glm::vec3(M[0]));
+
+                auto makeVert = [&](const glm::vec3& localP, const glm::vec2& uv) {
+                    Vertex v{};
+                    glm::vec3 wp = glm::vec3(M * glm::vec4(localP, 1.0f));
+                    v.position = glm::vec4(wp, uv.x);
+                    v.normal = glm::vec4(worldN, uv.y);
+                    v.tangent = glm::vec4(worldT, 1.0f);
+                    return v;
+                };
+
+                Vertex centerV = makeVert(glm::vec3(0.0f), glm::vec2(0.5f));
+                for (int s = 0; s < kSegments; ++s) {
+                    float a0 = kTwoPi * static_cast<float>(s) / static_cast<float>(kSegments);
+                    float a1 = kTwoPi * static_cast<float>(s + 1) / static_cast<float>(kSegments);
+                    glm::vec3 lp0(rPoly * std::cos(a0), rPoly * std::sin(a0), 0.0f);
+                    glm::vec3 lp1(rPoly * std::cos(a1), rPoly * std::sin(a1), 0.0f);
+                    Vertex vA = makeVert(lp1, glm::vec2(0.5f + 0.5f * std::cos(a1), 0.5f + 0.5f * std::sin(a1)));
+                    Vertex vB = makeVert(lp0, glm::vec2(0.5f + 0.5f * std::cos(a0), 0.5f + 0.5f * std::sin(a0)));
+                    TriangleGPU tri{};
+                    tri.v0 = centerV;
+                    tri.v1 = flipWinding ? vB : vA;
+                    tri.v2 = flipWinding ? vA : vB;
+                    tri.materialId = matId;
+                    data.triangles.push_back(tri);
+                }
+            } else if (prim.IsA<UsdLuxSphereLight>()) {
+                UsdLuxSphereLight spl(prim);
+                spl.GetColorAttr().Get(&color);
+                spl.GetIntensityAttr().Get(&intensity);
+                spl.GetExposureAttr().Get(&exposure);
+                float radius = 0.5f;
+                spl.GetRadiusAttr().Get(&radius);
+                bool treatAsPoint = false;
+                spl.GetTreatAsPointAttr().Get(&treatAsPoint);
+                float effRadius = (treatAsPoint || radius < 1e-3f) ? 0.02f : radius;
+                fluxScale = intensity * std::pow(2.0f, exposure);
+                if (!treatAsPoint && radius > 0.0f && radius < 1e-3f) {
+                    float ratio = radius / effRadius;
+                    fluxScale *= (ratio * ratio);
+                }
+
+                MaterialGPU emMat{};
+                emMat.albedo = glm::vec4(color[0], color[1], color[2], 1.0f);
+                emMat.emissive = glm::vec4(color[0] * fluxScale, color[1] * fluxScale, color[2] * fluxScale, 1.0f);
+                emMat.roughness = 1.0f;
+                emMat.type = MATERIAL_EMISSIVE;
+                uint32_t matId = static_cast<uint32_t>(data.materials.size());
+                data.materials.push_back(emMat);
+
+                const float phi = 0.5f * (1.0f + std::sqrt(5.0f));
+                const float invNorm = 1.0f / std::sqrt(1.0f + phi * phi);
+                const float a = invNorm;
+                const float b = phi * invNorm;
+                const std::array<glm::vec3, 12> unitVerts = {{
+                    {-a,  b,  0.0f}, { a,  b,  0.0f}, {-a, -b,  0.0f}, { a, -b,  0.0f},
+                    { 0.0f, -a,  b}, { 0.0f,  a,  b}, { 0.0f, -a, -b}, { 0.0f,  a, -b},
+                    { b,  0.0f, -a}, { b,  0.0f,  a}, {-b,  0.0f, -a}, {-b,  0.0f,  a}
+                }};
+                constexpr std::array<std::array<int, 3>, 20> faces = {{
+                    {{0, 11, 5}}, {{0, 5, 1}}, {{0, 1, 7}}, {{0, 7, 10}}, {{0, 10, 11}},
+                    {{1, 5, 9}}, {{5, 11, 4}}, {{11, 10, 2}}, {{10, 7, 6}}, {{7, 1, 8}},
+                    {{3, 9, 4}}, {{3, 4, 2}}, {{3, 2, 6}}, {{3, 6, 8}}, {{3, 8, 9}},
+                    {{4, 9, 5}}, {{2, 4, 11}}, {{6, 2, 10}}, {{8, 6, 7}}, {{9, 8, 1}}
+                }};
+                float unitArea = 0.0f;
+                for (const auto& f : faces) {
+                    unitArea += 0.5f * glm::length(glm::cross(unitVerts[f[1]] - unitVerts[f[0]], unitVerts[f[2]] - unitVerts[f[0]]));
+                }
+                const float rScale = effRadius * std::sqrt((4.0f * 3.14159265359f) / unitArea);
+                const bool flipWinding = (glm::determinant(glm::mat3(M)) < 0.0f);
+                const glm::mat3 normMat = glm::mat3(glm::transpose(glm::inverse(M)));
+
+                for (const auto& f : faces) {
+                    glm::vec3 lp0 = unitVerts[f[0]] * rScale;
+                    glm::vec3 lp1 = unitVerts[flipWinding ? f[2] : f[1]] * rScale;
+                    glm::vec3 lp2 = unitVerts[flipWinding ? f[1] : f[2]] * rScale;
+                    glm::vec3 wp0 = glm::vec3(M * glm::vec4(lp0, 1.0f));
+                    glm::vec3 wp1 = glm::vec3(M * glm::vec4(lp1, 1.0f));
+                    glm::vec3 wp2 = glm::vec3(M * glm::vec4(lp2, 1.0f));
+                    glm::vec3 wn = glm::cross(wp1 - wp0, wp2 - wp0);
+                    float wnLen = glm::length(wn);
+                    wn = (wnLen > 1e-7f) ? (wn / wnLen) : glm::normalize(normMat * unitVerts[f[0]]);
+                    glm::vec3 upRef = (std::abs(wn.y) < 0.99f) ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+                    glm::vec3 wt = glm::normalize(glm::cross(upRef, wn));
+
+                    TriangleGPU tri{};
+                    tri.v0.position = glm::vec4(wp0, 0.0f);
+                    tri.v0.normal = glm::vec4(wn, 0.0f);
+                    tri.v0.tangent = glm::vec4(wt, 1.0f);
+                    tri.v1.position = glm::vec4(wp1, 1.0f);
+                    tri.v1.normal = glm::vec4(wn, 0.0f);
+                    tri.v1.tangent = glm::vec4(wt, 1.0f);
+                    tri.v2.position = glm::vec4(wp2, 0.0f);
+                    tri.v2.normal = glm::vec4(wn, 1.0f);
+                    tri.v2.tangent = glm::vec4(wt, 1.0f);
+                    tri.materialId = matId;
+                    data.triangles.push_back(tri);
+                }
+            }
         }
         // --- Process Cameras (UsdGeomCamera) ---
         else if (prim.IsA<UsdGeomCamera>()) {
@@ -1817,13 +1966,13 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
 
         if (!emissiveMeshLights.empty()) {
             Logger::info("UsdLoader: Extracted {} physical emissive mesh lights from scene geometry", emissiveMeshLights.size());
-            if (emissiveMeshLights.size() > 64) {
+            if (emissiveMeshLights.size() > 512) {
                 std::sort(emissiveMeshLights.begin(), emissiveMeshLights.end(), [](const LightGPU& a, const LightGPU& b) {
                     float fluxA = (a.emission.r + a.emission.g + a.emission.b) * a.emission.w;
                     float fluxB = (b.emission.r + b.emission.g + b.emission.b) * b.emission.w;
                     return fluxA > fluxB;
                 });
-                emissiveMeshLights.resize(64);
+                emissiveMeshLights.resize(512);
             }
             for (const auto& l : emissiveMeshLights) {
                 data.lights.push_back(l);

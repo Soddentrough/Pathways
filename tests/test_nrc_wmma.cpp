@@ -1,5 +1,8 @@
 #include "rt/NRCManager.hpp"
+#include "vulkan/VulkanContext.hpp"
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <cassert>
 #include <cstddef>
 #include <cmath>
@@ -151,6 +154,134 @@ int main() {
         check_true(!std::isnan(w), "Adam weight update must never become NaN");
     }
     std::cout << "  -> Adam optimizer update loop remained numerically stable across 100 iterations." << std::endl;
+
+    // 5. Live GPU NRCManager Wave32 WMMA Inference, Training & Resolve Execution
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount > 0) {
+            std::cout << "[TEST 5] Live GPU NRCManager Inference, Resolve & Training Dispatches..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "NRC GPU Test");
+            if (vkCtx.hasCooperativeMatrix()) {
+                auto loadSpv = [](const std::string& name) -> std::vector<char> {
+                    std::vector<std::filesystem::path> cands = {
+#ifdef SHADER_DIR
+                        std::filesystem::path(SHADER_DIR) / name,
+#endif
+                        std::filesystem::current_path() / "shaders" / name,
+                        std::filesystem::current_path() / "build" / "shaders" / name
+                    };
+                    for (const auto& p : cands) {
+                        std::ifstream f(p, std::ios::binary | std::ios::ate);
+                        if (f.is_open()) {
+                            size_t sz = static_cast<size_t>(f.tellg());
+                            std::vector<char> buf(sz);
+                            f.seekg(0);
+                            f.read(buf.data(), static_cast<std::streamsize>(sz));
+                            return buf;
+                        }
+                    }
+                    return {};
+                };
+
+                auto inferSpv = loadSpv("nrc_encode_infer.comp.spv");
+                auto trainSpv = loadSpv("nrc_train.comp.spv");
+                auto resolveSpv = loadSpv("nrc_resolve.comp.spv");
+                check_true(!inferSpv.empty() && !trainSpv.empty() && !resolveSpv.empty(),
+                           "NRC SPIR-V shaders must exist");
+
+                VkDevice device = vkCtx.getDevice();
+                VmaAllocator allocator = vkCtx.getAllocator();
+                VkQueue queue = vkCtx.getGraphicsQueue();
+
+                NRCManager nrc(device, allocator, 64, 64, inferSpv, trainSpv, resolveSpv, vkCtx.getPhysicalDevice());
+                check_true(nrc.isInitialized(), "NRCManager must initialize on CooperativeMatrix GPU");
+
+                Image accumImg(device, allocator, 64, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+                               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                Image mlDiffImg(device, allocator, 64, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                nrc.updateDescriptors(accumImg.getImageView(), mlDiffImg.getImageView());
+
+                VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+                cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
+                VkCommandPool cmdPool = VK_NULL_HANDLE;
+                check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "NRC cmdPool created");
+
+                VkCommandBufferAllocateInfo cbAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+                cbAlloc.commandPool = cmdPool;
+                cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbAlloc.commandBufferCount = 1;
+                VkCommandBuffer cmd = VK_NULL_HANDLE;
+                check_true(vkAllocateCommandBuffers(device, &cbAlloc, &cmd) == VK_SUCCESS, "NRC cmd allocated");
+
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+
+                accumImg.transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                                          VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                          VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                mlDiffImg.transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                                           VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkClearColorValue zeroClear{};
+                VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCmdClearColorImage(cmd, accumImg.getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &range);
+                vkCmdClearColorImage(cmd, mlDiffImg.getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &range);
+
+                VkMemoryBarrier2 clrBar{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                clrBar.srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+                clrBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                clrBar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                clrBar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+                VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &clrBar;
+                vkCmdPipelineBarrier2(cmd, &dep);
+
+                nrc.resetCounters(cmd);
+                nrc.recordInference(cmd, 64, 64, glm::vec3(-5.0f), glm::vec3(5.0f), 64, 0, 1);
+                nrc.recordTraining(cmd, 1, glm::vec3(-5.0f), glm::vec3(5.0f), 1e-3f, 256);
+
+                vkEndCommandBuffer(cmd);
+                VkSubmitInfo sub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                sub.commandBufferCount = 1;
+                sub.pCommandBuffers = &cmd;
+                check_true(vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE) == VK_SUCCESS, "Submit NRC GPU dispatches");
+                vkQueueWaitIdle(queue);
+                vkDestroyCommandPool(device, cmdPool, nullptr);
+
+                check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors during NRC GPU execution");
+                std::cout << "  -> Live GPU NRC inference, resolve, and online training executed cleanly ("
+                          << nrc.getActiveBackendName() << ", 0 validation errors)." << std::endl;
+            }
+        }
+    }
 
     std::cout << "\n[SUCCESS] All Tier 4 Neural Radiance Caching (NRC) unit tests passed!" << std::endl;
     return 0;

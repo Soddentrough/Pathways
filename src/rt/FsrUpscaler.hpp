@@ -13,35 +13,12 @@
 
 namespace pathways {
 
-struct FsrUpscalePushConstants {
+struct FfxSdkPrepPushConstants {
     uint32_t renderWidth;
     uint32_t renderHeight;
-    uint32_t displayWidth;
-    uint32_t displayHeight;
-    float invRenderWidth;
-    float invRenderHeight;
-    float invDisplayWidth;
-    float invDisplayHeight;
-    float invTotalSamples;
-    float temporalWeight;
-    float jitterX;
-    float jitterY;
-    uint32_t frameIndex;
-    uint32_t resetHistory;
-    uint32_t cameraMoved;
-    uint32_t isInputNormalized;
-    uint32_t fsrVersion;
+    float sampleScale;
+    float nearZ;
 };
-
-struct FsrRcasPushConstants {
-    uint32_t displayWidth;
-    uint32_t displayHeight;
-    float sharpness;
-    uint32_t enableSharpening;
-};
-
-using Fsr3UpscalePushConstants = FsrUpscalePushConstants;
-using Fsr3RcasPushConstants = FsrRcasPushConstants;
 
 class FsrUpscaler : public IUpscaler {
 public:
@@ -53,8 +30,7 @@ public:
         uint32_t renderHeight,
         uint32_t displayWidth,
         uint32_t displayHeight,
-        const std::vector<char>& upscaleSpv,
-        const std::vector<char>& rcasSpv,
+        const std::vector<char>& sdkPrepSpv,
         VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT,
         const std::string& instanceName = "GPU 0 Primary Viewport",
         FsrVersion targetVersion = FsrVersion::Auto
@@ -82,7 +58,6 @@ public:
     uint64_t getVramUsageBytes() const { return m_vramUsageBytes; }
 
     Image* getOutputImage() const { return m_sharpenedImage.get(); }
-    Image* getUpscaledIntermediateImage() const { return m_upscaledImage.get(); }
     uint32_t getRenderWidth() const { return m_renderWidth; }
     uint32_t getRenderHeight() const { return m_renderHeight; }
     uint32_t getDisplayWidth() const { return m_displayWidth; }
@@ -97,7 +72,7 @@ private:
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
     void updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView);
-    void createPipelines(const std::vector<char>& upscaleSpv, const std::vector<char>& rcasSpv);
+    void createPipelines(const std::vector<char>& sdkPrepSpv);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -109,7 +84,7 @@ private:
     uint32_t m_displayHeight = 0;
     VkFormat m_format = VK_FORMAT_R16G16B16A16_SFLOAT;
     FsrVersion m_targetVersion = FsrVersion::Auto;
-    FsrVersion m_activeVersion = FsrVersion::Fsr4;
+    FsrVersion m_activeVersion = FsrVersion::Fsr3;
     bool m_hwMlSupported = false;
     void* m_ffxContext = nullptr;
     bool m_sdkFsr3Supported = false;
@@ -120,26 +95,17 @@ private:
     uint64_t m_vramUsageBytes = 0;
     uint64_t m_requiredFfxResources = 0;
 
-    std::unique_ptr<Image> m_upscaledImage;
     std::unique_ptr<Image> m_sharpenedImage;
-    std::unique_ptr<Image> m_historyImages[2];
     std::unique_ptr<Image> m_sdkColorInput;
     std::unique_ptr<Image> m_sdkDepthInput;
     std::unique_ptr<Image> m_sdkMotionVectorsInput;
-    uint32_t m_historyIndex = 0;
     bool m_historyValid = false;
 
     VkDescriptorPool m_descPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_upscaleDescLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_upscalePipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_upscalePipeline = VK_NULL_HANDLE;
-    VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_sdkPrepDescLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_sdkPrepPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_sdkPrepPipeline = VK_NULL_HANDLE;
     VkDescriptorSet m_sdkPrepDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-
-    VkDescriptorSetLayout m_rcasDescLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_rcasPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline m_rcasPipeline = VK_NULL_HANDLE;
-    VkDescriptorSet m_rcasDescSet = VK_NULL_HANDLE;
 
     VkImageView m_lastBoundInputViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView m_lastBoundMvViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };

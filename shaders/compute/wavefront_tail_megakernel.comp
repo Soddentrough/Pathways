@@ -8,7 +8,6 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -27,6 +26,8 @@ layout(binding = 1) uniform CameraUBO {
     uint spp;
     uint maxBounces;
     uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
 } ubo;
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
@@ -48,7 +49,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -60,6 +61,11 @@ rayQueryEXT g_rq;
 #define USE_GLOBAL_RAY_QUERY 1
 #define ENABLE_INLINE_SHADOWS 1
 #include "wavefront_shadow_inline.glsl"
+#include "mis_common.glsl"
+#include "bsdf_standard.glsl"
+#define SHADING_CORE_SKIP_SCENE_HIT
+#define SHADING_CORE_ENABLE_NEE
+#include "shading_core.glsl"
 
 layout(push_constant) uniform PushConstants {
     WavefrontTailPC pc;
@@ -80,12 +86,15 @@ void main() {
     f16vec3 throughputHalf;
     uint seed, pixelIndex;
     bool isSpecularPath, causticApplied;
-    unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
+    uint dispersionChannel = 0u;
+    unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
+    uint inPdfCode = unpackRayPdfCode(state);
     vec3 throughput = vec3(throughputHalf);
 
     vec3 accumRadiance = vec3(0.0);
     vec3 accumMlDiffuse = vec3(0.0);
     vec3 accumMlSpecular = vec3(0.0);
+    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
 
     for (uint bounce = pc.currentBounce; bounce < pc.maxBounces; ++bounce) {
         float closestT = (pc.maxRayDistance > 0.0) ? pc.maxRayDistance : 10000.0;
@@ -96,9 +105,37 @@ void main() {
         mat4x3 hitO2w = mat4x3(1.0);
         uint hitInstMatOffset = 0u;
 
-        // Trace scene intersection with hardware rayQueryEXT
-        rayQueryInitializeEXT(g_rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, rayOrigin, EPSILON, rayDir, closestT);
-        rayQueryProceedEXT(g_rq);
+        // Trace scene intersection with hardware rayQueryEXT (respecting ALPHA_MASK cutouts)
+        if (!hasAlphaMask) {
+            rayQueryInitializeEXT(g_rq, topLevelAS, gl_RayFlagsOpaqueEXT, RAY_MASK_ALL, rayOrigin, EPSILON, rayDir, closestT);
+            rayQueryProceedEXT(g_rq);
+        } else {
+            rayQueryInitializeEXT(g_rq, topLevelAS, gl_RayFlagsNoneEXT, RAY_MASK_ALL, rayOrigin, EPSILON, rayDir, closestT);
+            while (rayQueryProceedEXT(g_rq)) {
+                if (rayQueryGetIntersectionTypeEXT(g_rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+                    uint cInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(g_rq, false);
+                    uint cGeomIdx = rayQueryGetIntersectionGeometryIndexEXT(g_rq, false);
+                    uint cPrimIdx = rayQueryGetIntersectionPrimitiveIndexEXT(g_rq, false);
+                    InstanceGPU cInst = instances[cInstIdx];
+                    uint cTriIdx = cInst.firstTriangle + ((cGeomIdx == 0u) ? cPrimIdx : (cPrimIdx + cInst.numOpaqueTriangles));
+                    Triangle cTri = triangles[cTriIdx];
+                    ShadeMaterial sm = shadeMaterials[cTri.materialId + cInst.materialOffset];
+                    if (smGetAlphaMode(sm) == 1u) {
+                        vec2 cBary = rayQueryGetIntersectionBarycentricsEXT(g_rq, false);
+                        vec2 cUv = getTriangleUV(cTri, cBary);
+                        float cAlpha = sm.albedo.a;
+                        uint albTex = smGetAlbedoTex(sm);
+                        if (albTex > 0u && albTex <= 512u) {
+                            cAlpha *= SAMPLE_SCENE_TEXTURE(albTex, cUv).a;
+                        }
+                        if (cAlpha < smGetAlphaCutoff(sm)) {
+                            continue;
+                        }
+                    }
+                    rayQueryConfirmIntersectionEXT(g_rq);
+                }
+            }
+        }
 
         if (rayQueryGetIntersectionTypeEXT(g_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(g_rq, true);
@@ -201,15 +238,19 @@ void main() {
             continue;
         }
 
-        // Emissive
+        // Emissive with consistent MIS + caustic DS+L suppression
         vec3 emissive = mat.emissive.rgb;
         if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
             emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
         }
-        if (length(emissive) > 1e-3) {
-            vec3 emissiveContrib = throughput * emissive;
+        float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
+            ? 0.0
+            : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, uint(max(closestTri, 0)), rayOrigin, rayDir, closestT, inPdfCode, pc.numLights));
+        if (length(emissive) > 1e-3 && emitMisW > 0.0) {
+            vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (bounce > 0u) {
-                emissiveContrib = clampIndirectRadiance(emissiveContrib, pc.indirectClamp);
+                float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, inPdfCode);
+                emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
             }
             accumRadiance += emissiveContrib;
             if (pc.captureMlData != 0u) {
@@ -228,7 +269,8 @@ void main() {
             roughness *= mrSample.g;
             metallic *= mrSample.b;
         }
-        roughness = clamp(roughness, 0.04, 1.0);
+        bool isMirrorDelta = (metallic > 0.99 && roughness <= 0.008);
+        roughness = clamp(roughness, 0.001, 1.0);
         metallic = clamp(metallic, 0.0, 1.0);
         float alphaRoughness = roughness * roughness;
 
@@ -248,8 +290,14 @@ void main() {
         vec3 diffuseColor = baseColor.rgb * (1.0 - metallic);
         vec3 V = -rayDir;
 
+        float diffTrans = clamp(mat.diffuseTransmission, 0.0, 1.0);
+        if (mat.diffuseTransmissionTex > 0u && mat.diffuseTransmissionTex <= 512u) {
+            diffTrans *= SAMPLE_SCENE_TEXTURE(mat.diffuseTransmissionTex, hitUv).r;
+        }
+        diffTrans = clamp(diffTrans, 0.0, 1.0);
+
         // Clearcoat
-        float clearcoat = mat.clearcoat;
+        float clearcoat = clamp(mat.clearcoat, 0.0, 1.0);
         if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
             clearcoat *= SAMPLE_SCENE_TEXTURE(mat.clearcoatTex, hitUv).r;
         }
@@ -257,16 +305,24 @@ void main() {
         if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 512u) {
             clearcoatRoughness *= SAMPLE_SCENE_TEXTURE(mat.clearcoatRoughnessTex, hitUv).g;
         }
-        clearcoatRoughness = clamp(clearcoatRoughness, 0.04, 1.0);
+        clearcoatRoughness = clamp(clearcoatRoughness, 0.001, 1.0);
         float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
+        vec3 surfTan = geomTan - dot(geomTan, hitNormal) * hitNormal;
+        if (hitType != 0u || dot(surfTan, surfTan) <= 1e-6) {
+            vec3 b1, b2;
+            buildOrthonormalBasis(hitNormal, b1, b2);
+            surfTan = b1;
+            tanSign = 1.0;
+        } else {
+            surfTan = normalize(surfTan);
+        }
+        vec3 surfBitan = cross(hitNormal, surfTan) * tanSign;
+
         vec3 clearcoatNormal = hitNormal;
-        if (mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
-            vec3 up = abs(hitNormal.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
-            vec3 cTan = normalize(cross(up, hitNormal));
-            vec3 cBitan = cross(hitNormal, cTan);
+        if (clearcoat > 0.001 && mat.clearcoatNormalTex > 0u && mat.clearcoatNormalTex <= 512u) {
             vec3 cNormMap = SAMPLE_SCENE_TEXTURE(mat.clearcoatNormalTex, hitUv).rgb * 2.0 - 1.0;
-            clearcoatNormal = normalize(mat3(cTan, cBitan, hitNormal) * cNormMap);
+            clearcoatNormal = adjustShadingNormal(normalize(mat3(surfTan, surfBitan, hitNormal) * cNormMap), -rayDir);
         }
 
         // Volumetric Beer-Lambert absorption
@@ -283,92 +339,37 @@ void main() {
         bool enableRefraction = (ubo.flags & (1 << 3)) != 0;
         bool enableShadows = (ubo.flags & (1 << 4)) != 0;
 
-        float Fc_V = fresnelSchlick(clamp(dot(V, clearcoatNormal), 0.0, 1.0), 1.5) * clearcoat;
-        float clearcoatProb = (clearcoat > 0.001 && enableSpecular) ? clamp(Fc_V, 0.04, 0.95) : 0.0;
-        float baseSpecProb = enableSpecular ? clamp(mix(0.04, 1.0, metallic), 0.05, 0.95) * (1.0 - clearcoatProb) : 0.0;
+        bool isDielectricDelta = (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u);
 
-        // Direct Lighting (Streamlined 1-Sample NEE for secondary bounces)
-        if (enableDirect && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && pc.numLights > 0u) {
-            uint lightIdx = 0u;
-            float lightSelectPdf = 1.0;
-            if ((ubo.flags & (1 << 7)) != 0 && pc.numLights > 1u) {
-                SAMPLE_LIGHT_TREE(pc.numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
-            } else {
-                SAMPLE_LIGHT_ALIAS(pc.numLights, seed, lightIdx, lightSelectPdf);
-            }
+        StdBsdf bsdf = makeStdBsdf(diffuseColor, F0, alphaRoughness, diffTrans, metallic, dot(hitNormal, V), STD_BSDF_FULL);
+        stdBsdfSetLayers(bsdf, enableSpecular, clearcoatNormal, clearcoat, clearcoatAlpha, mat.sheenColor, clamp(mat.sheenRoughness, 0.01, 1.0));
+        float anisoStrength = clamp(mat.anisotropyStrength, 0.0, 1.0);
+        vec2 anisoRot = vec2(cos(mat.anisotropyRotation), sin(mat.anisotropyRotation));
+        vec3 anisoT = normalize(surfTan * anisoRot.x + surfBitan * anisoRot.y);
+        vec3 anisoB = normalize(cross(hitNormal, anisoT));
+        stdBsdfSetAnisoIridescence(bsdf, anisoT, anisoB, mix(alphaRoughness, 1.0, anisoStrength * anisoStrength), alphaRoughness,
+                                   mat.iridescence, mat.iridescenceIor, mat.iridescenceThickness);
 
-            Light light = lights[lightIdx];
-            vec3 lightDir;
-            float lightDist = 0.0;
-            float lightPdf = 1.0;
-            vec3 lightEmission = light.emission.rgb;
-            bool validLightSample = false;
-
-            if (uint(light.position.w) == 0u /* AREA QUAD */) {
-                vec2 luv = randVec2(seed);
-                vec3 lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                vec3 toLight = lightPoint - hitPoint;
-                lightDist = length(toLight);
-                lightDir = toLight / max(lightDist, 1e-4);
-
-                float cosLight = dot(-lightDir, light.normal.xyz);
-                if (cosLight > 0.0) {
-                    float area = light.emission.w;
-                    lightPdf = (lightDist * lightDist) / (area * cosLight);
-                    validLightSample = true;
-                }
-            } else if (uint(light.position.w) == 1u /* SPOT */) {
-                vec3 toLight = light.position.xyz - hitPoint;
-                lightDist = length(toLight);
-                lightDir = toLight / max(lightDist, 1e-4);
-
-                float cosSpot = dot(-lightDir, light.normal.xyz);
-                float innerCos = light.u.w;
-                float outerCos = light.v.w;
-                if (cosSpot >= outerCos) {
-                    float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                    lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
-                    lightPdf = 1.0;
-                    validLightSample = true;
-                }
-            } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
-                lightDir = normalize(light.normal.xyz);
-                lightDist = 10000.0;
-                lightPdf = 1.0;
-                validLightSample = true;
-            }
-
-            float NdotL = dot(hitNormal, lightDir);
-            if (validLightSample && NdotL > 0.0) {
-                vec3 H = normalize(V + lightDir);
-                float NdotH = clamp(dot(hitNormal, H), 0.0, 1.0);
-                float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-
-                vec3 diffuseBrdf = diffuseColor * INV_PI;
-                vec3 specBrdf = vec3(0.0);
-                if (enableSpecular && metallic > 0.1) {
-                    float D = distributionGGX(NdotH, alphaRoughness);
-                    float G = visibilitySmithGGXCorrelated(NdotL, NdotV, alphaRoughness);
-                    vec3 F = fresnelSchlickVec(VdotH, F0);
-                    specBrdf = D * G * F;
-                }
-                vec3 brdf = diffuseBrdf + specBrdf;
-
-                float lightPdfEff = max(lightPdf * lightSelectPdf, 1e-6);
-                float diffPdf = NdotL * INV_PI;
-                float misWeight = (uint(light.position.w) == 0u) ? (lightPdfEff / (lightPdfEff + diffPdf)) : 1.0;
-
-                float factor = (NdotL * misWeight) / lightPdfEff;
-                vec3 unshadowed = throughput * lightEmission * brdf * factor;
+        // Direct Lighting (Streamlined 1-Sample NEE via shared StdBsdf + MIS)
+        if (enableDirect && !isDielectricDelta && !isMirrorDelta && pc.numLights > 0u) {
+            vec3 shadowOrigin, lightDir, diffContrib, specContrib;
+            float lightDist;
+            if (evalStandardDirectNEE(bsdf, hitPoint, hitNormal, V, pc.numLights, 1u,
+                                      bounce + 1u < pc.maxBounces, seed,
+                                      shadowOrigin, lightDir, lightDist, diffContrib, specContrib)) {
+                vec3 diffUnshadowed = throughput * diffContrib;
+                vec3 specUnshadowed = throughput * specContrib;
+                vec3 unshadowed = diffUnshadowed + specUnshadowed;
                 if (bounce > 0u) {
                     unshadowed = clampIndirectRadiance(unshadowed, pc.indirectClamp);
+                    diffUnshadowed = clampIndirectRadiance(diffUnshadowed, pc.indirectClamp);
+                    specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
                 }
 
                 if (any(greaterThan(unshadowed, vec3(1e-5)))) {
                     bool occluded = false;
                     if (enableShadows) {
-                        occluded = traceShadowRayInline(hitPoint + hitNormal * EPSILON, lightDir, lightDist,
+                        occluded = traceShadowRayInline(shadowOrigin, lightDir, lightDist,
                                                        (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
                     }
                     if (!occluded) {
@@ -377,8 +378,7 @@ void main() {
                             if (isSpecularPath) {
                                 accumMlSpecular += unshadowed;
                             } else {
-                                accumMlDiffuse += unshadowed * (1.0 - metallic);
-                                accumMlSpecular += unshadowed * metallic;
+                                accumMlDiffuse += diffUnshadowed + specUnshadowed;
                             }
                         }
                     }
@@ -392,16 +392,18 @@ void main() {
         }
 
         vec3 nextDirection = vec3(0.0);
-        vec3 nextOrigin;
-        bool sampledSpecularLobe = false;
+        vec3 nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
 
-        if (transmission > 0.01 || (mat.type & MATERIAL_TYPE_MASK) == 2u /* DIELECTRIC / REFRACTION */) {
-            sampledSpecularLobe = true;
+        if (isDielectricDelta) {
+            inPdfCode = 0u;
             if (!enableRefraction) {
                 nextDirection = sampleCosineHemisphere(hitNormal, seed);
-                nextOrigin = hitPoint + hitNormal * EPSILON;
+                nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
                 throughput *= baseColor.rgb;
             } else {
+                if (mat.dispersion > 0.001 && dispersionChannel != 0u) {
+                    iorVal += (float(dispersionChannel - 1u) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+                }
                 float refractionRatio = frontFace ? (1.0 / iorVal) : iorVal;
                 vec3 unitDir = normalize(rayDir);
                 float cosTheta = min(dot(-unitDir, hitNormal), 1.0);
@@ -422,75 +424,53 @@ void main() {
 
                 if (cannotRefract || reflectProb > randFloat(seed)) {
                     nextDirection = reflect(unitDir, hitNormal);
-                    nextOrigin = hitPoint + hitNormal * EPSILON;
+                    nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
                 } else {
                     if (isThinWalled) {
                         nextDirection = unitDir;
-                        nextOrigin = hitPoint + unitDir * (EPSILON * 2.0);
+                        nextOrigin = offsetRayOrigin(hitPoint, unitDir * 2.0);
+                        throughput *= baseColor.rgb;
                     } else {
-                        nextDirection = refract(unitDir, hitNormal, refractionRatio);
-                        nextOrigin = hitPoint - hitNormal * EPSILON;
+                        if (mat.dispersion > 0.001 && dispersionChannel == 0u) {
+                            uint channel = min(uint(randFloat(seed) * 3.0), 2u);
+                            dispersionChannel = channel + 1u;
+                            vec3 mask = vec3(channel == 0u ? 3.0 : 0.0, channel == 1u ? 3.0 : 0.0, channel == 2u ? 3.0 : 0.0);
+                            throughput *= mask;
+                            iorVal += (float(channel) - 1.0) * (mat.dispersion * 0.03 * iorVal);
+                            refractionRatio = frontFace ? (1.0 / iorVal) : iorVal;
+                        }
+                        vec3 refrVec = refract(unitDir, hitNormal, refractionRatio);
+                        if (dot(refrVec, refrVec) > 1e-6) {
+                            nextDirection = normalize(refrVec);
+                            nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
+                            throughput *= baseColor.rgb;
+                        } else {
+                            nextDirection = reflect(unitDir, hitNormal);
+                            nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
+                        }
                     }
-                    throughput *= baseColor.rgb;
                 }
             }
+        } else if (isMirrorDelta) {
+            inPdfCode = 0u;
+            float NdotV = clamp(dot(hitNormal, V), 0.0, 1.0);
+            nextDirection = reflect(-V, hitNormal);
+            nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
+            throughput *= fresnelSchlickVec(NdotV, F0);
         } else {
-            float xi = randFloat(seed);
-
-            if (xi < clearcoatProb) {
-                sampledSpecularLobe = true;
-                vec3 T_cc, B_cc;
-                buildOrthonormalBasis(clearcoatNormal, T_cc, B_cc);
-                vec3 V_local = vec3(dot(V, T_cc), dot(V, B_cc), dot(V, clearcoatNormal));
-                if (V_local.z > 0.0) {
-                    vec3 H_local = sampleVNDF_GGX(V_local, clearcoatAlpha, clearcoatAlpha, seed);
-                    vec3 Hc = normalize(T_cc * H_local.x + B_cc * H_local.y + clearcoatNormal * H_local.z);
-                    vec3 L = reflect(-V, Hc);
-                    float NcDotL = clamp(dot(clearcoatNormal, L), 0.001, 1.0);
-                    float NcDotV = clamp(dot(clearcoatNormal, V), 0.001, 1.0);
-                    float VDotHc = clamp(dot(V, Hc), 0.0, 1.0);
-                    float Fc = fresnelSchlick(VDotHc, 1.5) * clearcoat;
-                    float g2_over_g1 = ratioSmithG2OverG1(NcDotV, NcDotL, clearcoatAlpha);
-                    float specWeight = g2_over_g1 * (Fc / max(clearcoatProb, 1e-4));
-                    throughput *= clamp(vec3(specWeight), vec3(0.0), vec3(10.0));
-                    nextDirection = L;
-                } else {
-                    break;
-                }
-            } else if (xi < clearcoatProb + baseSpecProb) {
-                sampledSpecularLobe = true;
-                vec3 T_spec, B_spec;
-                buildOrthonormalBasis(hitNormal, T_spec, B_spec);
-                vec3 V_local = vec3(dot(V, T_spec), dot(V, B_spec), dot(V, hitNormal));
-                if (V_local.z > 0.0) {
-                    vec3 H_local = sampleVNDF_GGX(V_local, alphaRoughness, alphaRoughness, seed);
-                    vec3 H = normalize(T_spec * H_local.x + B_spec * H_local.y + hitNormal * H_local.z);
-                    vec3 L = reflect(-V, H);
-                    float NdotL = clamp(dot(hitNormal, L), 0.001, 1.0);
-                    float NdotV = clamp(dot(hitNormal, V), 0.001, 1.0);
-                    float VdotH = clamp(dot(V, H), 0.0, 1.0);
-                    vec3 F = fresnelSchlickVec(VdotH, F0);
-                    float Fc = fresnelSchlick(VdotH, 1.5) * clearcoat;
-                    float g2_over_g1 = ratioSmithG2OverG1(NdotV, NdotL, alphaRoughness);
-                    float specWeight = g2_over_g1 * ((1.0 - Fc) / max(baseSpecProb, 1e-4));
-                    throughput *= F * clamp(vec3(specWeight), vec3(0.0), vec3(10.0));
-                    nextDirection = L;
-                } else {
-                    break;
-                }
-            } else {
-                sampledSpecularLobe = false;
-                uint clusterK = (pc.secondarySortMode == 3u) ? 8u : 4u;
-                uint frameRot = pc.frameIndex + pc.sppSampleIndex;
-                nextDirection = (pc.secondarySortMode >= 2u)
-                    ? sampleCosineHemisphereCoherent(hitNormal, seed, clusterK, frameRot)
-                    : sampleCosineHemisphere(hitNormal, seed);
-                vec3 H_diff = normalize(V + nextDirection);
-                vec3 F_diff = fresnelSchlickVec(clamp(dot(V, H_diff), 0.0, 1.0), F0);
-                float Fc = fresnelSchlick(clamp(dot(V, H_diff), 0.0, 1.0), 1.5) * clearcoat;
-                throughput *= (1.0 - Fc) * (vec3(1.0) - F_diff) * diffuseColor / max(1.0 - clearcoatProb - baseSpecProb, 1e-4);
+            float uLobe = randFloat(seed);
+            float uTrans = randFloat(seed);
+            vec2 uDir = randVec2(seed);
+            vec3 bsdfWeight;
+            float outPdf;
+            bool sampledSpecularLobe, isTrans;
+            if (!sampleStdBsdfBounce(bsdf, hitNormal, V, uLobe, uTrans, uDir,
+                                     nextDirection, bsdfWeight, outPdf, sampledSpecularLobe, isTrans)) {
+                break;
             }
-            nextOrigin = hitPoint + hitNormal * EPSILON;
+            throughput *= min(bsdfWeight, vec3(65000.0));
+            nextOrigin = offsetRayOrigin(hitPoint, isTrans ? -hitNormal : hitNormal);
+            inPdfCode = encodeBsdfPdf(outPdf);
         }
 
         // Russian roulette
@@ -499,7 +479,7 @@ void main() {
             break;
         }
 
-        isSpecularPath = isSpecularPath || sampledSpecularLobe;
+        // Primary AOV path classification (isSpecularPath) is fixed at bounce 0
         rayOrigin = nextOrigin;
         rayDir = nextDirection;
     }
@@ -518,12 +498,10 @@ void main() {
             if (any(greaterThan(accumMlDiffuse, vec3(0.0)))) {
                 vec4 prevD = imageLoad(uMlDiffuseImage, pixelCoord);
                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevD.rgb, accumMlDiffuse, seed), prevD.a));
-                accumFfxSignal(pixelCoord, accumMlDiffuse, false, false, seed);
             }
             if (any(greaterThan(accumMlSpecular, vec3(0.0)))) {
                 vec4 prevS = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevS.rgb, accumMlSpecular, seed), prevS.a));
-                accumFfxSignal(pixelCoord, accumMlSpecular, true, false, seed);
             }
         }
     }

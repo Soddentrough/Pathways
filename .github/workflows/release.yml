@@ -54,13 +54,18 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_NATIVE_OPTIMIZATION=ON \
-            -DBUILD_TESTING=OFF \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DPATHWAYS_PORTABLE_CPU=ON \
+            -DBUILD_TESTING=ON \
             -DCMAKE_INSTALL_PREFIX=/usr
 
       - name: Build
         run: |
-          cmake --build build --target pathways --parallel
+          cmake --build build --parallel 4
+
+      - name: Run Unit Tests (CTest)
+        run: |
+          SDL_VIDEODRIVER=dummy ctest --test-dir build --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
 
       - name: Package RPM & Tarball with CPack
         run: |
@@ -113,15 +118,21 @@ jobs:
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CONFIGURATION_TYPES=Release \
-            -DENABLE_NATIVE_OPTIMIZATION=ON \
-            -DBUILD_TESTING=OFF \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DPATHWAYS_PORTABLE_CPU=ON \
+            -DBUILD_TESTING=ON \
             -DCMAKE_PREFIX_PATH="${{ steps.sdl.outputs.prefix }};C:/vcpkg/installed/x64-windows" \
             -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build (Windows)
         shell: bash
         run: |
-          cmake --build build --config Release --target pathways --parallel
+          cmake --build build --config Release --parallel 4
+
+      - name: Run Unit Tests (Windows CTest)
+        shell: bash
+        run: |
+          SDL_VIDEODRIVER=dummy ctest --test-dir build -C Release --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
 
       - name: Package Release (Windows)
         shell: bash

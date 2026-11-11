@@ -2,7 +2,6 @@
 
 #include "core/Config.hpp"
 #include "rt/UpwaysPipeline.hpp"
-#include "rt/GatewayPipeline.hpp"
 #include "rt/FsrUpscaler.hpp"
 #include "vulkan/Image.hpp"
 #include "vulkan/Buffer.hpp"
@@ -62,13 +61,6 @@ public:
                         Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
                         PostProcessPipeline* postProcess, Image* outputImage);
 
-    bool dispatchGateway(VkCommandBuffer cmd, bool resetHistory,
-                         const Config& config, Camera* camera,
-                         uint32_t frameIndex, bool cameraMovedLastFrame,
-                         uint32_t accumulatedSamples,
-                         Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
-                         PostProcessPipeline* postProcess, Image* outputImage);
-
     bool dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
                      const Config& config, uint32_t frameIndex,
                      bool cameraMovedLastFrame, uint32_t accumulatedSamples,
@@ -89,15 +81,15 @@ public:
                            postProcess, outputImage, onDescriptorsInvalidated);
     }
 
+    void releaseInactivePipelines(const Config& config);
+
     [[nodiscard]] UpwaysPipeline* getUpwaysPipeline() const { return m_upwaysPipeline.get(); }
-    [[nodiscard]] GatewayPipeline* getGatewayPipeline() const { return m_gatewayPipeline.get(); }
     [[nodiscard]] FsrUpscaler* getFsrUpscaler() const { return m_fsrUpscaler.get(); }
     [[nodiscard]] FsrUpscaler* getFsr3Upscaler() const { return m_fsrUpscaler.get(); }
     [[nodiscard]] Image* getDisplayAlbedoImage() const { return m_displayAlbedoImage.get(); }
     [[nodiscard]] Image* getDisplayNormalsImage() const { return m_displayNormalsImage.get(); }
     [[nodiscard]] Image* getSecAccumImage() const { return m_secAccumImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapUpwaysDescSet() const { return m_tonemapUpwaysDescSet; }
-    [[nodiscard]] VkDescriptorSet getTonemapGatewayDescSet() const { return m_tonemapGatewayDescSet; }
     [[nodiscard]] VkDescriptorSet getTonemapFsrDescSet() const { return m_tonemapFsrDescSet; }
     [[nodiscard]] VkDescriptorSet getTonemapFsr3DescSet() const { return m_tonemapFsrDescSet; }
     [[nodiscard]] VkDescriptorPool getPostProcessDescPool() const { return m_postProcessDescPool; }
@@ -106,11 +98,6 @@ public:
     void destroyUpwaysPipelines();
     void createUpwaysResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd);
     void destroyUpwaysResources();
-
-    void createGatewayPipelines(const Config& config);
-    void destroyGatewayPipelines();
-    void createGatewayResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd);
-    void destroyGatewayResources();
 
     void createFsrPipelines(const Config& config);
     void destroyFsrPipelines();
@@ -123,6 +110,8 @@ public:
     void destroyFsr3Resources() { destroyFsrResources(); }
 
 private:
+    void refreshCachedDescriptors();
+
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
@@ -133,14 +122,24 @@ private:
 
     std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
     VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
-    std::unique_ptr<GatewayPipeline> m_gatewayPipeline;
-    VkDescriptorSet m_tonemapGatewayDescSet = VK_NULL_HANDLE;
     std::unique_ptr<Image> m_displayAlbedoImage;
     std::unique_ptr<Image> m_displayNormalsImage;
 
     std::unique_ptr<FsrUpscaler> m_fsrUpscaler;
     std::unique_ptr<Image> m_secAccumImage;
     VkDescriptorSet m_tonemapFsrDescSet = VK_NULL_HANDLE;
+
+    // Cached external frame targets for lazy on-demand pipeline instantiation
+    PostProcessPipeline* m_cachedPostProcess = nullptr;
+    Image* m_cachedAccumImage = nullptr;
+    Image* m_cachedOutputImage = nullptr;
+    Image* m_cachedNormalDepthImage = nullptr;
+    Image* m_cachedMotionVectorImage = nullptr;
+    Image* m_cachedMlAlbedoRoughnessImage = nullptr;
+    Image* m_cachedMlSpecularMotionImage = nullptr;
+    Image* m_cachedMlDiffuseImage = nullptr;
+    Image* m_cachedMlSpecularImage = nullptr;
+    Image* m_cachedFrameImage0 = nullptr;
 };
 
 } // namespace pathways

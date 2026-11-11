@@ -20,6 +20,7 @@ layout(binding = 1) uniform CameraUBO {
 } ubo;
 
 layout(binding = 12, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 13, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
 layout(binding = 14, rgba16f) uniform readonly image2D uMotionVectorImage;
 
 layout(std430, binding = 21) buffer CausticAtomicBuffer {
@@ -76,6 +77,10 @@ void main() {
         return;
     }
 
+    uint accumHist = pc.accumulateHistory & 0xFu;
+    uint cbTileSize = (pc.accumulateHistory >> 4u) & 0xFFFu;
+    uint fullWidth = (cbTileSize > 0u) ? (pc.accumulateHistory >> 16u) : pc.width;
+
     // 2. Cross-bilateral 3x3 tent filter (separable weights [0.25, 0.5, 0.25])
     const float kWeights[3] = float[3](0.25, 0.5, 0.25);
     vec3 spatialFiltered = vec3(0.0);
@@ -84,6 +89,15 @@ void main() {
     [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
         float wy = kWeights[dy + 1];
         [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+            if (cbTileSize > 0u) {
+                int nx = pixelCoord.x + dx;
+                int ny = pixelCoord.y + dy;
+                if (nx < 0 || ny < 0 ||
+                    (nx / int(cbTileSize)) != (pixelCoord.x / int(cbTileSize)) ||
+                    (ny / int(cbTileSize)) != (pixelCoord.y / int(cbTileSize))) {
+                    continue;
+                }
+            }
             float wx = kWeights[dx + 1];
             float w = wx * wy;
 
@@ -105,27 +119,46 @@ void main() {
         spatialFiltered = centerRawIrr;
     }
 
-    // 2. Motion-Vector Guided Temporal Accumulation
+    // 3. Motion-Vector Guided Temporal Accumulation
     vec3 finalIrr = spatialFiltered;
 
-    if (pc.accumulateHistory != 0u && pc.frameIndex > 0u) {
-        vec2 mv = imageLoad(uMotionVectorImage, pixelCoord).xy;
-        // Motion vectors are in clip delta coordinates [-1, 1], scale to pixel delta
-        vec2 prevPixCoord = vec2(pixelCoord) - mv * vec2(pc.width, pc.height);
-        ivec2 prevI = ivec2(round(prevPixCoord));
+    if (accumHist != 0u && pc.frameIndex > 0u) {
+        vec4 mvFull = imageLoad(uMotionVectorImage, pixelCoord);
+        vec2 mv = mvFull.xy;
+        ivec2 prevI = ivec2(-1);
+        if (cbTileSize > 0u) {
+            uint ty = uint(pixelCoord.y) / cbTileSize;
+            uint tx_half = uint(pixelCoord.x) / cbTileSize;
+            uint localX = uint(pixelCoord.x) % cbTileSize;
+            uint tx = tx_half * 2u + (1u - (ty & 1u));
+            vec2 fullCoord = vec2(float(tx * cbTileSize + localX), float(pixelCoord.y));
+            ivec2 prevFull = ivec2(round(fullCoord - mv * vec2(fullWidth, pc.height)));
+            if (prevFull.x >= 0 && prevFull.x < int(fullWidth) && prevFull.y >= 0 && prevFull.y < int(pc.height)) {
+                uint ptx = uint(prevFull.x) / cbTileSize;
+                uint pty = uint(prevFull.y) / cbTileSize;
+                if (((ptx + pty) & 1u) == 1u) {
+                    prevI = ivec2(int((ptx / 2u) * cbTileSize + (uint(prevFull.x) % cbTileSize)), prevFull.y);
+                }
+            }
+        } else {
+            // Motion vectors are in UV delta coordinates [-1, 1], scale to pixel delta
+            vec2 prevPixCoord = vec2(pixelCoord) - mv * vec2(pc.width, pc.height);
+            prevI = ivec2(round(prevPixCoord));
+        }
 
         if (prevI.x >= 0 && prevI.x < int(pc.width) && prevI.y >= 0 && prevI.y < int(pc.height)) {
-            vec4 prevGbuf = imageLoad(uNormalDepthImage, prevI);
+            vec4 prevGbuf = imageLoad(uPrevNormalDepthImage, prevI);
             float prevDepth = prevGbuf.w;
             vec3 prevNorm = prevGbuf.xyz;
+            float expectedPrevDepth = max(centerDepth + mvFull.z, 1e-3);
 
-            // Disocclusion validation
-            if (abs(prevDepth - centerDepth) / max(centerDepth, 1e-3) < 0.05 &&
-                dot(prevNorm, centerNorm) > 0.85) {
+            // Disocclusion validation against previous-frame G-Buffer
+            if (abs(prevDepth - expectedPrevDepth) / expectedPrevDepth < 0.08 &&
+                dot(prevNorm, centerNorm) > 0.80) {
                 vec3 prevIrr = imageLoad(uPrevCausticImage, prevI).rgb;
 
                 // Temporal blend: 15% new sample, 85% history for smooth temporal integration
-                float alpha = (pc.accumulateHistory == 2u) ? (1.0 / float(pc.frameIndex + 1u)) : 0.15;
+                float alpha = (accumHist == 2u) ? (1.0 / float(pc.frameIndex + 1u)) : 0.15;
                 finalIrr = mix(prevIrr, spatialFiltered, alpha);
             }
         }

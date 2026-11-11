@@ -1,6 +1,17 @@
 #include "scene/UsdLoader.hpp"
 #include "core/Logger.hpp"
 
+#include <iostream>
+#include <fstream>
+#include <filesystem>
+#include <cmath>
+#include <chrono>
+#include <cassert>
+
+#ifndef _BACKWARD_BACKWARD_WARNING_H
+#define _BACKWARD_BACKWARD_WARNING_H 1
+#endif
+
 #include <tbb/version.h>
 #include <pxr/pxr.h>
 #include <pxr/usd/usd/stage.h>
@@ -14,13 +25,6 @@
 #include <pxr/usd/usdGeom/primvarsAPI.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
-
-#include <iostream>
-#include <fstream>
-#include <filesystem>
-#include <cmath>
-#include <chrono>
-#include <cassert>
 
 using namespace pathways;
 

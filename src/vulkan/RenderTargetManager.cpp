@@ -3,6 +3,27 @@
 
 namespace pathways {
 
+namespace {
+VkFormat resolveFrameImageFormat(AccumFormat accumFormat) {
+    // Frame images retain an alpha channel for dynamic video billboard flagging (frameVal.a > 0.5)
+    return (accumFormat == AccumFormat::RGBA32_SFLOAT)
+        ? VK_FORMAT_R32G32B32A32_SFLOAT
+        : VK_FORMAT_R16G16B16A16_SFLOAT;
+}
+
+VkFormat resolveAccumImageFormat(AccumFormat accumFormat) {
+    switch (accumFormat) {
+        case AccumFormat::RGBA32_SFLOAT:
+            return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case AccumFormat::R11G11B10_UFLOAT:
+            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        case AccumFormat::RGBA16_SFLOAT:
+        default:
+            return VK_FORMAT_R16G16B16A16_SFLOAT;
+    }
+}
+} // namespace
+
 RenderTargetManager::RenderTargetManager(VkDevice device, VmaAllocator allocator, VkQueue queue)
     : m_device(device), m_allocator(allocator), m_queue(queue) {
 }
@@ -24,14 +45,9 @@ void RenderTargetManager::destroy() {
     m_mlSpecularMotionImage.reset();
     m_mlDiffuseImage.reset();
     m_mlSpecularImage.reset();
-    m_ffxDirectDiffuseImage.reset();
-    m_ffxDirectSpecularImage.reset();
-    m_ffxIndirectDiffuseImage.reset();
-    m_ffxIndirectSpecularImage.reset();
 }
 
 void RenderTargetManager::destroyGBufferResources() {
-    m_directLightImage.reset();
     m_normalDepthImage.reset();
     m_prevNormalDepthImage.reset();
 }
@@ -112,38 +128,6 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
-    if (m_ffxDirectDiffuseImage) {
-        m_ffxDirectDiffuseImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
-    if (m_ffxDirectSpecularImage) {
-        m_ffxDirectSpecularImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
-    if (m_ffxIndirectDiffuseImage) {
-        m_ffxIndirectDiffuseImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
-    if (m_ffxIndirectSpecularImage) {
-        m_ffxIndirectSpecularImage->transitionLayout(
-            cmd, VK_IMAGE_LAYOUT_GENERAL,
-            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-        );
-    }
 
     vkEndCommandBuffer(cmd);
 
@@ -167,7 +151,8 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
     m_renderWidth = rw;
     m_renderHeight = rh;
 
-    VkFormat frameFmt = (accumFormat == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat frameFmt = resolveFrameImageFormat(accumFormat);
+    VkFormat accumFmt = resolveAccumImageFormat(accumFormat);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             m_device, m_allocator, width, height,
@@ -179,14 +164,12 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
     }
     m_accumImage = std::make_unique<Image>(
         m_device, m_allocator, width, height,
-        frameFmt,
+        accumFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
 
-    // Internal post-process and tonemapping target is strictly 10-bit (or 16-bit float for scRGB HDR).
-    // The internal pipeline is never degraded to 8-bit; SDR 8-bit presentation occurs via blit to the swapchain.
     VkFormat outputFmt = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     if (isHdr && swapchainFormat == VK_FORMAT_R16G16B16A16_SFLOAT) {
         outputFmt = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -210,13 +193,17 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
     m_mlAlbedoRoughnessImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     m_mlSpecularMotionImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
     m_mlDiffuseImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
@@ -228,27 +215,9 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
     m_mlSpecularImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    );
-
-    constexpr VkImageUsageFlags kFfxSignalUsage =
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    m_ffxDirectDiffuseImage = std::make_unique<Image>(
-        m_device, m_allocator, rw, rh,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxDirectSpecularImage = std::make_unique<Image>(
-        m_device, m_allocator, rw, rh,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxIndirectDiffuseImage = std::make_unique<Image>(
-        m_device, m_allocator, rw, rh,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxIndirectSpecularImage = std::make_unique<Image>(
-        m_device, m_allocator, rw, rh,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     transitionAllToGeneral(cmd);
@@ -257,7 +226,8 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
 void RenderTargetManager::recreateAccumImages(uint32_t width, uint32_t height, AccumFormat accumFormat,
                                              const std::vector<uint32_t>& concurrentQueues,
                                              VkCommandBuffer cmd) {
-    VkFormat frameFmt = (accumFormat == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
+    VkFormat frameFmt = resolveFrameImageFormat(accumFormat);
+    VkFormat accumFmt = resolveAccumImageFormat(accumFormat);
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
         m_frameImages[i] = std::make_unique<Image>(
             m_device, m_allocator, width, height,
@@ -269,7 +239,7 @@ void RenderTargetManager::recreateAccumImages(uint32_t width, uint32_t height, A
     }
     m_accumImage = std::make_unique<Image>(
         m_device, m_allocator, width, height,
-        frameFmt,
+        accumFmt,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
@@ -306,12 +276,6 @@ void RenderTargetManager::recreateAccumImages(uint32_t width, uint32_t height, A
 void RenderTargetManager::createGBufferResources(uint32_t width, uint32_t height,
                                                  const std::vector<uint32_t>& concurrentQueues,
                                                  VkCommandBuffer cmd) {
-    m_directLightImage = std::make_unique<Image>(
-        m_device, m_allocator, width, height,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    );
-
     m_normalDepthImage = std::make_unique<Image>(
         m_device, m_allocator, width, height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -323,15 +287,16 @@ void RenderTargetManager::createGBufferResources(uint32_t width, uint32_t height
     m_prevNormalDepthImage = std::make_unique<Image>(
         m_device, m_allocator, width, height,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
     vkBeginCommandBuffer(cmd, &beginInfo);
-    m_directLightImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-    m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+    m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     vkEndCommandBuffer(cmd);
 
     VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
@@ -375,13 +340,17 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
     m_mlAlbedoRoughnessImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     m_mlSpecularMotionImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
     m_mlDiffuseImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
@@ -393,34 +362,11 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
     m_mlSpecularImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
-    constexpr VkImageUsageFlags kFfxSignalUsage =
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    m_ffxDirectDiffuseImage = std::make_unique<Image>(
-        m_device, m_allocator, renderWidth, renderHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxDirectSpecularImage = std::make_unique<Image>(
-        m_device, m_allocator, renderWidth, renderHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxIndirectDiffuseImage = std::make_unique<Image>(
-        m_device, m_allocator, renderWidth, renderHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-    m_ffxIndirectSpecularImage = std::make_unique<Image>(
-        m_device, m_allocator, renderWidth, renderHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT, kFfxSignalUsage
-    );
-
-    m_directLightImage = std::make_unique<Image>(
-        m_device, m_allocator, renderWidth, renderHeight,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-    );
     m_normalDepthImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -431,7 +377,9 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
     m_prevNormalDepthImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
     );
 
     vkResetCommandBuffer(cmd, 0);
@@ -469,36 +417,6 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
-    m_ffxDirectDiffuseImage->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-    m_ffxDirectSpecularImage->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-    m_ffxIndirectDiffuseImage->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-    m_ffxIndirectSpecularImage->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
-    );
-    m_directLightImage->transitionLayout(
-        cmd, VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_NONE, 0,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
-    );
     m_normalDepthImage->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, 0,
@@ -509,7 +427,7 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         cmd, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, 0,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
     vkEndCommandBuffer(cmd);

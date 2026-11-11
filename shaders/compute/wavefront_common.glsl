@@ -13,11 +13,21 @@
 #include "nrc_common.glsl"
 #include "wavefront_shared.glsl"
 
-#define SAMPLE_SCENE_TEXTURE(texId, uv) textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), 0.0)
+#define DECLARE_SCENE_TEXTURES_BINDING(bind_idx) \
+    layout(binding = bind_idx) uniform sampler2D sceneTextures[512]; \
+    vec4 sampleSceneTexture(uint texId, vec2 uv) { \
+        uint idx = texId - 1u; \
+        return textureLod(sceneTextures[nonuniformEXT(idx)], uv, 0.0); \
+    } \
+    vec4 sampleSceneTextureLod(uint texId, vec2 uv, float baseLod) { \
+        uint idx = texId - 1u; \
+        int levels = textureQueryLevels(sceneTextures[nonuniformEXT(idx)]); \
+        float lod = clamp(baseLod + float(max(levels - 1, 0)), 0.0, 12.0); \
+        return textureLod(sceneTextures[nonuniformEXT(idx)], uv, lod); \
+    }
 
-#define SAMPLE_SCENE_TEXTURE_LOD(texId, uv, baseLod) \
-    textureLod(sceneTextures[nonuniformEXT((texId) - 1u)], (uv), \
-               clamp((baseLod) + float(textureQueryLevels(sceneTextures[nonuniformEXT((texId) - 1u)]) - 1), 0.0, 12.0))
+#define SAMPLE_SCENE_TEXTURE(texId, uv) sampleSceneTexture((texId), (uv))
+#define SAMPLE_SCENE_TEXTURE_LOD(texId, uv, baseLod) sampleSceneTextureLod((texId), (uv), (baseLod))
 
 // Ray Cone texture LOD base offset (Akenine-Möller et al. / RTXPT RayCones.hlsli):
 // Returns C_Delta + log2(coneWidth) - 0.5 * log2(|N.V|) so adding log2(max(W_tex, H_tex)) yields mip level.
@@ -206,15 +216,18 @@ struct Triangle {
 
     uint octTan1;
     uint octTan2;
-    uint uv0;
-    uint uv1;
-
-    uint uv2;
     uint tanSigns;
     uint materialId;
-    uint padding0;
 
-    uvec4 reserved;
+    float uv0x;
+    float uv0y;
+    float uv1x;
+    float uv1y;
+
+    float uv2x;
+    float uv2y;
+    uint padding0;
+    uint reserved0;
 };
 
 vec3 getTriangleNormal(in Triangle tri, in vec2 bary) {
@@ -231,9 +244,9 @@ vec2 getTriangleUV(in Triangle tri, in vec2 bary) {
     float u = bary.x;
     float v = bary.y;
     float w = 1.0 - u - v;
-    vec2 uv0 = unpackHalf2x16(tri.uv0);
-    vec2 uv1 = unpackHalf2x16(tri.uv1);
-    vec2 uv2 = unpackHalf2x16(tri.uv2);
+    vec2 uv0 = vec2(tri.uv0x, tri.uv0y);
+    vec2 uv1 = vec2(tri.uv1x, tri.uv1y);
+    vec2 uv2 = vec2(tri.uv2x, tri.uv2y);
     return w * uv0 + u * uv1 + v * uv2;
 }
 
@@ -287,9 +300,22 @@ layout(std430, binding = 35) readonly buffer ShadeMaterialsBuffer {
     ShadeMaterial shadeMaterials[];
 };
 
-layout(std430, binding = 40) readonly buffer VertexPositionsBuffer {
-    vec4 vertexPositions[];
-};
+uint  smGetAlbedoTex(in ShadeMaterial sm)        { return sm.tex_flags.x & 0x0FFFu; }
+uint  smGetAlphaMode(in ShadeMaterial sm)        { return (sm.tex_flags.x >> 12u) & 0x3u; }
+bool  smIsThin(in ShadeMaterial sm)              { return ((sm.tex_flags.x >> 14u) & 1u) != 0u; }
+bool  smIsTransmissive(in ShadeMaterial sm)      { return ((sm.tex_flags.x >> 15u) & 1u) != 0u; }
+uint  smGetNormalTex(in ShadeMaterial sm)        { return (sm.tex_flags.x >> 16u) & 0x0FFFu; }
+uint  smGetMrTex(in ShadeMaterial sm)            { return sm.tex_flags.y & 0x0FFFu; }
+uint  smGetEmissiveTex(in ShadeMaterial sm)      { return (sm.tex_flags.y >> 16u) & 0x0FFFu; }
+uint  smGetDiffTransTex(in ShadeMaterial sm)     { return sm.tex_flags.z & 0x0FFFu; }
+uint  smGetSpecularTex(in ShadeMaterial sm)      { return (sm.tex_flags.z >> 12u) & 0x0FFFu; }
+float smGetRhoMax(in ShadeMaterial sm)           { return float((sm.tex_flags.z >> 24u) & 0xFFu) * (1.0 / 255.0); }
+uint  smGetTypeFlags(in ShadeMaterial sm)        { return sm.tex_flags.w & 0xFFFFu; }
+float smGetNormalScale(in ShadeMaterial sm)      { return unpackHalf2x16(sm.tex_flags.w).y; }
+float smGetAlphaCutoff(in ShadeMaterial sm) {
+    uint c8 = ((sm.tex_flags.x >> 28u) & 0xFu) | (((sm.tex_flags.y >> 12u) & 0xFu) << 4u);
+    return float(c8) * (1.0 / 254.0);
+}
 
 struct Material {
     vec4 albedo;
@@ -523,56 +549,9 @@ vec2 hitGetBary(Hit h) {
     return unpackUnorm2x16(h.baryPacked);
 }
 
-// Reconstruct 3D world position dynamically from a 16-byte Hit atom.
-// Triangle vertices are fetched in object space and transformed by the TLAS instance matrix.
-vec3 reconstructHitPosition(Hit h) {
-    if ((h.flags & 1u) != 0u) {
-        // Procedural sphere: exact world-space position stored directly in Hit data fields
-        return vec3(uintBitsToFloat(h.instanceId),
-                    uintBitsToFloat(h.primitiveId),
-                    uintBitsToFloat(h.baryPacked));
-    } else {
-        // Triangle: fetch BLAS vertices from binding 40 and interpolate by unorm16 barycentrics
-        vec2 bary = unpackUnorm2x16(h.baryPacked);
-        float w = 1.0 - bary.x - bary.y;
-        vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
-        vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
-        vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
-        vec3 localPos = w * v0 + bary.x * v1 + bary.y * v2;
-        InstanceGPU inst = instances[h.instanceId];
-        return (inst.transform * vec4(localPos, 1.0)).xyz;
-    }
-}
-
-// Reconstruct 3D world position and surface normal dynamically from a 16-byte Hit atom.
-// Triangle vertices and normals are transformed by instance transform and inverse-transpose.
-// Procedural spheres return dummy norm=(0,1,0) and are rejected in giApplyTap().
-void reconstructHitPositionAndNormal(Hit h, out vec3 pos, out vec3 norm) {
-    if ((h.flags & 1u) != 0u) {
-        pos = vec3(uintBitsToFloat(h.instanceId),
-                   uintBitsToFloat(h.primitiveId),
-                   uintBitsToFloat(h.baryPacked));
-        norm = vec3(0.0, 1.0, 0.0);
-    } else {
-        vec2 bary = unpackUnorm2x16(h.baryPacked);
-        float w = 1.0 - bary.x - bary.y;
-        vec3 v0 = vertexPositions[3u * h.primitiveId + 0u].xyz;
-        vec3 v1 = vertexPositions[3u * h.primitiveId + 1u].xyz;
-        vec3 v2 = vertexPositions[3u * h.primitiveId + 2u].xyz;
-        vec3 localPos = w * v0 + bary.x * v1 + bary.y * v2;
-        vec3 crossN = cross(v1 - v0, v2 - v0);
-        float lenCross = length(crossN);
-        vec3 localNorm = (lenCross > 1e-8) ? (crossN / lenCross) : vec3(0.0, 1.0, 0.0);
-        if ((h.flags & 2u) == 0u) {
-            localNorm = -localNorm; // Back-facing
-        }
-        InstanceGPU inst = instances[h.instanceId];
-        pos = (inst.transform * vec4(localPos, 1.0)).xyz;
-        mat3 normalMat = transpose(inverse(mat3(inst.transform)));
-        vec3 worldNorm = normalMat * localNorm;
-        float lenNorm = length(worldNorm);
-        norm = (lenNorm > 1e-8) ? (worldNorm / lenNorm) : vec3(0.0, 1.0, 0.0);
-    }
+// Suppress backward DS+L caustic paths when forward photon caustics already integrated LS+D.
+bool shouldSuppressCausticEmitterHit(bool causticApplied, bool isSpecularPath, uint inPdfCode, uint bounce) {
+    return causticApplied && !isSpecularPath && (inPdfCode == 0u) && (bounce >= 2u);
 }
 
 // 16-byte packed ray geometry (read by intersect & shade)
@@ -585,7 +564,7 @@ struct RayHit {
     vec4 hitData0;
     // x: hitT (float)
     // y: uintBitsToFloat(packOct32(hitNormal))
-    // z: uintBitsToFloat(packHalf2x16(hitUv))
+    // z: uintBitsToFloat(packHalf2x16(fract(hitUv)))
     // w: uintBitsToFloat(packedInfo)
     // packedInfo:
     // bits 0..15: matId (16 bits)
@@ -604,9 +583,10 @@ RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hit
     uint tSignBit = (tanSign < 0.0) ? 1u : 0u;
     uint angleCode = packTangentAngle13(hitNormal, geomTan);
     uint packedInfo = (matId & 0xFFFFu) | ((hitType & 0x3u) << 16u) | (tSignBit << 18u) | ((angleCode & 0x1FFFu) << 19u);
+    vec2 wrappedUv = hitUv - floor(hitUv);
     hit.hitData0 = vec4(hitT,
                         uintBitsToFloat(packOct32(hitNormal)),
-                        uintBitsToFloat(packHalf2x16(hitUv)),
+                        uintBitsToFloat(packHalf2x16(wrappedUv)),
                         uintBitsToFloat(packedInfo));
     hit.hitData1 = uvec4(hitAtom.instanceId, hitAtom.primitiveId, hitAtom.baryPacked, hitAtom.flags);
     return hit;
@@ -660,7 +640,7 @@ struct RayState {
     layout(std430, binding = 10) writeonly restrict buffer OutRayStateQueue { RayState d[]; } wfOutStateQueues[2]; \
     layout(std430, binding = 15) readonly restrict buffer InRayGeomQueue { RayGeometry d[]; } wfInGeomQueues[2]; \
     layout(std430, binding = 16) writeonly restrict buffer OutRayGeomQueue { RayGeometry d[]; } wfOutGeomQueues[2]; \
-    layout(std430, binding = bind_idx) buffer QueueCounters { QueueCountersBuffer queueCounters; }
+    layout(std430, binding = bind_idx) coherent buffer QueueCounters { QueueCountersBuffer queueCounters; }
 
 #define inStates  wfInStateQueues[WF_IN_QUEUE_IDX].d
 #define outStates wfOutStateQueues[WF_OUT_QUEUE_IDX].d
@@ -722,16 +702,9 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             vec3 xVirt_ = origin + primDir_ * reflDist_; \
             vec3 prevXVirt_ = xVirt_; \
             InstanceGPU rInst_; if (!(isMiss) && (hit.hitData1.w & 1u) == 0u && hit.hitData1.y != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData1.x]).transform != rInst_.invTransform)) { \
-                vec2 rBary_ = unpackUnorm2x16(hit.hitData1.z); \
-                float rW_ = 1.0 - rBary_.x - rBary_.y; \
-                vec3 rV0_ = vertexPositions[3u * hit.hitData1.y + 0u].xyz; \
-                vec3 rV1_ = vertexPositions[3u * hit.hitData1.y + 1u].xyz; \
-                vec3 rV2_ = vertexPositions[3u * hit.hitData1.y + 2u].xyz; \
-                vec3 rLocalPos_ = rW_ * rV0_ + rBary_.x * rV1_ + rBary_.y * rV2_; \
-                /* rInst_ already loaded above */ \
-                vec3 rCurrWorld_ = (rInst_.transform * vec4(rLocalPos_, 1.0)).xyz; \
+                vec3 rLocalPos_ = (inverse(rInst_.transform) * vec4((pt), 1.0)).xyz; \
                 vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
-                vec3 rDeltaWorld_ = rCurrWorld_ - rPrevWorld_; \
+                vec3 rDeltaWorld_ = (pt) - rPrevWorld_; \
                 vec3 reflAxis_ = rayDir - primDir_; \
                 float axisLenSq_ = dot(reflAxis_, reflAxis_); \
                 vec3 nMirror_ = (axisLenSq_ > 1e-6) ? (reflAxis_ * inversesqrt(axisLenSq_)) : vec3(0.0, 1.0, 0.0); \
@@ -740,7 +713,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             } \
             vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
             vec4 pClip_ = ubo.prevViewProj * vec4(prevXVirt_, 1.0); \
-            vec2 vS_ = vec2(0.0); \
+            vec2 vS_ = vSurf_; \
             if (cClip_.w > 1e-4) { \
                 if (pClip_.w > 1e-2) { \
                     vS_ = clamp((cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5, vec2(-2.0), vec2(2.0)); \
@@ -748,13 +721,9 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
                     vS_ = vec2(2.0); \
                 } \
             } \
-            if (dot(vSurf_, vSurf_) > dot(vS_, vS_)) { \
-                vS_ = vSurf_; \
-            } \
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
             imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); } \
         } \
-        RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss); \
     } while(false)
 
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied) {
@@ -1116,10 +1085,11 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
     // Advance PRNG for every lane (guarantees cross-bounce randomness)
     vec2 rLocal = randVec2(seed);
 
-    // Broadcast leader's tangent-space direction sample across cluster
-    vec2 r;
-    r.x = subgroupShuffle(rLocal.x, leaderLane);
-    r.y = subgroupShuffle(rLocal.y, leaderLane);
+    // Broadcast leader's coarse quadrant while preserving independent uniform sub-quadrant offset per lane
+    vec2 rLeader;
+    rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
+    rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
+    vec2 r = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
 
     // Continuous orthonormal basis projection (Duff et al.)
     float phi = TWO_PI * r.x;
@@ -1191,8 +1161,7 @@ float visibilitySmithGGXCorrelated(float NdotL, float NdotV, float alpha) {
 }
 
 // Importance sample GGX microfacet distribution for half-vector H in world space
-vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
-    vec2 xi = randVec2(seed);
+vec3 sampleGGXVec2(vec3 N, float alpha, vec2 xi) {
     float a2 = max(alpha * alpha, 1e-6);
     float phi = TWO_PI * xi.x;
     float cosTheta = sqrt(clamp((1.0 - xi.y) / max(1.0 + (a2 - 1.0) * xi.y, 1e-7), 0.0, 1.0));
@@ -1205,6 +1174,10 @@ vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
     vec3 bitangent = cross(N, tangent);
 
     return normalize(tangent * H_local.x + bitangent * H_local.y + N * H_local.z);
+}
+
+vec3 sampleGGX(vec3 N, float alpha, inout uint seed) {
+    return sampleGGXVec2(N, alpha, randVec2(seed));
 }
 
 // Visible Normal Distribution Function (VNDF) Sampling (Dupuy & Heitz 2023)
@@ -1260,9 +1233,10 @@ vec3 sampleGGXCoherent(vec3 N, float alpha, inout uint seed, uint clusterSize, u
     uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
     vec2 rLocal = randVec2(seed);
 
-    vec2 xi;
-    xi.x = subgroupShuffle(rLocal.x, leaderLane);
-    xi.y = subgroupShuffle(rLocal.y, leaderLane);
+    vec2 rLeader;
+    rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
+    rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
+    vec2 xi = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
 
     float a2 = max(alpha * alpha, 1e-6);
     float phi = TWO_PI * xi.x;
@@ -1282,9 +1256,10 @@ vec3 sampleAnisotropicGGXCoherent(vec3 N, vec3 T, vec3 B, float ax, float ay, in
     uint leaderLane = getCoherentLeaderLane(clusterSize, frameIndex);
     vec2 rLocal = randVec2(seed);
 
-    vec2 xi;
-    xi.x = subgroupShuffle(rLocal.x, leaderLane);
-    xi.y = subgroupShuffle(rLocal.y, leaderLane);
+    vec2 rLeader;
+    rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
+    rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
+    vec2 xi = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
 
     float phi = atan(ay * sin(TWO_PI * xi.x), ax * cos(TWO_PI * xi.x));
     if (phi < 0.0) phi += TWO_PI;
@@ -1436,63 +1411,6 @@ bool applyRussianRoulette16(inout f16vec3 throughput, float pathLum, uint bounce
     }
     return false;
 }
-#endif
-
-#ifdef WF_ENABLE_FFX_SIGNALS
-layout(binding = 46, rgba16f) uniform image2D uFfxDirectDiffuseImage;
-layout(binding = 47, rgba16f) uniform image2D uFfxDirectSpecularImage;
-layout(binding = 48, rgba16f) uniform image2D uFfxIndirectDiffuseImage;
-layout(binding = 49, rgba16f) uniform image2D uFfxIndirectSpecularImage;
-
-void accumFfxSignalImpl(ivec2 coord, vec3 radiance, bool isSpecular, bool isDirect, inout uint seed) {
-    if (isSpecular) {
-        if (isDirect) {
-            vec4 prev = imageLoad(uFfxDirectSpecularImage, coord);
-            imageStore(uFfxDirectSpecularImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
-        } else {
-            vec4 prev = imageLoad(uFfxIndirectSpecularImage, coord);
-            imageStore(uFfxIndirectSpecularImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
-        }
-    } else {
-        if (isDirect) {
-            vec4 prev = imageLoad(uFfxDirectDiffuseImage, coord);
-            imageStore(uFfxDirectDiffuseImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
-        } else {
-            vec4 prev = imageLoad(uFfxIndirectDiffuseImage, coord);
-            imageStore(uFfxIndirectDiffuseImage, coord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
-        }
-    }
-}
-
-void recordFfxSecondaryHitTImpl(uint pixelIdx, float hitDist, bool isMiss, bool isSpecular, uint width) {
-    ivec2 coord = ivec2(int(pixelIdx % width), int(pixelIdx / width));
-    float hitTVal = isMiss ? 1000.0 : clamp(hitDist, 0.001, 1000.0);
-    if (isSpecular) {
-        vec4 prev = imageLoad(uFfxIndirectSpecularImage, coord);
-        float outHitT = (prev.a > 1e-4) ? min(prev.a, hitTVal) : hitTVal;
-        imageStore(uFfxIndirectSpecularImage, coord, vec4(prev.rgb, outHitT));
-    } else {
-        vec4 prev = imageLoad(uFfxIndirectDiffuseImage, coord);
-        float outHitT = (prev.a > 1e-4) ? min(prev.a, hitTVal) : hitTVal;
-        imageStore(uFfxIndirectDiffuseImage, coord, vec4(prev.rgb, outHitT));
-    }
-}
-
-#define accumFfxSignal(coord, radiance, isSpecular, isDirect, seed) \
-    do { \
-        if ((pc.captureMlData & 4u) != 0u) { \
-            accumFfxSignalImpl((coord), (radiance), (isSpecular), (isDirect), (seed)); \
-        } \
-    } while(false)
-
-#define RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss) \
-    do { \
-        if (pc.currentBounce == 1u && (pc.captureMlData & 4u) != 0u) { \
-            recordFfxSecondaryHitTImpl((pixelIdx), float(hitDist), (isMiss), isSpecularPath, pc.width); \
-        } \
-    } while(false)
-#else
-#define RECORD_FFX_SECONDARY_HIT_T(pixelIdx, hitDist, isMiss) do {} while(false)
 #endif
 
 #endif // WAVEFRONT_COMMON_GLSL

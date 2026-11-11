@@ -168,7 +168,7 @@ static_assert(sizeof(WavefrontTailPC) == 88, "WavefrontTailPC must be 88 bytes")
 #else
 #undef wf_uint
 #define WAVEFRONT_QUEUE_COUNTERS_BINDING(bind_idx) \
-    layout(std430, binding = bind_idx) buffer QueueCounters { \
+    layout(std430, binding = bind_idx) coherent buffer QueueCounters { \
         QueueCountersBuffer queueCounters; \
     }
 #endif

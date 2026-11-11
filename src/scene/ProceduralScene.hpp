@@ -67,15 +67,18 @@ struct alignas(16) TriangleShadeGPU {
 
     uint32_t octTan1 = 0;
     uint32_t octTan2 = 0;
-    uint32_t uv0 = 0;
-    uint32_t uv1 = 0;
-
-    uint32_t uv2 = 0;
     uint32_t tanSigns = 0;
     uint32_t materialId = 0;
-    uint32_t padding0 = 0;
 
-    uint32_t reserved[4] = {0, 0, 0, 0};
+    float uv0x = 0.0f;
+    float uv0y = 0.0f;
+    float uv1x = 0.0f;
+    float uv1y = 0.0f;
+
+    float uv2x = 0.0f;
+    float uv2y = 0.0f;
+    uint32_t padding0 = 0;
+    uint32_t reserved0 = 0;
 };
 static_assert(sizeof(TriangleShadeGPU) == 64, "TriangleShadeGPU must be exactly 64 bytes (2 triangles per 128B cache line)");
 
@@ -88,18 +91,19 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
 
     s.octTan1    = packOct32(glm::vec3(tri.v1.tangent));
     s.octTan2    = packOct32(glm::vec3(tri.v2.tangent));
-    s.uv0        = glm::packHalf2x16(glm::vec2(tri.v0.position.w, tri.v0.normal.w));
-    s.uv1        = glm::packHalf2x16(glm::vec2(tri.v1.position.w, tri.v1.normal.w));
-
-    s.uv2        = glm::packHalf2x16(glm::vec2(tri.v2.position.w, tri.v2.normal.w));
+    s.uv0x       = tri.v0.position.w;
+    s.uv0y       = tri.v0.normal.w;
+    s.uv1x       = tri.v1.position.w;
+    s.uv1y       = tri.v1.normal.w;
+    s.uv2x       = tri.v2.position.w;
+    s.uv2y       = tri.v2.normal.w;
 
     uint32_t signs = 0;
     if (tri.v0.tangent.w >= 0.0f) signs |= (1u << 0);
     if (tri.v1.tangent.w >= 0.0f) signs |= (1u << 1);
     if (tri.v2.tangent.w >= 0.0f) signs |= (1u << 2);
     // Precompute Ray Cone triangle LOD constant C_Delta = 0.5 * log2(Area_UV / Area_Obj) (RTXPT RayCones.hlsli)
-    // Packed into upper 16 bits of tanSigns (dword 9, same 16B vector load as uv2 and materialId)
-    // so wavefront_classify / wavefront_intersect never touch the 4th 16B uvec4 (reserved).
+    // Packed into upper 16 bits of tanSigns.
     glm::vec3 p0(tri.v0.position);
     glm::vec3 p1(tri.v1.position);
     glm::vec3 p2(tri.v2.position);
@@ -118,10 +122,7 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
 
     s.materialId = tri.materialId;
     s.padding0   = tri.padding[0];
-    s.reserved[0] = 0;
-    s.reserved[1] = 0;
-    s.reserved[2] = 0;
-    s.reserved[3] = 0;
+    s.reserved0  = 0;
 
     return s;
 }
@@ -136,8 +137,10 @@ static_assert(sizeof(SphereGPU) == 32, "SphereGPU must be exactly 32 bytes");
 struct TextureData {
     uint32_t width = 0;
     uint32_t height = 0;
-    std::vector<uint8_t> pixels; // RGBA8
+    std::vector<uint8_t> pixels;     // RGBA8 (LDR)
+    std::vector<uint16_t> hdrPixels; // RGBA16F (HDR EXR / Radiance .hdr)
     bool isSrgb = false;
+    bool isHdr = false;
 };
 
 struct MeshRange {

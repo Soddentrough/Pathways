@@ -91,15 +91,19 @@ class MiniJsonParser {
         skipWs();
         size_t start = p;
         if (p < s.size() && (s[p] == '-' || s[p] == '+')) p++;
+        size_t digitsStart = p;
         while (p < s.size() && ((s[p] >= '0' && s[p] <= '9') || s[p] == '.' || s[p] == 'e' || s[p] == 'E' || s[p] == '-' || s[p] == '+')) {
             p++;
+        }
+        if (p == digitsStart) {
+            return JsonVal();
         }
         JsonVal v;
         v.type = JsonVal::Number;
         try {
             v.numVal = std::stod(std::string(s.substr(start, p - start)));
         } catch (...) {
-            v.numVal = 0.0;
+            return JsonVal();
         }
         return v;
     }
@@ -110,12 +114,15 @@ class MiniJsonParser {
         if (get() != '{') return v;
         while (p < s.size()) {
             char c = peek();
+            if (c == '\0') break;
             if (c == '}') { get(); break; }
             if (c == ',') { get(); continue; }
+            if (c != '"') break;
             std::string key = parseStr();
-            skipWs();
             if (get() != ':') break;
+            size_t before = p;
             v.obj[key] = parseVal();
+            if (p == before) break;
         }
         return v;
     }
@@ -126,9 +133,15 @@ class MiniJsonParser {
         if (get() != '[') return v;
         while (p < s.size()) {
             char c = peek();
+            if (c == '\0') break;
             if (c == ']') { get(); break; }
             if (c == ',') { get(); continue; }
+            size_t before = p;
             v.arr.push_back(parseVal());
+            if (p == before) {
+                v.arr.pop_back();
+                break;
+            }
         }
         return v;
     }
@@ -139,6 +152,7 @@ public:
     JsonVal parseVal() {
         skipWs();
         char c = peek();
+        if (c == '\0') return JsonVal();
         if (c == '{') return parseObj();
         if (c == '[') return parseArr();
         if (c == '"') {
@@ -148,18 +162,48 @@ public:
             return v;
         }
         if (c == 't' || c == 'f') {
-            JsonVal v;
-            v.type = JsonVal::Bool;
-            if (s.compare(p, 4, "true") == 0) { p += 4; v.bVal = true; }
-            else if (s.compare(p, 5, "false") == 0) { p += 5; v.bVal = false; }
-            return v;
+            auto isIdentCont = [](char ch) {
+                return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') || ch == '_';
+            };
+            if (s.compare(p, 4, "true") == 0 && (p + 4 == s.size() || !isIdentCont(s[p + 4]))) {
+                p += 4;
+                JsonVal v;
+                v.type = JsonVal::Bool;
+                v.bVal = true;
+                return v;
+            }
+            if (s.compare(p, 5, "false") == 0 && (p + 5 == s.size() || !isIdentCont(s[p + 5]))) {
+                p += 5;
+                JsonVal v;
+                v.type = JsonVal::Bool;
+                v.bVal = false;
+                return v;
+            }
+            while (p < s.size() && isIdentCont(s[p])) {
+                p++;
+            }
+            return JsonVal();
         }
         if (c == 'n') {
-            if (s.compare(p, 4, "null") == 0) p += 4;
+            auto isIdentCont = [](char ch) {
+                return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                       (ch >= '0' && ch <= '9') || ch == '_';
+            };
+            if (s.compare(p, 4, "null") == 0 && (p + 4 == s.size() || !isIdentCont(s[p + 4]))) {
+                p += 4;
+                return JsonVal();
+            }
+            while (p < s.size() && isIdentCont(s[p])) {
+                p++;
+            }
             return JsonVal();
         }
         if ((c >= '0' && c <= '9') || c == '-' || c == '+') {
             return parseNum();
+        }
+        if (c != '}' && c != ']' && c != ',') {
+            p++;
         }
         return JsonVal();
     }

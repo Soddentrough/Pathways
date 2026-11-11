@@ -7,6 +7,7 @@
 #include <string_view>
 #include <cstdlib>
 #include <filesystem>
+#include <stdexcept>
 
 namespace pathways {
 
@@ -181,32 +182,21 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
         cfg.upways_superres = true;
         cfg.denoiser_mode = DenoiserMode::Upways;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default Performance (2.0x / 1080p)
-    } else if (a == "gateway" || a == "gateway-sr" || a == "gateway_sr") {
-        cfg.upscaler_mode = UpscalerMode::Gateway;
-        cfg.gateway_superres = true;
-        cfg.denoiser_mode = DenoiserMode::Gateway;
-        if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f; // Default Performance (2.0x / 1080p)
-    } else if (a == "fsr" || a == "fsr3" || a == "fsr3.1" || a == "fsr4" || a == "fsr5") {
+    } else if (a == "fsr" || a == "fsr3" || a == "fsr3.1" || a == "fsr4") {
         cfg.upscaler_mode = UpscalerMode::FSR;
         if (a == "fsr3" || a == "fsr3.1") cfg.fsr_version = FsrVersion::Fsr3;
         else if (a == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
-        else if (a == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
         else cfg.fsr_version = FsrVersion::Auto;
-        if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f; // Default Quality (1.5x)
-    } else if (a == "fsr1" || a == "cas" || a == "spatial") {
-        cfg.upscaler_mode = UpscalerMode::FSR1;
         if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.6667f; // Default Quality (1.5x)
     } else if (a == "none" || a == "off" || a == "disable") {
         cfg.upscaler_mode = UpscalerMode::None;
         cfg.upways_superres = false;
-        cfg.gateway_superres = false;
         cfg.render_scale = 1.0f;
         cfg.render_width = 0;
         cfg.render_height = 0;
         return true;
     } else {
-        Logger::warn("Unknown scaler mode '{}'. Available: upways, gateway, fsr, fsr1, none", algo);
-        return false;
+        throw std::runtime_error("Unsupported scaler mode '" + std::string(algo) + "'. Available: upways, fsr (fsr3, fsr4), none");
     }
 
     if (!param.empty()) {
@@ -223,14 +213,11 @@ bool applyScaler(Config& cfg, std::string_view algo, std::string_view param = {}
                 cfg.render_height = 0;
                 if (scale >= 0.999f) {
                     cfg.upways_superres = false;
-                    cfg.gateway_superres = false;
-                    if (cfg.upscaler_mode == UpscalerMode::Upways || cfg.upscaler_mode == UpscalerMode::Gateway) {
+                    if (cfg.upscaler_mode == UpscalerMode::Upways) {
                         cfg.upscaler_mode = UpscalerMode::None;
                     }
                 } else if (cfg.upscaler_mode == UpscalerMode::Upways) {
                     cfg.upways_superres = true;
-                } else if (cfg.upscaler_mode == UpscalerMode::Gateway) {
-                    cfg.gateway_superres = true;
                 }
             }
         } else {
@@ -345,8 +332,9 @@ void Config::printUsage(const char* progName) {
               << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
-              << "  --denoiser <mode>       Real-time denoiser: 'svgf'/'relax'/'asvgf' (Adaptive Edge-Aware SVGF, 5-dispatch dilated E-SVGF) or 'none' [default: none]\n"
-              << "  --relax, --svgf, --asvgf Shortcut to enable the Adaptive E-SVGF real-time denoiser\n\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'svgf'/'esvgf' (5-dispatch dilated E-SVGF), 'rayregen' (FFX stub), or 'none' [default: none]\n"
+              << "  --upways, --svgf        Shortcut to enable Upways or Adaptive E-SVGF real-time denoiser\n"
+              << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -621,6 +609,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.capture_frames = static_cast<uint32_t>(std::stoul(argv[++i]));
             continue;
         }
+        if (arg == "--capture-input-spp" && i + 1 < argc) {
+            cfg.capture_input_spp = std::max(1u, static_cast<uint32_t>(std::stoul(argv[++i])));
+            continue;
+        }
+        if (arg.starts_with("--capture-input-spp=")) {
+            cfg.capture_input_spp = std::max(1u, static_cast<uint32_t>(std::stoul(arg.substr(arg.find('=') + 1))));
+            continue;
+        }
         if (arg == "--capture-reference-spp" && i + 1 < argc) {
             cfg.capture_reference_spp = static_cast<uint32_t>(std::stoul(argv[++i]));
             continue;
@@ -840,7 +836,7 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
+            if (mode == "svgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
@@ -852,29 +848,19 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
                 if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
-            } else if (mode == "gateway") {
-                if (cfg.upscaler_mode != UpscalerMode::Gateway) {
-                    cfg.gateway_superres = false;
-                }
-                cfg.denoiser_mode = DenoiserMode::Gateway;
-            } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
-                cfg.upscaler_mode = UpscalerMode::Gateway;
-                cfg.gateway_superres = true;
-                cfg.denoiser_mode = DenoiserMode::Gateway;
-                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, ffx, or none.", mode);
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, svgf, esvgf, rayregen, or none.");
             }
             continue;
         }
         if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "relax" || mode == "asvgf" || mode == "esvgf") {
+            if (mode == "svgf" || mode == "esvgf") {
                 cfg.denoiser_mode = DenoiserMode::Svgf;
             } else if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
@@ -886,30 +872,19 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
                 if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
-            } else if (mode == "gateway") {
-                if (cfg.upscaler_mode != UpscalerMode::Gateway) {
-                    cfg.gateway_superres = false;
-                }
-                cfg.denoiser_mode = DenoiserMode::Gateway;
-            } else if (mode == "gateway_sr" || mode == "gateway-sr" || mode == "gateway_2x") {
-                cfg.upscaler_mode = UpscalerMode::Gateway;
-                cfg.gateway_superres = true;
-                cfg.denoiser_mode = DenoiserMode::Gateway;
-                if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
             } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                Logger::warn("Unknown denoiser mode '{}'. Expected svgf, relax, esvgf, gateway, upways, ffx, or none.", mode);
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, svgf, esvgf, rayregen, or none.");
             }
             continue;
         }
         // Consolidated Scaler / Upscaler CLI flag:
-        //   --scaler <upways|gateway|fsr|fsr1|none> [preset|WxH]
+        //   --scaler <upways|fsr|none> [preset|WxH]
         // Examples:
         //   --res 4k --scaler upways quality
-        //   --res 4k --scaler gateway quality
         //   --res 4k --scaler fsr quality
         //   --res 4k --scaler upways 1080
         //   --res 4k --scaler fsr 1080
@@ -983,11 +958,11 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.denoiser_mode = DenoiserMode::Upways;
             continue;
         }
-        if (arg == "--gateway") {
-            cfg.denoiser_mode = DenoiserMode::Gateway;
+        if (arg == "--upways-heuristic") {
+            cfg.upways_heuristic_fallback = true;
             continue;
         }
-        if (arg == "--svgf" || arg == "--relax" || arg == "--asvgf" || arg == "--esvgf") {
+        if (arg == "--svgf" || arg == "--esvgf") {
             cfg.denoiser_mode = DenoiserMode::Svgf;
             continue;
         }
@@ -997,10 +972,6 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg == "--upways-sr" || arg == "--upways-superres") {
             applyScaler(cfg, "upways");
-            continue;
-        }
-        if (arg == "--gateway-sr" || arg == "--gateway-superres") {
-            applyScaler(cfg, "gateway");
             continue;
         }
         if (arg == "--fsr") {
@@ -1015,16 +986,11 @@ Config Config::parse(int argc, char* argv[]) {
             applyScaler(cfg, "fsr4");
             continue;
         }
-        if (arg == "--fsr5") {
-            applyScaler(cfg, "fsr5");
-            continue;
-        }
         if (arg == "--fsr-version" && i + 1 < argc) {
             std::string v = argv[++i];
             std::transform(v.begin(), v.end(), v.begin(), ::tolower);
             if (v == "3" || v == "3.1" || v == "fsr3") cfg.fsr_version = FsrVersion::Fsr3;
             else if (v == "4" || v == "4.1" || v == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
-            else if (v == "5" || v == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
             else cfg.fsr_version = FsrVersion::Auto;
             continue;
         }
@@ -1033,7 +999,6 @@ Config Config::parse(int argc, char* argv[]) {
             std::transform(v.begin(), v.end(), v.begin(), ::tolower);
             if (v == "3" || v == "3.1" || v == "fsr3") cfg.fsr_version = FsrVersion::Fsr3;
             else if (v == "4" || v == "4.1" || v == "fsr4") cfg.fsr_version = FsrVersion::Fsr4;
-            else if (v == "5" || v == "fsr5") cfg.fsr_version = FsrVersion::Fsr5;
             else cfg.fsr_version = FsrVersion::Auto;
             continue;
         }
@@ -1060,14 +1025,6 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
-            continue;
-        }
-        if (arg == "--gateway-weights" && i + 1 < argc) {
-            cfg.gateway_weights_path = argv[++i];
-            continue;
-        }
-        if (arg.starts_with("--gateway-weights=")) {
-            cfg.gateway_weights_path = arg.substr(arg.find('=') + 1);
             continue;
         }
         if (arg == "--light-tree") {
@@ -1336,24 +1293,32 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if ((arg == "--accum-format" || arg == "--format") && i + 1 < argc) {
             std::string fmt = argv[++i];
+            std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::tolower);
             cfg.explicit_accum_format = true;
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
-            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
+            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "rg11" || fmt == "rg11b10" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
                 cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
+            } else if (fmt == "rgba16" || fmt == "fp16" || fmt == "r16g16b16a16_sfloat" || fmt == "16") {
+                cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             } else {
+                Logger::warn("Unknown accumulation format '{}'. Expected fp16, fp32, or r11g11b10 (rg11); defaulting to fp16.", fmt);
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
             continue;
         }
         if (arg.starts_with("--accum-format=") || arg.starts_with("--format=")) {
             std::string fmt = arg.substr(arg.find('=') + 1);
+            std::transform(fmt.begin(), fmt.end(), fmt.begin(), ::tolower);
             cfg.explicit_accum_format = true;
             if (fmt == "rgba32" || fmt == "fp32" || fmt == "r32g32b32a32_sfloat" || fmt == "32") {
                 cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
-            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
+            } else if (fmt == "r11g11b10" || fmt == "r11g11b10f" || fmt == "b10g11r11" || fmt == "rg11" || fmt == "rg11b10" || fmt == "r11" || fmt == "compact" || fmt == "fp11") {
                 cfg.accum_format = AccumFormat::R11G11B10_UFLOAT;
+            } else if (fmt == "rgba16" || fmt == "fp16" || fmt == "r16g16b16a16_sfloat" || fmt == "16") {
+                cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             } else {
+                Logger::warn("Unknown accumulation format '{}'. Expected fp16, fp32, or r11g11b10 (rg11); defaulting to fp16.", fmt);
                 cfg.accum_format = AccumFormat::RGBA16_SFLOAT;
             }
             continue;
@@ -1791,6 +1756,12 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--relax" || arg == "--asvgf" || arg == "--gateway" || arg == "--gateway-sr" ||
+            arg == "--fsr1" || arg == "--fsr2" || arg == "--fsr5" || arg == "--taa" ||
+            arg == "--restir-di" || arg == "--restir-gi") {
+            throw std::runtime_error("Unsupported or removed CLI flag '" + arg + "'");
+        }
+
         Logger::warn("Unknown command-line argument: {}", arg);
     }
 
@@ -1827,17 +1798,11 @@ Config Config::parse(int argc, char* argv[]) {
             if (cfg.denoiser_mode == DenoiserMode::Upways && cfg.upscaler_mode == UpscalerMode::None) {
                 cfg.upways_superres = true;
                 cfg.upscaler_mode = UpscalerMode::Upways;
-            } else if (cfg.denoiser_mode == DenoiserMode::Gateway && cfg.upscaler_mode == UpscalerMode::None) {
-                cfg.gateway_superres = true;
-                cfg.upscaler_mode = UpscalerMode::Gateway;
             }
         } else {
             cfg.render_scale = 1.0f;
             if (cfg.upscaler_mode == UpscalerMode::Upways) {
                 cfg.upways_superres = false;
-                cfg.upscaler_mode = UpscalerMode::None;
-            } else if (cfg.upscaler_mode == UpscalerMode::Gateway) {
-                cfg.gateway_superres = false;
                 cfg.upscaler_mode = UpscalerMode::None;
             }
         }

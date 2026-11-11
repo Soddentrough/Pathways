@@ -29,6 +29,9 @@ uint64_t readSysfsUint64(const std::string& path) {
 }
 
 std::string queryOperatingSystem() {
+#ifdef _WIN32
+    return "Windows";
+#else
     std::ifstream osRelease("/etc/os-release");
     if (osRelease.is_open()) {
         std::string line;
@@ -48,10 +51,28 @@ std::string queryOperatingSystem() {
         return std::string(uts.sysname) + " " + uts.release + " (" + uts.machine + ")";
     }
 #endif
-    return "Linux";
+    return "Unknown OS";
+#endif
 }
 
 std::string queryCpuModel() {
+#ifdef _WIN32
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        char buf[256] = {};
+        DWORD bufSize = sizeof(buf) - 1;
+        DWORD type = 0;
+        if (RegQueryValueExA(hKey, "ProcessorNameString", nullptr, &type, reinterpret_cast<LPBYTE>(buf), &bufSize) == ERROR_SUCCESS &&
+            (type == REG_SZ || type == REG_EXPAND_SZ)) {
+            RegCloseKey(hKey);
+            std::string model(buf);
+            size_t first = model.find_first_not_of(" \t");
+            return (first != std::string::npos) ? model.substr(first) : model;
+        }
+        RegCloseKey(hKey);
+    }
+    return "Unknown CPU";
+#else
     std::ifstream cpuInfo("/proc/cpuinfo");
     if (cpuInfo.is_open()) {
         std::string line;
@@ -67,10 +88,19 @@ std::string queryCpuModel() {
             }
         }
     }
-    return "AMD Threadripper Processor";
+    return "Unknown CPU";
+#endif
 }
 
 uint64_t queryTotalRamMB() {
+#ifdef _WIN32
+    MEMORYSTATUSEX memStatus{};
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        return static_cast<uint64_t>(memStatus.ullTotalPhys / (1024ULL * 1024ULL));
+    }
+    return 0;
+#else
     std::ifstream memInfo("/proc/meminfo");
     if (memInfo.is_open()) {
         std::string line;
@@ -84,7 +114,8 @@ uint64_t queryTotalRamMB() {
             }
         }
     }
-    return 65536;
+    return 0;
+#endif
 }
 
 } // namespace

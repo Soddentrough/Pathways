@@ -89,9 +89,9 @@ echo "[4/5] Running Test Suite 2: 4K Native (3840x2160) @ 1 SPP (Benchmark Mode)
 
 python3 scripts/verify_frame.py output/test_cornell_4k.png output/stats_4k.json 3840 2160 10.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
-# 4b. Test Suite 2b: 4K Native Multi-GPU Interleaved Scanlines (1 SPP, Sub-8ms Target)
+# 4b. Test Suite 2b: 4K Native Multi-GPU 64x64 Checkerboard Tiling (1 SPP, Sub-8ms Target)
 echo ""
-echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1 SPP)..."
+echo "[4b] Running Test Suite 2b: 4K Native 64x64 Checkerboard Tiling (Dual R9700, 1 SPP)..."
 "${PATHWAYS_BIN}" \
     --headless \
     --width 3840 \
@@ -102,10 +102,10 @@ echo "[4b] Running Test Suite 2b: 4K Native Interleaved Scanlines (Dual R9700, 1
     --warmup-frames 30 \
     --no-accumulation \
     --mgpu \
-    --dump-frame output/test_cornell_4k_mgpu_interleaved.png \
-    --dump-stats output/stats_4k_mgpu_interleaved.json
+    --dump-frame output/test_cornell_4k_mgpu_checkerboard.png \
+    --dump-stats output/stats_4k_mgpu_checkerboard.json
 
-python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_interleaved.png output/stats_4k_mgpu_interleaved.json 3840 2160 8.0 --max-mean-lum 0.85 --max-blown-pct 12.0
+python3 scripts/verify_frame.py output/test_cornell_4k_mgpu_checkerboard.png output/stats_4k_mgpu_checkerboard.json 3840 2160 8.0 --max-mean-lum 0.85 --max-blown-pct 12.0
 
 # 4c. Test Suite 2c: 4K Native Multi-GPU Frame Pacing & Camera Motion Regression Test
 echo ""

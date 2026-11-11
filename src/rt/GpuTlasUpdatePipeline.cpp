@@ -38,6 +38,15 @@ void GpuTlasUpdatePipeline::destroyPipelineResources() {
     m_tlasInstanceBuffer.reset();
     m_tlasInputInstancesBuffer.reset();
     m_tlasScratchBuffer.reset();
+    m_stagingShaderInstances = {};
+    m_stagingInputInstances = {};
+}
+
+void GpuTlasUpdatePipeline::initShaderInstances(Buffer* shaderInstBuf, const std::vector<InstanceGPU>& initialInstances) {
+    m_shaderInstanceBuffer = shaderInstBuf;
+    m_cpuShaderInstances = initialInstances;
+    m_stagingShaderInstances = {};
+    m_shaderInstancesDirty = false;
 }
 
 void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asInstances, AccelerationStructureManager* asManager) {
@@ -45,7 +54,7 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
     uint32_t instanceCount = static_cast<uint32_t>(asInstances.size());
     m_tlasInstanceCount = instanceCount;
 
-    // 1. Device-local TLAS Instance Buffer (64 bytes per VkAccelerationStructureInstanceKHR)
+    // 1. Pure DEVICE_LOCAL TLAS Instance Buffer (64 bytes per VkAccelerationStructureInstanceKHR, written by compute shader)
     VkDeviceSize instanceBufferSize = sizeof(VkAccelerationStructureInstanceKHR) * instanceCount;
     m_tlasInstanceBuffer = std::make_unique<Buffer>(
         m_allocator, instanceBufferSize,
@@ -53,16 +62,17 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+        0,
         64
     );
 
-    // 2. Host-visible GPU Instance Data Buffer (96 bytes per ASInstanceGPUData)
+    // 2. Device-local GPU Instance Data Buffer (96 bytes per ASInstanceGPUData, updated via frame-slot staging)
     VkDeviceSize inputBufferSize = sizeof(ASInstanceGPUData) * instanceCount;
     m_tlasInputInstancesBuffer = std::make_unique<Buffer>(
         m_allocator, inputBufferSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
@@ -82,40 +92,23 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
         );
     }
 
-    // 4. Initialize both instance buffers with their exact transforms, BLAS addresses, and metadata
+    // 4. Initialize CPU shadow & GPU input instance buffer
+    m_cpuInputInstances.resize(instanceCount);
+    for (uint32_t i = 0; i < instanceCount; ++i) {
+        m_cpuInputInstances[i].transform = asInstances[i].transform;
+        m_cpuInputInstances[i].customIndex = asInstances[i].customIndex;
+        m_cpuInputInstances[i].mask = asInstances[i].mask;
+        m_cpuInputInstances[i].hitGroupId = asInstances[i].hitGroupId;
+        m_cpuInputInstances[i].flags = asInstances[i].flags;
+        m_cpuInputInstances[i].blasAddress = asInstances[i].blasAddress;
+        m_cpuInputInstances[i].pad0 = 0;
+        m_cpuInputInstances[i].pad1 = 0;
+    }
     if (m_tlasInputInstancesBuffer) {
-        std::vector<ASInstanceGPUData> initData(instanceCount);
-        for (uint32_t i = 0; i < instanceCount; ++i) {
-            initData[i].transform = asInstances[i].transform;
-            initData[i].customIndex = asInstances[i].customIndex;
-            initData[i].mask = asInstances[i].mask;
-            initData[i].hitGroupId = asInstances[i].hitGroupId;
-            initData[i].flags = asInstances[i].flags;
-            initData[i].blasAddress = asInstances[i].blasAddress;
-            initData[i].pad0 = 0;
-            initData[i].pad1 = 0;
-        }
-        m_tlasInputInstancesBuffer->copyFrom(initData.data(), sizeof(ASInstanceGPUData) * instanceCount);
+        m_tlasInputInstancesBuffer->copyFrom(m_cpuInputInstances.data(), inputBufferSize);
     }
-
-    if (m_tlasInstanceBuffer) {
-        std::vector<VkAccelerationStructureInstanceKHR> vkInstances(instanceCount);
-        for (uint32_t i = 0; i < instanceCount; ++i) {
-            VkTransformMatrixKHR vkTransform{};
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    vkTransform.matrix[r][c] = asInstances[i].transform[c][r];
-                }
-            }
-            vkInstances[i].transform = vkTransform;
-            vkInstances[i].instanceCustomIndex = asInstances[i].customIndex;
-            vkInstances[i].mask = asInstances[i].mask;
-            vkInstances[i].instanceShaderBindingTableRecordOffset = asInstances[i].hitGroupId;
-            vkInstances[i].flags = asInstances[i].flags;
-            vkInstances[i].accelerationStructureReference = asInstances[i].blasAddress;
-        }
-        m_tlasInstanceBuffer->copyFrom(vkInstances.data(), instanceBufferSize);
-    }
+    m_stagingInputInstances = {};
+    m_needsGpuUpdate = false;
 
     // 5. Update descriptor set if already created
     updateDescriptors();
@@ -231,7 +224,64 @@ void GpuTlasUpdatePipeline::updateDescriptors() {
     }
 }
 
-void GpuTlasUpdatePipeline::recordGpuTlasUpdate(VkCommandBuffer cmd, AccelerationStructureManager* asManager, AccelerationStructure* tlas, bool updateMode) {
+void GpuTlasUpdatePipeline::recordGpuTlasUpdate(VkCommandBuffer cmd, uint32_t frameSlot, AccelerationStructureManager* asManager, AccelerationStructure* tlas, bool updateMode) {
+    uint32_t slot = frameSlot % 2u;
+    bool issuedTransfer = false;
+
+    if (m_shaderInstancesDirty && m_shaderInstanceBuffer && !m_cpuShaderInstances.empty()) {
+        VkDeviceSize shaderBytes = std::min<VkDeviceSize>(
+            sizeof(InstanceGPU) * m_cpuShaderInstances.size(), m_shaderInstanceBuffer->getSize());
+        if (shaderBytes > 0) {
+            if (!m_stagingShaderInstances[slot] || m_stagingShaderInstances[slot]->getSize() < shaderBytes) {
+                m_stagingShaderInstances[slot] = std::make_unique<Buffer>(
+                    m_allocator, std::max(shaderBytes, m_shaderInstanceBuffer->getSize()),
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+                );
+            }
+            m_stagingShaderInstances[slot]->copyFrom(m_cpuShaderInstances.data(), shaderBytes);
+            VkBufferCopy copyRegion{ 0, 0, shaderBytes };
+            vkCmdCopyBuffer(cmd, m_stagingShaderInstances[slot]->getBuffer(), m_shaderInstanceBuffer->getBuffer(), 1, &copyRegion);
+            issuedTransfer = true;
+        }
+        m_shaderInstancesDirty = false;
+    }
+
+    if (m_needsGpuUpdate && m_tlasInputInstancesBuffer && !m_cpuInputInstances.empty()) {
+        VkDeviceSize inputBytes = std::min<VkDeviceSize>(
+            sizeof(ASInstanceGPUData) * m_cpuInputInstances.size(), m_tlasInputInstancesBuffer->getSize());
+        if (inputBytes > 0) {
+            if (!m_stagingInputInstances[slot] || m_stagingInputInstances[slot]->getSize() < inputBytes) {
+                m_stagingInputInstances[slot] = std::make_unique<Buffer>(
+                    m_allocator, std::max(inputBytes, m_tlasInputInstancesBuffer->getSize()),
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT
+                );
+            }
+            m_stagingInputInstances[slot]->copyFrom(m_cpuInputInstances.data(), inputBytes);
+            VkBufferCopy copyRegion{ 0, 0, inputBytes };
+            vkCmdCopyBuffer(cmd, m_stagingInputInstances[slot]->getBuffer(), m_tlasInputInstancesBuffer->getBuffer(), 1, &copyRegion);
+            issuedTransfer = true;
+        }
+    }
+
+    if (issuedTransfer) {
+        VkMemoryBarrier2 xferBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        xferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        xferBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        xferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        xferBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo xferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        xferDep.memoryBarrierCount = 1;
+        xferDep.pMemoryBarriers = &xferBarrier;
+        vkCmdPipelineBarrier2(cmd, &xferDep);
+    }
+
+    if (!m_needsGpuUpdate) {
+        return;
+    }
     if (!m_updateTlasPipeline || !m_tlasInstanceBuffer || !m_tlasScratchBuffer || !tlas || m_tlasInstanceCount == 0 || !asManager) {
         return;
     }
@@ -253,50 +303,49 @@ void GpuTlasUpdatePipeline::recordGpuTlasUpdate(VkCommandBuffer cmd, Acceleratio
     m_needsGpuUpdate = false;
 }
 
+void GpuTlasUpdatePipeline::syncFromCpuTransforms(const std::vector<InstanceGPU>& shaderInstances,
+                                                  const std::vector<ASInstanceGPUData>& primaryInputInstances,
+                                                  bool triggerTlasRebuild) {
+    if (!shaderInstances.empty()) {
+        m_cpuShaderInstances = shaderInstances;
+        m_shaderInstancesDirty = true;
+    }
+    const size_t count = std::min(m_cpuInputInstances.size(), primaryInputInstances.size());
+    for (size_t i = 0; i < count; ++i) {
+        m_cpuInputInstances[i].transform = primaryInputInstances[i].transform;
+    }
+    if (triggerTlasRebuild && count > 0) {
+        m_needsGpuUpdate = true;
+    }
+}
+
 void GpuTlasUpdatePipeline::updateInstanceTransform(uint32_t index, const glm::mat4& transform, std::vector<SceneInstance>& sceneInstances) {
     glm::mat4 prevTransform = (index < sceneInstances.size()) ? sceneInstances[index].transform : transform;
     if (index < sceneInstances.size()) {
         sceneInstances[index].transform = transform;
     }
-    if (m_shaderInstanceBuffer && (index + 1) * sizeof(InstanceGPU) <= m_shaderInstanceBuffer->getSize()) {
-        void* mappedInst = m_shaderInstanceBuffer->map();
-        if (mappedInst) {
-            VkDeviceSize instOffset = index * sizeof(InstanceGPU) + offsetof(InstanceGPU, transform);
-            std::memcpy(static_cast<char*>(mappedInst) + instOffset, &transform, sizeof(glm::mat4));
-            std::memcpy(static_cast<char*>(mappedInst) + instOffset + sizeof(glm::mat4), &prevTransform, sizeof(glm::mat4));
-            vmaFlushAllocation(m_allocator, m_shaderInstanceBuffer->getAllocation(), instOffset, sizeof(glm::mat4) * 2);
-            m_shaderInstanceBuffer->unmap();
-        }
+    if (index < m_cpuShaderInstances.size()) {
+        m_cpuShaderInstances[index].transform = transform;
+        m_cpuShaderInstances[index].invTransform = prevTransform;
+        m_shaderInstancesDirty = true;
     }
-    if (!m_tlasInputInstancesBuffer || index >= m_tlasInstanceCount) {
+    if (index >= m_tlasInstanceCount || index >= m_cpuInputInstances.size()) {
         return;
     }
-    VkDeviceSize offset = index * sizeof(ASInstanceGPUData) + offsetof(ASInstanceGPUData, transform);
-    void* mapped = m_tlasInputInstancesBuffer->map();
-    if (mapped) {
-        std::memcpy(static_cast<char*>(mapped) + offset, &transform, sizeof(glm::mat4));
-        vmaFlushAllocation(m_allocator, m_tlasInputInstancesBuffer->getAllocation(), offset, sizeof(glm::mat4));
-        m_tlasInputInstancesBuffer->unmap();
-        m_needsGpuUpdate = true;
-    }
+    m_cpuInputInstances[index].transform = transform;
+    m_needsGpuUpdate = true;
 }
 
 void GpuTlasUpdatePipeline::updateAnimatedInstances(float frameDelta, bool animateObjects, float animSpeed,
                                                    const std::vector<AnimatedInstance>& animInstances,
                                                    std::vector<SceneInstance>& sceneInstances) {
     if (!animateObjects || animSpeed <= 0.0001f || animInstances.empty()) {
-        if (m_wasAnimatingLastFrame && m_shaderInstanceBuffer) {
+        if (m_wasAnimatingLastFrame) {
             for (const auto& anim : animInstances) {
                 uint32_t idx = anim.instanceIndex;
-                if (idx < sceneInstances.size() && (idx + 1) * sizeof(InstanceGPU) <= m_shaderInstanceBuffer->getSize()) {
-                    const glm::mat4& cur = sceneInstances[idx].transform;
-                    void* mappedInst = m_shaderInstanceBuffer->map();
-                    if (mappedInst) {
-                        VkDeviceSize instOffset = idx * sizeof(InstanceGPU) + offsetof(InstanceGPU, invTransform);
-                        std::memcpy(static_cast<char*>(mappedInst) + instOffset, &cur, sizeof(glm::mat4));
-                        vmaFlushAllocation(m_allocator, m_shaderInstanceBuffer->getAllocation(), instOffset, sizeof(glm::mat4));
-                        m_shaderInstanceBuffer->unmap();
-                    }
+                if (idx < sceneInstances.size() && idx < m_cpuShaderInstances.size()) {
+                    m_cpuShaderInstances[idx].invTransform = sceneInstances[idx].transform;
+                    m_shaderInstancesDirty = true;
                 }
             }
             m_wasAnimatingLastFrame = false;

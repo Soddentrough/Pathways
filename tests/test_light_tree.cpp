@@ -1,4 +1,5 @@
 #include "scene/LightTree.hpp"
+#include "scene/SceneGeometryPipeline.hpp"
 #include <iostream>
 #include <vector>
 #include <cassert>
@@ -140,6 +141,64 @@ int main() {
         check_true(coveredLightIndices.size() == 64, "All 64 lights covered");
         check_true(maxDepth <= 10, "Tree depth is O(log2 N)");
         std::cout << "[PASS] 64-light tree hierarchy, flux conservation, and bounds verified (depth: " << maxDepth << ")." << std::endl;
+    }
+
+    // 4. SceneGeometryPipeline partitioning + dynamic LightTree rebuild flux conservation
+    {
+        SceneData scene;
+        MaterialGPU opaqueMat{};
+        opaqueMat.albedo = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+        opaqueMat.emissive = glm::vec4(25.0f, 20.0f, 15.0f, 1.0f);
+        opaqueMat.type = MATERIAL_DIFFUSE;
+        MaterialGPU glassMat{};
+        glassMat.albedo = glm::vec4(1.0f);
+        glassMat.ior = 1.5f;
+        glassMat.transmission = 1.0f;
+        glassMat.type = MATERIAL_DIELECTRIC;
+        scene.materials = { opaqueMat, glassMat };
+
+        TriangleGPU glassTri{};
+        glassTri.v0.position = glm::vec4(-1.0f, 0.0f, -1.0f, 0.0f);
+        glassTri.v1.position = glm::vec4( 1.0f, 0.0f, -1.0f, 1.0f);
+        glassTri.v2.position = glm::vec4( 0.0f, 1.0f, -1.0f, 0.5f);
+        glassTri.materialId = 1u;
+
+        TriangleGPU emitTri{};
+        emitTri.v0.position = glm::vec4(-0.5f, 2.0f, -0.5f, 0.0f);
+        emitTri.v1.position = glm::vec4( 0.5f, 2.0f, -0.5f, 1.0f);
+        emitTri.v2.position = glm::vec4( 0.5f, 2.0f,  0.5f, 1.0f);
+        emitTri.materialId = 0u;
+
+        // Place non-opaque triangle first to verify partitionSceneGeometry reorders opaque first
+        scene.triangles = { glassTri, emitTri };
+
+        LightGPU quadLight{};
+        quadLight.position = glm::vec4(-0.5f, 2.0f, -0.5f, static_cast<float>(LIGHT_AREA_QUAD));
+        quadLight.u = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);
+        quadLight.v = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
+        quadLight.normal = glm::vec4(0.0f, -1.0f, 0.0f, 0.0f);
+        quadLight.emission = glm::vec4(25.0f, 20.0f, 15.0f, 1.0f);
+        scene.lights = { quadLight };
+
+        SceneGeometryPipeline geomPipe(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        uint32_t numOpaque = 0;
+        geomPipe.partitionSceneGeometry(scene, numOpaque);
+        check_true(numOpaque == 1u, "partitionSceneGeometry must partition 1 opaque + 1 non-opaque triangle");
+        check_true(scene.triangles[0].materialId == 0u && scene.triangles[1].materialId == 1u,
+                   "Opaque emissive triangle must precede dielectric triangle after partitioning");
+
+        bool hasNonOpaque = false, hasAlphaMask = false;
+        geomPipe.updateSceneTransparency(scene.materials, hasNonOpaque, hasAlphaMask);
+        check_true(hasNonOpaque && !hasAlphaMask, "Dielectric detected as non-opaque without alpha mask");
+
+        std::vector<LightTreeNodeGPU> nodesA, nodesB;
+        buildLightTree(scene.lights, nodesA);
+        scene.lights[0].emission *= 3.0f;
+        scene.lights[0].emission.w = 1.0f;
+        buildLightTree(scene.lights, nodesB);
+        assert_near(nodesB[0].bboxMin.w, nodesA[0].bboxMin.w * 3.0f, 0.05f,
+                    "Dynamic light intensity scaling by 3x scales LightTree root flux by 3x");
+        std::cout << "[PASS] SceneGeometryPipeline partitioning & dynamic LightTree rebuild verified." << std::endl;
     }
 
     std::cout << "\nALL HIERARCHICAL LIGHT TREE TESTS PASSED SUCCESSFULLY!" << std::endl;

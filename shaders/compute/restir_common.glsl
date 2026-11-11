@@ -38,7 +38,7 @@
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// Reservoir layout: 7 × 4 B = 28 bytes, matches DiReservoirGPU in ReSTIRManager.hpp
+// Reservoir layout: 8 × 4 B = 32 bytes, matches DiReservoirGPU in ReSTIRTypes.hpp
 // -----------------------------------------------------------------------------
 struct DiReservoir {
     uint  idxM;        // [15:0] light index, [31:16] M
@@ -46,8 +46,9 @@ struct DiReservoir {
     float targetPdf;   // p̂ of the selected sample at the storing pixel
     uint  flags;       // [7:0] age, [8] valid, [9] transmission lobe, [25:10] oct16(x1 normal)
     float hitDist;     // x1 -> light-sample distance (1e4 for directional lights)
-    uint  lightPacked; // [15:0] oct16(light normal), [23:16] uv.u8, [31:24] uv.v8
+    uint  lightPacked; // [15:0] oct16(light normal), [31:16] reserved
     uint  x1Misc;      // [15:0] fp16 cos(theta at light, stored config), [31:16] fp16 primary hit distance
+    uint  lightUv16;   // packUnorm2x16(luv) — full 16-bit area-light sample UV
 };
 
 // Tunables / bias gates
@@ -144,14 +145,17 @@ DiReservoir invalidDiReservoir() {
     r.hitDist = 0.0;
     r.lightPacked = 0u;
     r.x1Misc = 0u;
+    r.lightUv16 = 0u;
     return r;
 }
 
-// The RIS stage functions below require the `lights` and `lightNodes` storage
-// buffers to be declared before this include. Passes that only need the
-// reservoir type for invalidation writes (dielectric / emissive / passthrough /
-// conductor) skip them by not defining RESTIR_INCLUDE_SAMPLER_HELPERS.
+// The RIS stage functions below require `lights`, `lightNodes`, `triangles`
+// and `ubo` to be declared before this include. Passes that only need the
+// reservoir type for invalidation writes skip them by not defining
+// RESTIR_INCLUDE_SAMPLER_HELPERS.
 #ifdef RESTIR_INCLUDE_SAMPLER_HELPERS
+
+#include "mis_common.glsl"
 
 // -----------------------------------------------------------------------------
 // Direct light path reconnection for a stored (lightIndex, luv) sample
@@ -345,9 +349,10 @@ void restirDiFreshStream(
         r.wSum = totalWeightSum;
         r.targetPdf = sel.target;
         r.hitDist = sel.dist;
-        r.lightPacked = restirPackOct16(lights[sel.lightIdx].normal.xyz) | (restirPackUv8(sel.luv) << 16u);
+        r.lightPacked = restirPackOct16(lights[sel.lightIdx].normal.xyz);
         r.flags = restirPackFlags(0u, true, sel.isTrans, hitNormal);
         r.x1Misc = restirPackF16Pair(sel.cosLight, min(hitT, 60000.0));
+        r.lightUv16 = packUnorm2x16(sel.luv);
     } else {
         // Unlit / backfacing candidates evaluated this frame: carries 0 weight, but M trials
         r.idxM = restirPackIdxM(0u, M);
@@ -357,6 +362,7 @@ void restirDiFreshStream(
         r.lightPacked = 0u;
         r.flags = restirPackFlags(0u, true, false, hitNormal);
         r.x1Misc = restirPackF16Pair(1.0, min(hitT, 60000.0));
+        r.lightUv16 = 0u;
     }
 }
 
@@ -406,7 +412,7 @@ void restirDiApplyTap(
     }
 
     Light srcLight = lights[srcLightIdx];
-    vec2 srcLuv = restirUnpackUv8(src.lightPacked >> 16u);
+    vec2 srcLuv = unpackUnorm2x16(src.lightUv16);
     vec3 reconDir;
     float reconDist;
     vec3 reconEmission;
@@ -441,7 +447,7 @@ void restirDiApplyTap(
         sel.dir = reconDir;
         sel.dist = reconDist;
         sel.emission = reconEmission;
-        sel.selectPdf = (numLights <= 1u) ? 1.0 : lights[srcLightIdx].sampling.z;
+        sel.selectPdf = misLightSelectPdf(srcLightIdx, hitPoint, numLights);
         sel.cosLight = cosLightNew;
         sel.ndotL = NdotL;
         sel.target = pHat;
@@ -452,11 +458,12 @@ void restirDiApplyTap(
         r.idxM = restirPackIdxM(srcLightIdx, combinedM);
         r.targetPdf = pHat;
         r.hitDist = reconDist;
-        r.lightPacked = restirPackOct16(srcLight.normal.xyz) | (restirPackUv8(srcLuv) << 16u);
+        r.lightPacked = restirPackOct16(srcLight.normal.xyz);
         // x1 context is re-stamped with the CURRENT surface: the reservoir
         // describes this pixel for the next frame's taps.
         r.flags = restirPackFlags(ageNew, true, isTrans, hitNormal);
         r.x1Misc = restirPackF16Pair(cosLightNew, min(hitT, 60000.0));
+        r.lightUv16 = packUnorm2x16(srcLuv);
     } else {
         r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
     }
@@ -465,43 +472,71 @@ void restirDiApplyTap(
 #endif // RESTIR_INCLUDE_SAMPLER_HELPERS
 
 // =============================================================================
-// ReSTIR GI (path-space) — Phase 2, docs/RESTIR_PT_DESIGN.md
+// ReSTIR PT Indirect Path-Space Resampling (Secondary Vertex Reconnection)
 // =============================================================================
+// Resamples the 1-bounce illumination integral at primary hit x1 over the
+// triangle-surface domain Omega_GI (with full-sphere partition S^2 = Omega_GI u
+// (S^2 \ Omega_GI) so sky, cutouts, spheres, dielectrics, and indexed emitters
+// remain 100% unbiased in standard MC while contributing M=1, w=0 trials to GI).
 //
-// Resamples the direct-lighting integral at the primary hit x1:
-//     L_direct(x1) = ∫ f_r(x1) cosθ1 L(x2→x1) dω2
-// Candidates are bounce-1 continuation directions: a world-space secondary
-// vertex x2 plus the radiance estimate L̂2 measured there (shadowed NEE at
-// x2). Reuse happens entirely on the x1 side; the x2 side is only replayed
-// through an inline visibility ray from x1.
-//
-// Stored as scalar uints (fp32 bit patterns) to avoid std430 vec3 padding:
-// 32 bytes total. Stores 16-byte Hit atom (instanceId, primitiveId, baryPacked, flags).
+// Stored as 8 scalar uints (32 bytes), matching GiReservoirGPU in ReSTIRTypes.hpp:
+//   posXBits:      floatBitsToUint(x2.x) world-space reconnection vertex
+//   posYBits:      floatBitsToUint(x2.y)
+//   posZBits:      floatBitsToUint(x2.z)
+//   wSumBits:      RIS running weight sum (fp32 bits)
+//   targetCosBits: [31:8] fp32(target)[31:8], [7:0] cosSrc (unorm8)
+//   radRgb9e5:     RGB9E5 shared-exponent radiance L̂2 at x2
+//   normalsPacked: [15:0] oct16(n2), [31:16] oct16(x1Normal)
+//   dSrcFlagsM:    [15:0] fp16 dSrc, [16] valid, [17] hasSurface,
+//                  [23:18] age (0..63), [31:24] M (0..255)
 struct GiReservoir {
-    uint hitInstanceId;   // TLAS instance custom index
-    uint hitPrimitiveId;  // Triangle index in BLAS geometry (or sphere index)
-    uint hitBaryPacked;   // packUnorm2x16(bary.xy) or oct32 normal
-    uint wSumBits;        // RIS running weight sum (fp32 bits)
-    uint targetBits;      // p̂ of the current winner AT THE RECORDING PIXEL (fp32 bits)
-    uint radRG;           // fp16 (L̂2.r, L̂2.g)
-    uint radB_dSrc;       // fp16 L̂2.b, fp16 d_src = |x2 - x1| when recorded
-    uint flagsM;          // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
+    uint posXBits;
+    uint posYBits;
+    uint posZBits;
+    uint wSumBits;
+    uint targetCosBits;
+    uint radRgb9e5;
+    uint normalsPacked;
+    uint dSrcFlagsM;
 };
 
-// Per-pixel BRDF context at the primary hit x1. Written at bounce 0 and
-// consumed at bounce 1 of the same frame/sample. 24 bytes.
+// Per-pixel BRDF context at the primary hit x1 (24 bytes, matches X1ContextGPU).
 struct X1Context {
-    uint n1Oct;     // oct32(x1 normal)
-    uint albedoRG;  // fp16 (albedo.r, albedo.g)
-    uint albedoB;   // fp16 albedo.b
-    uint flags;     // [0] valid: diffuse cosine reflection-lobe continuation
-    uint woOct;     // oct32(x1 -> camera direction, i.e. V at the primary hit)
-    uint f0Pad;     // [15:0] fp16 scalar F0, [31:16] fp16 roughness
+    uint n1Oct;     // oct32(x1 world shading normal)
+    uint albedoRG;  // fp16 (baseColor.r, baseColor.g)
+    uint albedoB;   // [15:0] fp16 baseColor.b, [31:16] fp16 metallic
+    uint flags;     // [0] valid, [1] reserved, [31:2] qSelf fp32[31:2]
+    uint woOct;     // oct32(x1 -> camera direction, V at primary hit)
+    uint f0Pad;     // [15:0] fp16 dielectric scalar F0, [31:16] fp16 roughness
 };
 
-const float GI_TAP_MIN_COS        = 0.05;
-const float GI_TAP_MIN_DIST       = 1e-3;
-const float GI_WEIGHT_CLAMP_MAX   = 500.0;
+const uint  GI_MAX_AGE          = 63u;
+const uint  GI_INVALID_INST_20  = 0xFFFFFu;
+const float GI_TAP_MIN_COS      = 0.05;
+const float GI_TAP_MIN_DIST     = 1e-3;
+const float GI_WEIGHT_CLAMP_MAX = 500.0;
+
+uint restirPackRgb9e5(vec3 rgb) {
+    vec3 c = clamp(rgb, vec3(0.0), vec3(65408.0));
+    float maxC = max(c.r, max(c.g, c.b));
+    if (maxC < 1e-6) return 0u;
+    int expShared = clamp(max(-15, int(floor(log2(maxC)))) + 16, 0, 31);
+    float denom = exp2(float(expShared - 24));
+    int maxM = int(floor(maxC / denom + 0.5));
+    if (maxM == 512 && expShared < 31) {
+        denom *= 2.0;
+        expShared += 1;
+    }
+    uvec3 m = uvec3(clamp(ivec3(floor(c / denom + 0.5)), ivec3(0), ivec3(511)));
+    return m.r | (m.g << 9u) | (m.b << 18u) | (uint(expShared) << 27u);
+}
+
+vec3 restirUnpackRgb9e5(uint p) {
+    if (p == 0u) return vec3(0.0);
+    int expShared = int((p >> 27u) & 0x1Fu);
+    float scale = exp2(float(expShared - 24));
+    return vec3(float(p & 0x1FFu), float((p >> 9u) & 0x1FFu), float((p >> 18u) & 0x1FFu)) * scale;
+}
 
 X1Context invalidX1Context() {
     X1Context c;
@@ -514,99 +549,80 @@ X1Context invalidX1Context() {
     return c;
 }
 
-X1Context makeX1Context(vec3 n1, vec3 albedo, vec3 wo, float f0, float roughness) {
+X1Context makeX1Context(vec3 n1, vec3 baseColor, float metallic, vec3 wo, float f0Scalar, float roughness, float qSelf) {
     X1Context c;
     c.n1Oct = packOct32(normalize(n1));
-    c.albedoRG = packHalf2x16(clamp(albedo.rg, vec2(0.0), vec2(65000.0)));
-    c.albedoB = packHalf2x16(vec2(clamp(albedo.b, 0.0, 65000.0), 0.0));
-    c.flags = 1u;
+    c.albedoRG = packHalf2x16(clamp(baseColor.rg, vec2(0.0), vec2(65000.0)));
+    c.albedoB = packHalf2x16(vec2(clamp(baseColor.b, 0.0, 65000.0), clamp(metallic, 0.0, 1.0)));
+    c.flags = (floatBitsToUint(max(qSelf, 1e-8)) & ~3u) | 1u;
     c.woOct = packOct32(normalize(wo));
-    c.f0Pad = packHalf2x16(vec2(clamp(f0, 0.0, 1.0), clamp(roughness, 0.0, 1.0)));
+    c.f0Pad = packHalf2x16(vec2(clamp(f0Scalar, 0.0, 1.0), clamp(roughness, 0.0, 1.0)));
     return c;
 }
 
-bool x1ContextValid(X1Context c) { return (c.flags & 1u) != 0u; }
-vec3 x1ContextNormal(X1Context c) { return unpackOct32(c.n1Oct); }
-vec3 x1ContextAlbedo(X1Context c) {
+bool  x1ContextValid(X1Context c)     { return (c.flags & 1u) != 0u; }
+vec3  x1ContextNormal(X1Context c)    { return unpackOct32(c.n1Oct); }
+vec3  x1ContextBaseColor(X1Context c) {
     vec2 rg = unpackHalf2x16(c.albedoRG);
     return vec3(rg.x, rg.y, unpackHalf2x16(c.albedoB).x);
 }
-vec3 x1ContextWo(X1Context c) { return unpackOct32(c.woOct); }
-float x1ContextF0(X1Context c) { return unpackHalf2x16(c.f0Pad).x; }
+float x1ContextMetallic(X1Context c)  { return unpackHalf2x16(c.albedoB).y; }
+float x1ContextQSelf(X1Context c)     { return uintBitsToFloat(c.flags & ~3u); }
+vec3  x1ContextWo(X1Context c)        { return unpackOct32(c.woOct); }
+float x1ContextF0(X1Context c)        { return unpackHalf2x16(c.f0Pad).x; }
 float x1ContextRoughness(X1Context c) { return unpackHalf2x16(c.f0Pad).y; }
 
 GiReservoir invalidGiReservoir() {
     GiReservoir r;
-    r.hitInstanceId = 0xFFFFFFFFu;
-    r.hitPrimitiveId = 0xFFFFFFFFu;
-    r.hitBaryPacked = 0u;
+    r.posXBits = 0u;
+    r.posYBits = 0u;
+    r.posZBits = 0u;
     r.wSumBits = 0u;
-    r.targetBits = 0u;
-    r.radRG = 0u;
-    r.radB_dSrc = 0u;
-    r.flagsM = 0u;
+    r.targetCosBits = 0u;
+    r.radRgb9e5 = 0u;
+    r.normalsPacked = 0u;
+    r.dSrcFlagsM = 0u;
     return r;
 }
 
-bool  giIsValid(GiReservoir r)     { return (r.flagsM & 1u) != 0u; }
-uint  giGetAge(GiReservoir r)      { return (r.flagsM >> 1u) & 0xFFu; }
-uint  giGetM(GiReservoir r)        { return (r.flagsM >> 9u) & 0x3FFu; }
-uint  giGetHitFlags(GiReservoir r) { return (r.flagsM >> 19u) & 0x3u; }
-float giGetCosSrc(GiReservoir r)   { return float((r.flagsM >> 21u) & 0xFFu) * (1.0 / 255.0); }
-Hit   giGetHit(GiReservoir r) {
-    Hit h;
-    h.instanceId = r.hitInstanceId;
-    h.primitiveId = r.hitPrimitiveId;
-    h.baryPacked = r.hitBaryPacked;
-    h.flags = giGetHitFlags(r);
-    return h;
-}
-vec3  giGetX2(GiReservoir r) {
-    return reconstructHitPosition(giGetHit(r));
-}
-vec3  giGetRadiance(GiReservoir r) {
-    vec2 rg = unpackHalf2x16(r.radRG);
-    vec2 bD = unpackHalf2x16(r.radB_dSrc);
-    return vec3(rg.x, rg.y, bD.x);
-}
-float giGetWSum(GiReservoir r)   { return uintBitsToFloat(r.wSumBits); }
-float giGetTarget(GiReservoir r) { return uintBitsToFloat(r.targetBits); }
-float giGetDSrc(GiReservoir r)   { return unpackHalf2x16(r.radB_dSrc).y; }
+bool  giIsValid(GiReservoir r)      { return ((r.dSrcFlagsM >> 16u) & 1u) != 0u; }
+bool  giHasSurface(GiReservoir r)   { return ((r.dSrcFlagsM >> 17u) & 1u) != 0u; }
+uint  giGetAge(GiReservoir r)       { return (r.dSrcFlagsM >> 18u) & 0x3Fu; }
+uint  giGetM(GiReservoir r)         { return (r.dSrcFlagsM >> 24u) & 0xFFu; }
+float giGetDSrc(GiReservoir r)      { return unpackHalf2x16(r.dSrcFlagsM & 0xFFFFu).x; }
+float giGetCosSrc(GiReservoir r)    { return float(r.targetCosBits & 0xFFu) * (1.0 / 255.0); }
+float giGetTarget(GiReservoir r)    { return uintBitsToFloat(r.targetCosBits & ~0xFFu); }
+float giGetWSum(GiReservoir r)      { return uintBitsToFloat(r.wSumBits); }
+vec3  giGetX2(GiReservoir r)        { return vec3(uintBitsToFloat(r.posXBits), uintBitsToFloat(r.posYBits), uintBitsToFloat(r.posZBits)); }
+vec3  giGetN2(GiReservoir r)        { return restirUnpackOct16(r.normalsPacked & 0xFFFFu); }
+vec3  giGetX1Normal(GiReservoir r)  { return restirUnpackOct16((r.normalsPacked >> 16u) & 0xFFFFu); }
+vec3  giGetRadiance(GiReservoir r)  { return restirUnpackRgb9e5(r.radRgb9e5); }
 
-GiReservoir makeGiReservoir(Hit hit, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
+GiReservoir makeGiReservoir(bool hasSurface, vec3 x2, vec3 n2, vec3 x1Normal, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
     GiReservoir r = invalidGiReservoir();
-    vec3 L = clamp(radiance, vec3(0.0), vec3(65000.0));
-    r.hitInstanceId = hit.instanceId;
-    r.hitPrimitiveId = hit.primitiveId;
-    r.hitBaryPacked = hit.baryPacked;
-    r.wSumBits = floatBitsToUint(wSum);
-    r.targetBits = floatBitsToUint(target);
-    r.radRG = packHalf2x16(L.rg);
-    r.radB_dSrc = packHalf2x16(vec2(L.b, clamp(dSrc, 0.0, 65000.0)));
-    uint uCos = uint(clamp(round(clamp(cosSrc, 0.0, 1.0) * 255.0), 0.0, 255.0));
-    r.flagsM = 1u | ((min(age, 255u) & 0xFFu) << 1u) | ((min(M, 1023u) & 0x3FFu) << 9u) | ((hit.flags & 0x3u) << 19u) | ((uCos & 0xFFu) << 21u);
+    bool validSurf = hasSurface && (target > 0.0);
+    r.posXBits = validSurf ? floatBitsToUint(x2.x) : 0u;
+    r.posYBits = validSurf ? floatBitsToUint(x2.y) : 0u;
+    r.posZBits = validSurf ? floatBitsToUint(x2.z) : 0u;
+    r.wSumBits = floatBitsToUint(max(wSum, 0.0));
+    uint uCos = validSurf ? uint(clamp(round(clamp(cosSrc, 0.0, 1.0) * 255.0), 0.0, 255.0)) : 0u;
+    uint tBits = validSurf ? (floatBitsToUint(max(target, 0.0)) & ~0xFFu) : 0u;
+    r.targetCosBits = tBits | uCos;
+    r.radRgb9e5 = validSurf ? restirPackRgb9e5(radiance) : 0u;
+    uint octN2 = validSurf ? restirPackOct16(n2) : 0u;
+    uint octN1 = restirPackOct16(x1Normal);
+    r.normalsPacked = octN2 | (octN1 << 16u);
+    uint dHalf = validSurf ? (packHalf2x16(vec2(clamp(dSrc, 0.0, 65000.0), 0.0)) & 0xFFFFu) : 0u;
+    r.dSrcFlagsM = dHalf |
+                   (1u << 16u) |
+                   ((validSurf ? 1u : 0u) << 17u) |
+                   ((min(age, GI_MAX_AGE) & 0x3Fu) << 18u) |
+                   ((min(M, 255u) & 0xFFu) << 24u);
     return r;
 }
 
-// GI target proxy at x1 for a candidate secondary vertex:
-//     p̂ = (1 / π) · max(cosθ1, 0) · lum(L̂2) · ρ̄
-// Incorporates cosine lobe projection, average primary albedo, and
-// candidate arrival radiance for robust relative weighting.
-float giTargetAt(vec3 albedo, vec3 n1, vec3 x1, vec3 x2, vec3 radiance) {
-    vec3 dv = x2 - x1;
-    float dist = length(dv);
-    if (dist < 1e-4) return 0.0;
-    float cos1 = dot(n1, dv / dist);
-    if (cos1 <= 0.0) return 0.0;
-    float albedoBar = dot(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.3333333));
-    float lum = dot(max(radiance, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
-    if (lum <= 1e-6) return 0.0;
-    return albedoBar * INV_PI * cos1 * lum;
-}
-
-// Full analytical Jacobian for path reconnection:
+// Full analytical Jacobian for secondary vertex reconnection:
 // J = (||x2 - x_src||^2 / ||x2 - x_new||^2) * (cos(theta_rc_new) / cos(theta_rc_src))
-// Matches test_restir_pt_math.cpp TEST 1 exactly.
 float evalGIJacobian(float dSrc, float dNew, float cosRcSrc, float cosRcNew) {
     if (dSrc >= 5000.0 || dNew >= 5000.0) return 1.0;
     float dSqSrc = dSrc * dSrc;
@@ -616,88 +632,5 @@ float evalGIJacobian(float dSrc, float dNew, float cosRcSrc, float cosRcNew) {
     float J = (dSqSrc / dSqNew) * (cosNewEff / cosSrcEff);
     return clamp(J, RESTIR_JACOBIAN_CLAMP_MIN, RESTIR_JACOBIAN_CLAMP_MAX);
 }
-
-// Reconnects a previous-frame GI tap to the current x1 and stream-combines
-// it into r. Returns true when the tap wins the reservoir.
-//
-// Exact analytical Jacobian with dynamic normal reconstruction and hybrid
-// shift map footprint gating.
-// ageNew is stamped by the caller (temporal taps: age+1, spatial: age).
-bool giApplyTap(inout GiReservoir r, in GiReservoir tap, vec3 x1, vec3 n1,
-                vec3 albedo, float roughness, uint mCap, uint ageNew, inout uint seed) {
-    if (!giIsValid(tap) || giGetM(tap) == 0u) return false;
-
-    // Reject procedural spheres as x2: Hit atom encodes spPos.xyz in instance/primitive/bary
-    // and lacks the reconstructed surface normal, causing biased reconnection Jacobians.
-    if ((giGetHit(tap).flags & 1u) != 0u) return false;
-
-    uint mTap = min(giGetM(tap), mCap);
-    if (mTap == 0u) return false;
-
-    float pTap = giGetTarget(tap);
-    float weight = 0.0;
-    float pHat = 0.0;
-    vec3 x2c;
-    vec3 n2c;
-    reconstructHitPositionAndNormal(giGetHit(tap), x2c, n2c);
-    vec3 radC = giGetRadiance(tap);
-    float dNew = 0.0;
-    float cosRcNew = 0.0;
-
-    if (pTap > 0.0) {
-        vec3 toNew = x2c - x1;
-        dNew = length(toNew);
-        if (dNew >= GI_TAP_MIN_DIST) {
-            vec3 dirNew = toNew / dNew;
-            float cos1 = dot(n1, dirNew);
-            if (cos1 > GI_TAP_MIN_COS) {
-                float dSrc = max(giGetDSrc(tap), 1e-3);
-                float distRatio = dSrc / max(dNew, 1e-3);
-
-                // Footprint-based reconnection criterion (validateReconnectionFootprint):
-                // Distance ratio in [0.2, 5.0]; reject reconnection if receiver is specular/glossy
-                bool validFootprint = (distRatio >= 0.2 && distRatio <= 5.0);
-                if (validFootprint && roughness < 0.15) {
-                    validFootprint = false;
-                }
-
-                if (validFootprint) {
-                    pHat = giTargetAt(albedo, n1, x1, x2c, radC);
-                    if (pHat > 0.0) {
-                        cosRcNew = clamp(abs(dot(n2c, -dirNew)), 0.0, 1.0);
-                        float cosRcSrc = giGetCosSrc(tap);
-                        float jac = evalGIJacobian(dSrc, dNew, cosRcSrc, cosRcNew);
-                        float targetRatio = pHat / max(pTap, 1e-6);
-                        weight = (giGetWSum(tap) / float(giGetM(tap))) *
-                                 float(mTap) *
-                                 targetRatio * jac;
-                        if (isnan(weight) || isinf(weight) || !(weight > 0.0)) {
-                            weight = 0.0;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    float wSelf = (giIsValid(r) && giGetTarget(r) > 0.0) ? giGetWSum(r) : 0.0;
-    uint mSelf = giIsValid(r) ? giGetM(r) : 0u;
-    uint combinedM = mSelf + mTap;
-    float combined = wSelf + weight;
-
-    if (weight > 0.0 && (randFloat(seed) * combined < weight)) {
-        r = makeGiReservoir(giGetHit(tap), combined, combinedM, pHat, radC, dNew, cosRcNew, ageNew);
-        return true;
-    }
-    if (giIsValid(r) && giGetTarget(r) > 0.0) {
-        r = makeGiReservoir(giGetHit(r), combined, combinedM, giGetTarget(r),
-                            giGetRadiance(r), giGetDSrc(r), giGetCosSrc(r), giGetAge(r));
-    } else {
-        r = makeGiReservoir(giIsValid(r) ? giGetHit(r) : invalidHit(), 0.0, combinedM, 0.0,
-                            vec3(0.0), giIsValid(r) ? giGetDSrc(r) : 0.0, giIsValid(r) ? giGetCosSrc(r) : 0.0, ageNew);
-    }
-    return false;
-}
-
 
 #endif // RESTIR_COMMON_GLSL

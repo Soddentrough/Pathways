@@ -57,9 +57,16 @@ void VideoBillboardManager::init(const std::string& scenePath, const SceneData& 
     };
     if (!exeDir.empty()) {
         candidates.push_back(exeDir / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+        candidates.push_back(exeDir / "scenes" / "cyber_city_ad_1.mp4");
         candidates.push_back(exeDir / ".." / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
         candidates.push_back(exeDir / ".." / ".." / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+        candidates.push_back(exeDir / ".." / "share" / "pathways" / "scenes" / "cyber_city" / "cyber_city_ad_1.mp4");
+        candidates.push_back(exeDir / ".." / "share" / "pathways" / "scenes" / "cyber_city_ad_1.mp4");
     }
+#if defined(__linux__) || defined(__unix__)
+    candidates.push_back("/usr/share/pathways/scenes/cyber_city/cyber_city_ad_1.mp4");
+    candidates.push_back("/usr/share/pathways/scenes/cyber_city_ad_1.mp4");
+#endif
 
     std::filesystem::path foundPath;
     for (const auto& c : candidates) {

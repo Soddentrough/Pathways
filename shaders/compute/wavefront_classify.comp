@@ -9,13 +9,23 @@
 
 #define WF_IN_QUEUE_IDX  0u
 #define WF_OUT_QUEUE_IDX 0u
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
+#include "restir_common.glsl"
+
+layout(std430, binding = 32) writeonly buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
+layout(std430, binding = 37) writeonly buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+layout(std430, binding = 38) writeonly buffer GiCurrentReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
 
 layout(local_size_x = 8, local_size_y = 4) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 layout(binding = 23, rgba16f) uniform image2D uMotionVectorImage;
 layout(binding = 24, rgba16f) uniform image2D uNormalDepthImage;
 layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
@@ -52,6 +62,8 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 layout(binding = 7) uniform sampler2D environmentMap;
 
+#include "shading_core.glsl"
+
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
 layout(std430, binding = 13) buffer IndirectCommand {
@@ -68,10 +80,6 @@ layout(std430, binding = 17) writeonly buffer OutRayHitQueue {
 
 layout(std430, binding = 18) writeonly buffer MaterialIndexQueue {
     uint materialIndices[];
-};
-
-layout(std430, binding = 33) writeonly buffer PixelToRayBuffer {
-    uint pixelToRay[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -188,38 +196,11 @@ void main() {
         uint hitInstMatOffset = 0u;
         uint hitInstIdx = 0u;
 
-        // Hardware BVH Traversal with 100% fixed-function opaque traversal
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, EPSILON, direction, closestT);
-        rayQueryProceedEXT(rq);
-
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-            closestT = rayQueryGetIntersectionTEXT(rq, true);
-            hitInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-            uint instIdx = hitInstIdx;
-            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
-            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            InstanceGPU inst = instances[instIdx];
-            closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
-            closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-            hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-            hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-            hitInstMatOffset = inst.materialOffset;
-        }
-
-        // Test procedural spheres
-        if (pc.numSpheres > 0u) {
-            for (uint i = 0; i < pc.numSpheres; ++i) {
-                float spT;
-                vec3 spNorm;
-                if (intersectSphere(origin, direction, spheres[i], EPSILON, closestT, spT, spNorm)) {
-                    closestT = spT;
-                    closestSphere = int(i);
-                    closestSphereNorm = spNorm;
-                    closestTri = -1;
-                }
-            }
-        }
+        traceClosestSceneHit(
+            origin, direction, EPSILON, closestT, pc.numSpheres,
+            closestT, closestTri, closestSphere, closestBary, closestSphereNorm,
+            hitInstIdx, hitInstMatOffset, hitO2w, hitW2o
+        );
 
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
         pixelIndex = uint(storeCoord.x + storeCoord.y * int(storeWidth));
@@ -261,7 +242,13 @@ void main() {
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
                         imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
                     }
-                    accumFfxSignal(storeCoord, skyColor, false, true, seed);
+                }
+                if ((ubo.flags & (1u << 9)) != 0u) {
+                    x1Contexts[pixelIndex] = invalidX1Context();
+                    if (pc.sppSampleIndex == 0u) {
+                        currentReservoirs[pixelIndex] = invalidDiReservoir();
+                        giReservoirs[pixelIndex] = invalidGiReservoir();
+                    }
                 }
             }
         } else {
@@ -367,19 +354,26 @@ void main() {
                     imageStore(uAccumImage, storeCoord, vec4(0.0, 0.0, 0.0, -min(primaryDepth, 65000.0)));
                 }
 
+                vec2 quantUv = unpackHalf2x16(packHalf2x16(hitUv - floor(hitUv)));
+                float rayConeBaseLod = (closestTri >= 0)
+                    ? computeRayConeBaseLod(hit.hitData1.w >> 16u, closestT, direction, hitNormal,
+                                            2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
+                                            0u, 0u)
+                    : -16.0;
+
                 if (needNormals) {
                     vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                     if (matId < pc.numMaterials && closestTri >= 0) {
                         Material mat = materials[matId];
                         if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-                            vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
+                            vec3 normalMap = SAMPLE_SCENE_TEXTURE_LOD(mat.normalTex, quantUv, rayConeBaseLod).rgb * 2.0 - 1.0;
                             normalMap.xy *= mat.normalScale;
                             normalMap = normalize(normalMap);
                             vec3 orthoTan = tanDir - dot(tanDir, shadingNormal) * shadingNormal;
                             float tanLenSq = dot(orthoTan, orthoTan);
                             vec3 gTan = (tanLenSq > 1e-6) ? (orthoTan * inversesqrt(tanLenSq)) : vec3(1.0, 0.0, 0.0);
                             vec3 gBitan = cross(shadingNormal, gTan) * tanSign;
-                            shadingNormal = normalize(mat3(gTan, gBitan, shadingNormal) * normalMap);
+                            shadingNormal = adjustShadingNormal(normalize(mat3(gTan, gBitan, shadingNormal) * normalMap), -direction);
                         }
                     }
                     primaryNormal = normalize(transpose(mat3(ubo.viewInverse)) * shadingNormal);
@@ -393,15 +387,24 @@ void main() {
                 }
 
                 if (pc.captureMlData != 0u) {
+                    float clearcoatVal = 0.0;
+                    float clearcoatRoughnessVal = 0.0;
                     if (matId < pc.numMaterials) {
                         Material mat = materials[matId];
-                        albedoVal = mat.albedo.rgb;
+                        vec4 baseColor = mat.albedo;
                         if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                            albedoVal *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv).rgb;
+                            baseColor *= SAMPLE_SCENE_TEXTURE_LOD(mat.albedoTex, quantUv, rayConeBaseLod);
+                        }
+                        if (mat.alphaMode == 1u) {
+                            albedoVal = (baseColor.a < mat.alphaCutoff) ? vec3(1.0) : baseColor.rgb;
+                        } else if (mat.alphaMode == 2u) {
+                            albedoVal = (baseColor.a < 0.99) ? vec3(1.0) : baseColor.rgb;
+                        } else {
+                            albedoVal = baseColor.rgb;
                         }
                         emissiveVal = mat.emissive.rgb;
                         if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
-                            emissiveVal *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
+                            emissiveVal *= SAMPLE_SCENE_TEXTURE_LOD(mat.emissiveTex, quantUv, rayConeBaseLod).rgb;
                         }
                         if (archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
                             albedoVal = clamp(albedoVal + emissiveVal, vec3(0.0), vec3(1.0));
@@ -410,7 +413,7 @@ void main() {
                         metallicVal = mat.metallic;
                         transmissionVal = mat.transmission;
                         if (mat.mrTex > 0u && mat.mrTex <= 512u) {
-                            vec4 mrSample = SAMPLE_SCENE_TEXTURE(mat.mrTex, hitUv);
+                            vec4 mrSample = SAMPLE_SCENE_TEXTURE_LOD(mat.mrTex, quantUv, rayConeBaseLod);
                             roughnessVal *= mrSample.g;
                             metallicVal *= mrSample.b;
                         }
@@ -420,15 +423,22 @@ void main() {
                         if ((mat.type & MATERIAL_TYPE_MASK) == 2u /* MATERIAL_DIELECTRIC */) {
                             transmissionVal = max(transmissionVal, 1.0);
                         }
+                        clearcoatVal = clamp(mat.clearcoat, 0.0, 1.0);
+                        if (mat.clearcoatTex > 0u && mat.clearcoatTex <= 512u) {
+                            clearcoatVal *= SAMPLE_SCENE_TEXTURE_LOD(mat.clearcoatTex, quantUv, rayConeBaseLod).r;
+                        }
+                        clearcoatRoughnessVal = clamp(mat.clearcoatRoughness, 0.0, 1.0);
+                        if (mat.clearcoatRoughnessTex > 0u && mat.clearcoatRoughnessTex <= 512u) {
+                            clearcoatRoughnessVal *= SAMPLE_SCENE_TEXTURE_LOD(mat.clearcoatRoughnessTex, quantUv, rayConeBaseLod).g;
+                        }
                     }
                     float dSpec = 1.0 / (1.0 + max(primaryDepth, 0.0));
-                    float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE || length(emissiveVal) > 1e-3) ? 1.0 : 0.0;
+                    float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE) ? 1.0 : 0.0;
                     float clampedMet = clamp(metallicVal, 0.0, 1.0);
-                    float denoiseRoughness = (transmissionVal < 0.5)
-                        ? ((clampedMet >= 0.05) ? min(roughnessVal, 0.69) : max(roughnessVal, 0.085))
-                        : clamp(roughnessVal, 0.65, 0.69);
-                    imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(albedoVal, denoiseRoughness));
-                    if (denoiseRoughness < 0.70) imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (transmissionVal >= 0.5) ? -dSpec : dSpec, 0.0));
+                    float physicalRoughness = clamp(mix(roughnessVal, clearcoatRoughnessVal, clearcoatVal), 0.0, 1.0);
+                    vec3 mlAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(albedoVal, vec3(0.004));
+                    imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(mlAlbedo, physicalRoughness));
+                    imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (transmissionVal >= 0.5) ? -dSpec : dSpec, 0.0));
                     if (isPrimaryEmissive > 0.0) imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
                     if (clampedMet > 0.0) imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
                 }

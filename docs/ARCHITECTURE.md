@@ -122,7 +122,7 @@ Rays traversing downstream BVHs share coherent ray frustums, boosting BVH node h
 ### 3.3 Secondary Ray Radiance Clamping
 To eliminate high-energy Monte Carlo fireflies caused by specular-diffuse-specular paths, secondary rays enforce scene-invariant radiance clamping:
 $$\mathbf{L}_{\text{clamped}} = \min\left(\mathbf{L}_{\text{secondary}}, \frac{L_{\text{max}}}{\max(1.0, \|\mathbf{p} - \mathbf{x}\|)}\right)$$
-Configurable via `--indirect-clamp` (default `10.0`), suppressing caustic fireflies with zero energy loss on primary surfaces.
+Configurable via `--indirect-clamp` (default `35.0`), suppressing caustic fireflies with zero energy loss on primary surfaces.
 
 ---
 
@@ -164,19 +164,20 @@ Screen space is subdivided into $64\times 64$ alternating tiles (2,040 tiles at 
 
 ---
 
-## 5. Super-Resolution & Neural Reconstruction (Experimental — Undocumented)
+## 5. Denoising, Super-Resolution & FidelityFX SDK Integration
 
-Pathways contains experimental reconstruction and super-resolution code paths (`src/rt/Fsr3Upscaler.*`,
-`src/rt/UpwaysPipeline.*`, `shaders/compute/fsr3_*.comp`, `shaders/compute/upways_*.comp`). These are
-**experimental at best** and are intentionally excluded from user-facing documentation and the GUI. They
-are reachable only via hidden CLI flags (`--scaler`, `--denoiser`, `--upways*`) and carry no performance or
-quality guarantee.
+Pathways exposes a clean, lazily-allocated reconstruction lineup (`0 MB` idle VRAM when inactive):
 
-> **Accuracy note**: the `fsr3`/`fsr1` passes are Pathways-authored custom filters, **not** the official AMD
-> FidelityFX SDK techniques. A feasibility study for integrating the genuine AMD FSR 3.1 Vulkan Upscaler
-> (FidelityFX-SDK `v1.1.x`) is recorded in `docs/reports/codebase_review_2026_10_07.md` (finding A3); the
-> integration was descoped by the project owner. Until then, no AMD/FSR branding is claimed anywhere
-> user-facing.
+1. **Pure Monte Carlo (`--denoiser none --upscaler none`, Default)**:
+   - Unbiased progressive accumulation (`accum_running_avg.comp` / `accum_tonemap_fused.comp`) in `RGBA16F`, `RGBA32F`, or `R11G11B10_UFLOAT` (with exact bitwise stochastic rounding).
+2. **AMD FidelityFX Super Resolution 3.1.6 (`--upscaler fsr3` / `--scaler fsr3 <preset>`, `src/rt/Fsr3Upscaler.cpp`)**:
+   - Compiled natively from the open-source C++ & SPIR-V AMD FidelityFX SDK v2.4.0 Vulkan backend (`libamd_fidelityfx_upscaler_vk.so`).
+3. **E-SVGF Spatio-Temporal Wavelet Denoiser (`--denoiser svgf`, `src/rt/DenoiserPipeline.cpp`)**:
+   - In-house variance-guided spatio-temporal À-Trous filter (`denoise_fused_temporal.comp` $\to$ `denoise_atrous_step1.comp` $\to$ `denoise_atrous_coarse_remodulate.comp`) over demodulated diffuse and specular streams.
+4. **Upways 3.0 Neural Spatiotemporal Reconstructor & Continuous Subpixel Upscaler (`--denoiser upways` / `--upscaler upways`, `src/rt/UpwaysPipeline.cpp`, In Development)**:
+   - 3-pass co-designed diffuse + metallic-Fresnel specular demodulation (`upways_temporal.comp`), 6-stage 3-scale RDNA 4 FP8 E4M3 Wave32 WMMA spatiotemporal backbone (`upways_neural_guide.comp`), and continuous subpixel ray-locus gather + Catmull-Rom resolve (`upways_upscale_resolve.comp`, `73,686` parameters = `89,536 B` FP8+FP32 weights). See [`docs/UPWAYS_INTEGRATION.md`](UPWAYS_INTEGRATION.md).
+5. **Native Vulkan Provider Stub Slots (`src/rt/FfxSdkRuntime.cpp`)**:
+   - Clean `dlopen`/`LoadLibrary` stub slots are retained for **AMD FSR 4.1.2 ML**, **FSR Ray Regeneration 1.2.1**, and **FSR Radiance Caching 0.9.0**. Because AMD FidelityFX SDK v2.4.0 currently ships FSR 4, Ray Regeneration, and Radiance Caching exclusively as closed-source Windows DirectX 12 / prebuilt DLLs with no official Linux Vulkan provider, these slots honestly report unavailable/stub status on Linux Vulkan until native Vulkan providers ship.
 
 ## 6. Reservoir Spatiotemporal Importance Sampling (ReSTIR PT)
 
@@ -185,8 +186,8 @@ All resampling runs **inline in the wavefront shade passes** (`shaders/compute/r
 used by `wavefront_shade_diffuse/complex.comp`); `src/rt/ReSTIRManager.cpp` is a lean owner
 of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc). Enabled via `--restir`.
 
-- **Direct Lighting Resampling**: 28 B direct reservoir (light index + M, weight sum, scalar target p̂,
-  age/valid/lobe flags, oct-encoded x1 & light normals, 8-bit-per-channel light UV,
+- **Direct Lighting Resampling**: 32 B `DiReservoir` (light index + M, RIS weight sum, scalar target p̂,
+  age/valid/transmission-lobe flags, oct-encoded x1 & light normals, full 16-bit per-channel area-light UV via `packUnorm2x16`,
   fp16 cosine & primary distance) — every field is read back during reuse.
 - **Temporal Reservoir Reuse**: The previous frame's grid is sampled at the
   MV-reprojected pixel; stored samples are reconnected to the current surface, re-weighted
@@ -197,13 +198,12 @@ of the per-pixel reservoir grids (lazy allocation, zero-fill on (re)alloc). Enab
   per-pixel randomly rotated cross offset (±2 px). Buffer-based taps keep reuse legal under
   the wavefront's divergent per-material control flow.
 - **Finalization**: Full GGX + diffuse BRDF evaluation of the winning light with a single
-  inline shadow ray; an occluded winner zeroes its reservoir so bad history dies immediately.
-- **Indirect Path-Space Resampling (Secondary-Vertex Reconnection)**: The indirect path term
-  is estimated by resampling cached secondary vertices at the primary hit x1. A 24 B per-pixel
+  decoupled shadow ray; an occluded winner zeroes its reservoir so bad history dies immediately.
+- **Indirect Path-Space Resampling (Full-Sphere Secondary-Vertex Reconnection)**: Indirect illumination
+  is partitioned across the full sphere $S^2 = \Omega_{\text{GI}} \sqcup (S^2 \setminus \Omega_{\text{GI}})$ so non-diffuse/glossy transmission and specular lobes remain unbiased while cached diffuse/rough secondary vertices at `x1` are resampled over $\Omega_{\text{GI}}$. A 24 B per-pixel
   `X1Context` (normal, albedo, wo, F0) is written at bounce 0; a 32 B `GiReservoir` (x2 world position,
-  shadowed L̂2 radiance, weight sum, p̂, d_src, age/M) is double-buffered. Taps reconnect
-  neighbors' x2 to the current x1 with the `(d_src/d_new)²` solid-angle Jacobian; the
-  winner gets one replay visibility ray (skipped when the path's own candidate wins).
+  shadowed L̂2 radiance, weight sum, p̂, d_src, oct-encoded n2, age/M) is double-buffered. Reconnected
+  winners enqueue a stream-compacted `PackedShadowRay` into `ShadowRayQueue` (binding 12) for decoupled hardware visibility replay in `wavefront_shadow.comp` (skipped when the path's own candidate wins).
 - **Debug views** (`--debug-view`, also a GUI combo): a post pass overwrites the output
   image with live reservoir state — Direct/Indirect sample-count M (log heatmap), finalized weight
   w = wSum/(p̂·M) (log scale, firefly hunting), winner light index (golden-ratio hue),
@@ -232,17 +232,17 @@ In traditional rasterization and path tracing engines, triangle vertex positions
 2. **Shading Kernels** need surface normals, texture coordinates, tangents, and material IDs to evaluate BSDFs and sample textures; they do *not* require vertex positions because world-space hit points are computed from ray origins, direction, and ray query hit distances $t$ ($\mathbf{p} = \mathbf{o} + t \cdot \mathbf{d}$).
 
 Pathways segregates positions from shading geometry into two decoupled buffers:
-- **`m_positionBuffer`**: A contiguous array of 16-byte `glm::vec4(x, y, z, 1.0f)` positions used strictly for hardware BLAS builds.
-- **`m_triangleShadeBuffer` (`TriangleShadeGPU`)**: An aligned **64-byte** structure containing exclusively the attributes required during shading — **2 triangles per 128-byte RDNA 4 vector cache line**, so consecutive triangle fetches never straddle a cache-line boundary. Normals and tangents are octahedrally encoded (4 bytes each instead of 16) and UVs are packed as half-float pairs:
+- **`m_positionBuffer`**: A contiguous array of 16-byte `glm::vec4(x, y, z, 1.0f)` positions used strictly for hardware BLAS builds (`VK_KHR_ray_tracing_position_fetch` reconstructs exact hit positions inside hardware BVH leaves without binding `m_positionBuffer` to shading descriptor sets).
+- **`m_triangleShadeBuffer` (`TriangleShadeGPU`)**: An aligned **64-byte** structure containing exclusively the attributes required during shading — **2 triangles per 128-byte RDNA 4 vector cache line**, so consecutive triangle fetches never straddle a cache-line boundary. Normals and tangents are octahedrally encoded (4 bytes each instead of 16) while UVs are stored in full 32-bit `float` precision (`24 B`) to eliminate half-float texture swim on tiled architectural meshes:
 
 | Field | GLSL / C++ Type | Byte Size | Description |
 | :--- | :--- | :---: | :--- |
 | `octNormal0/1/2` | `uint32_t` × 3 | 12 | Per-vertex normals, octahedral 32-bit encoding (`unpackOct32`) |
 | `octTan0/1/2` | `uint32_t` × 3 | 12 | Per-vertex tangents, octahedral 32-bit encoding |
-| `uv0/1/2` | `uint32_t` × 3 | 12 | Per-vertex UVs, packed `half2` (`unpackHalf2x16`) |
 | `tanSigns` | `uint32_t` | 4 | Tangent handedness signs (bit-packed) |
 | `materialId` | `uint32_t` | 4 | Scene material index |
-| `padding0` + `reserved[4]` | `uint32_t[5]` | 20 | Alignment / forward-compatibility padding |
+| `uv0x..uv2y` | `float` × 6 | 24 | Full FP32 per-vertex texture coordinates (`(uv0x, uv0y)`, `(uv1x, uv1y)`, `(uv2x, uv2y)`) |
+| `padding0` + `reserved0` | `uint32_t` × 2 | 8 | Packed ray-cone triangle LOD (`padding0`) & alignment padding |
 | **Total** | | **64 Bytes** | **2 triangles per 128B Vector Cache Line (0 Split Cache-Line Penalty)** |
 
 ```cpp
@@ -253,13 +253,13 @@ struct alignas(16) TriangleShadeGPU {
     uint32_t octTan0 = 0;     // oct-encoded tangent, vertex 0
     uint32_t octTan1 = 0;
     uint32_t octTan2 = 0;
-    uint32_t uv0 = 0;         // packed half2 UV, vertex 0
-    uint32_t uv1 = 0;
-    uint32_t uv2 = 0;
     uint32_t tanSigns = 0;
     uint32_t materialId = 0;
-    uint32_t padding0 = 0;
-    uint32_t reserved[4] = {0, 0, 0, 0};
+    float uv0x = 0.0f, uv0y = 0.0f;
+    float uv1x = 0.0f, uv1y = 0.0f;
+    float uv2x = 0.0f, uv2y = 0.0f;
+    uint32_t padding0 = 0;    // packed half2 ray-cone triangle LOD constant
+    uint32_t reserved0 = 0;
 };
 static_assert(sizeof(TriangleShadeGPU) == 64, "TriangleShadeGPU must be exactly 64 bytes (2 triangles per 128B cache line)");
 ```
@@ -340,19 +340,19 @@ The primary wavefront and compute pipelines bind scene data through descriptor s
 | **9** | `storageBuffer` | `inStates` | 16 B | Input ray state queue (throughput, seed, pixel index, flags) |
 | **10** | `storageBuffer` | `outStates` | 16 B | Output ray state queue for next bounce |
 | **11** | `storageBuffer` | `queueCounters` | 256 B | Atomic workgroup and ray queue counters |
+| **12** | `storageBuffer` | `shadowRayQueue` | **16 B**/ray | Stream-compacted `PackedShadowRay` queue (direct NEE + ReSTIR PT GI replay visibility) |
+| **13–19** | `storageBuffer` | `dgcAndGeomQueues` | Variable | Indirect dispatch commands, DGC stream, ray geometry, hit, and material index queues |
 | **20–22** | `storageBuffer` | `nrcQueue/Counters` | Variable | Neural direct-light caching query, train, and counter buffers |
-| **23–24** | `storageImage` | `motionVectors / normalDepth` | RG16F / RGBA16F | Temporal motion vectors and G-Buffer normal/depth |
+| **23–24** | `storageImage` | `motionVectors / normalDepth` | RGBA16F | 2.5D temporal motion vectors (`.xy` UV delta, `.z` linear depth delta) and G-Buffer normal/depth |
 | **25** | `storageBuffer` | `lightTree` | Variable | Hierarchical 3D Light Tree nodes |
 | **26–29** | `storageImage` | `albedoRough / specMetal / mlDiff / mlSpec` | RGBA16F | Denoising feature maps & separated diffuse/specular buffers |
-| **30** | `storageBuffer` | `instances` | 64 B | Scene mesh instance transforms and material offsets |
+| **30** | `storageBuffer` | `instances` | **144 B** | Scene mesh instance transforms (`transform`, `invTransform`) and triangle/material offsets (`InstanceGPU`) |
 | **31** | `storageImage` | `causticImage` | RGBA16F | Forward photon-traced caustic splat target |
-| **32** | `storageBuffer` | `restirReservoirs` | **28 B**/px | ReSTIR DI reservoirs, current frame slot (write) |
+| **32** | `storageBuffer` | `restirReservoirs` | **32 B**/px | ReSTIR PT direct reservoirs (`DiReservoir`), current frame slot (write) |
+| **33** | `storageImage` | `prevNormalDepthImage` | RGBA16F | Previous frame G-Buffer normal/depth for temporal reprojection (`readonly`) |
 | **34** | `storageBuffer` | `materialArchetypes` | **4 B** | Compact scalar BSDF archetype lookup buffer |
 | **35** | `storageBuffer` | `shadeMaterials` | **64 B** | Compact cache-line aligned shading material buffer |
-| **36** | `storageBuffer` | `restirHistory` | **28 B**/px | ReSTIR DI reservoirs, previous frame slot (temporal/spatial taps, read-only) |
-| **37** | `storageBuffer` | `x1Contexts` | **24 B**/px | ReSTIR GI: BRDF context at primary hit (written bounce 0, read bounce 1, single-buffered) |
-| **38** | `storageBuffer` | `giReservoirs` | **32 B**/px | ReSTIR GI reservoirs, current frame slot (write) |
-| **39** | `storageBuffer` | `giHistory` | **32 B**/px | ReSTIR GI reservoirs, previous frame slot (taps, read-only) |
-| **40** | `storageBuffer` | `positions` | **48 B**/tri | Segregated vertex positions (`3 x vec4`) for triangle reconstruction |
-| **41–45** | `storageBuffer` | `ptReservoirs / pathSamples / shadeReq` | **32–144 B**/px | ReSTIR PT path reservoirs, path samples, and reconnection request/result buffers |
-| **47** | `storageImage` | `prevNormalDepthImage` | RGBA16F | Previous frame G-Buffer normal/depth for temporal reprojection |
+| **36** | `storageBuffer` | `restirHistory` | **32 B**/px | ReSTIR PT direct reservoirs (`DiReservoir`), previous frame slot (temporal/spatial taps, read-only) |
+| **37** | `storageBuffer` | `x1Contexts` | **24 B**/px | ReSTIR PT: BRDF context at primary hit (written bounce 0, read bounce 1, single-buffered) |
+| **38** | `storageBuffer` | `giReservoirs` | **32 B**/px | ReSTIR PT indirect reservoirs (`GiReservoir`), current frame slot (write) |
+| **39** | `storageBuffer` | `giHistory` | **32 B**/px | ReSTIR PT indirect reservoirs (`GiReservoir`), previous frame slot (taps, read-only) |

@@ -12,6 +12,7 @@
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <memory>
+#include <array>
 #include <vector>
 #include <string>
 #include <future>
@@ -64,7 +65,9 @@ public:
                          SceneGeometryPipeline* geomPipeline);
 
     void uploadGpuBuffers(SceneGeometryPipeline* geomPipeline);
-    void updateDynamicLights(SceneData& sceneData);
+    void updateDynamicLights(SceneData& sceneData, bool immediateHostCopy = false);
+    void recordDynamicLightUpload(VkCommandBuffer cmd, uint32_t frameSlot);
+    void releasePositionBuffer() noexcept { m_positionBuffer.reset(); }
     void loadTextures(const std::string& hdriPath, const std::string& scenePath);
     void updateCamera(Camera* camera, const Config& config);
 
@@ -92,6 +95,9 @@ public:
     [[nodiscard]] Buffer* getShadeMaterialBuffer() const noexcept { return m_shadeMaterialBuffer.get(); }
     [[nodiscard]] Buffer* getLightBuffer() const noexcept { return m_lightBuffer.get(); }
     [[nodiscard]] Buffer* getLightTreeBuffer() const noexcept { return m_lightTreeBuffer.get(); }
+    [[nodiscard]] bool hasDynamicLightUpdate() const noexcept { return m_dynamicLightsDirty; }
+    [[nodiscard]] const std::vector<LightGPU>& getCpuDynamicLights() const noexcept { return m_cpuDynamicLights; }
+    [[nodiscard]] const std::vector<LightTreeNodeGPU>& getCpuDynamicLightTree() const noexcept { return m_cpuDynamicLightTree; }
 
     // Accessors for Textures
     [[nodiscard]] Texture* getEnvironmentMap() const noexcept { return m_environmentMap.get(); }
@@ -100,11 +106,22 @@ public:
     [[nodiscard]] Texture* getBlueNoiseTexture() const noexcept { return m_blueNoiseTexture.get(); }
     [[nodiscard]] const std::vector<std::unique_ptr<Texture>>& getSceneTextures() const noexcept { return m_sceneTextures; }
 
-    // Reclaims host-side triangles after upload
-    void reclaimHostTriangles() noexcept {
+    // Reclaims host-side triangles and uncompressed texture pixels after upload
+    void reclaimHostMemory() noexcept {
         m_sceneData.triangles.clear();
         m_sceneData.triangles.shrink_to_fit();
+        for (auto& tex : m_sceneData.textures) {
+            tex.pixels.clear();
+            tex.pixels.shrink_to_fit();
+            tex.hdrPixels.clear();
+            tex.hdrPixels.shrink_to_fit();
+        }
     }
+    void reclaimHostTriangles() noexcept { reclaimHostMemory(); }
+
+    // Reloads and prepares SceneData on demand (e.g. lazy secondary GPU init after host memory reclamation)
+    SceneData reloadPreparedSceneData(const std::string& filepath, const Config& config,
+                                      SceneGeometryPipeline* geomPipeline) const;
 
 private:
     VkDevice m_device = VK_NULL_HANDLE;
@@ -145,6 +162,11 @@ private:
     std::unique_ptr<Buffer> m_shadeMaterialBuffer;
     std::unique_ptr<Buffer> m_lightBuffer;
     std::unique_ptr<Buffer> m_lightTreeBuffer;
+    std::array<std::unique_ptr<Buffer>, 2> m_lightStaging;
+    std::array<std::unique_ptr<Buffer>, 2> m_lightTreeStaging;
+    std::vector<LightGPU> m_cpuDynamicLights;
+    std::vector<LightTreeNodeGPU> m_cpuDynamicLightTree;
+    bool m_dynamicLightsDirty = false;
 
     // Scene Textures
     std::vector<std::unique_ptr<Texture>> m_sceneTextures;

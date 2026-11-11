@@ -3,7 +3,6 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -32,12 +31,8 @@ layout(std430, binding = 3) readonly buffer SpheresBuffer {
     Sphere spheres[];
 };
 
-layout(std430, binding = 4) readonly buffer MaterialsBuffer {
-    Material materials[];
-};
-
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 layout(std430, binding = 12) readonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
@@ -70,7 +65,8 @@ void main() {
     bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
     bool occluded = false;
 
-    bool isSpecularPath = (isSpecular > 0.5);
+    bool isSpecularPath = (isSpecular >= 1.5);
+    float specFrac = isSpecularPath ? 1.0 : clamp(isSpecular, 0.0, 1.0);
     // UBO bit 26 (--transparent-shadows, biased fast mode): dielectrics and emissives
     // do not occlude NEE. Default (unbiased): every surface occludes except alpha
     // cutouts, consistent with BSDF-sampled paths, which refract through/terminate on them.
@@ -102,27 +98,29 @@ void main() {
                 uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
                 uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 uint arch = materialArchetypes[matId];
+                ShadeMaterial sm = shadeMaterials[matId];
                 if (transparentShadows) {
                     if (arch == 3u || (!enableCaustics && arch == 2u) || (isSpecularPath && arch == 2u)) {
                         continue;
                     }
                     if (enableCaustics && arch == 2u) {
-                        if (materials[matId].thickness <= 0.001) {
+                        if (smIsThin(sm)) {
                             continue;
                         }
                     }
                 }
 
-                if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
-                    Material mat = materials[matId];
+                uint alphaMode = smGetAlphaMode(sm);
+                if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
                     Triangle ctri = triangles[triIdx];
                     vec2 cuv = getTriangleUV(ctri, bary);
-                    float calpha = mat.albedo.a;
-                    if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                        calpha *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, cuv).a;
+                    float calpha = sm.albedo.a;
+                    uint albTex = smGetAlbedoTex(sm);
+                    if (albTex > 0u && albTex <= 512u) {
+                        calpha *= SAMPLE_SCENE_TEXTURE(albTex, cuv).a;
                     }
-                    float cutoff = (mat.alphaMode == 1u) ? mat.alphaCutoff : 0.5;
+                    float cutoff = (alphaMode == 1u) ? smGetAlphaCutoff(sm) : 0.5;
                     if (calpha < cutoff) {
                         continue;
                     }
@@ -139,11 +137,12 @@ void main() {
         bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
         for (uint i = 0; i < pc.numSpheres; ++i) {
             uint sMatId = spheres[i].materialId;
-            Material sMat = materials[sMatId];
-            bool isDielectric = ((sMat.type & MATERIAL_TYPE_MASK) == 2u || sMat.transmission > 0.05);
+            ShadeMaterial sMat = shadeMaterials[sMatId];
+            uint sType = smGetTypeFlags(sMat) & MATERIAL_TYPE_MASK;
+            bool isDielectric = (sType == 2u || smIsTransmissive(sMat));
             if (transparentShadows) {
-                if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
-                if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+                if (sType == 3u || (!enableCaustics && isDielectric)) continue;
+                if (enableCaustics && isDielectric && smIsThin(sMat)) continue;
             }
             float spT;
             vec3 spNorm;
@@ -163,14 +162,16 @@ void main() {
         }
 
         if (pc.captureMlData != 0u) {
-            if (isSpecular > 0.5) {
-                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, radiance, seed), prevSpec.a));
-            } else {
+            vec3 diffRad = radiance * (1.0 - specFrac);
+            vec3 specRad = radiance * specFrac;
+            if (dot(diffRad, diffRad) > 1e-12) {
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radiance, seed), prevDiff.a));
+                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffRad, seed), prevDiff.a));
             }
-            accumFfxSignal(pixelCoord, radiance, isSpecular > 0.5, pc.currentBounce == 0u, seed);
+            if (dot(specRad, specRad) > 1e-12) {
+                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specRad, seed), prevSpec.a));
+            }
         }
     }
 }

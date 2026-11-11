@@ -95,10 +95,12 @@ struct alignas(16) ShadeMaterialGPU {
     glm::vec4 albedo = glm::vec4(1.0f);        // 16 bytes: baseColorFactor (linear RGBA)
     glm::vec4 emissive_spec = glm::vec4(0.0f); // 16 bytes: xyz: emissive (linear RGB), w: specularFactor
     glm::vec4 pbrParams = glm::vec4(1.0f, 0.0f, 1.5f, 0.0f); // 16 bytes: x: roughness, y: metallic, z: ior, w: diffuseTransmission
-    glm::uvec4 tex_flags = glm::uvec4(0);      // 16 bytes: x: albedoTex | (normalTex << 16)
-                                               //           y: mrTex | (emissiveTex << 16)
-                                               //           z: diffTransTex | (specularTex << 16)
-                                               //           w: (type & 0xFFFF) | (packHalf16(normalScale) << 16)
+    glm::uvec4 tex_flags = glm::uvec4(0);      // 16 bytes:
+                                               //   x: [11:0] albedoTex, [13:12] alphaMode, [14] isThin, [15] isTransmissive,
+                                               //      [27:16] normalTex, [31:28] alphaCutoff[3:0]
+                                               //   y: [11:0] mrTex, [15:12] alphaCutoff[7:4], [27:16] emissiveTex
+                                               //   z: [11:0] diffTransTex, [23:12] specularTex, [31:24] rhoMaxU8
+                                               //   w: [15:0] (type | MATERIAL_FLAG_*), [31:16] packHalf16(normalScale)
 };
 static_assert(sizeof(ShadeMaterialGPU) == 64, "ShadeMaterialGPU must be exactly 64 bytes (std430 aligned)");
 
@@ -108,31 +110,36 @@ inline ShadeMaterialGPU createShadeMaterial(const MaterialGPU& mat) {
     sm.emissive_spec = glm::vec4(glm::vec3(mat.emissive), mat.specularFactor);
     sm.pbrParams = glm::vec4(mat.roughness, mat.metallic, mat.ior, mat.diffuseTransmission);
 
-    uint32_t alb = (mat.albedoTex <= 512u) ? mat.albedoTex : 0u;
-    uint32_t nrm = (mat.normalTex <= 512u) ? mat.normalTex : 0u;
-    uint32_t mr  = (mat.mrTex <= 512u) ? mat.mrTex : 0u;
-    uint32_t em  = (mat.emissiveTex <= 512u) ? mat.emissiveTex : 0u;
-    uint32_t dt  = (mat.diffuseTransmissionTex <= 512u) ? mat.diffuseTransmissionTex : 0u;
-    uint32_t sp  = (mat.specularTex <= 512u) ? mat.specularTex : 0u;
-    uint32_t tp  = mat.type & 0xFFu;
+    uint32_t alb = (mat.albedoTex <= 512u) ? (mat.albedoTex & 0x0FFFu) : 0u;
+    uint32_t nrm = (mat.normalTex <= 512u) ? (mat.normalTex & 0x0FFFu) : 0u;
+    uint32_t mr  = (mat.mrTex <= 512u) ? (mat.mrTex & 0x0FFFu) : 0u;
+    uint32_t em  = (mat.emissiveTex <= 512u) ? (mat.emissiveTex & 0x0FFFu) : 0u;
+    uint32_t dt  = (mat.diffuseTransmissionTex <= 512u) ? (mat.diffuseTransmissionTex & 0x0FFFu) : 0u;
+    uint32_t sp  = (mat.specularTex <= 512u) ? (mat.specularTex & 0x0FFFu) : 0u;
+    uint32_t alphaMode = mat.alphaMode & 0x3u;
+    uint32_t isThin = (mat.thickness <= 0.001f) ? 1u : 0u;
+    uint32_t isTransmissive = (mat.transmission > 0.05f) ? 1u : 0u;
+    uint32_t cutoffU8 = static_cast<uint32_t>(std::clamp(std::round(mat.alphaCutoff * 254.0f), 0.0f, 254.0f));
+    uint32_t tp  = mat.type & 0xFFFFu;
     uint32_t nScaleHalf = glm::packHalf2x16(glm::vec2(mat.normalScale, 0.0f)) & 0xFFFFu;
 
     // Conservative upper bound of directional-hemispherical reflectance rho_max in [0, 1]
-    // for ReSTIR PT geometric target proxy evaluation (Approach B: Path-Database).
+    // for ReSTIR PT geometric target proxy evaluation.
     float maxColor = std::max({ mat.albedo.r, mat.albedo.g, mat.albedo.b });
     float maxTrans = mat.diffuseTransmission;
     float rhoMax = std::clamp(std::max(maxColor, maxTrans), 0.01f, 1.0f);
     uint32_t rhoMaxU8 = static_cast<uint32_t>(std::clamp(std::round(rhoMax * 255.0f), 1.0f, 255.0f));
 
-    sm.tex_flags.x = alb | (nrm << 16u);
-    sm.tex_flags.y = mr | (em << 16u);
-    sm.tex_flags.z = dt | (sp << 16u);
-    sm.tex_flags.w = tp | (rhoMaxU8 << 8u) | (nScaleHalf << 16u);
+    sm.tex_flags.x = alb | (alphaMode << 12u) | (isThin << 14u) | (isTransmissive << 15u) |
+                     (nrm << 16u) | ((cutoffU8 & 0xFu) << 28u);
+    sm.tex_flags.y = mr | (((cutoffU8 >> 4u) & 0xFu) << 12u) | (em << 16u);
+    sm.tex_flags.z = dt | (sp << 12u) | (rhoMaxU8 << 24u);
+    sm.tex_flags.w = tp | (nScaleHalf << 16u);
     return sm;
 }
 
 inline float getShadeMaterialRhoMax(const ShadeMaterialGPU& sm) {
-    return static_cast<float>((sm.tex_flags.w >> 8u) & 0xFFu) * (1.0f / 255.0f);
+    return static_cast<float>((sm.tex_flags.z >> 24u) & 0xFFu) * (1.0f / 255.0f);
 }
 
 enum MaterialArchetype : uint32_t {

@@ -4,12 +4,25 @@
 #extension GL_KHR_shader_subgroup_ballot : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_nonuniform_qualifier : enable
 
 #define WF_IN_QUEUE_IDX  ((pc.currentBounce & 1u) ^ 1u)
 #define WF_OUT_QUEUE_IDX (pc.currentBounce & 1u)
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+} ubo;
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
@@ -24,6 +37,9 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
 };
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+DECLARE_SCENE_TEXTURES_BINDING(8)
+
+#include "shading_core.glsl"
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -77,43 +93,18 @@ void main() {
     int closestTri = -1;
     vec2 closestBary = vec2(0.0);
     int closestSphere = -1;
+    vec3 closestSphereNorm = vec3(0.0, 1.0, 0.0);
     mat4x3 hitW2o = mat4x3(1.0);
     mat4x3 hitO2w = mat4x3(1.0);
     uint hitInstMatOffset = 0u;
     uint hitInstIdx = 0u;
 
     if (inRange) {
-        // Fixed-function hardware BVH traversal with zero shader ALU interrupts
-        rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, 0xFF, origin, EPSILON, direction, closestT);
-        rayQueryProceedEXT(rq);
-
-        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
-            closestT = rayQueryGetIntersectionTEXT(rq, true);
-            hitInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-            uint instIdx = hitInstIdx;
-            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(rq, true);
-            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-            InstanceGPU inst = instances[instIdx];
-            closestTri = int(inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles)));
-            closestBary = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-            hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-            hitO2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
-            hitInstMatOffset = inst.materialOffset;
-        }
-
-        // Procedural Spheres intersection test
-        if (pc.numSpheres > 0u) {
-            for (uint i = 0; i < pc.numSpheres; ++i) {
-                float spT;
-                vec3 spNorm;
-                if (intersectSphere(origin, direction, spheres[i], EPSILON, closestT, spT, spNorm)) {
-                    closestT = spT;
-                    closestSphere = int(i);
-                    closestTri = -1;
-                }
-            }
-        }
+        traceClosestSceneHit(
+            origin, direction, EPSILON, closestT, pc.numSpheres,
+            closestT, closestTri, closestSphere, closestBary, closestSphereNorm,
+            hitInstIdx, hitInstMatOffset, hitO2w, hitW2o
+        );
     }
 
     RayHit hit;

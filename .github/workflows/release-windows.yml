@@ -52,14 +52,20 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
-            -DENABLE_NATIVE_OPTIMIZATION=ON \
-            -DBUILD_TESTING=OFF \
+            -DENABLE_NATIVE_OPTIMIZATION=OFF \
+            -DPATHWAYS_PORTABLE_CPU=ON \
+            -DBUILD_TESTING=ON \
             -DCPACK_GENERATOR="NSIS;ZIP"
 
-      - name: Compile Pathways & Shaders
+      - name: Compile Pathways, Shaders & Unit Tests
         shell: msys2 {0}
         run: |
-          cmake --build build --target pathways -j16
+          cmake --build build -j4
+
+      - name: Run Unit Tests (CTest)
+        shell: msys2 {0}
+        run: |
+          SDL_VIDEODRIVER=dummy ctest --test-dir build --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
 
       - name: Package Windows Installer (NSIS) & Portable ZIP
         shell: msys2 {0}

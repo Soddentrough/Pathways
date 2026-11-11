@@ -328,7 +328,8 @@ public:
                          uint32_t channels, uint32_t dataType, uint32_t frameIndex, uint32_t spp,
                          const void* payloadData, size_t payloadBytes,
                          float fovDeg = 45.0f, float aspectRatio = 16.0f / 9.0f,
-                         const float camPos[3] = nullptr);
+                         const float camPos[3] = nullptr,
+                         const float jitterXY[2] = nullptr);
     static bool saveStatsJSON(const std::string& filepath, const FrameStats& stats);
     static std::string generateDefaultTelemetryPath();
 };

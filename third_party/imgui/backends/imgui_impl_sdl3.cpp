@@ -404,13 +404,9 @@ bool ImGui_ImplSDL3_ProcessEvent(const SDL_Event* event)
             float wheel_x = -event->wheel.x;
             float wheel_y = event->wheel.y;
 
-            // In SDL3, when direction is SDL_MOUSEWHEEL_FLIPPED (natural scrolling active in OS/desktop,
-            // e.g. GNOME Wayland), X and Y are opposite; negate them to normalize for Dear ImGui.
-            if (event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
-            {
-                wheel_x = -wheel_x;
-                wheel_y = -wheel_y;
-            }
+            // Note: SDL3 already flips event->wheel.{x,y} when OS natural scrolling
+            // (SDL_MOUSEWHEEL_FLIPPED) is enabled, so passing them directly to Dear ImGui
+            // preserves the user's desktop natural/traditional scroll preference.
 
             // Guard against NaN / Inf values (issue #7546)
             if (isnan(wheel_x) || isinf(wheel_x)) wheel_x = 0.0f;

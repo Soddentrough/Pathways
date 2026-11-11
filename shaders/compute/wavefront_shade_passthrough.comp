@@ -6,7 +6,6 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 
 layout(local_size_x = 32) in;
@@ -46,7 +45,7 @@ layout(std430, binding = 5) readonly buffer LightsBuffer {
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -147,12 +146,13 @@ void main() {
         // ReSTIR DI: passthrough (cutout continuation) does not maintain a
         // reservoir; invalidate this pixel's current-frame slot so stale
         // history cannot be tapped next frame (review 2026-10-10 §4.8).
-        if ((ubo.flags & (1 << 9)) != 0) {
+        if ((ubo.flags & (1u << 9)) != 0u) {
             if (bounce == 0u) {
-                currentReservoirs[pixelIndex] = invalidDiReservoir();
                 x1Contexts[pixelIndex] = invalidX1Context();
-            } else if (bounce == 1u) {
-                giReservoirs[pixelIndex] = invalidGiReservoir();
+                if (pc.sppSampleIndex == 0u) {
+                    currentReservoirs[pixelIndex] = invalidDiReservoir();
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
             }
         }
 
@@ -172,7 +172,7 @@ void main() {
             }
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), 0.0));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             if (pc.captureMlData != 0u) {
                 if (isSpecularPath) {
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -181,7 +181,6 @@ void main() {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
                 }
-                accumFfxSignal(pixelCoord, skyContrib, isSpecularPath, bounce == 0u, seed);
             }
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
@@ -336,7 +335,7 @@ void main() {
                                     if (!occluded) {
                                         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                         vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), 0.0));
+                                        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, unshadowed, seed), prev.a));
                                         if (pc.captureMlData != 0u) {
                                             if (isSpecularPath) {
                                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
@@ -345,7 +344,6 @@ void main() {
                                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                                                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, unshadowed, seed), prevDiff.a));
                                             }
-                                            accumFfxSignal(pixelCoord, unshadowed, isSpecularPath, bounce == 0u, seed);
                                         }
                                     }
                                 } else
@@ -353,7 +351,7 @@ void main() {
                                 {
                                     hasShadowRay = true;
                                     shadowCandidate.originDist = vec4(hitPoint + hitNormal * EPSILON, selectedLightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 1.0 : 0.0)));
+                                    shadowCandidate.dirPixelRad = uvec4(packOct32(selectedLightDir), pixelIndex, packHalf2x16(unshadowed.rg), packHalf2x16(vec2(unshadowed.b, isSpecularPath ? 2.0 : 0.0)));
                                 }
                             } else {
                                 ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));

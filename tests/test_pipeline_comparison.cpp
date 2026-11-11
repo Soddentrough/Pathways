@@ -144,16 +144,43 @@ int main() {
         Config cDbgView = Config::parse(3, const_cast<char**>(argvDbgView));
         check_true(cDbgView.debug_view == DebugViewMode::RestirM, "--debug-view restir-m sets DebugViewMode::RestirM");
 
-        const char* argvDenoiser[] = { "pathways", "--relax" };
+        const char* argvDenoiser[] = { "pathways", "--svgf" };
         Config cDenoiser = Config::parse(2, const_cast<char**>(argvDenoiser));
-        check_true(cDenoiser.denoiser_mode == DenoiserMode::Svgf, "--relax sets DenoiserMode::Svgf");
+        check_true(cDenoiser.denoiser_mode == DenoiserMode::Svgf, "--svgf sets DenoiserMode::Svgf");
+
+        const char* argvDenoiserEsvgf[] = { "pathways", "--denoiser", "esvgf" };
+        Config cDenoiserEsvgf = Config::parse(3, const_cast<char**>(argvDenoiserEsvgf));
+        check_true(cDenoiserEsvgf.denoiser_mode == DenoiserMode::Svgf, "--denoiser esvgf sets DenoiserMode::Svgf");
+
+        const char* argvDenoiserUpways[] = { "pathways", "--denoiser", "upways" };
+        Config cDenoiserUpways = Config::parse(3, const_cast<char**>(argvDenoiserUpways));
+        check_true(cDenoiserUpways.denoiser_mode == DenoiserMode::Upways, "--denoiser upways sets DenoiserMode::Upways");
+
+        // Verify removed vaporware/alias flags are strictly rejected
+        auto expectRejected = [](std::initializer_list<const char*> args, const char* label) {
+            std::vector<char*> argv;
+            for (const char* a : args) argv.push_back(const_cast<char*>(a));
+            bool rejected = false;
+            try {
+                (void)Config::parse(static_cast<int>(argv.size()), argv.data());
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            check_true(rejected, label);
+        };
+        expectRejected({ "pathways", "--relax" }, "Removed --relax flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--asvgf" }, "Removed --asvgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "relax" }, "Removed --denoiser relax must throw std::runtime_error");
+        expectRejected({ "pathways", "--scaler", "fsr1" }, "Removed --scaler fsr1 must throw std::runtime_error");
+        expectRejected({ "pathways", "--scaler", "fsr5" }, "Removed --scaler fsr5 must throw std::runtime_error");
+        expectRejected({ "pathways", "--scaler", "gateway" }, "Removed --scaler gateway must throw std::runtime_error");
 
         check_true(cfgDef.capture_reference_spp == 256, "Default capture_reference_spp must be 256");
         const char* argvRefSpp[] = { "pathways", "--capture-reference-spp", "128" };
         Config cRefSpp = Config::parse(3, const_cast<char**>(argvRefSpp));
         check_true(cRefSpp.capture_reference_spp == 128, "--capture-reference-spp sets custom reference SPP");
 
-        check_true(cfgDef.capture_channels == 20, "Default capture_channels must be 20");
+        check_true(cfgDef.capture_channels == 24, "Default capture_channels must be 24 (PTTD v3)");
         check_true(cfgDef.instance_density == 1.0f, "Default instance_density must be 1.0");
         check_true(cfgDef.cull_distance == 0.0f, "Default cull_distance must be 0.0");
 
@@ -305,6 +332,20 @@ int main() {
 
         std::filesystem::remove(testPath, ec);
         std::cout << "  -> 16-bit PNG async screenshot pipeline & naming format verified." << std::endl;
+
+        // Verify uncapped HDR OpenEXR output via TinyEXR
+        std::string exrPath = "screenshots/pw_hdr_test.exr";
+        std::vector<float> hdrPixels(w * h * 4, 0.0f);
+        for (uint32_t i = 0; i < w * h; ++i) {
+            hdrPixels[i * 4 + 0] = 14.5f;
+            hdrPixels[i * 4 + 1] = 3.25f;
+            hdrPixels[i * 4 + 2] = 0.75f;
+            hdrPixels[i * 4 + 3] = 1.0f;
+        }
+        check_true(ImageDumper::saveEXR(exrPath, w, h, hdrPixels.data()), "ImageDumper::saveEXR must succeed");
+        check_true(std::filesystem::exists(exrPath) && std::filesystem::file_size(exrPath) > 64, "EXR file must be non-empty");
+        std::filesystem::remove(exrPath, ec);
+        std::cout << "  -> Uncapped HDR OpenEXR serialization verified." << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

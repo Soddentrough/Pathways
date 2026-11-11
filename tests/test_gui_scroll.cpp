@@ -2,9 +2,14 @@
 #include <cassert>
 #include <cmath>
 #include <limits>
+#include <vector>
 #include <SDL3/SDL.h>
 #include "imgui.h"
 #include "imgui_impl_sdl3.h"
+#include "ui/GuiManager.hpp"
+#include "vulkan/VulkanContext.hpp"
+
+using namespace pathways;
 
 void check_true(bool cond, const char* msg) {
     if (!cond) {
@@ -281,13 +286,13 @@ int main() {
     ImGui::End();
     ImGui::Render();
 
-    // Frame 12: FLIPPED SDL3 wheel scroll DOWN (SDL: y = +1.0f, FLIPPED - Wayland natural scrolling)
-    // SDL3 FLIPPED emits opposite signs; backend MUST invert to prevent snap-back to 0!
+    // Frame 12: FLIPPED SDL3 wheel scroll DOWN (SDL3 already pre-flips wheel.y = -1.0f when SDL_MOUSEWHEEL_FLIPPED)
+    // Backend MUST NOT double-invert SDL3's pre-flipped sign!
     SDL_Event wheelFlip{};
     wheelFlip.type = SDL_EVENT_MOUSE_WHEEL;
     wheelFlip.wheel.windowID = winId;
     wheelFlip.wheel.x = 0.0f;
-    wheelFlip.wheel.y = 1.0f;
+    wheelFlip.wheel.y = -1.0f;
     wheelFlip.wheel.direction = SDL_MOUSEWHEEL_FLIPPED;
     ImGui_ImplSDL3_ProcessEvent(&wheelFlip);
 
@@ -298,8 +303,8 @@ int main() {
     check_true(ImGui::Begin("BackendTestPanel", nullptr, panelFlags), "Begin frame 12");
     renderPanelContent();
     float sY_f12 = ImGui::GetScrollY();
-    check_true(sY_f12 > sY_f11, "FLIPPED wheel scroll DOWN correctly advanced ScrollY (did not snap back to 0)");
-    std::cout << "[PASS] Frame 12: FLIPPED natural wheel scroll DOWN verified (no snap-back)! ScrollY: " << sY_f12 << " px." << std::endl;
+    check_true(sY_f12 > sY_f11, "FLIPPED wheel scroll DOWN preserved SDL3 pre-flipped sign (no double-inversion)");
+    std::cout << "[PASS] Frame 12: FLIPPED natural wheel scroll DOWN verified (no double-inversion)! ScrollY: " << sY_f12 << " px." << std::endl;
     ImGui::End();
     ImGui::Render();
 
@@ -367,6 +372,81 @@ int main() {
 
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext(ctx2);
+
+    // -------------------------------------------------------------------------
+    // Real GuiManager HDR Pipeline Recreation & Popup State Verification
+    // -------------------------------------------------------------------------
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount > 0) {
+            std::cout << "[TEST] Real GuiManager Vulkan 1.4 HDR Pipeline & State Transitions..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "GuiManager Test");
+            GuiManager guiMgr(
+                sdlWin,
+                vkCtx.getInstance(),
+                vkCtx.getPhysicalDevice(),
+                vkCtx.getDevice(),
+                vkCtx.getGraphicsQueueFamily(),
+                vkCtx.getGraphicsQueue(),
+                VK_FORMAT_B8G8R8A8_UNORM,
+                2, 2,
+                HdrDisplayMode::SDR,
+                200.0f
+            );
+
+            check_true(!guiMgr.needsPipelineUpdate(VK_FORMAT_B8G8R8A8_UNORM, HdrDisplayMode::SDR, 200.0f),
+                       "GuiManager must not need pipeline update for matching SDR format/mode/nits");
+            check_true(!guiMgr.needsPipelineUpdate(VK_FORMAT_B8G8R8A8_UNORM, HdrDisplayMode::SDR, 250.0f),
+                       "GuiManager must ignore paper-white nits changes while in SDR mode");
+            check_true(guiMgr.needsPipelineUpdate(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 200.0f),
+                       "GuiManager must detect HDR10 PQ format/mode change");
+
+            guiMgr.updateSwapchainFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 200.0f, 2);
+            check_true(!guiMgr.needsPipelineUpdate(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 200.0f),
+                       "GuiManager HDR10 PQ 200 nits pipeline recreation updated state cleanly");
+            check_true(guiMgr.needsPipelineUpdate(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 250.0f),
+                       "GuiManager must detect paper-white nits change in HDR mode");
+
+            guiMgr.updateSwapchainFormat(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 250.0f, 2);
+            check_true(!guiMgr.needsPipelineUpdate(VK_FORMAT_A2B10G10R10_UNORM_PACK32, HdrDisplayMode::HDR10, 250.0f),
+                       "GuiManager HDR10 PQ 250 nits pipeline recreation updated state cleanly");
+
+            guiMgr.updateSwapchainFormat(VK_FORMAT_R16G16B16A16_SFLOAT, HdrDisplayMode::scRGB, 203.0f, 2);
+            check_true(!guiMgr.needsPipelineUpdate(VK_FORMAT_R16G16B16A16_SFLOAT, HdrDisplayMode::scRGB, 203.0f),
+                       "GuiManager scRGB Linear pipeline recreation updated state cleanly");
+
+            check_true(!guiMgr.hasOpenPopupOrActiveItem(), "No popup open initially");
+            check_true(!guiMgr.closeOpenPopupOrActiveItem(), "closeOpenPopupOrActiveItem returns false when idle");
+            check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors during GuiManager HDR pipeline switches");
+            std::cout << "[PASS] Real GuiManager HDR10 PQ & scRGB Linear pipeline recreation verified (0 validation errors)." << std::endl;
+        }
+    }
+
     SDL_DestroyWindow(sdlWin);
     SDL_Quit();
 

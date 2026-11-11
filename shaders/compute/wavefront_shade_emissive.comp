@@ -6,33 +6,14 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
 
-#define WF_ENABLE_FFX_SIGNALS 1
 #include "wavefront_common.glsl"
 #include "procedural_noise.glsl"
-#include "restir_common.glsl"
-
-layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
-    DiReservoir currentReservoirs[];
-};
-
-// ReSTIR GI state (docs/RESTIR_PT_DESIGN.md): these materials neither
-// produce a GI candidate nor an X1 diffuse context; both slots are
-// invalidated so stale history cannot be tapped next frame.
-layout(std430, binding = 37) buffer X1ContextsBuffer {
-    X1Context x1Contexts[];
-};
-
-layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
-    GiReservoir giReservoirs[];
-};
-
-layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
-    GiReservoir giHistoryReservoirs[];
-};
 
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 23, rgba16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 33, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
@@ -72,9 +53,29 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 };
 
 #include "mis_common.glsl"
+#include "restir_common.glsl"
+#include "bsdf_standard.glsl"
+
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
+
+layout(std430, binding = 37) buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    GiReservoir giReservoirs[];
+};
+
+layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
+    GiReservoir giHistoryReservoirs[];
+};
+
+#include "restir_gi_reuse.glsl"
 
 layout(binding = 7) uniform sampler2D environmentMap;
-layout(binding = 8) uniform sampler2D sceneTextures[512];
+DECLARE_SCENE_TEXTURES_BINDING(8)
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -110,6 +111,8 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint activeCount = queueCounters.currentMaterialCounts[3]; // Emissive queue
     bool inRange = (idx < activeCount);
+    bool hasGiShadowRay = false;
+    PackedShadowRay giShadowCandidate;
 
     if (inRange) {
         uint rayIdx = materialIndices[3u * pc.maxQueueCapacity + idx];
@@ -131,15 +134,29 @@ void main() {
         bool isSpecularPath, causticApplied;
         unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied);
 
-        // ReSTIR DI: emissive surfaces do not maintain a reservoir; invalidate
-        // this pixel's current-frame slot so stale history cannot be tapped
-        // next frame (review 2026-10-10 §4.8).
-        if ((ubo.flags & (1 << 9)) != 0) {
+        // ReSTIR PT: primary emissive hits invalidate DI/X1/GI; secondary
+        // emissive hits (e.g. ceiling area light) spawned from diffuse X1
+        // surfaces evaluate their MIS-weighted emitter radiance AND run GI
+        // reuse over the complementary domain (M = 1, w_self = 0).
+        if ((ubo.flags & (1u << 9)) != 0u) {
             if (pc.currentBounce == 0u) {
-                currentReservoirs[pixelIndex] = invalidDiReservoir();
                 x1Contexts[pixelIndex] = invalidX1Context();
+                if (pc.sppSampleIndex == 0u) {
+                    currentReservoirs[pixelIndex] = invalidDiReservoir();
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
             } else if (pc.currentBounce == 1u) {
-                giReservoirs[pixelIndex] = invalidGiReservoir();
+                X1Context giCtx = x1Contexts[pixelIndex];
+                if (x1ContextValid(giCtx)) {
+                    restirGiRunReuse(
+                        pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
+                        pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                        giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
+                        seed, hasGiShadowRay, giShadowCandidate
+                    );
+                } else if (pc.sppSampleIndex == 0u) {
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                }
             }
         }
         vec3 throughput = vec3(throughputHalf);
@@ -173,7 +190,6 @@ void main() {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), prevDiff.a));
                 }
-                accumFfxSignal(pixelCoord, accumRadiance, isSpecularPath, pc.currentBounce == 0u, seed);
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
         } else {
@@ -243,11 +259,17 @@ void main() {
             }
 
             // MIS weight against NEE at the spawning vertex (mis_common.glsl).
+            uint inPdfCode = unpackRayPdfCode(state);
             float emitMisW = (pc.currentBounce == 0u) ? 1.0
-                : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, unpackRayPdfCode(state), pc.numLights);
+                : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, inPdfCode, pc.numLights);
             vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (pc.currentBounce > 0u) {
-                emissiveContrib = clampIndirectRadiance(emissiveContrib, pc.indirectClamp);
+                float effClamp = (!isSpecularPath && inPdfCode == 0u && pc.currentBounce >= 2u)
+                    ? (causticApplied ? 0.0 : min(pc.indirectClamp, 3.0))
+                    : computeAdaptiveFireflyClamp(pc.indirectClamp, inPdfCode);
+                emissiveContrib = (effClamp <= 0.0 && causticApplied)
+                    ? vec3(0.0)
+                    : clampIndirectRadiance(emissiveContrib, effClamp);
             }
             accumRadiance += emissiveContrib;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
@@ -266,8 +288,27 @@ void main() {
                     float emissiveFlag = (pc.currentBounce == 0u) ? 1.0 : prevDiff.a;
                     imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), emissiveFlag));
                 }
-                accumFfxSignal(pixelCoord, accumRadiance, isSpecularPath, pc.currentBounce == 0u, seed);
             }
+        }
+    }
+
+    // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
+    uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
+    uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
+    uint giShadowWaveCount = subgroupBallotBitCount(giShadowBallot);
+
+    uint giShadowGlobalOffset = 0u;
+    if (giShadowWaveCount > 0u) {
+        if (subgroupElect()) {
+            giShadowGlobalOffset = atomicAdd(queueCounters.shadowRayCount, giShadowWaveCount);
+        }
+        giShadowGlobalOffset = subgroupBroadcastFirst(giShadowGlobalOffset);
+    }
+
+    if (hasGiShadowRay) {
+        uint targetIdxGiShadow = giShadowGlobalOffset + giShadowLaneSlot;
+        if (targetIdxGiShadow < pc.maxQueueCapacity) {
+            shadowRays[targetIdxGiShadow] = giShadowCandidate;
         }
     }
 

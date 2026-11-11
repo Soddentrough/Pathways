@@ -1,61 +1,54 @@
-# Pathways: Gateway (4-Pass) vs. Upways (3-Pass) Architecture & Integration
+# Pathways: Upways 3.0 FP8 WMMA Neural Reconstructor & Continuous Subpixel Resolve
 
-This document records the architectural separation, shader contracts, descriptor layouts, memory footprints, and verification protocols for the two distinct real-time denoising and super-resolution pipelines in **Pathways**:
-
-1. **`--denoiser gateway` / `--scaler gateway` ([`GatewayPipeline`](file:///home/naoki/Development/Pathways/src/rt/GatewayPipeline.cpp))**:
-   - **4-Pass Parameter-Guided Analytical E-SVGF Pipeline** (`1,072` FP16 weights = `2,144` bytes).
-   - Uses diffuse-only demodulation, a single-quad $16 \to 32 \to 16$ WMMA MLP to modulate analytical SVGF filter parameters, a 2-step dilated $3\times 3$ À-Trous wavelet cascade ($s \in \{2, 6\}$), and a single-stage $3\times 3$ subpixel upscale resolve.
-2. **`--denoiser upways` / `--scaler upways` ([`UpwaysPipeline`](file:///home/naoki/Development/Pathways/src/rt/UpwaysPipeline.cpp))**:
-   - **3-Pass Combined Neural Spatiotemporal Reconstructor & Multi-Scale Kernel-Predicting Upscaler** (`40,256` FP16 weights = `80,512` bytes).
-   - Eliminates the À-Trous wavelet cascade (`upways_atrous.comp` does not exist). Uses co-designed diffuse + metallic-Fresnel specular demodulation, dielectric-glass-aware firefly suppression, a Shift-Invariant 3-Scale Spatiotemporal Recurrent 2D Halo-WMMA U-Net ($13\times 13$ quad = $26\times 26$ pixel receptive field) with variance/history-gated direct log-radiance refinement, and a fused 2-stage hierarchical multi-scale neural KPN ($s=3$ coarse with 5-tap coplanar cardinal extremum suppression + $s=1$ fine = hole-free $9\times 9$ / `81`-tap receptive field) inside shared LDS.
+This document specifies the shader contracts, descriptor layouts, memory footprint, and verification suite for **Upways 3.0** ([`UpwaysPipeline`](file:///home/naoki/Development/Pathways/src/rt/UpwaysPipeline.cpp)), Pathways' in-development real-time RDNA 4 neural denoising and super-resolution pipeline (`--denoiser upways` / `--upscaler upways` / `--scaler upways <preset>`).
 
 ---
 
-## 1. Side-by-Side Architectural Separation
+## 1. Architectural Overview
 
-| Component | `--denoiser gateway` (`GatewayPipeline`) | `--denoiser upways` (`UpwaysPipeline`) |
-| :--- | :--- | :--- |
-| **Shader Files** | `gateway_common.glsl`, `gateway_temporal.comp`, `gateway_neural_guide.comp`, `gateway_atrous.comp`, `gateway_upscale_resolve.comp` | `upways_common.glsl`, `upways_temporal.comp`, `upways_neural_guide.comp`, `upways_upscale_resolve.comp` (**Zero `upways_atrous.comp`**) |
-| **Compute Passes** | **4 Passes** (5 dispatches: Temporal $\to$ Quad MLP $\to$ À-Trous $s=2$ $\to$ À-Trous $s=6$ $\to$ Upscale) | **3 Passes** (3 dispatches: Temporal $\to$ 3-Scale U-Net $\to$ Fused 2-Stage Multi-Scale KPN Upscale) |
-| **Specular Demodulation** | None (diffuse-only demodulation; raw specular filtered directly) | **Co-Designed Metallic-Fresnel Specular Demodulation** (`demodulateSpecular` / `remodulateSpecular` using per-pixel `metallic`) |
-| **Neural Network** | Single-quad 2-layer MLP ($16 \to 32 \to 16$, zero spatial gather, zero recurrence) | **3-Scale Spatiotemporal Recurrent 2D Halo-WMMA U-Net** ($16\times 16 \to 8\times 8 \to 4\times 4$ quads, 5-ch hidden state, direct log-radiance refinement) |
-| **Weight Footprint** | `1,072` FP16 params = **`2,144` bytes** (`gateway_default_weights.hpp`) | `40,256` FP16 params = **`80,512` bytes** (`upways_weights.hpp` / `upways_default_weights.hpp`) |
-| **Spatial Filtering & Upscaling** | 2 global `rgba16f` À-Trous image passes ($s=2, 6$) + 1-stage $3\times 3$ resolve | **Fused 2-Stage Multi-Scale Neural KPN in `24x24` LDS** (Stage 1 coarse $s=3$ + Stage 2 fine $s=1$ = hole-free $9\times 9$ / `81`-tap KPN in one pass) |
+Upways 3.0 is a **3-pass** neural spatiotemporal reconstructor and continuous subpixel upscaler (`73,686` parameters = `89,536` bytes: `69,632 B` FP8 E4M3 WMMA 16×16 blocks + `19,904 B` FP32 scales, biases, 3×3 depthwise filters, and residual `skip_scale`, [`upways_weights.hpp`](file:///home/naoki/Development/Pathways/src/rt/upways_weights.hpp)):
+- **Co-Designed Demodulation**: Separate diffuse albedo demodulation and metallic-Fresnel specular demodulation (`demodulateDiffuse` / `demodulateSpecular` / `remodulateDiffuse` / `remodulateSpecular`) paired with invertible log-irradiance compression (`logIrradianceEncode` / `logIrradianceDecode`) in [`upways_common.glsl`](file:///home/naoki/Development/Pathways/shaders/compute/upways_common.glsl).
+- **6-Stage 3-Scale RDNA 4 FP8 E4M3 WMMA Spatiotemporal Backbone**: Executes on `VK_KHR_cooperative_matrix` + `VK_EXT_float_e4m3` Wave32 subgroups (`32x4` workgroup = 4 Wave32 subgroups covering `16x8` pixels) across `L0` (render), `L1` ($1/2$), and `L2` ($1/4$) scales, including a dilated ($d=3$) bottleneck, widened `DEC0` (`32 -> 64 -> 32`) inverted-bottleneck decoder, and a 16-channel GRU-gated recurrent hidden state stored in a 4-layer `RGBA16F` `image2DArray`.
+- **Continuous Subpixel Ray-Locus Gather & Catmull-Rom Resolve**: Register-resident (`0 B` LDS) display-rate pass performing a 9-tap continuous subpixel ray-locus gather (`w0..w8`, subpixel phase offset, log residual refinement) fused with a 5-tap Jimenez anti-ringing Catmull-Rom high-resolution temporal resolve and zero-copy ping-pong history swap. Runs either coupled with super-resolution (`--upscaler upways`, Halton base-(2,3) camera jitter enabled) or standalone at native `1.0x` resolution (`--denoiser upways`).
+- **Default Neural Execution & Debug Fallback**: By default (`config.upways_heuristic_fallback == false`), the trained FP8+FP32 weights drive reconstruction. Passing `--upways-heuristic` enables the analytical bilateral fallback for A/B debugging.
+- **Zero Idle VRAM**: `UpwaysPipeline` is lazily allocated on first activation and released when inactive.
 
 ---
 
-## 2. Upways 3-Pass Descriptor & Memory Contract ([`UpwaysPipeline.cpp`](file:///home/naoki/Development/Pathways/src/rt/UpwaysPipeline.cpp))
+## 2. 3-Pass Descriptor & Memory Contract ([`UpwaysPipeline.cpp`](file:///home/naoki/Development/Pathways/src/rt/UpwaysPipeline.cpp))
 
-### Pass 1: [`upways_temporal.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_temporal.comp) (`16x16` Workgroup, `6,192 B` LDS)
-- **Bindings `0..15`**: Storage images (`uCurrentDiffuse`, `uCurrentSpecular` with `.a = metallic`, `uNormalDepth`, `uPrevNormalDepth`, `uMotionVectors`, `uAlbedoRoughness`, `uSpecularMotion`, `uPrevSpecularMotion`, `uHistoryDiffuseIn`, `uHistorySpecularIn`, `uHistoryMomentsIn`, `uTemporalDiffuseOut`, `uTemporalSpecularOut`, `uReprojDiffuseOut`, `uReprojSpecularOut`, `uHistoryMomentsOut`).
-- **Binding `16`**: `NeuralFeaturesOutBuffer` (`16` `float16_t`s = `2 * uvec4` per $2\times 2$ quad).
+All three passes share the unified `56`-byte [`UpwaysPushConstants`](file:///home/naoki/Development/Pathways/src/rt/UpwaysPipeline.hpp#L20-L36) block.
 
-### Pass 2: [`upways_neural_guide.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_neural_guide.comp) (`32x8` Workgroup, 8 Wave32 Subgroups, `32,768 B` LDS)
-- **Binding `0`**: `NeuralFeaturesInBuffer`
-- **Binding `1`**: `WeightsBuffer` (`80,512` bytes: `156` $16\times 16$ FP16 WMMA tiles + 9 bias vectors)
-- **Bindings `2..7`**: `uTemporalDiffuseInOut`, `uTemporalSpecularInOut`, `uReprojDiffuseIn`, `uReprojSpecularIn`, `uHistoryDiffuseOut`, `uHistorySpecularOut`
-- **Binding `8`**: `UpscaleKernelOutBuffer` (`3 * uvec4` = `48` bytes = `24` `float16_t`s per $2\times 2$ quad: 9 neural kernel weights `w0..w8`, `detailGain`, 4 neural edge-stopping parameters `phiZ, phiN, phiLD, phiLS`, 2 mean log-radiance refinement scalars, and 5 recurrent hidden state channels `hNew0..hNew4`).
+### Pass 1: [`upways_temporal.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_temporal.comp) (`16x16` Workgroup, `6,624 B` / `6.47 KB` LDS)
+- **Bindings `0..6`** (`storageImage`): Current render-rate G-buffer & radiance inputs (`uDemodDiffuse`, `uDemodSpecular`, `uAlbedoRoughness`, `uNormalDepth`, `uSurfaceMotion`, `uSpecularMotion`, `uAuxMetadata`).
+- **Bindings `7..11`** (`combinedImageSampler`): Linear-sampled ping-pong history (`uPrevIrrDiffHr`, `uPrevIrrSpecHr`, `uPrevGeomNd`, `uPrevGeomHitT`, `uPrevNeuralHidden` `sampler2DArray`).
+- **Bindings `12..19`** (`storageImage`): Current geometry history & render-rate transients (`uCurrGeomNd`, `uCurrGeomHitT`, `uTransientLogDiff`, `uTransientLogSpec`, `uTransientGuideDiff`, `uTransientGuideSpec`, `uTransientDilatedMv`, `uTransientTemporalConf`).
+- **Binding `20`** (`storageBuffer`): `PyramidFp8Buf` (`PYR_X0` 32-ch + `PYR_HW0` 16-ch FP8 E4M3 packed feature pyramid).
 
-### Pass 3: [`upways_upscale_resolve.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_upscale_resolve.comp) (`16x16` Workgroup, `19,884 B` LDS)
-- **Bindings `0..1`**: `uDenoisedDiffuse` (`m_tempDiffImage`), `uDenoisedSpecular` (`m_tempSpecImage`)
-- **Bindings `2..4`**: `uNormalDepth`, `uAlbedoRoughness`, `uMotionVectors`
-- **Binding `5`**: `UpscaleKernelInBuffer` (`3 * uvec4` per $2\times 2$ quad)
-- **Bindings `6..8`**: `uDisplayHistoryIn`, `uDisplayOut`, `uDisplayHistoryOut`
-- **Binding `9`**: `uSpecularMetallic` (bound to `m_cachedDemodSpecularView` where `.a` carries exact per-render-pixel `metallic` $\in [0, 1]$ for `remodulateSpecular`).
+### Pass 2: [`upways_neural_guide.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_neural_guide.comp) (`32x4` Workgroup, 4 Wave32 Subgroups, 6 Specialized Stages `SPEC_STAGE_ID = 0..5`, $\le 32\text{ KB}$ LDS)
+- **Binding `0`** (`storageBuffer`): `WeightFp8Buf` (`69,632 B` packed `uvec4` FP8 E4M3 16×16 WMMA weight blocks).
+- **Binding `1`** (`storageBuffer`): `WeightFp32Buf` (`19,904 B` FP32 per-channel scales, biases, 3×3 depthwise filters, and `skip_scale`).
+- **Binding `2`** (`storageBuffer`): `PyramidFp8Buf` (`L0` / `L1` / `L2` multi-scale FP8 E4M3 intermediate activations).
+- **Binding `3`** (`storageBuffer`): `SubpixelParamsBuf` (16-ch FP16 subpixel gather & residual parameters per render pixel = `2 * uvec4`).
+- **Binding `4`** (`storageImage`): `uCurrNeuralHidden` (4-layer `RGBA16F` `image2DArray` storing 16-ch GRU-updated recurrent hidden state).
+
+### Pass 3: [`upways_upscale_resolve.comp`](file:///home/naoki/Development/Pathways/shaders/compute/upways_upscale_resolve.comp) (`16x16` Workgroup, `0 B` LDS Register-Resident)
+- **Bindings `0..6`** (`storageImage`): Render-rate transients & normals (`uNormalDepth`, `uTransientLogDiff`, `uTransientLogSpec`, `uTransientGuideDiff`, `uTransientGuideSpec`, `uTransientDilatedMv`, `uTransientTemporalConf`).
+- **Binding `7`** (`storageBuffer`): `SubpixelParamsBuf` (`2 * uvec4` FP16 neural parameters per render pixel).
+- **Binding `8`** (`storageBuffer`): `WeightFp32Buf` (reads `SKIP_SCALE_F32_OFFSET` for diffuse/specular residual skip scaling).
+- **Bindings `9..12`** (`combinedImageSampler`): High-resolution ping-pong history (`uPrevIrrDiffHr`, `uPrevIrrSpecHr`, `uPrevGuideDiffHr`, `uPrevGuideSpecHr`).
+- **Bindings `13..17`** (`storageImage`): Resolved display output `uOutputColor` + next-frame high-resolution ping-pong history (`uCurrIrrDiffHr`, `uCurrIrrSpecHr`, `uCurrGuideDiffHr`, `uCurrGuideSpecHr`).
 
 ---
 
-## 3. Engine Verification Commands
+## 3. Verification Suite
 
-### Automated Invariant Tests
 ```bash
-/home/naoki/Development/Pathways/build/linux-release/bin/test_upways_pipeline
+ctest --preset linux-test -R "UpwaysPipeline|FidelityFxFeatures"
 ```
 Verifies:
-- Real shader push constant struct layouts for both `Upways` (3-pass: `20B`, `36B`, `32B`) and `Gateway` (4-pass: `20B`, `36B`, `12B`, `32B`).
-- Invertible log transform mathematical roundtrip across $0$ to $10,000$ nits.
+- Unified `56`-byte `UpwaysPushConstants` ABI and multi-scale `computeUpwaysPyramidDims` alignment.
+- Invertible log-irradiance encode/decode roundtrip across $0$ to $10,000$ nits ($< 1\%$ relative error).
 - Co-designed diffuse albedo and metallic-Fresnel specular demodulation/remodulation roundtrip.
-- `Upways` (`40,256` FP16 params = `80,512` bytes) and `Gateway` (`1,072` FP16 params = `2,144` bytes) weight buffer offsets and embedded weight arrays.
-- Disocclusion confidence gating and 90-degree camera flick rejection.
-- 3-Pass `Upways` LDS footprints (`Pass 1 = 6.05 KB`, `Pass 2 = 32.00 KB`, `Pass 3 = 19.42 KB`, all $\le 32\text{ KB}$).
-- CLI flag separation (`--denoiser gateway` / `--scaler gateway` vs. `--denoiser upways` / `--scaler upways`).
+- `73,686`-parameter (`89,536`-byte: `69,632 B` FP8 + `19,904 B` FP32) weight buffer layout, embedded header vs `data/models/upways_weights.bin` byte-exact integrity, and finite non-zero parameter checks.
+- End-to-end RDNA 4 GPU execution (`0` Vulkan validation errors/warnings), finite output verification, and PSNR / edge-retention regression checks in both `1.0x` native denoiser and `1.5x` super-resolution modes.

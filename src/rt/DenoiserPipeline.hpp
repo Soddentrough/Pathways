@@ -74,8 +74,7 @@ public:
         float    depthThreshold;            // Default: 0.08f (static geometry)
         float    dynamicDepthThreshold;     // Default: 0.15f (dynamic objects)
         float    mvDiscrepancyThreshold;    // Default: 2.00f
-        uint32_t isRayRegeneration;         // 1 = AMD FSR Ray Regeneration 1.2.1 (4-Signal + HitT)
-        float    _pad[2];
+        float    _pad[3];
     };
     static_assert(sizeof(FusedTemporalPushConstants) == 80, "FusedTemporalPushConstants must be 80 bytes");
 
@@ -104,8 +103,7 @@ public:
         float    aspectRatio;
         float    edgeThresholdLow;       // Default: 0.35f (ramp top)
         uint32_t accumulatedSamples;     // Used only if ENABLE_STATIONARY_PREVIEW
-        uint32_t isRayRegeneration;      // 1 = AMD FSR Ray Regeneration 1.2.1 Compose
-        float    padding;
+        float    padding[2];
     };
     static_assert(sizeof(AtrousCoarseRemodulatePushConstants) == 48, "AtrousCoarseRemodulatePushConstants must be 48 bytes");
 
@@ -139,10 +137,6 @@ public:
         Image* specularMotion,
         const CameraMatrices& cameraMatrices,
         DenoiserMode denoiserMode = DenoiserMode::Svgf,
-        Image* ffxDirectDiffuse = nullptr,
-        Image* ffxDirectSpecular = nullptr,
-        Image* ffxIndirectDiffuse = nullptr,
-        Image* ffxIndirectSpecular = nullptr,
         bool fastUpscalerCoupled = false
     );
 
@@ -176,11 +170,7 @@ private:
         Image* normalDepth,
         Image* albedoRoughness,
         Image* accumImage,
-        Image* specularMotion,
-        Image* ffxDirectDiffuse = nullptr,
-        Image* ffxDirectSpecular = nullptr,
-        Image* ffxIndirectDiffuse = nullptr,
-        Image* ffxIndirectSpecular = nullptr
+        Image* specularMotion
     );
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotQueriesRecorded = { false, false };
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotFastCoupled = { false, false };

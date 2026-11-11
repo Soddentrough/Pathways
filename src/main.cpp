@@ -236,7 +236,7 @@ int main(int argc, char* argv[]) {
             const auto initStats = engine.getStats();
             const std::string expectedFsr3 = initStats.supports_fsr3 ? "FSR 3.1" : "None";
             const std::string expectedFsr4 = initStats.supports_fsr4 ? "FSR 4.1 ML" : "None";
-            const std::string expectedRayRegen = initStats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1" : "None";
+            const std::string expectedRayRegen = initStats.supports_fsr_rr ? "FFX Ray Regeneration" : "None";
 
             // 1. Baseline Native 1.0x + Off (MC)
             cfg.upscaler_mode = pathways::UpscalerMode::None;
@@ -267,27 +267,24 @@ int main(int argc, char* argv[]) {
             cfg.render_scale = 0.6666667f;
             if (!stepAndVerify("3. FSR 4.1 ML Request (Runtime Gating)", 4, expectedFsr4, "None")) return 1;
 
-            // 4. Switch to Upways SR and Gateway SR, then back to FSR 3.1 and Native 1.0x
+            // 4. Switch to Upways SR (neural + heuristic debug toggle), then back to FSR 3.1 and Native 1.0x
             if (initStats.has_cooperative_matrix) {
                 cfg.upscaler_mode = pathways::UpscalerMode::Upways;
                 cfg.upways_superres = true;
-                cfg.gateway_superres = false;
+                cfg.upways_heuristic_fallback = false;
                 cfg.render_scale = 0.6666667f;
-                if (!stepAndVerify("4a. Upways SR (0.67x)", 4, "Upways", "None")) return 1;
+                if (!stepAndVerify("4a. Upways SR Neural (0.67x)", 4, "Upways", "None")) return 1;
 
-                cfg.upscaler_mode = pathways::UpscalerMode::Gateway;
-                cfg.upways_superres = false;
-                cfg.gateway_superres = true;
-                cfg.render_scale = 0.6666667f;
-                if (!stepAndVerify("4b. Gateway SR (0.67x)", 4, "Gateway", "None")) return 1;
+                cfg.upways_heuristic_fallback = true;
+                if (!stepAndVerify("4b. Upways SR Heuristic Debug Fallback (0.67x)", 4, "Upways", "None")) return 1;
+                cfg.upways_heuristic_fallback = false;
             }
 
             cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.upways_superres = false;
-            cfg.gateway_superres = false;
             cfg.render_scale = 0.6666667f;
-            if (!stepAndVerify("4c. Switch Gateway SR -> FSR 3.1 (0.67x)", 4, expectedFsr3, "None")) return 1;
+            if (!stepAndVerify("4c. Switch Upways SR -> FSR 3.1 (0.67x)", 4, expectedFsr3, "None")) return 1;
 
             cfg.upscaler_mode = pathways::UpscalerMode::None;
             cfg.render_scale = 1.0f;
@@ -303,15 +300,12 @@ int main(int argc, char* argv[]) {
             if (initStats.has_cooperative_matrix) {
                 cfg.denoiser_mode = pathways::DenoiserMode::Upways;
                 if (!stepAndVerify("5c. Native 1.0x + Upways Denoiser", 4, "None", "Upways")) return 1;
-
-                cfg.denoiser_mode = pathways::DenoiserMode::Gateway;
-                if (!stepAndVerify("5d. Native 1.0x + Gateway Denoiser", 4, "None", "Gateway")) return 1;
             }
 
             cfg.denoiser_mode = pathways::DenoiserMode::None;
-            if (!stepAndVerify("5e. Native 1.0x + Off (MC)", 4, "None", "None")) return 1;
+            if (!stepAndVerify("5d. Native 1.0x + Off (MC)", 4, "None", "None")) return 1;
 
-            // 6. Combined FSR 3.1 (0.67x) + Denoisers + GI & Caching (NRC, ReSTIR PT, Caustics)
+            // 6. Combined FSR 3.1 / FSR 4.1 ML (0.67x) + Denoisers + GI & Caching (NRC, ReSTIR PT, Caustics)
             cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
@@ -322,10 +316,31 @@ int main(int argc, char* argv[]) {
                 cfg.denoiser_mode = pathways::DenoiserMode::Upways;
                 if (!stepAndVerify("6b. FSR 3.1 (0.67x) + Upways Denoiser", 4, expectedFsr3, "Upways")) return 1;
 
-                cfg.denoiser_mode = pathways::DenoiserMode::Gateway;
-                if (!stepAndVerify("6c. FSR 3.1 (0.67x) + Gateway Denoiser", 4, expectedFsr3, "Gateway")) return 1;
+                if (initStats.supports_fsr4) {
+                    cfg.fsr_version = pathways::FsrVersion::Fsr4;
+                    cfg.denoiser_mode = pathways::DenoiserMode::Upways;
+                    if (!stepAndVerify("6c. FSR 4.1 ML (0.67x) + Upways Denoiser", 4, expectedFsr4, "Upways")) return 1;
+
+                    cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
+                    if (!stepAndVerify("6d. FSR 4.1 ML (0.67x) + E-SVGF", 4, expectedFsr4, "SVGF")) return 1;
+
+                    // Verify live transition from coupled FSR 4.1 ML + Upways Denoiser -> Upways SR -> Native Upways Denoiser
+                    cfg.upscaler_mode = pathways::UpscalerMode::Upways;
+                    cfg.upways_superres = true;
+                    cfg.denoiser_mode = pathways::DenoiserMode::Upways;
+                    if (!stepAndVerify("6e. Switch FSR4+Upways -> Upways SR (0.67x)", 4, "Upways", "Upways")) return 1;
+
+                    cfg.upscaler_mode = pathways::UpscalerMode::None;
+                    cfg.upways_superres = false;
+                    cfg.render_scale = 1.0f;
+                    cfg.denoiser_mode = pathways::DenoiserMode::Upways;
+                    if (!stepAndVerify("6f. Switch Upways SR -> Native Upways Denoiser (1.0x)", 4, "None", "Upways")) return 1;
+                }
             }
 
+            cfg.upscaler_mode = pathways::UpscalerMode::FSR;
+            cfg.fsr_version = pathways::FsrVersion::Fsr3;
+            cfg.render_scale = 0.6666667f;
             cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
             cfg.enable_nrc = true;
             cfg.nrc_backend = pathways::NrcBackend::FfxRadianceCache;

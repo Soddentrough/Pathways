@@ -37,20 +37,8 @@ layout(push_constant) uniform AtrousCoarseRemodulatePushConstants {
     float aspectRatio;
     float edgeThresholdLow;      // 0.35 (ramp top)
     uint  accumulatedSamples;    // Used only if ENABLE_STATIONARY_PREVIEW
-    uint  isRayRegeneration;     // 1 = AMD FSR Ray Regeneration Compose (re-modulate specular BRDF)
-    float padding;
+    float padding[2];
 } pc;
-
-// AMD FidelityFX Denoiser (Ray Regeneration 1.2.1) split-sum BRDF re-modulation factor
-vec3 ffxApproximateSpecBrdf(vec3 specAlbedo, float roughness, float NoV) {
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.04, -0.04);
-    vec4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * clamp(NoV, 0.0, 1.0))) * r.x + r.y;
-    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
-    vec3 f0 = mix(vec3(0.04), clamp(specAlbedo, vec3(0.04), vec3(1.0)), 0.5);
-    return max(f0 * AB.x + vec3(AB.y), vec3(0.05));
-}
 
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);

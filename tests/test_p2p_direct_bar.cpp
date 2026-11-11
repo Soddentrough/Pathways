@@ -33,8 +33,21 @@ int main() {
         return 0;
     }
 
-    std::vector<VkPhysicalDevice> gpus(gpuCount);
-    vkEnumeratePhysicalDevices(instance, &gpuCount, gpus.data());
+    std::vector<VkPhysicalDevice> allDevs(gpuCount);
+    vkEnumeratePhysicalDevices(instance, &gpuCount, allDevs.data());
+    std::vector<VkPhysicalDevice> gpus;
+    for (VkPhysicalDevice pd : allDevs) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(pd, &props);
+        if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+            gpus.push_back(pd);
+        }
+    }
+    if (gpus.size() < 2) {
+        std::cout << "Less than 2 hardware Vulkan 1.4 GPUs found (" << gpus.size() << "). Skipping P2P test." << std::endl;
+        vkDestroyInstance(instance, nullptr);
+        return 0;
+    }
 
     std::vector<const char*> devExts = {
         "VK_KHR_external_memory_fd",
@@ -203,9 +216,98 @@ int main() {
         return 1;
     }
 
-    std::cout << "[SUCCESS] P2P Direct BAR DMA-BUF memory bound across Dual GPUs successfully!" << std::endl;
+    // 6. Execute real GPU 1 -> GPU 0 payload transfer across the DMA-BUF mapping!
+    VkQueue q0 = VK_NULL_HANDLE, q1 = VK_NULL_HANDLE;
+    vkGetDeviceQueue(dev0, 0, 0, &q0);
+    vkGetDeviceQueue(dev1, 0, 0, &q1);
+
+    uint32_t hostVisIdx0 = UINT32_MAX;
+    for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
+        const auto flags = memProps0.memoryTypes[i].propertyFlags;
+        if ((flags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+            (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            hostVisIdx0 = i;
+            break;
+        }
+    }
+    assert(hostVisIdx0 != UINT32_MAX);
+
+    VkBufferCreateInfo rbBufInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    rbBufInfo.size = bufferSize;
+    rbBufInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    rbBufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer rbBuf0 = VK_NULL_HANDLE;
+    if (vkCreateBuffer(dev0, &rbBufInfo, nullptr, &rbBuf0) != VK_SUCCESS) return 1;
+
+    VkMemoryRequirements rbReq{};
+    vkGetBufferMemoryRequirements(dev0, rbBuf0, &rbReq);
+    VkMemoryAllocateInfo rbAlloc{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    rbAlloc.allocationSize = rbReq.size;
+    rbAlloc.memoryTypeIndex = hostVisIdx0;
+    VkDeviceMemory rbMem0 = VK_NULL_HANDLE;
+    if (vkAllocateMemory(dev0, &rbAlloc, nullptr, &rbMem0) != VK_SUCCESS) return 1;
+    if (vkBindBufferMemory(dev0, rbBuf0, rbMem0, 0) != VK_SUCCESS) return 1;
+
+    VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    cpInfo.queueFamilyIndex = 0;
+    VkCommandPool cp0 = VK_NULL_HANDLE, cp1 = VK_NULL_HANDLE;
+    vkCreateCommandPool(dev0, &cpInfo, nullptr, &cp0);
+    vkCreateCommandPool(dev1, &cpInfo, nullptr, &cp1);
+
+    VkCommandBufferAllocateInfo cbInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbInfo.commandBufferCount = 1;
+    cbInfo.commandPool = cp1;
+    VkCommandBuffer cmd1 = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(dev1, &cbInfo, &cmd1);
+    cbInfo.commandPool = cp0;
+    VkCommandBuffer cmd0 = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(dev0, &cbInfo, &cmd0);
+
+    constexpr uint32_t kPattern = 0xA5C35AA5u;
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd1, &beginInfo);
+    vkCmdFillBuffer(cmd1, buf1, 0, bufferSize, kPattern);
+    vkEndCommandBuffer(cmd1);
+
+    VkSubmitInfo sub1{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    sub1.commandBufferCount = 1;
+    sub1.pCommandBuffers = &cmd1;
+    if (vkQueueSubmit(q1, 1, &sub1, VK_NULL_HANDLE) != VK_SUCCESS) return 1;
+    vkQueueWaitIdle(q1);
+
+    vkBeginCommandBuffer(cmd0, &beginInfo);
+    VkBufferCopy copyRegion{ 0, 0, bufferSize };
+    vkCmdCopyBuffer(cmd0, buf0, rbBuf0, 1, &copyRegion);
+    vkEndCommandBuffer(cmd0);
+
+    VkSubmitInfo sub0{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    sub0.commandBufferCount = 1;
+    sub0.pCommandBuffers = &cmd0;
+    if (vkQueueSubmit(q0, 1, &sub0, VK_NULL_HANDLE) != VK_SUCCESS) return 1;
+    vkQueueWaitIdle(q0);
+
+    void* mapped = nullptr;
+    if (vkMapMemory(dev0, rbMem0, 0, bufferSize, 0, &mapped) != VK_SUCCESS || !mapped) return 1;
+    const uint32_t* words = static_cast<const uint32_t*>(mapped);
+    const size_t wordCount = bufferSize / sizeof(uint32_t);
+    for (size_t i = 0; i < wordCount; i += 257) {
+        if (words[i] != kPattern) {
+            std::cerr << "[FAIL] Cross-GPU DMA-BUF payload mismatch at word " << i
+                      << ": got 0x" << std::hex << words[i] << std::dec << std::endl;
+            return 1;
+        }
+    }
+    vkUnmapMemory(dev0, rbMem0);
+
+    std::cout << "[SUCCESS] P2P Direct BAR DMA-BUF 4 MB payload written on GPU 1 and verified byte-exact on GPU 0!" << std::endl;
 
     // Cleanup
+    vkDestroyCommandPool(dev0, cp0, nullptr);
+    vkDestroyCommandPool(dev1, cp1, nullptr);
+    vkDestroyBuffer(dev0, rbBuf0, nullptr);
+    vkFreeMemory(dev0, rbMem0, nullptr);
     vkDestroyBuffer(dev0, buf0, nullptr);
     vkFreeMemory(dev0, mem0, nullptr);
     vkDestroyBuffer(dev1, buf1, nullptr);

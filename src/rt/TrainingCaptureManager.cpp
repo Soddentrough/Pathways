@@ -76,8 +76,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_engine->m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_engine->m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && !isReference && m_engine->isRestirActive())) flags |= (1 << 7);
-    if (!isReference && m_engine->isRestirActive()) flags |= (1 << 9) | (1 << 24);
+    const bool useCaptureRestir = (!isReference && m_engine->isRestirActive() && m_engine->m_config.capture_channels >= 23);
+    if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && useCaptureRestir)) flags |= (1 << 7);
+    if (useCaptureRestir) flags |= (1 << 9);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
 
@@ -97,7 +98,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     };
 
     Image* targetAccumImg = m_engine->m_frameImages[0];
-    bool isTargetFp16 = targetAccumImg && (targetAccumImg->getFormat() == VK_FORMAT_R16G16B16A16_SFLOAT);
+    const VkFormat targetFmt = targetAccumImg ? targetAccumImg->getFormat() : VK_FORMAT_R32G32B32A32_SFLOAT;
+    const bool isTargetFp16 = (targetFmt == VK_FORMAT_R16G16B16A16_SFLOAT);
+    const bool isTargetRg11 = (targetFmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
 
     if (isReference) {
         // --- GROUND TRUTH REFERENCE CAPTURE PASS ---
@@ -156,9 +159,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
             wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
 
-            // ubo with spp = 1 so samples accumulate full unscaled radiance; enable subpixel jitter for ground truth convergence
+            // ubo with spp = 1 so samples accumulate full unscaled radiance; disable TAA projection lock so all 256 samples integrate uniformly over the pixel footprint
             CameraUniform ubo = m_engine->m_camera->getUniformData(wfSceneData.frameIndex, 1, activeOfflineBounces, flags,
-                                                         true, width, height, 0, /*updatePrev=*/false,
+                                                         false, width, height, 0, /*updatePrev=*/false,
                                                          m_engine->m_config.capture_halton_length);
             m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
@@ -196,7 +199,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         }
 
         // 3. Read back targetAccumImg (m_frameImages[0]) and write PTTD reference file
-        VkDeviceSize accumPixelBytes = isTargetFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float));
+        VkDeviceSize accumPixelBytes = isTargetRg11 ? sizeof(uint32_t) : (isTargetFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float)));
         VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width) * height * accumPixelBytes;
 
         Buffer stagingAccum(allocator, stagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
@@ -251,7 +254,17 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             return glm::detail::toFloat16(std::clamp(val, -65500.0f, 65500.0f));
         };
 
-        if (isTargetFp16) {
+        if (isTargetRg11) {
+            const uint32_t* src = static_cast<const uint32_t*>(stagingAccum.map());
+            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
+                glm::vec3 rgb = glm::unpackF2x11_1x10(src[p]);
+                refPayload[p * 4 + 0] = safeToFp16(rgb.r * invSpp);
+                refPayload[p * 4 + 1] = safeToFp16(rgb.g * invSpp);
+                refPayload[p * 4 + 2] = safeToFp16(rgb.b * invSpp);
+                refPayload[p * 4 + 3] = sppFp16;
+            }
+            stagingAccum.unmap();
+        } else if (isTargetFp16) {
             const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
             for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
                 refPayload[p * 4 + 0] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 0]) * invSpp);
@@ -275,15 +288,17 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         float fov = m_engine->m_camera ? m_engine->m_camera->getFov() : 45.0f;
         float aspect = m_engine->m_camera ? m_engine->m_camera->getAspect() : (static_cast<float>(width) / height);
         float camPosArr[3] = { camPos.x, camPos.y, camPos.z };
+        float zeroJitter[2] = { 0.0f, 0.0f };
 
         std::string refPath = std::format("{}/frame_{:05d}_reference.bin", m_engine->m_config.capture_training_data_dir, frameIdx);
         ImageDumper::savePTTD(refPath, width, height, 4, 0 /* Float16 */,
                               frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t),
-                              fov, aspect, camPosArr);
+                              fov, aspect, camPosArr,
+                              (m_engine->m_config.capture_channels >= 23) ? zeroJitter : nullptr);
         Logger::info("  -> Saved reference: {} (4 channels, {} SPP)", refPath, spp);
 
     } else {
-        // --- 1-SPP NOISY INPUT + ML FEATURE EXTRACTION PASS ---
+        // --- NOISY INPUT + ML FEATURE EXTRACTION PASS (PTTD v3) ---
         // 1. Clear targetAccumImg and ML images to zero
         VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
         vkResetCommandBuffer(cmd, 0);
@@ -299,15 +314,20 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         clearImage(cmd, m_engine->m_mlSpecularMotionImage);
         clearImage(cmd, m_engine->m_motionVectorImage);
         clearImage(cmd, m_engine->m_normalDepthImage);
+        if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
+            clearImage(cmd, m_engine->m_prevNormalDepthImage);
+        }
 
-        // 2. Set camera UBO (advances m_prevViewProj to track true velocity)
-        bool enableInputJitter = (width < m_engine->m_config.width || height < m_engine->m_config.height);
-        CameraUniform ubo = m_engine->m_camera->getUniformData(frameIdx, 1, m_engine->m_config.max_bounces, flags,
+        // 2. Set camera UBO (advances m_prevViewProj to track true velocity; enables Halton subpixel jitter for SR)
+        const uint32_t inputSpp = std::max(1u, spp);
+        const bool enableInputJitter = (m_engine->m_config.capture_halton_length > 1u) &&
+                                       (width < m_engine->m_config.width || height < m_engine->m_config.height);
+        CameraUniform ubo = m_engine->m_camera->getUniformData(frameIdx, inputSpp, m_engine->m_config.max_bounces, flags,
                                                      enableInputJitter, width, height, 0, /*updatePrev=*/true,
                                                      m_engine->m_config.capture_halton_length);
         m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
-        // 3. Dispatch 1-SPP with captureMlData = 1
+        // 3. Dispatch inputSpp with captureMlData = 1
         WavefrontSceneData wfSceneData{};
         wfSceneData.numTriangles = m_engine->m_numTriangles;
         wfSceneData.numSpheres = m_engine->m_numSpheres;
@@ -334,7 +354,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
         wfSceneData.captureMlData = 1;
 
-        m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, 1, m_engine->m_config.max_bounces, wfSceneData);
+        m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, inputSpp, m_engine->m_config.max_bounces, wfSceneData);
 
         // NOTE: ReSTIR DI resampling happens inline in the wavefront shade
         // dispatches above; there is no separate ReSTIR pass to record here.
@@ -395,6 +415,31 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         copyImgToBuffer(m_engine->m_normalDepthImage, offsetND);
         copyImgToBuffer(m_engine->m_mlSpecularMotionImage, offsetSM);
         copyImgToBuffer(m_engine->m_motionVectorImage, offsetMV);
+
+        if (useCaptureRestir && m_engine->m_normalDepthImage && m_engine->m_prevNormalDepthImage) {
+            m_engine->m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            m_engine->m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+            VkImageCopy ndCopy{};
+            ndCopy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            ndCopy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            ndCopy.extent = { width, height, 1 };
+            vkCmdCopyImage(cmd,
+                           m_engine->m_normalDepthImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           m_engine->m_prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &ndCopy);
+
+            m_engine->m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            m_engine->m_prevNormalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        }
 
         if (resBuffer) {
             VkBufferMemoryBarrier2 bufBarrier{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2 };
@@ -488,17 +533,23 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                         float res_m = std::clamp(static_cast<float>(M) / 64.0f, 0.0f, 1.0f);
                         float pHat = std::max(res.targetPdf, 1e-4f);
                         float res_w = std::clamp(res.wSum / (std::max(static_cast<float>(M), 1.0f) * pHat), 0.0f, 4.0f) * 0.25f;
-                        // Reservoirs are direct-light (DI) only; the GI flag
-                        // channel is reserved for path-space ReSTIR PT.
-                        float res_is_gi = 0.0f;
 
                         inputPayload[p * outChannels + 20] = glm::packHalf1x16(res_m);
                         inputPayload[p * outChannels + 21] = glm::packHalf1x16(res_w);
-                        inputPayload[p * outChannels + 22] = glm::packHalf1x16(res_is_gi);
+                        inputPayload[p * outChannels + 22] = mvPixels[p * 4 + 2]; // vLinearDepthDelta (mvExpectDz)
                     } else {
                         inputPayload[p * outChannels + 20] = glm::packHalf1x16(0.04f);
                         inputPayload[p * outChannels + 21] = glm::packHalf1x16(0.04f);
-                        inputPayload[p * outChannels + 22] = glm::packHalf1x16(0.0f);
+                        inputPayload[p * outChannels + 22] = mvPixels[p * 4 + 2]; // vLinearDepthDelta (mvExpectDz)
+                    }
+                    if (outChannels >= 24) {
+                        float linDepth = glm::unpackHalf1x16(ndPixels[p * 4 + 3]);
+                        float mvW      = glm::unpackHalf1x16(mvPixels[p * 4 + 3]);
+                        float isEmis   = glm::unpackHalf1x16(diffPixels[p * 4 + 3]);
+                        bool isSurf    = (linDepth > 1e-4f && linDepth < 9999.0f);
+                        bool isPsr     = isSurf && (std::abs(mvW) < 1e-4f);
+                        float reactive = isPsr ? 0.85f : ((isEmis > 0.5f) ? 0.5f : 0.0f);
+                        inputPayload[p * outChannels + 23] = glm::packHalf1x16(reactive);
                     }
                 }
             } else {
@@ -537,12 +588,15 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         float fov = m_engine->m_camera ? m_engine->m_camera->getFov() : 45.0f;
         float aspect = m_engine->m_camera ? m_engine->m_camera->getAspect() : (static_cast<float>(width) / height);
         float camPosArr[3] = { camPos.x, camPos.y, camPos.z };
+        float jitterArr[2] = { ubo.jitterOffset.x, ubo.jitterOffset.y };
 
         std::string inpPath = std::format("{}/frame_{:05d}_input.bin", m_engine->m_config.capture_training_data_dir, frameIdx);
         ImageDumper::savePTTD(inpPath, width, height, outChannels, 0 /* Float16 */,
-                              frameIdx, 1, inputPayload.data(), inputPayload.size() * sizeof(uint16_t),
-                              fov, aspect, camPosArr);
-        Logger::info("  -> Saved input    : {} ({} channels, 1 SPP)", inpPath, outChannels);
+                              frameIdx, inputSpp, inputPayload.data(), inputPayload.size() * sizeof(uint16_t),
+                              fov, aspect, camPosArr,
+                              (outChannels >= 23 || enableInputJitter) ? jitterArr : nullptr);
+        Logger::info("  -> Saved input    : {} ({} channels, {} SPP, jitter=({:.4f}, {:.4f}))",
+                     inpPath, outChannels, inputSpp, jitterArr[0], jitterArr[1]);
     }
 }
 
@@ -762,10 +816,10 @@ void TrainingCaptureManager::updateCaptureCamera(Camera* camera, uint32_t frameI
             break;
         }
         case CaptureCameraMode::Rotate: {
-            // Pure rotation / angular view shift: fixed position, pan yaw + tilt pitch
-            float degPerFrame = 360.0f / std::max(totalFrames, 120u);
-            float sweepYaw = degPerFrame * static_cast<float>(frameIdx);
-            float nodPitch = 5.0f * std::sin(2.0f * PI * (static_cast<float>(frameIdx) / std::max(totalFrames, 60u)));
+            // Pure rotation / angular view shift: fixed position, bounded smooth pan yaw + tilt pitch
+            float phase = static_cast<float>(frameIdx) / static_cast<float>(std::max(totalFrames, 16u));
+            float sweepYaw = 14.0f * std::sin(2.0f * PI * phase);
+            float nodPitch = 4.0f * std::sin(4.0f * PI * phase);
             camera->setPose(m_choreoInitialPos, m_choreoInitialYaw + sweepYaw, m_choreoInitialPitch + nodPitch);
             camera->setFov(m_choreoInitialFov);
             break;
@@ -792,14 +846,34 @@ void TrainingCaptureManager::updateCaptureCamera(Camera* camera, uint32_t frameI
             break;
         }
         case CaptureCameraMode::Orbit: {
-            // Spherical orbit around scene focus / default target
-            glm::vec3 center = m_engine->m_sceneData.boundsMin + (m_engine->m_sceneData.boundsMax - m_engine->m_sceneData.boundsMin) * 0.5f;
-            float radius = glm::length(m_choreoInitialPos - center);
-            if (radius < 0.1f) radius = 3.5f;
-            float angle = 2.0f * PI * t;
-            float camY = m_choreoInitialPos.y + 0.3f * std::sin(PI * t);
-            glm::vec3 orbitPos = center + glm::vec3(radius * std::sin(angle), camY - center.y, radius * std::cos(angle));
-            camera->setAnimatedPose(orbitPos, center, glm::vec3(0.0f, 1.0f, 0.0f), m_choreoInitialFov);
+            // Smooth bounded turntable arc around forward focal point (keeps enclosed rooms in frame)
+            float radYaw = glm::radians(m_choreoInitialYaw);
+            float radPitch = glm::radians(m_choreoInitialPitch);
+            glm::vec3 forward0(
+                std::cos(radYaw) * std::cos(radPitch),
+                std::sin(radPitch),
+                std::sin(radYaw) * std::cos(radPitch)
+            );
+            forward0 = glm::normalize(forward0);
+            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+            glm::vec3 right0 = glm::normalize(glm::cross(forward0, worldUp));
+            glm::vec3 groundForward0 = glm::normalize(glm::cross(worldUp, right0));
+
+            glm::vec3 boundsCenter = m_engine->m_sceneData.boundsMin + (m_engine->m_sceneData.boundsMax - m_engine->m_sceneData.boundsMin) * 0.5f;
+            float distToCenter = glm::dot(boundsCenter - m_choreoInitialPos, groundForward0);
+            float orbitR = std::clamp(distToCenter, 1.5f, 3.5f);
+            glm::vec3 focalPoint = m_choreoInitialPos + groundForward0 * orbitR;
+
+            float phase = static_cast<float>(frameIdx) / static_cast<float>(std::max(totalFrames, 16u));
+            float angleRad = glm::radians(16.0f * std::sin(2.0f * PI * phase));
+            glm::vec3 rel = -groundForward0 * std::cos(angleRad) + right0 * std::sin(angleRad);
+            glm::vec3 orbitPos = focalPoint + rel * orbitR + worldUp * (0.06f * std::sin(2.0f * PI * phase));
+
+            glm::vec3 lookDir = glm::normalize((m_choreoInitialPos + forward0 * orbitR) - orbitPos);
+            float yaw = glm::degrees(std::atan2(lookDir.z, lookDir.x));
+            float pitch = glm::degrees(std::asin(std::clamp(lookDir.y, -0.999f, 0.999f)));
+            camera->setPose(orbitPos, yaw, pitch);
+            camera->setFov(m_choreoInitialFov);
             break;
         }
         case CaptureCameraMode::Gaming:
@@ -938,8 +1012,8 @@ void TrainingCaptureManager::run() {
             }
         }
 
-        // 1. Render 1-SPP Noisy Input Frame FIRST (evaluates true inter-frame motion vectors from f-1 to f)
-        captureTrainingFrame(f, /*isReference=*/false, 1);
+        // 1. Render Noisy Input Frame FIRST (evaluates true inter-frame motion vectors from f-1 to f)
+        captureTrainingFrame(f, /*isReference=*/false, std::max(1u, m_engine->m_config.capture_input_spp));
 
         // 2. Render Ground Truth Reference Frame SECOND (same instantaneous animation and camera pose)
         captureTrainingFrame(f, /*isReference=*/true, m_engine->m_config.capture_reference_spp);

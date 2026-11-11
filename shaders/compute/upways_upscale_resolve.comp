@@ -1,655 +1,351 @@
 #version 460
-#extension GL_KHR_memory_scope_semantics : require
-#extension GL_KHR_shader_subgroup_basic : require
-#extension GL_KHR_shader_subgroup_ballot : require
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_KHR_shader_subgroup_vote : require
-#extension GL_KHR_cooperative_matrix : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_EXT_control_flow_attributes : enable
-#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_control_flow_attributes : require
 
 #include "upways_common.glsl"
 
-// Eight Wave32 subgroups per workgroup (256 threads), processing a 16x16 display tile
-layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba32ui) uniform readonly uimage2D uDenoisedDiffuse;
-layout(set = 0, binding = 1, rgba32ui) uniform readonly uimage2D uDenoisedSpecular;
-layout(set = 0, binding = 2, rgba16f)  uniform readonly image2D  uNormalDepth;
-layout(set = 0, binding = 3, rgba16f)  uniform readonly image2D  uAlbedoRoughness;
-layout(set = 0, binding = 4, rgba16f)  uniform readonly image2D  uMotionVectors;
+// Render-resolution transient & G-buffer inputs
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uNormalDepth;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D tLogDiff;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D tLogSpec;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D tGuideDiff;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D tGuideSpec;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D tDilatedMv;
+layout(set = 0, binding = 6, rgba16f) uniform readonly image2D tTemporalConf;
 
-layout(std430, set = 0, binding = 5) readonly buffer UpscaleKernelInBuffer {
-    uvec4 kernelVec4[];
-} uUpscaleKernelIn;
+// Render-resolution 16-ch neural parameters & FP32 skip_scale weights
+layout(set = 0, binding = 7, std430) readonly buffer SubpixelParamsBuf {
+    f16vec4 uSubpixelParams[];
+};
 
-layout(set = 0, binding = 6, rg32ui)   uniform readonly uimage2D  uDisplayHistoryIn;
-layout(set = 0, binding = 7, rgba16f)  uniform writeonly image2D  uDisplayOut;
-layout(set = 0, binding = 8, rg32ui)   uniform writeonly uimage2D uDisplayHistoryOut;
-layout(set = 0, binding = 9, rgba16f)  uniform readonly image2D   uSpecularMetallic;
-layout(set = 0, binding = 10, rgba16f) uniform readonly image2D   uSpecularMotion;
-layout(set = 0, binding = 11, rgba32ui) uniform readonly uimage2D  uHistoryDiffuseIn;
-layout(set = 0, binding = 12, rg32ui)   uniform readonly uimage2D  uHistorySpecularIn;
-layout(set = 0, binding = 13, rgba16f)  uniform readonly image2D   uHistoryMomentsIn;
-layout(set = 0, binding = 14, rgba32ui) uniform writeonly uimage2D uHistoryDiffuseOut;
-layout(set = 0, binding = 15, rg32ui)  uniform writeonly uimage2D uHistorySpecularOut;
-layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D  uHistoryMomentsOut;
+layout(set = 0, binding = 8, std430) readonly buffer WeightFp32Buf {
+    float w_f32[];
+};
 
-layout(std430, set = 0, binding = 17) readonly buffer WeightsBuffer {
-    float16_t weights[];
-} uWeights;
+// Display-resolution hardware-sampled history & BRDF guides (VK_FILTER_LINEAR, CLAMP_TO_EDGE)
+layout(set = 0, binding = 9)  uniform sampler2D uPrevIrrDiffHr;
+layout(set = 0, binding = 10) uniform sampler2D uPrevIrrSpecHr;
+layout(set = 0, binding = 11) uniform sampler2D uPrevGuideDiffHr;
+layout(set = 0, binding = 12) uniform sampler2D uPrevGuideSpecHr;
 
-layout(push_constant) uniform UpscaleResolvePushConstants {
-    uint renderWidth;
-    uint renderHeight;
-    uint displayWidth;
-    uint displayHeight;
-    float jitterX;
-    float jitterY;
-    uint enableDisplayHistory;
-    float displayHistoryAlpha;
-} pc;
-
-const float MAX_LOG1P_IRRADIANCE     = 11.09035489;
-const uint SUBPIXEL_MLP_FC1_W_OFFSET = 40256u;
-const uint SUBPIXEL_MLP_FC1_B_OFFSET = 40512u;
-const uint SUBPIXEL_MLP_FC2_W_OFFSET = 40528u;
-const uint SUBPIXEL_MLP_FC2_B_OFFSET = 40784u;
-
-// 12.66 KB total LDS shared across two non-overlapping phases:
-// - Phase A: 256 display threads x 16 FP16 channels for Wave32 WMMA 16 -> 16 -> 16 Subpixel Synthesis MLP
-// - Phase B: 18x18 max render-resolution anchor tile (324 texels x 20 FP16 = 6480 FP16)
-shared float16_t s_buf[6480];
-
-float16_t leakyRelu16(float16_t x) {
-    return (x > float16_t(0.0)) ? x : (x * float16_t(0.1));
-}
-
-float sanitizeFp16ToFloat(float16_t x) {
-    float v = float(x);
-    return (isnan(v) || isinf(v)) ? 0.0 : v;
-}
-
-void writeTileTexelToLds(uint idx, uvec4 td, uvec4 ts) {
-    f16vec3 d0   = f16vec3(unpackIrr11_11_10(td.x));
-    f16vec3 s0   = f16vec3(unpackIrr11_11_10(td.y));
-    f16vec2 ndXY = unpackFloat2x16(ts.x);
-    f16vec2 ndZW = unpackFloat2x16(ts.y);
-    f16vec2 dzNd = unpackFloat2x16(ts.z);
-    f16vec2 drRg = unpackFloat2x16(ts.w);
-    uint b0 = idx << 3u;
-    uint b1 = 2592u + (idx << 2u);
-    uint b2 = 3888u + (idx << 3u);
-    s_buf[b0 + 0u] = d0.x;
-    s_buf[b0 + 1u] = d0.y;
-    s_buf[b0 + 2u] = d0.z;
-    s_buf[b0 + 3u] = s0.x;
-    s_buf[b0 + 4u] = s0.y;
-    s_buf[b0 + 5u] = s0.z;
-    s_buf[b0 + 6u] = float16_t(td.z & 0x7FFu);
-    s_buf[b0 + 7u] = float16_t((td.z >> 11u) & 0x7FFu);
-    s_buf[b1 + 0u] = float16_t(td.z >> 22u);
-    s_buf[b1 + 1u] = float16_t(td.w & 0x7FFu);
-    s_buf[b1 + 2u] = float16_t((td.w >> 11u) & 0x7FFu);
-    s_buf[b1 + 3u] = float16_t(td.w >> 22u);
-    s_buf[b2 + 0u] = ndXY.x;
-    s_buf[b2 + 1u] = ndXY.y;
-    s_buf[b2 + 2u] = ndZW.x;
-    s_buf[b2 + 3u] = ndZW.y;
-    s_buf[b2 + 4u] = dzNd.x;
-    s_buf[b2 + 5u] = dzNd.y;
-    s_buf[b2 + 6u] = drRg.x;
-    s_buf[b2 + 7u] = drRg.y;
-}
-
-void computeBilinearCoords(
-    vec2 uv,
-    ivec2 texSize,
-    out ivec2 p00,
-    out ivec2 p10,
-    out ivec2 p01,
-    out ivec2 p11,
-    out vec2 f
-) {
-    vec2 cUv   = clamp(uv, vec2(0.0), vec2(1.0));
-    vec2 pos   = cUv * vec2(texSize) - vec2(0.5);
-    vec2 rPos  = round(pos);
-    pos        = mix(pos, rPos, lessThan(abs(pos - rPos), vec2(1e-5)));
-    ivec2 base = ivec2(floor(pos));
-    f          = pos - vec2(base);
-    ivec2 maxP = texSize - ivec2(1);
-
-    p00 = clamp(base + ivec2(0, 0), ivec2(0), maxP);
-    p10 = clamp(base + ivec2(1, 0), ivec2(0), maxP);
-    p01 = clamp(base + ivec2(0, 1), ivec2(0), maxP);
-    p11 = clamp(base + ivec2(1, 1), ivec2(0), maxP);
-}
-
-#define UNPACK_IRR_P1(p) \
-    vec3( \
-        unpackHalf2x16((((p) & 0x7FFu) << 1u) + 0x3C00u | (((((p) >> 11u) & 0x7FFu) << 17u) + 0x3C000000u)), \
-        unpackHalf2x16((((p) >> 22u) << 2u) + 0x3C00u).x \
-    )
-
-#define UNPACK_GUIDE_RAW(p) \
-    vec3(float((p) & 0x7FFu), float(((p) >> 11u) & 0x7FFu), float((p) >> 22u))
-
-const vec3 GUIDE_UNPACK_SCALE = vec3(1.0 / 2047.0, 1.0 / 2047.0, 1.0 / 1023.0);
-
-#define INTERP_PACKED_ALL(h00_, h10_, h01_, h11_, f, outDiff, outSpec, outGDiff, outGSpec) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            outDiff  = unpackIrr11_11_10((h00_).x); \
-            outSpec  = unpackIrr11_11_10((h00_).y); \
-            outGDiff = unpackGuide11_11_10((h00_).z); \
-            outGSpec = unpackGuide11_11_10((h00_).w); \
-        } else { \
-            outDiff  = max(vec3(f16vec3(mix(mix(UNPACK_IRR_P1((h00_).x),    UNPACK_IRR_P1((h10_).x),    (f).x), mix(UNPACK_IRR_P1((h01_).x),    UNPACK_IRR_P1((h11_).x),    (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-            outSpec  = max(vec3(f16vec3(mix(mix(UNPACK_IRR_P1((h00_).y),    UNPACK_IRR_P1((h10_).y),    (f).x), mix(UNPACK_IRR_P1((h01_).y),    UNPACK_IRR_P1((h11_).y),    (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-            outGDiff = vec3(f16vec3(mix(mix(UNPACK_GUIDE_RAW((h00_).z), UNPACK_GUIDE_RAW((h10_).z), (f).x), mix(UNPACK_GUIDE_RAW((h01_).z), UNPACK_GUIDE_RAW((h11_).z), (f).x), (f).y) * GUIDE_UNPACK_SCALE)); \
-            outGSpec = vec3(f16vec3(mix(mix(UNPACK_GUIDE_RAW((h00_).w), UNPACK_GUIDE_RAW((h10_).w), (f).x), mix(UNPACK_GUIDE_RAW((h01_).w), UNPACK_GUIDE_RAW((h11_).w), (f).x), (f).y) * GUIDE_UNPACK_SCALE)); \
-        } \
-    } while (false)
-
-#define INTERP_PACKED_COMP0(h00_, h10_, h01_, h11_, f, outDiff, outGDiff) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            outDiff  = unpackIrr11_11_10((h00_).x); \
-            outGDiff = unpackGuide11_11_10((h00_).z); \
-        } else { \
-            outDiff  = max(vec3(f16vec3(mix(mix(UNPACK_IRR_P1((h00_).x),    UNPACK_IRR_P1((h10_).x),    (f).x), mix(UNPACK_IRR_P1((h01_).x),    UNPACK_IRR_P1((h11_).x),    (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-            outGDiff = vec3(f16vec3(mix(mix(UNPACK_GUIDE_RAW((h00_).z), UNPACK_GUIDE_RAW((h10_).z), (f).x), mix(UNPACK_GUIDE_RAW((h01_).z), UNPACK_GUIDE_RAW((h11_).z), (f).x), (f).y) * GUIDE_UNPACK_SCALE)); \
-        } \
-    } while (false)
-
-#define SAMPLE_BILINEAR_PACKED_COMP1(imgH, p00, p10, p01, p11, f, outIrr, outGuide) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            uvec4 h00_ = imageLoad(imgH, p00); \
-            outIrr   = unpackIrr11_11_10(h00_.y); \
-            outGuide = unpackGuide11_11_10(h00_.w); \
-        } else { \
-            uvec4 h00_ = imageLoad(imgH, p00); \
-            uvec4 h10_ = imageLoad(imgH, p10); \
-            uvec4 h01_ = imageLoad(imgH, p01); \
-            uvec4 h11_ = imageLoad(imgH, p11); \
-            outIrr   = max(vec3(f16vec3(mix(mix(UNPACK_IRR_P1(h00_.y),    UNPACK_IRR_P1(h10_.y),    (f).x), mix(UNPACK_IRR_P1(h01_.y),    UNPACK_IRR_P1(h11_.y),    (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-            outGuide = vec3(f16vec3(mix(mix(UNPACK_GUIDE_RAW(h00_.w), UNPACK_GUIDE_RAW(h10_.w), (f).x), mix(UNPACK_GUIDE_RAW(h01_.w), UNPACK_GUIDE_RAW(h11_.w), (f).x), (f).y) * GUIDE_UNPACK_SCALE)); \
-        } \
-    } while (false)
+// Display-resolution resolved HDR output & ping-pong history outputs
+layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D uOutputColor;
+layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D uCurrIrrDiffHr;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D uCurrIrrSpecHr;
+layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D uCurrGuideDiffHr;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D uCurrGuideSpecHr;
 
 void main() {
-    uint lane     = gl_LocalInvocationID.x;
-    uint sg       = subgroupBroadcastFirst(gl_LocalInvocationID.y);
-    uint localIdx = sg * 32u + lane;
-    uint lx       = localIdx & 15u;
-    uint ly       = localIdx >> 4u;
-
-    ivec2 renderSize  = ivec2(int(pc.renderWidth), int(pc.renderHeight));
-    ivec2 displaySize = ivec2(int(pc.displayWidth), int(pc.displayHeight));
-    ivec2 displayPos  = ivec2(int(gl_WorkGroupID.x * 16u + lx), int(gl_WorkGroupID.y * 16u + ly));
-
-    float invDispW = float(pc.renderWidth) / float(pc.displayWidth);
-    float invDispH = float(pc.renderHeight) / float(pc.displayHeight);
-
-    ivec2 wgDisp0 = ivec2(gl_WorkGroupID.xy) * 16;
-    ivec2 wgDisp1 = min(wgDisp0 + ivec2(15), displaySize - ivec2(1));
-
-    int baseAncX = clamp(int(floor((float(wgDisp0.x) + 0.5) * invDispW)), 0, renderSize.x - 1) - 1;
-    int baseAncY = clamp(int(floor((float(wgDisp0.y) + 0.5) * invDispH)), 0, renderSize.y - 1) - 1;
-    int maxAncX  = clamp(int(floor((float(wgDisp1.x) + 0.5) * invDispW)), 0, renderSize.x - 1) + 1;
-    int maxAncY  = clamp(int(floor((float(wgDisp1.y) + 0.5) * invDispH)), 0, renderSize.y - 1) + 1;
-
-    uint tileW     = uint(maxAncX - baseAncX + 1);
-    uint tileH     = uint(maxAncY - baseAncY + 1);
-    uint tileCount = min(tileW * tileH, 324u);
-    uint qW        = (pc.renderWidth + 1u) >> 1u;
-
-    bool validDisp   = (displayPos.x < displaySize.x && displayPos.y < displaySize.y);
-    float hasHistory = ((pc.enableDisplayHistory & 1u) != 0u) ? 1.0 : 0.0;
-
-    float ux   = (float(displayPos.x) + 0.5) * invDispW;
-    float uy   = (float(displayPos.y) + 0.5) * invDispH;
-    int ancX   = clamp(int(floor(ux)), 0, renderSize.x - 1);
-    int ancY   = clamp(int(floor(uy)), 0, renderSize.y - 1);
-
-    float scaleX = float(pc.displayWidth) / float(max(pc.renderWidth, 1u));
-    float scaleY = float(pc.displayHeight) / float(max(pc.renderHeight, 1u));
-    float invSx  = 1.0 / max(scaleX, 1.0);
-    float invSy  = 1.0 / max(scaleY, 1.0);
-
-    float dpx = (ux - float(ancX)) - 0.5;
-    float dpy = (uy - float(ancY)) - 0.5;
-    float dtx = clamp(dpx - pc.jitterX, -0.95, 0.95);
-    float dty = clamp(dpy - pc.jitterY, -0.95, 0.95);
-    float r2  = dtx * dtx + dty * dty;
-
-    // 1. Issue Phase A SSBO Loads First, Followed Immediately by Unconditional td0 & prefHistIrr in BB0
-    //    Because all loads are in BB0 with SSBO loads queued first, RDNA FIFO waits only on vmcnt(2)
-    //    for Phase A WMMA while td0 and prefHistIrr fly in parallel in VMEM.
-    uint qGlobal = (uint(ancY) >> 1u) * qW + (uint(ancX) >> 1u);
-    uvec4 kv0 = uUpscaleKernelIn.kernelVec4[qGlobal * 3u + 0u];
-    uvec4 kv1 = uUpscaleKernelIn.kernelVec4[qGlobal * 3u + 1u];
-
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w1;
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> w2;
-    coopMatLoad(w1, uWeights.weights, SUBPIXEL_MLP_FC1_W_OFFSET, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-    coopMatLoad(w2, uWeights.weights, SUBPIXEL_MLP_FC2_W_OFFSET, 16u, gl_CooperativeMatrixLayoutColumnMajor);
-    uint colLane = lane & 15u;
-    float16_t b1Scalar = uWeights.weights[SUBPIXEL_MLP_FC1_B_OFFSET + colLane];
-    float16_t b2Scalar = uWeights.weights[SUBPIXEL_MLP_FC2_B_OFFSET + colLane];
-
-    float invTileW = 1.0 / float(tileW);
-    uint idx0Clamped = min(localIdx, tileCount - 1u);
-    uint ty0 = uint(float(idx0Clamped) * invTileW + 1e-4);
-    uint tx0 = idx0Clamped - ty0 * tileW;
-    ivec2 rPos0 = clamp(ivec2(baseAncX + int(tx0), baseAncY + int(ty0)), ivec2(0), renderSize - ivec2(1));
-    uvec4 td0 = imageLoad(uDenoisedDiffuse, rPos0);
-    uvec4 ts0 = imageLoad(uDenoisedSpecular, rPos0);
-    vec2 mvSurfPref = vec2(f16vec2(imageLoad(uMotionVectors, ivec2(ancX, ancY)).xy));
-
-    uint mBase = localIdx * 16u;
-    uint qOff0 = sg * 512u;
-    uint qOff1 = qOff0 + 256u;
-    float16_t qxSub = ((uint(ancX) & 1u) != 0u) ? float16_t(0.5) : float16_t(-0.5);
-    float16_t qySub = ((uint(ancY) & 1u) != 0u) ? float16_t(0.5) : float16_t(-0.5);
-    f16vec2 o01 = unpackFloat2x16(kv0.x) + qxSub * unpackFloat2x16(kv1.x);
-    f16vec2 o23 = unpackFloat2x16(kv0.y) + qxSub * unpackFloat2x16(kv1.y);
-    f16vec2 o45 = unpackFloat2x16(kv0.z) + qySub * unpackFloat2x16(kv1.z);
-    f16vec2 o67 = unpackFloat2x16(kv0.w) + qySub * unpackFloat2x16(kv1.w);
-    {
-        s_buf[mBase + 0u]  = o01.x; s_buf[mBase + 1u]  = o01.y;
-        s_buf[mBase + 2u]  = o23.x; s_buf[mBase + 3u]  = o23.y;
-        s_buf[mBase + 4u]  = o45.x; s_buf[mBase + 5u]  = o45.y;
-        s_buf[mBase + 6u]  = o67.x; s_buf[mBase + 7u]  = o67.y;
-        s_buf[mBase + 8u]  = float16_t(dpx);
-        s_buf[mBase + 9u]  = float16_t(dpy);
-        s_buf[mBase + 10u] = float16_t(dtx);
-        s_buf[mBase + 11u] = float16_t(dty);
-        s_buf[mBase + 12u] = float16_t(r2);
-        s_buf[mBase + 13u] = float16_t(invSx);
-        s_buf[mBase + 14u] = float16_t(invSy);
-        s_buf[mBase + 15u] = float16_t(hasHistory);
-    }
-    subgroupMemoryBarrierShared();
-
-    {
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> act;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b1Acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(b1Scalar);
-
-        coopMatLoad(act, s_buf, qOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h0 = coopMatMulAdd(act, w1, b1Acc);
-        for (int i = 0; i < h0.length(); ++i) {
-            h0[i] = leakyRelu16(h0[i]);
-        }
-
-        coopMatLoad(act, s_buf, qOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h1 = coopMatMulAdd(act, w1, b1Acc);
-        for (int i = 0; i < h1.length(); ++i) {
-            h1[i] = leakyRelu16(h1[i]);
-        }
-
-        subgroupMemoryBarrierShared();
-        coopMatStore(h0, s_buf, qOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(h1, s_buf, qOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        subgroupMemoryBarrierShared();
-
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> b2Acc =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(b2Scalar);
-
-        coopMatLoad(act, s_buf, qOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> out0 = coopMatMulAdd(act, w2, b2Acc);
-        coopMatLoad(act, s_buf, qOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> out1 = coopMatMulAdd(act, w2, b2Acc);
-
-        subgroupMemoryBarrierShared();
-        coopMatStore(out0, s_buf, qOff0, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatStore(out1, s_buf, qOff1, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupMemoryBarrierShared();
-
-    float16_t l0 = s_buf[mBase + 0u];
-    float16_t l1 = s_buf[mBase + 1u];
-    float16_t l2 = s_buf[mBase + 2u];
-    float16_t l3 = s_buf[mBase + 3u];
-    float16_t l4 = s_buf[mBase + 4u];
-    float16_t l5 = s_buf[mBase + 5u];
-    float16_t l6 = s_buf[mBase + 6u];
-    float16_t l7 = s_buf[mBase + 7u];
-    float16_t l8 = s_buf[mBase + 8u];
-
-    float16_t rawAlphaD16    = s_buf[mBase + 9u];
-    float16_t rawAlphaS16    = s_buf[mBase + 10u];
-    float16_t rawAlphaG16    = s_buf[mBase + 11u];
-    float16_t rawResD16      = s_buf[mBase + 12u];
-    float16_t rawResS16      = s_buf[mBase + 13u];
-    float16_t rawSpecSharp16 = s_buf[mBase + 14u];
-    float16_t rawActGate16   = s_buf[mBase + 15u];
-
-    // 3. Phase B: Reuse s_buf[0..6479] for Workgroup Render-Resolution Anchor Tile
-    barrier();
-    if (localIdx < tileCount) {
-        writeTileTexelToLds(localIdx, td0, ts0);
-    }
-    if (tileCount > 256u) {
-        uint idx1 = localIdx + 256u;
-        if (idx1 < tileCount) {
-            uint ty1 = uint(float(idx1) * invTileW + 1e-4);
-            uint tx1 = idx1 - ty1 * tileW;
-            ivec2 rPos1 = clamp(ivec2(baseAncX + int(tx1), baseAncY + int(ty1)), ivec2(0), renderSize - ivec2(1));
-            uvec4 td1 = imageLoad(uDenoisedDiffuse, rPos1);
-            uvec4 ts1 = imageLoad(uDenoisedSpecular, rPos1);
-            writeTileTexelToLds(idx1, td1, ts1);
-        }
-    }
-    barrier();
-
-    if (!validDisp) {
+    ivec2 displayPos = ivec2(gl_GlobalInvocationID.xy);
+    if (displayPos.x >= int(pc.displayWidth) || displayPos.y >= int(pc.displayHeight)) {
         return;
     }
 
-    uint cx1  = uint(ancX - baseAncX);
-    uint cy1  = uint(ancY - baseAncY) * tileW;
-    uint cy0  = cy1 - tileW;
-    uint cy2  = cy1 + tileW;
-    uint cIdx = cy1 + cx1;
+    ivec2 anc;
+    float dx0;
+    float dy0;
+    {
+        float uy = (float(displayPos.y) + 0.5) * (float(pc.renderHeight) / float(pc.displayHeight));
+        float ux = (float(displayPos.x) + 0.5) * (float(pc.renderWidth)  / float(pc.displayWidth));
+        int ancY = clamp(int(floor(uy)), 0, int(pc.renderHeight) - 1);
+        int ancX = clamp(int(floor(ux)), 0, int(pc.renderWidth)  - 1);
+        anc = ivec2(ancX, ancY);
+        vec2 jitter = vec2(f16vec2(vec2(pc.jitterX, pc.jitterY)));
+        dx0 = ((ux - float(ancX)) - 0.5) - jitter.x;
+        dy0 = ((uy - float(ancY)) - 0.5) - jitter.y;
+    }
 
-    uint gBase0 = cIdx << 3u;
-    uint gBase1 = 2592u + (cIdx << 2u);
-    uint gBase2 = 3888u + (cIdx << 3u);
-    vec3 fDiffAnc = vec3(f16vec3(vec3(float(s_buf[gBase0 + 6u]), float(s_buf[gBase0 + 7u]), float(s_buf[gBase1 + 0u])) * GUIDE_UNPACK_SCALE));
-    uint gw = (uint(s_buf[gBase1 + 1u]) & 0x7FFu)
-            | ((uint(s_buf[gBase1 + 2u]) & 0x7FFu) << 11u)
-            | (uint(s_buf[gBase1 + 3u]) << 22u);
-    float isSurfHr;
-    bool hasCustomSpecMv;
-    vec3 fSpecAnc = unpackSpecGuide29(gw, isSurfHr, hasCustomSpecMv);
+    // 1. Scoped streaming 9-tap subpixel ray-locus gather in unbiased linear irradiance space (<64 VGPRs, 0 LDS)
+    vec3 currDiffLinHr;
+    vec3 currSpecLinHr;
+    f16vec3 dMinF16;
+    f16vec3 dMaxF16;
+    f16vec3 sMinF16;
+    f16vec3 sMaxF16;
+    float roughCenter;
+    float zCenter;
 
-    vec3  nCenter    = vec3(float(s_buf[gBase2 + 0u]), float(s_buf[gBase2 + 1u]), float(s_buf[gBase2 + 2u]));
-    float zCenter    = float(s_buf[gBase2 + 3u]);
-    float relDzHr    = float(s_buf[gBase2 + 4u]);
-    float nDotHr     = float(s_buf[gBase2 + 5u]);
-    float relDReflHr = float(s_buf[gBase2 + 6u]);
-    float roughHr    = float(s_buf[gBase2 + 7u]);
+    {
+        float r2_0 = dx0 * dx0 + dy0 * dy0;
 
-    // Issue bilinear history texel loads before 9-tap softmax exp(), LDS gather, tanh(), and sigmoid exp()
-    float inBSurfHr = 0.0;
-    vec2  fSurf = vec2(0.0);
-    vec2  effSpecMvPref = mvSurfPref;
-    uvec4 h00Pref = uvec4(0u), h10Pref = uvec4(0u), h01Pref = uvec4(0u), h11Pref = uvec4(0u);
-    if (hasHistory > 0.5) {
-        if (hasCustomSpecMv) {
-            effSpecMvPref = vec2(f16vec2(imageLoad(uSpecularMotion, ivec2(ancX, ancY)).xy));
+        vec4 ndC = sanitizeVec4Input(imageLoad(uNormalDepth, anc));
+        f16vec3 ncF16 = f16vec3(ndC.xyz);
+        zCenter = ndC.w;
+        float invZc = 1.0 / max(zCenter, 0.1);
+
+        f16vec2 yCsF16;
+        vec3 accD;
+        vec3 accS;
+        {
+            vec4 ldC = imageLoad(tLogDiff, anc);
+            vec3 dc = ldC.rgb;
+            roughCenter = ldC.a;
+            float ydC = max(dc.x, max(dc.y, dc.z));
+            dMinF16 = f16vec3(dc);
+            dMaxF16 = f16vec3(dc);
+            accD = upwaysExpm1Vec3(dc);
+
+            vec3 sc = imageLoad(tLogSpec, anc).rgb;
+            float ysC = max(sc.x, max(sc.y, sc.z));
+            yCsF16 = f16vec2(ydC, ysC);
+            sMinF16 = f16vec3(sc);
+            sMaxF16 = f16vec3(sc);
+            accS = upwaysExpm1Vec3(sc);
         }
-        vec2 prevUvSurf = (vec2(displayPos) + vec2(0.5)) / vec2(displaySize) - mvSurfPref;
-        inBSurfHr = (prevUvSurf.x >= 0.0 && prevUvSurf.x <= 1.0 && prevUvSurf.y >= 0.0 && prevUvSurf.y <= 1.0) ? 1.0 : 0.0;
-        if (inBSurfHr > 0.0) {
-            ivec2 s00, s10, s01, s11;
-            computeBilinearCoords(prevUvSurf, displaySize, s00, s10, s01, s11, fSurf);
-            h00Pref = imageLoad(uHistoryDiffuseIn, s00);
-            if (fSurf.x != 0.0 || fSurf.y != 0.0) {
-                h10Pref = imageLoad(uHistoryDiffuseIn, s10);
-                h01Pref = imageLoad(uHistoryDiffuseIn, s01);
-                h11Pref = imageLoad(uHistoryDiffuseIn, s11);
+
+        float kSub;
+        float kSubS;
+        float kZ;
+        float kN;
+        float kLum;
+        {
+            uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
+            float smoothC = clamp(1.0 - roughCenter, 0.0, 1.0);
+            vec4 u0 = vec4(uSubpixelParams[cIdx * 4u + 0u]);
+            float u4 = float(uSubpixelParams[cIdx * 4u + 1u].x);
+            kSub  = upwaysSoftplus(u0.x);
+            kSubS = kSub + upwaysSoftplus(u0.y) * (smoothC * smoothC);
+            kZ    = upwaysSoftplus(u0.z);
+            kN    = upwaysSoftplus(u0.w);
+            kLum  = upwaysSoftplus(u4);
+        }
+
+        float sumWd = 1.0;
+        float sumWs = 1.0;
+
+        ivec2 maxLr = ivec2(int(pc.renderWidth) - 1, int(pc.renderHeight) - 1);
+        [[dont_unroll]] for (int tap = 0; tap < 8; ++tap) {
+            int idx9 = (tap < 4) ? tap : (tap + 1);
+            int dy = (idx9 / 3) - 1;
+            int dx = (idx9 % 3) - 1;
+            ivec2 np = clamp(anc + ivec2(dx, dy), ivec2(0), maxLr);
+
+            float ddx = dx0 - float(dx);
+            float ddy = dy0 - float(dy);
+            float dr2 = (ddx * ddx + ddy * ddy) - r2_0;
+
+            float basePen;
+            {
+                vec4 ndI = sanitizeVec4Input(imageLoad(uNormalDepth, np));
+                float dz = clamp(abs(zCenter - ndI.w) * invZc, 0.0, 2.0);
+                float ndot = clamp(dot(vec3(ncF16), ndI.xyz), 0.0, 1.0);
+                basePen = kZ * dz + kN * (1.0 - ndot);
+            }
+
+            float geomPen;
+            {
+                vec4 ldI = imageLoad(tLogDiff, np);
+                vec3 di = ldI.rgb;
+                geomPen = basePen + kN * abs(roughCenter - ldI.a);
+                dMinF16 = min(dMinF16, f16vec3(di));
+                dMaxF16 = max(dMaxF16, f16vec3(di));
+                float ydI = max(di.x, max(di.y, di.z));
+                float ld = clamp(-(kSub * dr2 + geomPen + kLum * abs(ydI - float(yCsF16.x))), -40.0, 10.0);
+                float wd = exp(ld);
+                sumWd += wd;
+                accD += wd * upwaysExpm1Vec3(di);
+            }
+
+            {
+                vec3 si = imageLoad(tLogSpec, np).rgb;
+                sMinF16 = min(sMinF16, f16vec3(si));
+                sMaxF16 = max(sMaxF16, f16vec3(si));
+                float ysI = max(si.x, max(si.y, si.z));
+                float ls = clamp(-(kSubS * dr2 + geomPen + kLum * abs(ysI - float(yCsF16.y))), -40.0, 10.0);
+                float ws = exp(ls);
+                sumWs += ws;
+                accS += ws * upwaysExpm1Vec3(si);
             }
         }
+
+        currDiffLinHr = accD / sumWd;
+        currSpecLinHr = accS / sumWs;
     }
 
-    float activityGate = clamp(float(rawActGate16), 0.0, 1.0);
-    float z0 = sanitizeFp16ToFloat(o01.x);
-    float z1 = sanitizeFp16ToFloat(o01.y);
-    float z2 = sanitizeFp16ToFloat(o23.x);
-    float z3 = sanitizeFp16ToFloat(o23.y);
-    float z4 = sanitizeFp16ToFloat(o45.x);
-    float z5 = sanitizeFp16ToFloat(o45.y);
-    float z6 = sanitizeFp16ToFloat(o67.x);
-    float z7 = sanitizeFp16ToFloat(o67.y);
+    float isSurfF = (zCenter > 1e-4 && zCenter < SKY_DEPTH_THRESHOLD) ? 1.0 : 0.0;
 
-    float smoothC  = clamp(1.0 - roughHr, 0.0, 1.0);
-    float smoothC2 = smoothC * smoothC;
+    vec4 dilMv = (pc.resetHistory == 0u) ? imageLoad(tDilatedMv, anc) : vec4(0.0);
+    vec2 surfMv = dilMv.xy;
+    vec2 specMv = dilMv.zw;
 
-    float betaSub    = max(z0, 0.0) * activityGate;
-    float betaDisocc = max(z2, 0.0) * activityGate;
-    float gammaJit   = max(z3, 0.0) * activityGate;
-    float betaClip   = max(z4, 0.0) * activityGate;
-    float betaLum    = max(z5, 0.0) * activityGate;
-    float betaZ      = max(z6, 0.0) * activityGate;
-    float betaN      = max(z7, 0.0) * activityGate;
+    uvec2 prevSize = (pc.resetHistory == 0u)
+        ? uvec2(textureSize(uPrevIrrDiffHr, 0))
+        : uvec2(pc.displayWidth, pc.displayHeight);
 
-    uint tapIdx[9] = uint[9](
-        cy0 + cx1 - 1u, cy0 + cx1, cy0 + cx1 + 1u,
-        cIdx - 1u,      cIdx,      cIdx + 1u,
-        cy2 + cx1 - 1u, cy2 + cx1, cy2 + cx1 + 1u
-    );
-    const vec2 kTapOff[9] = vec2[9](
-        vec2(-1.0, -1.0), vec2(0.0, -1.0), vec2(1.0, -1.0),
-        vec2(-1.0,  0.0), vec2(0.0,  0.0), vec2(1.0,  0.0),
-        vec2(-1.0,  1.0), vec2(0.0,  1.0), vec2(1.0,  1.0)
-    );
-
-    vec3  tapDiff[9];
-    vec3  tapSpec[9];
-    float tapYDiff[9];
-    float tapYSpec[9];
-    float phiGeom[9];
-    float geomAff[9];
-
-    float sumAff   = 0.0;
-    float sumYDiff = 0.0;
-    float sumYSpec = 0.0;
-
-    [[unroll]]
-    for (uint i = 0u; i < 9u; ++i) {
-        uint b0i = tapIdx[i] << 3u;
-        vec3 d_i = vec3(float(s_buf[b0i + 0u]), float(s_buf[b0i + 1u]), float(s_buf[b0i + 2u]));
-        vec3 s_i = vec3(float(s_buf[b0i + 3u]), float(s_buf[b0i + 4u]), float(s_buf[b0i + 5u]));
-        float yD = max(d_i.r, max(d_i.g, d_i.b));
-        float yS = max(s_i.r, max(s_i.g, s_i.b));
-        tapDiff[i]  = d_i;
-        tapSpec[i]  = s_i;
-        tapYDiff[i] = yD;
-        tapYSpec[i] = yS;
-
-        if (i == 4u) {
-            phiGeom[i] = 0.0;
-            geomAff[i] = 0.0;
-        } else {
-            uint b2i = 3888u + (tapIdx[i] << 3u);
-            vec3 n_i = vec3(float(s_buf[b2i + 0u]), float(s_buf[b2i + 1u]), float(s_buf[b2i + 2u]));
-            float z_i = float(s_buf[b2i + 3u]);
-            float dz = clamp(abs(zCenter - z_i) / max(max(zCenter, z_i), 0.1), 0.0, 2.0);
-            float dn = 1.0 - clamp(dot(nCenter, n_i), 0.0, 1.0);
-            float pg = 16.0 * (betaZ * dz + betaN * dn);
-            float af = exp(-pg);
-            phiGeom[i] = pg;
-            geomAff[i] = af;
-            sumAff   += af;
-            sumYDiff += af * yD;
-            sumYSpec += af * yS;
-        }
+    f16vec2 disoccF16;
+    {
+        float reactiveCenter = imageLoad(tLogSpec, anc).a;
+        float mvSpeedLr = sqrt(dot(surfMv, surfMv) + 1e-12);
+        float reactiveDisocc = reactiveCenter * clamp(mvSpeedLr * 32.0, 0.0, 1.0);
+        vec3 tConf = imageLoad(tTemporalConf, anc).xyz;
+        float nDotPos = clamp(tConf.y, 0.0, 1.0);
+        float disoccD = clamp(tConf.x + (1.0 - nDotPos) + reactiveDisocc, 0.0, 1.0);
+        float smoothLr = clamp(1.0 - roughCenter, 0.0, 1.0);
+        float disoccS = clamp(max(disoccD, (smoothLr * smoothLr) * tConf.z), 0.0, 1.0);
+        disoccF16 = f16vec2(disoccD, disoccS);
     }
 
-    float invWGeom  = 1.0 / (sumAff + 1e-4);
-    float meanYDiff = sumYDiff * invWGeom;
-    float meanYSpec = sumYSpec * invWGeom;
-    float madYDiff  = 0.0;
-    float madYSpec  = 0.0;
-    [[unroll]]
-    for (uint i = 0u; i < 9u; ++i) {
-        if (i != 4u) {
-            madYDiff += geomAff[i] * abs(tapYDiff[i] - meanYDiff);
-            madYSpec += geomAff[i] * abs(tapYSpec[i] - meanYSpec);
-        }
-    }
-    madYDiff *= invWGeom;
-    madYSpec *= invWGeom;
-    float geomCov = sumAff / (sumAff + 1.0);
-    float threshD = meanYDiff + madYDiff;
-    float threshS = meanYSpec + madYSpec;
+    // 2. Scoped BRDF guide warp & subpixel jitter-locus HR guide accumulation
+    f16vec3 guideDiffF16;
+    f16vec3 guideSpecF16;
+    f16vec2 validHistF16;
+    float kDisocc;
 
-    float rawLogits[9] = float[9](
-        float(l0), float(l1), float(l2),
-        float(l3), float(l4), float(l5),
-        float(l6), float(l7), float(l8)
-    );
-    float deltaSpec = max(float(rawSpecSharp16) + smoothC2 * max(z1, 0.0), 0.0) * activityGate;
+    {
+        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
+        float u1y = float(uSubpixelParams[cIdx * 4u + 1u].y);
+        float rawHg = float(uSubpixelParams[cIdx * 4u + 2u].x);
+        kDisocc = upwaysSoftplus(u1y);
 
-    float modLogitDiff[9];
-    float modLogitSpec[9];
-    float maxLogitDiff = -1e30;
-    float maxLogitSpec = -1e30;
+        vec4 gdVec4 = imageLoad(tGuideDiff, anc);
+        vec4 gsVec4 = imageLoad(tGuideSpec, anc);
+        vec3 currGuideDiffHr = gdVec4.rgb;
+        vec3 currGuideSpecHr = gsVec4.rgb;
+        validHistF16 = f16vec2(gdVec4.a, gsVec4.a);
 
-    [[unroll]]
-    for (uint i = 0u; i < 9u; ++i) {
-        float yD = tapYDiff[i];
-        float yS = tapYSpec[i];
-        float exD = max(0.0, yD - threshD);
-        float exS = max(0.0, yS - threshS);
-        float dID = geomCov * exD;
-        float dIS = geomCov * roughHr * exS;
+        vec2 dispUv = (vec2(displayPos) + 0.5) / vec2(float(pc.displayWidth), float(pc.displayHeight));
+        vec2 prevSurfUv = dispUv - surfMv;
+        bool surfInBounds = (pc.resetHistory == 0u) &&
+            (prevSurfUv.x >= 0.0) && (prevSurfUv.x <= 1.0) &&
+            (prevSurfUv.y >= 0.0) && (prevSurfUv.y <= 1.0);
 
-        float kD = (min(yD, threshD) + exD / (1.0 + betaClip * dID)) / max(yD, 1e-4);
-        float kS = (min(yS, threshS) + exS / (1.0 + betaClip * dIS)) / max(yS, 1e-4);
-        tapDiff[i] *= kD;
-        tapSpec[i] *= kS;
-
-        float ld = rawLogits[i];
-        float ls = rawLogits[i];
-        if (i == 4u) {
-            ld -= betaClip * dID;
-            ls += deltaSpec - betaClip * dIS;
-        } else {
-            vec2 off = kTapOff[i];
-            float phiSub = betaSub * (dot(off, off) - 2.0 * (off.x * dpx + off.y * dpy));
-            ld -= (phiSub + phiGeom[i]) + (betaLum + betaClip) * dID;
-            ls -= (phiSub + (1.0 + smoothC2) * phiGeom[i]) + (betaLum + betaClip) * dIS;
-        }
-        modLogitDiff[i] = ld;
-        modLogitSpec[i] = ls;
-        maxLogitDiff = max(maxLogitDiff, ld);
-        maxLogitSpec = max(maxLogitSpec, ls);
-    }
-
-    float sumWDiff = 0.0;
-    float sumWSpec = 0.0;
-    vec3 currDiffHr  = vec3(0.0);
-    vec3 currSpecLog = vec3(0.0);
-    vec3 currSpecLin = vec3(0.0);
-    [[unroll]]
-    for (uint i = 0u; i < 9u; ++i) {
-        float wD = exp(modLogitDiff[i] - maxLogitDiff);
-        float wS = exp(modLogitSpec[i] - maxLogitSpec);
-        sumWDiff    += wD;
-        sumWSpec    += wS;
-        currDiffHr  += wD * tapDiff[i];
-        currSpecLog += wS * tapSpec[i];
-        currSpecLin += wS * (exp(tapSpec[i]) - vec3(1.0));
-    }
-    float invSumWDiff = 1.0 / max(sumWDiff, 1e-12);
-    float invSumWSpec = 1.0 / max(sumWSpec, 1e-12);
-    currDiffHr  *= invSumWDiff;
-    currSpecLog *= invSumWSpec;
-    currSpecLin *= invSumWSpec;
-    float specLinW = smoothC2 * activityGate;
-    vec3 currSpecHr = mix(currSpecLog, log(vec3(1.0) + max(currSpecLin, vec3(0.0))), specLinW);
-
-    float resDHr = tanh(float(rawResD16));
-    float resSHr = tanh(float(rawResS16));
-    vec3 refCurrDiffHr = max(currDiffHr + vec3(resDHr * isSurfHr), vec3(0.0));
-    vec3 refCurrSpecHr = max(currSpecHr + vec3(resSHr * isSurfHr), vec3(0.0));
-
-    float nDotPos    = clamp(nDotHr, 0.0, 1.0);
-    float dnDisocc   = (1.0 - nDotPos) * (1.0 - nDotPos);
-    float disoccSurf = clamp(relDzHr + dnDisocc, 0.0, 1.0);
-    float disoccSpec = clamp(max(disoccSurf, smoothC2 * relDReflHr), 0.0, 1.0);
-
-    float dJit2        = clamp((scaleX * scaleX) * (dtx * dtx) + (scaleY * scaleY) * (dty * dty), 0.0, 2.0);
-    float adjRawAlphaD = float(rawAlphaD16) + 16.0 * betaDisocc * disoccSurf;
-    float adjRawAlphaS = float(rawAlphaS16) + 16.0 * betaDisocc * disoccSpec;
-    float adjRawAlphaG = float(rawAlphaG16) + 16.0 * betaDisocc * disoccSurf - gammaJit * dJit2 * (1.0 - disoccSurf);
-
-    float horizonDecay = (pc.displayHistoryAlpha > 0.0) ? pc.displayHistoryAlpha : 1.0;
-    float movingDecay  = 0.80 + 0.20 * horizonDecay;
-    float motionGate   = clamp(length(mvSurfPref * vec2(displaySize)), 0.0, 1.0);
-    float baseDecay    = mix(horizonDecay, movingDecay, motionGate);
-    float effDecayD    = mix(baseDecay, 1.0, disoccSurf);
-    float effDecayS    = mix(baseDecay, 1.0, disoccSpec);
-
-    float netAlphaD    = (1.0 / (1.0 + exp(-adjRawAlphaD))) * effDecayD;
-    float netAlphaS    = (1.0 / (1.0 + exp(-adjRawAlphaS))) * effDecayS;
-    float netAlphaG    = 1.0 / (1.0 + exp(-adjRawAlphaG));
-
-    float inBSpecHr   = inBSurfHr;
-    vec3 wDiffHr      = vec3(0.0);
-    vec3 wSpecHr      = vec3(0.0);
-    vec3 wGuideDiffHr = vec3(0.0);
-    vec3 wGuideSpecHr = vec3(0.0);
-
-    if (hasHistory > 0.5) {
-        if (!hasCustomSpecMv) {
-            if (inBSurfHr > 0.0) {
-                INTERP_PACKED_ALL(h00Pref, h10Pref, h01Pref, h11Pref, fSurf, wDiffHr, wSpecHr, wGuideDiffHr, wGuideSpecHr);
-            }
-        } else {
-            if (inBSurfHr > 0.0) {
-                INTERP_PACKED_COMP0(h00Pref, h10Pref, h01Pref, h11Pref, fSurf, wDiffHr, wGuideDiffHr);
-            }
-            vec2 prevUvSpec = (vec2(displayPos) + vec2(0.5)) / vec2(displaySize) - effSpecMvPref;
-            inBSpecHr = (prevUvSpec.x >= 0.0 && prevUvSpec.x <= 1.0 && prevUvSpec.y >= 0.0 && prevUvSpec.y <= 1.0) ? 1.0 : 0.0;
-            if (inBSpecHr > 0.0) {
-                ivec2 p00, p10, p01, p11;
-                vec2  fSpec;
-                computeBilinearCoords(prevUvSpec, displaySize, p00, p10, p01, p11, fSpec);
-                SAMPLE_BILINEAR_PACKED_COMP1(uHistoryDiffuseIn, p00, p10, p01, p11, fSpec, wSpecHr, wGuideSpecHr);
+        vec3 wGuideDiff = currGuideDiffHr;
+        vec3 wGuideSpec = currGuideSpecHr;
+        if (pc.resetHistory == 0u) {
+            if (surfInBounds) {
+                wGuideDiff = textureLod(uPrevGuideDiffHr, prevSurfUv, 0.0).rgb;
+                wGuideSpec = textureLod(uPrevGuideSpecHr, prevSurfUv, 0.0).rgb;
+            } else {
+                wGuideDiff = vec3(0.0);
+                wGuideSpec = vec3(0.0);
             }
         }
+
+        vec3 absGd = abs(currGuideDiffHr - wGuideDiff);
+        vec3 absGs = abs(currGuideSpecHr - wGuideSpec);
+        float guideDeltaD = clamp(max(absGd.x, max(absGd.y, absGd.z)), 0.0, 1.0);
+        float guideDeltaS = clamp(max(absGs.x, max(absGs.y, absGs.z)), 0.0, 1.0);
+        float guideDeltaMax = max(guideDeltaD, guideDeltaS);
+        float mvGateG = clamp(sqrt(dot(surfMv, surfMv) + 1e-12) * 64.0, 0.0, 1.0);
+
+        float vdHrG = float(validHistF16.x) * (surfInBounds ? 1.0 : 0.0) * isSurfF;
+        float scaleX = float(pc.displayWidth)  / float(max(pc.renderWidth,  1u));
+        float scaleY = float(pc.displayHeight) / float(max(pc.renderHeight, 1u));
+        float dRayX = scaleX * dx0;
+        float dRayY = scaleY * dy0;
+        float wLocus = exp(clamp(-2.5 * (dRayX * dRayX + dRayY * dRayY), -20.0, 0.0));
+
+        float hGBase = vdHrG * clamp(rawHg - kDisocc * (float(disoccF16.x) + mvGateG * 2.0 * guideDeltaMax * guideDeltaMax), 0.0, 0.96);
+        float effAlphaG = 1.0;
+        if (pc.preserveJitterGuide == 0u) {
+            float alphaLocus = wLocus * (1.0 - 0.5 * hGBase) + (1.0 - wLocus) * (1.0 - hGBase) * 0.1;
+            float gateG = vdHrG * clamp(hGBase * 4.0, 0.0, 1.0);
+            effAlphaG = 1.0 + gateG * (alphaLocus - 1.0);
+        }
+
+        vec3 guideDiffHr = clamp((1.0 - effAlphaG) * wGuideDiff + effAlphaG * currGuideDiffHr, vec3(0.0), vec3(1.0));
+        vec3 guideSpecHr = clamp((1.0 - effAlphaG) * wGuideSpec + effAlphaG * currGuideSpecHr, vec3(0.0), vec3(1.0));
+        guideDiffF16 = f16vec3(guideDiffHr);
+        guideSpecF16 = f16vec3(guideSpecHr);
+        imageStore(uCurrGuideDiffHr, displayPos, vec4(guideDiffF16, float16_t(1.0)));
+        imageStore(uCurrGuideSpecHr, displayPos, vec4(guideSpecF16, float16_t(1.0)));
     }
 
-    // 5. Learned Target-Resolution Temporal Accumulation & Log-Irradiance Refinement
-    float validSurfHr = inBSurfHr * hasHistory * isSurfHr;
-    float validSpecHr = inBSpecHr * hasHistory * isSurfHr;
+    // 3. Scoped Diffuse 5-tap Catmull-Rom RLS linear resolve & remodulation
+    vec3 modDiffHr;
+    float kGhost;
+    {
+        float inBSurf = 0.0;
+        vec4 wDiff4 = (pc.resetHistory == 0u)
+            ? sampleCatmullRom5Tap(uPrevIrrDiffHr, displayPos, uvec2(pc.displayWidth, pc.displayHeight), prevSize, surfMv, inBSurf)
+            : vec4(0.0);
+        vec3 wDiff = wDiff4.rgb;
+        float prevHistLenD = wDiff4.a * 64.0;
 
-    float effAlphaD = 1.0 - validSurfHr * (1.0 - netAlphaD);
-    float effAlphaS = 1.0 - validSpecHr * (1.0 - netAlphaS);
-    float effAlphaG = 1.0 - validSurfHr * (1.0 - netAlphaG);
+        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
+        float rawHd = float(uSubpixelParams[cIdx * 4u + 1u].z);
+        vec3 u2yzw = vec3(uSubpixelParams[cIdx * 4u + 2u].yzw);
+        float u3w = float(uSubpixelParams[cIdx * 4u + 3u].w);
+        kGhost = upwaysSoftplus(u3w);
 
-    vec3 blendedDiffHr  = (1.0 - effAlphaD) * wDiffHr + effAlphaD * refCurrDiffHr;
-    vec3 blendedSpecLog = (1.0 - effAlphaS) * wSpecHr + effAlphaS * refCurrSpecHr;
-    vec3 blendedSpecLin = (1.0 - effAlphaS) * (exp(wSpecHr) - vec3(1.0)) + effAlphaS * (exp(refCurrSpecHr) - vec3(1.0));
-    vec3 blendedSpecHr  = mix(blendedSpecLog, log(vec3(1.0) + max(blendedSpecLin, vec3(0.0))), specLinW);
-    vec3 irrDiffHr = clamp(blendedDiffHr * activityGate, vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
-    vec3 irrSpecHr = clamp(blendedSpecHr * activityGate, vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
+        float disoccD = float(disoccF16.x);
+        float vdHr = (pc.resetHistory == 0u) ? (float(validHistF16.x) * inBSurf * isSurfF) : 0.0;
+        float gammaD = vdHr * clamp(rawHd - kDisocc * disoccD, 0.0, 0.985);
+        float keptD = gammaD * prevHistLenD;
+        float hWeightD = keptD / (1.0 + keptD);
+        float nextHistNormD = clamp((1.0 + keptD) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
+        float maturityD = clamp(keptD * (1.0 / 16.0), 0.0, 1.0);
 
-    vec3 guideDiffHr = (1.0 - effAlphaG) * wGuideDiffHr + effAlphaG * fDiffAnc;
-    vec3 guideSpecHr = (1.0 - effAlphaG) * wGuideSpecHr + effAlphaG * fSpecAnc;
+        vec3 resD = vec3(safeTanh(u2yzw.x), safeTanh(u2yzw.y), safeTanh(u2yzw.z)) * 0.8;
+        vec3 skipD = vec3(f16vec3(vec3(
+            w_f32[SKIP_SCALE_F32_OFFSET + 0u],
+            w_f32[SKIP_SCALE_F32_OFFSET + 1u],
+            w_f32[SKIP_SCALE_F32_OFFSET + 2u]
+        )));
+        vec3 effSkipD = vec3(1.0) + (skipD - vec3(1.0)) * (1.0 - maturityD);
+        vec3 baseLogD = upwaysLog1pVec3(max(effSkipD * currDiffLinHr, vec3(0.0)));
+        vec3 refDiffHr = clamp(
+            max(baseLogD + resD * isSurfF * (1.0 - maturityD), vec3(0.0)),
+            vec3(0.0),
+            vec3(MAX_LOG1P_IRRADIANCE)
+        );
+        vec3 boxMinD = min(vec3(dMinF16), refDiffHr);
+        vec3 boxMaxD = max(vec3(dMaxF16), refDiffHr);
+        float rectTD = safeTanh(kGhost * disoccD);
+        vec3 rectWDiff = clamp(wDiff + rectTD * (clamp(wDiff, boxMinD, boxMaxD) - wDiff), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
+        vec3 linDiffBlend = (1.0 - hWeightD) * upwaysExpm1Vec3(refDiffHr) + hWeightD * upwaysExpm1Vec3(rectWDiff);
+        vec3 irrDiffHr = clamp(upwaysLog1pVec3(max(linDiffBlend, vec3(0.0))), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
+        imageStore(uCurrIrrDiffHr, displayPos, vec4(f16vec4(vec4(irrDiffHr, nextHistNormD))));
+        modDiffHr = vec3(guideDiffF16) * upwaysExpm1Vec3(irrDiffHr);
+    }
 
-    // 6. Stage 4: Target-Resolution Remodulation to Linear HDR Radiance
-    vec3 linDiffHr = exp(irrDiffHr) - vec3(1.0);
-    vec3 linSpecHr = exp(irrSpecHr) - vec3(1.0);
-    vec3 rgbHr = sanitizeVec3(guideDiffHr * linDiffHr + guideSpecHr * linSpecHr);
+    // 4. Scoped Specular 5-tap Catmull-Rom RLS linear resolve & final HDR output
+    {
+        float inBSpec = 0.0;
+        vec4 wSpec4 = (pc.resetHistory == 0u)
+            ? sampleCatmullRom5Tap(uPrevIrrSpecHr, displayPos, uvec2(pc.displayWidth, pc.displayHeight), prevSize, specMv, inBSpec)
+            : vec4(0.0);
+        vec3 wSpec = wSpec4.rgb;
+        float prevHistLenS = wSpec4.a * 64.0;
 
-    imageStore(uDisplayOut, displayPos, vec4(rgbHr, 1.0));
-    uvec2 newHistIrr   = uvec2(packIrr11_11_10(irrDiffHr), packIrr11_11_10(irrSpecHr));
-    uvec2 newHistGuide = uvec2(packGuide11_11_10(guideDiffHr), packGuide11_11_10(guideSpecHr));
-    imageStore(uHistoryDiffuseOut, displayPos, uvec4(newHistIrr, newHistGuide));
+        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
+        float rawHs = float(uSubpixelParams[cIdx * 4u + 1u].w);
+        vec3 u3xyz = vec3(uSubpixelParams[cIdx * 4u + 3u].xyz);
 
-    // Unconditionally write render-resolution (rW x rH) history mip for Stage 1
-    if (pc.displayWidth == pc.renderWidth * 2u && pc.displayHeight == pc.renderHeight * 2u) {
-        vec3 qDiff = irrDiffHr + subgroupShuffleXor(irrDiffHr, 1u);
-        vec3 qSpec = irrSpecHr + subgroupShuffleXor(irrSpecHr, 1u);
-        qDiff = (qDiff + subgroupShuffleXor(qDiff, 16u)) * 0.25;
-        qSpec = (qSpec + subgroupShuffleXor(qSpec, 16u)) * 0.25;
-        if (((lx | ly) & 1u) == 0u) {
-            imageStore(uHistorySpecularOut, ivec2(ancX, ancY), uvec4(packIrr11_11_10(qDiff), packIrr11_11_10(qSpec), 0u, 0u));
-        }
-    } else {
-        ivec2 dispFromAnc = clamp(ivec2(floor((vec2(ancX, ancY) + vec2(0.5)) * vec2(scaleX, scaleY))), ivec2(0), displaySize - ivec2(1));
-        if (displayPos == dispFromAnc) {
-            imageStore(uHistorySpecularOut, ivec2(ancX, ancY), uvec4(newHistIrr, 0u, 0u));
-        }
+        float disoccS = float(disoccF16.y);
+        float vsHr = (pc.resetHistory == 0u) ? (float(validHistF16.y) * inBSpec * isSurfF) : 0.0;
+        float gammaS = vsHr * clamp(rawHs - kDisocc * disoccS, 0.0, 0.980);
+        float keptS = gammaS * prevHistLenS;
+        float hWeightS = keptS / (1.0 + keptS);
+        float nextHistNormS = clamp((1.0 + keptS) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
+        float maturityS = clamp(keptS * (1.0 / 16.0), 0.0, 1.0);
+
+        vec3 resS = vec3(safeTanh(u3xyz.x), safeTanh(u3xyz.y), safeTanh(u3xyz.z)) * 0.8;
+        vec3 skipS = vec3(f16vec3(vec3(
+            w_f32[SKIP_SCALE_F32_OFFSET + 3u],
+            w_f32[SKIP_SCALE_F32_OFFSET + 4u],
+            w_f32[SKIP_SCALE_F32_OFFSET + 5u]
+        )));
+        vec3 effSkipS = vec3(1.0) + (skipS - vec3(1.0)) * (1.0 - maturityS);
+        vec3 baseLogS = upwaysLog1pVec3(max(effSkipS * currSpecLinHr, vec3(0.0)));
+        vec3 refSpecHr = clamp(
+            max(baseLogS + resS * isSurfF * (1.0 - maturityS), vec3(0.0)),
+            vec3(0.0),
+            vec3(MAX_LOG1P_IRRADIANCE)
+        );
+        vec3 boxMinS = min(vec3(sMinF16), refSpecHr);
+        vec3 boxMaxS = max(vec3(sMaxF16), refSpecHr);
+        float rectTS = safeTanh(kGhost * disoccS);
+        vec3 rectWSpec = clamp(wSpec + rectTS * (clamp(wSpec, boxMinS, boxMaxS) - wSpec), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
+        vec3 linSpecBlend = (1.0 - hWeightS) * upwaysExpm1Vec3(refSpecHr) + hWeightS * upwaysExpm1Vec3(rectWSpec);
+        vec3 irrSpecHr = clamp(upwaysLog1pVec3(max(linSpecBlend, vec3(0.0))), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
+        imageStore(uCurrIrrSpecHr, displayPos, vec4(f16vec4(vec4(irrSpecHr, nextHistNormS))));
+
+        vec3 modSpecHr = vec3(guideSpecF16) * upwaysExpm1Vec3(irrSpecHr);
+        float invExp = 1.0 / max(pc.preExposure, 1e-6);
+        vec3 rgbHr = sanitizeRadiance((modDiffHr + modSpecHr) * invExp);
+        imageStore(uOutputColor, displayPos, vec4(f16vec4(vec4(rgbHr, 1.0))));
     }
 }
-

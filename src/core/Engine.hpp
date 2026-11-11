@@ -18,7 +18,6 @@
 #include "rt/NRCManager.hpp"
 #include "rt/ReSTIRManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
-#include "rt/GatewayPipeline.hpp"
 #include "rt/FsrUpscaler.hpp"
 #include "rt/Fsr3Upscaler.hpp"
 #include "rt/SuperResolutionManager.hpp"
@@ -101,7 +100,6 @@ public:
     QualityGovernor* getGovernor() const { return m_governor.get(); }
     NRCManager* getNrcManager() const { return m_nrcManager; }
     UpwaysPipeline* getUpwaysPipeline() const { return m_superResolution ? m_superResolution->getUpwaysPipeline() : nullptr; }
-    GatewayPipeline* getGatewayPipeline() const { return m_superResolution ? m_superResolution->getGatewayPipeline() : nullptr; }
     FsrUpscaler* getFsrUpscaler() const { return m_superResolution ? m_superResolution->getFsrUpscaler() : nullptr; }
     Fsr3Upscaler* getFsr3Upscaler() const { return m_superResolution ? m_superResolution->getFsr3Upscaler() : nullptr; }
     SuperResolutionManager* getSuperResolution() const { return m_superResolution.get(); }
@@ -252,7 +250,7 @@ private:
     void initTlasBuffers(const std::vector<ASInstanceInput>& asInstances);
     void initTlasBuffers(uint32_t instanceCount);
     void initTlasUpdatePipeline();
-    void recordGpuTlasUpdate(VkCommandBuffer cmd, bool updateMode = true);
+    void recordGpuTlasUpdate(VkCommandBuffer cmd, uint32_t frameSlot, bool updateMode = true);
     void updateInstanceTransform(uint32_t index, const glm::mat4& transform);
     void markTlasDirty();
     void updateAnimatedInstances(float frameDelta);
@@ -289,17 +287,12 @@ private:
     std::unique_ptr<PostProcessPipeline> m_postProcess;
 
     // G-Buffer & ML Observing Pointers (resources owned by RenderTargetManager)
-    Image* m_directLightImage = nullptr;
     Image* m_normalDepthImage = nullptr;
     Image* m_prevNormalDepthImage = nullptr;
     Image* m_mlAlbedoRoughnessImage = nullptr;
     Image* m_mlSpecularMotionImage = nullptr;
     Image* m_mlDiffuseImage = nullptr;
     Image* m_mlSpecularImage = nullptr;
-    Image* m_ffxDirectDiffuseImage = nullptr;
-    Image* m_ffxDirectSpecularImage = nullptr;
-    Image* m_ffxIndirectDiffuseImage = nullptr;
-    Image* m_ffxIndirectSpecularImage = nullptr;
     void createGBufferResources();
     void destroyGBufferResources();
     void syncRenderTargetPointers();
@@ -329,8 +322,10 @@ private:
     void updateFsrDescriptors();
     void updateFsr3Descriptors();
 
-    // In-House ReLAX / A-SVGF Denoiser Subsystem
+    // E-SVGF & AMD FSR Ray Regeneration Denoiser Subsystem (lazily allocated)
     std::unique_ptr<DenoiserPipeline> m_denoiser;
+    void ensureNrcInitialized();
+    void ensureDenoiserInitialized();
 
     // Real-Time Caustics Subsystem
     std::unique_ptr<CausticsPipeline> m_causticsPipeline;

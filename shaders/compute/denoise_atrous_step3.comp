@@ -48,9 +48,7 @@ void main() {
     //    low-variance surfaces skips mid-scale taps and passes through radiance
     if (subgroupAll(effectiveRho >= 0.55 || (inDiffuse.a < 1e-4 && (!hasSpec || inSpecular.a < 1e-4)))) {
         imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
-        if (hasSpec) {
-            imageStore(uOutSpecular, coord, inSpecular);
-        }
+        imageStore(uOutSpecular, coord, hasSpec ? inSpecular : vec4(0.0));
         return;
     }
 
@@ -80,5 +78,7 @@ void main() {
             pc.tanHalfFovY, pc.aspectRatio, imgMax);
         vec4 finalSpecular = mix(filteredSpecular, inSpecular, edgeBlend);
         imageStore(uOutSpecular, coord, vec4(clamp(finalSpecular.rgb, 0.0, 65000.0), clamp(finalSpecular.a, 0.0, 65000.0)));
+    } else {
+        imageStore(uOutSpecular, coord, vec4(0.0));
     }
 }

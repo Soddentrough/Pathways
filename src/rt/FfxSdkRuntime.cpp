@@ -341,6 +341,9 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 {
     std::vector<FfxSdkVersionInfo> result;
 #if defined(PATHWAYS_HAS_FFX_SDK)
+    if (!selectModuleForHeader(createDescType)) {
+        return result;
+    }
     struct VersionCacheEntry {
         uint64_t createDescType;
         VkPhysicalDevice physDevice;
@@ -385,13 +388,9 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
         std::vector<const char*> mlExts;
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{};
         coopFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
-        coopFeatures.cooperativeMatrix = VK_TRUE;
 
         VkPhysicalDeviceVulkan12Features vk12Features{};
         vk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        vk12Features.shaderFloat16 = VK_TRUE;
-        vk12Features.shaderInt8 = VK_TRUE;
-        vk12Features.storageBuffer8BitAccess = VK_TRUE;
         vk12Features.pNext = &coopFeatures;
 
         void** tailNext = &coopFeatures.pNext;
@@ -399,7 +398,6 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 #ifdef VK_EXT_mutable_descriptor_type
         VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableFeatures{};
         mutableFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT;
-        mutableFeatures.mutableDescriptorType = VK_TRUE;
         if (hasExt(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
             *tailNext = &mutableFeatures;
             tailNext = &mutableFeatures.pNext;
@@ -408,13 +406,15 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
 #ifdef VK_EXT_shader_float8
         VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{};
         float8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT;
-        float8Features.shaderFloat8 = VK_TRUE;
-        float8Features.shaderFloat8CooperativeMatrix = VK_TRUE;
         if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
             *tailNext = &float8Features;
             tailNext = &float8Features.pNext;
         }
 #endif
+
+        VkPhysicalDeviceFeatures2 queryFeat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        queryFeat2.pNext = &vk12Features;
+        vkGetPhysicalDeviceFeatures2(physDevice, &queryFeat2);
 
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -424,12 +424,12 @@ std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
         if (supportsHardwareMl(physDevice)) {
             mlExts.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
 #ifdef VK_EXT_shader_float8
-            if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME)) {
+            if (hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) && float8Features.shaderFloat8 == VK_TRUE) {
                 mlExts.push_back(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
             }
 #endif
 #ifdef VK_EXT_mutable_descriptor_type
-            if (hasExt(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME)) {
+            if (hasExt(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME) && mutableFeatures.mutableDescriptorType == VK_TRUE) {
                 mlExts.push_back(VK_EXT_MUTABLE_DESCRIPTOR_TYPE_EXTENSION_NAME);
             }
 #endif

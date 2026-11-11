@@ -3,6 +3,7 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <bit>
 
 namespace pathways {
 
@@ -103,10 +104,11 @@ void CausticsPipeline::createDescriptorLayouts() {
         throw std::runtime_error("Failed to create caustic splat descriptor set layout");
     }
 
-    // 1c. Filter Layout: CameraUBO(1), NormalDepth(12), MotionVector(14), AtomicBuffer(21), FilteredCaustic(22), PrevCaustic(23)
+    // 1c. Filter Layout: CameraUBO(1), NormalDepth(12), PrevNormalDepth(13), MotionVector(14), AtomicBuffer(21), FilteredCaustic(22), PrevCaustic(23)
     std::vector<VkDescriptorSetLayoutBinding> filterBindings = {
         { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 21, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 22, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -244,6 +246,7 @@ void CausticsPipeline::createPipelines(const std::vector<char>& traceSpv,
 }
 
 void CausticsPipeline::createResources(ImmediateSubmitFn immediateSubmit) {
+    m_hasHistory = false;
     uint32_t photonCount = std::max(m_photonCount, 65536u);
     VkDeviceSize photonBufferSize = static_cast<VkDeviceSize>(photonCount) * 64;
     m_causticPhotonBuffer = std::make_unique<Buffer>(
@@ -317,9 +320,10 @@ void CausticsPipeline::updateDescriptors(
     const std::vector<std::unique_ptr<Texture>>& sceneTextures,
     Texture* dummyWhite,
     Buffer* instanceBuffer,
-    const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs,
+        const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs,
     Image* normalDepthImage,
-    Image* motionVectorImage)
+    Image* motionVectorImage,
+    Image* prevNormalDepthImage)
 {
     if (!m_descPool || !m_causticPhotonBuffer || !m_causticAtomicBuffer ||
         !m_filteredCausticImage || !m_prevCausticImage || !normalDepthImage ||
@@ -348,7 +352,9 @@ void CausticsPipeline::updateDescriptors(
     VkDescriptorBufferInfo photonBufInfo{ m_causticPhotonBuffer->getBuffer(), 0, m_causticPhotonBuffer->getSize() };
     VkDescriptorBufferInfo atomicBufInfo{ m_causticAtomicBuffer->getBuffer(), 0, m_causticAtomicBuffer->getSize() };
 
+    Image* actualPrevNd = prevNormalDepthImage ? prevNormalDepthImage : normalDepthImage;
     VkDescriptorImageInfo ndImageInfo{ VK_NULL_HANDLE, normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevNdImageInfo{ VK_NULL_HANDLE, actualPrevNd->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mvImageInfo{ VK_NULL_HANDLE, motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo filteredCausticInfo{ VK_NULL_HANDLE, m_filteredCausticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo prevCausticInfo{ VK_NULL_HANDLE, m_prevCausticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
@@ -389,6 +395,7 @@ void CausticsPipeline::updateDescriptors(
         VkDescriptorSet filterSet = m_filterDescSets[slot];
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &camInfos[slot], nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ndImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevNdImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 21, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicBufInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, filterSet, 22, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &filteredCausticInfo, nullptr, nullptr });
@@ -473,7 +480,9 @@ void CausticsPipeline::recordSplatAndFilter(
     bool cameraMovedLastFrame,
     bool hasDielectrics,
     const glm::vec3& dielectricBoundsMin,
-    const glm::vec3& dielectricBoundsMax)
+    const glm::vec3& dielectricBoundsMax,
+    uint32_t fullScreenWidth,
+    uint32_t checkerboardTileSize)
 {
     if (!m_splatPipeline || !m_filterPipeline ||
         !m_causticAtomicBuffer || !m_causticPhotonBuffer || !m_filteredCausticImage) return;
@@ -522,12 +531,15 @@ void CausticsPipeline::recordSplatAndFilter(
         glm::vec4 targetBBoxMin;
         glm::vec4 targetBBoxMax;
     } splatPC;
+    const uint32_t packedSplatCb = (checkerboardTileSize > 0u && fullScreenWidth > 0u)
+        ? ((fullScreenWidth << 16u) | (checkerboardTileSize & 0xFFFFu))
+        : 0u;
     splatPC.width = m_width;
     splatPC.height = m_height;
     splatPC.photonCount = m_photonCount;
     splatPC.fov = cameraFov;
     splatPC.targetBBoxMin = glm::vec4(dielectricBoundsMin, hasDielectrics ? 1.0f : 0.0f);
-    splatPC.targetBBoxMax = glm::vec4(dielectricBoundsMax, 0.0f);
+    splatPC.targetBBoxMax = glm::vec4(dielectricBoundsMax, std::bit_cast<float>(packedSplatCb));
 
     vkCmdPushConstants(cmd, m_splatPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(splatPC), &splatPC);
     uint32_t splatGroups = (m_photonCount + 255) / 256;
@@ -552,10 +564,10 @@ void CausticsPipeline::recordSplatAndFilter(
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_filterPipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_filterPipelineLayout, 0, 1, &m_filterDescSets[frameSlot], 0, nullptr);
 
-    uint32_t accumHist = 0u;
-    if (progressiveAccumulation && !cameraMovedLastFrame) {
-        accumHist = 2u; // stationary progressive
-    }
+    uint32_t accumHist = !m_hasHistory
+        ? 0u
+        : ((progressiveAccumulation && !cameraMovedLastFrame) ? 2u : 1u);
+    m_hasHistory = true;
 
     struct CausticFilterPC {
         uint32_t width;
@@ -566,7 +578,9 @@ void CausticsPipeline::recordSplatAndFilter(
     filterPC.width = m_width;
     filterPC.height = m_height;
     filterPC.frameIndex = frameIndex;
-    filterPC.accumulateHistory = accumHist;
+    filterPC.accumulateHistory = (checkerboardTileSize > 0u && fullScreenWidth > 0u)
+        ? ((fullScreenWidth << 16u) | ((checkerboardTileSize & 0xFFFu) << 4u) | (accumHist & 0xFu))
+        : accumHist;
 
     vkCmdPushConstants(cmd, m_filterPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(filterPC), &filterPC);
     uint32_t filterGroupsX = (m_width + 15) / 16;
@@ -639,7 +653,9 @@ void CausticsPipeline::recordFullPass(
     bool cameraMovedLastFrame,
     bool hasDielectrics,
     const glm::vec3& dielectricBoundsMin,
-    const glm::vec3& dielectricBoundsMax)
+    const glm::vec3& dielectricBoundsMax,
+    uint32_t fullScreenWidth,
+    uint32_t checkerboardTileSize)
 {
     if (!hasDielectrics || numLights == 0) return;
 
@@ -649,7 +665,8 @@ void CausticsPipeline::recordFullPass(
 
     recordSplatAndFilter(cmd, frameSlot, normalDepthImage, cameraFov, frameIndex,
                          progressiveAccumulation, cameraMovedLastFrame,
-                         hasDielectrics, dielectricBoundsMin, dielectricBoundsMax);
+                         hasDielectrics, dielectricBoundsMin, dielectricBoundsMax,
+                         fullScreenWidth, checkerboardTileSize);
 }
 
 } // namespace pathways

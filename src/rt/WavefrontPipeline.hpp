@@ -119,11 +119,7 @@ public:
                                 VkBuffer x1ContextBuffer = VK_NULL_HANDLE,
                                 VkBuffer giReservoirBuffer = VK_NULL_HANDLE,
                                 VkBuffer giHistoryReservoirBuffer = VK_NULL_HANDLE,
-                                VkBuffer positionBuffer = VK_NULL_HANDLE,
-                                VkImageView ffxDirectDiffuseImageView = VK_NULL_HANDLE,
-                                VkImageView ffxDirectSpecularImageView = VK_NULL_HANDLE,
-                                VkImageView ffxIndirectDiffuseImageView = VK_NULL_HANDLE,
-                                VkImageView ffxIndirectSpecularImageView = VK_NULL_HANDLE);
+                                VkImageView prevNormalDepthImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
@@ -132,6 +128,7 @@ public:
                      uint32_t spp, uint32_t maxBounces,
                      const WavefrontSceneData& sceneData);
     void setWarmupSppOverride(uint32_t spp) { m_warmupSppOverride = spp; }
+    uint32_t getWarmupSppOverride() const { return m_warmupSppOverride; }
 
     struct BounceProfilingData {
         uint32_t bounce = 0;
@@ -181,7 +178,6 @@ public:
 
     Buffer* getRayGeomQueue(uint32_t slot) const { return m_rayGeomQueueA[slot].get(); }
     Buffer* getRayHitQueue(uint32_t slot) const { return m_rayHitQueue[slot].get(); }
-    Buffer* getPixelToRayQueue(uint32_t slot) const { return m_pixelToRayQueue[slot].get(); }
 
     using PostClassifyCallback = std::function<void(VkCommandBuffer cmd, uint32_t frameSlot)>;
     void setPostClassifyCallback(PostClassifyCallback cb) { m_postClassifyCallback = std::move(cb); }
@@ -230,9 +226,9 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_secondaryIndexQueue; // 4B index * 8 octants (Directional DGC Queues)
     std::array<std::unique_ptr<Buffer>, 2> m_shadowQueue;    // 32B PackedShadowRay
     std::array<std::unique_ptr<Buffer>, 2> m_queueCounters;
-    std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;   // Double-buffered per in-flight frame slot
+    std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;     // Pure DEVICE_LOCAL indirect dispatch commands
+    std::array<std::unique_ptr<Buffer>, 2> m_indirectReadback; // Host-cached telemetry readback per frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_dgcStream;
-    std::array<std::unique_ptr<Buffer>, 2> m_pixelToRayQueue; // 4B pixel-to-ray mapping for ReSTIR PT
 
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

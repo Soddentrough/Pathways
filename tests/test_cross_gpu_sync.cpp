@@ -51,7 +51,11 @@ int main() {
     qInfo0.queueCount = 1;
     qInfo0.pQueuePriorities = &priority;
 
+    VkPhysicalDeviceVulkan12Features features12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    features12.timelineSemaphore = VK_TRUE;
+
     VkPhysicalDeviceVulkan13Features features13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    features13.pNext = &features12;
     features13.synchronization2 = VK_TRUE;
 
     VkDeviceCreateInfo dInfo0{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
@@ -207,6 +211,104 @@ int main() {
     }
 
     std::cout << "[SUCCESS] 100 cross-GPU synchronization cycles passed with zero errors!" << std::endl;
+
+    // Phase 2: Permanent Cross-GPU Timeline Semaphore (VK_SEMAPHORE_TYPE_TIMELINE)
+    // Zero per-frame FD export/import overhead, matching MultiGpuManager architecture
+    std::cout << "Testing permanent cross-GPU VK_SEMAPHORE_TYPE_TIMELINE across 16 steps..." << std::endl;
+    {
+        VkSemaphoreTypeCreateInfo timelineType1{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        timelineType1.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        timelineType1.initialValue = 0;
+
+        VkExportSemaphoreCreateInfo tlExport{ VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO };
+        tlExport.pNext = &timelineType1;
+        tlExport.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+        VkSemaphoreCreateInfo tlInfo1{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        tlInfo1.pNext = &tlExport;
+        VkSemaphore tlSem1 = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(dev1, &tlInfo1, nullptr, &tlSem1) != VK_SUCCESS) {
+            std::cerr << "Failed to create exportable timeline semaphore on Dev 1." << std::endl;
+            return 1;
+        }
+
+        VkSemaphoreTypeCreateInfo timelineType0{ VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+        timelineType0.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        timelineType0.initialValue = 0;
+
+        VkSemaphoreCreateInfo tlInfo0{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        tlInfo0.pNext = &timelineType0;
+        VkSemaphore tlSem0 = VK_NULL_HANDLE;
+        if (vkCreateSemaphore(dev0, &tlInfo0, nullptr, &tlSem0) != VK_SUCCESS) {
+            std::cerr << "Failed to create importable timeline semaphore on Dev 0." << std::endl;
+            return 1;
+        }
+
+        VkSemaphoreGetFdInfoKHR getTlFd{ VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR };
+        getTlFd.semaphore = tlSem1;
+        getTlFd.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        int tlFd = -1;
+        if (pfnGetSemaphoreFdKHR(dev1, &getTlFd, &tlFd) != VK_SUCCESS || tlFd < 0) {
+            std::cerr << "Failed to export timeline semaphore FD from Dev 1." << std::endl;
+            return 1;
+        }
+
+        // Permanent import (flags = 0) — imported once and reused for all timeline steps
+        VkImportSemaphoreFdInfoKHR impTl{ VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR };
+        impTl.semaphore = tlSem0;
+        impTl.flags = 0;
+        impTl.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        impTl.fd = tlFd;
+        if (pfnImportSemaphoreFdKHR(dev0, &impTl) != VK_SUCCESS) {
+            std::cerr << "Failed to permanently import timeline semaphore FD into Dev 0." << std::endl;
+            close(tlFd);
+            return 1;
+        }
+
+        for (uint64_t step = 1; step <= 16; ++step) {
+            VkCommandBufferSubmitInfo cmdInfo1{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdInfo1.commandBuffer = cmd1;
+            VkSemaphoreSubmitInfo sigTl{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            sigTl.semaphore = tlSem1;
+            sigTl.value = step;
+            sigTl.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            VkSubmitInfo2 sub1{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            sub1.commandBufferInfoCount = 1;
+            sub1.pCommandBufferInfos = &cmdInfo1;
+            sub1.signalSemaphoreInfoCount = 1;
+            sub1.pSignalSemaphoreInfos = &sigTl;
+            if (vkQueueSubmit2(q1, 1, &sub1, VK_NULL_HANDLE) != VK_SUCCESS) return 1;
+
+            VkCommandBufferSubmitInfo cmdInfo0{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdInfo0.commandBuffer = cmd0;
+            VkSemaphoreSubmitInfo waitTl{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
+            waitTl.semaphore = tlSem0;
+            waitTl.value = step;
+            waitTl.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            VkSubmitInfo2 sub0{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            sub0.commandBufferInfoCount = 1;
+            sub0.pCommandBufferInfos = &cmdInfo0;
+            sub0.waitSemaphoreInfoCount = 1;
+            sub0.pWaitSemaphoreInfos = &waitTl;
+
+            VkFence fence0 = VK_NULL_HANDLE;
+            VkFenceCreateInfo fInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            vkCreateFence(dev0, &fInfo, nullptr, &fence0);
+            if (vkQueueSubmit2(q0, 1, &sub0, fence0) != VK_SUCCESS) return 1;
+            vkWaitForFences(dev0, 1, &fence0, VK_TRUE, UINT64_MAX);
+            vkDestroyFence(dev0, fence0, nullptr);
+
+            uint64_t counterVal0 = 0;
+            if (vkGetSemaphoreCounterValue(dev0, tlSem0, &counterVal0) != VK_SUCCESS || counterVal0 < step) {
+                std::cerr << "Timeline semaphore counter mismatch on Dev 0 at step " << step << std::endl;
+                return 1;
+            }
+        }
+
+        vkDestroySemaphore(dev0, tlSem0, nullptr);
+        vkDestroySemaphore(dev1, tlSem1, nullptr);
+        std::cout << "[SUCCESS] Permanent cross-GPU timeline semaphore verified across 16 steps!" << std::endl;
+    }
 
     vkDestroySemaphore(dev0, sem0, nullptr);
     vkDestroySemaphore(dev1, sem1, nullptr);

@@ -7,6 +7,7 @@
 #include "scene/ProceduralScene.hpp"
 
 #include <glm/glm.hpp>
+#include <array>
 #include <vector>
 #include <memory>
 #include <cstdint>
@@ -25,18 +26,26 @@ public:
 
     void initBuffers(const std::vector<ASInstanceInput>& asInstances, AccelerationStructureManager* asManager);
     void initBuffers(uint32_t instanceCount, AccelerationStructureManager* asManager, VkDeviceAddress defaultBlasAddr);
+    void initShaderInstances(Buffer* shaderInstBuf, const std::vector<InstanceGPU>& initialInstances);
     void createPipeline(const std::vector<char>& compCode);
     void updateDescriptors();
 
-    void recordGpuTlasUpdate(VkCommandBuffer cmd, AccelerationStructureManager* asManager, AccelerationStructure* tlas, bool updateMode = true);
+    void recordGpuTlasUpdate(VkCommandBuffer cmd, uint32_t frameSlot, AccelerationStructureManager* asManager, AccelerationStructure* tlas, bool updateMode = true);
+    void recordGpuTlasUpdate(VkCommandBuffer cmd, AccelerationStructureManager* asManager, AccelerationStructure* tlas, bool updateMode = true) {
+        recordGpuTlasUpdate(cmd, 0u, asManager, tlas, updateMode);
+    }
     void updateInstanceTransform(uint32_t index, const glm::mat4& transform, std::vector<SceneInstance>& sceneInstances);
     void updateAnimatedInstances(float frameDelta, bool animateObjects, float animSpeed,
                                 const std::vector<AnimatedInstance>& animInstances,
                                 std::vector<SceneInstance>& sceneInstances);
 
-    [[nodiscard]] bool needsGpuUpdate() const noexcept { return m_needsGpuUpdate; }
+    [[nodiscard]] bool needsGpuUpdate() const noexcept { return m_needsGpuUpdate || m_shaderInstancesDirty; }
+    [[nodiscard]] bool needsTlasRebuild() const noexcept { return m_needsGpuUpdate; }
+    void syncFromCpuTransforms(const std::vector<InstanceGPU>& shaderInstances,
+                               const std::vector<ASInstanceGPUData>& primaryInputInstances,
+                               bool triggerTlasRebuild);
     void markDirty() noexcept { m_needsGpuUpdate = true; }
-    void clearDirty() noexcept { m_needsGpuUpdate = false; }
+    void clearDirty() noexcept { m_needsGpuUpdate = false; m_shaderInstancesDirty = false; }
     [[nodiscard]] uint32_t getGpuUpdateCount() const noexcept { return m_tlasGpuUpdateCount; }
     [[nodiscard]] uint32_t getInstanceCount() const noexcept { return m_tlasInstanceCount; }
 
@@ -44,6 +53,8 @@ public:
     [[nodiscard]] Buffer* getInputInstancesBuffer() const noexcept { return m_tlasInputInstancesBuffer.get(); }
     [[nodiscard]] Buffer* getScratchBuffer() const noexcept { return m_tlasScratchBuffer.get(); }
     void setShaderInstanceBuffer(Buffer* shaderInstBuf) noexcept { m_shaderInstanceBuffer = shaderInstBuf; }
+    [[nodiscard]] const std::vector<InstanceGPU>& getCpuShaderInstances() const noexcept { return m_cpuShaderInstances; }
+    [[nodiscard]] const std::vector<ASInstanceGPUData>& getCpuInputInstances() const noexcept { return m_cpuInputInstances; }
     [[nodiscard]] VkPipeline getPipeline() const noexcept { return m_updateTlasPipeline; }
     [[nodiscard]] VkPipelineLayout getPipelineLayout() const noexcept { return m_updateTlasPipelineLayout; }
     [[nodiscard]] VkDescriptorSet getDescriptorSet() const noexcept { return m_updateTlasDescSet; }
@@ -59,9 +70,14 @@ private:
     std::unique_ptr<Buffer> m_tlasInstanceBuffer;
     std::unique_ptr<Buffer> m_tlasInputInstancesBuffer;
     std::unique_ptr<Buffer> m_tlasScratchBuffer;
+    std::array<std::unique_ptr<Buffer>, 2> m_stagingShaderInstances;
+    std::array<std::unique_ptr<Buffer>, 2> m_stagingInputInstances;
+    std::vector<InstanceGPU> m_cpuShaderInstances;
+    std::vector<ASInstanceGPUData> m_cpuInputInstances;
     Buffer* m_shaderInstanceBuffer = nullptr;
     uint32_t m_tlasInstanceCount = 0;
     bool m_needsGpuUpdate = false;
+    bool m_shaderInstancesDirty = false;
     bool m_wasAnimatingLastFrame = false;
     uint32_t m_tlasGpuUpdateCount = 0;
 

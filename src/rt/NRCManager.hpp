@@ -43,7 +43,8 @@ public:
                uint32_t width, uint32_t height,
                const std::vector<char>& inferSpv,
                const std::vector<char>& trainSpv,
-               const std::vector<char>& resolveSpv = {});
+               const std::vector<char>& resolveSpv = {},
+               VkPhysicalDevice physDevice = VK_NULL_HANDLE);
     ~NRCManager();
 
     NRCManager(const NRCManager&) = delete;
@@ -87,6 +88,7 @@ private:
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
+    VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;

@@ -66,11 +66,16 @@ void EngineDescriptorManager::init(
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
         { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
         { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
         { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr }
+        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
+        { 26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 28, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 29, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
+        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
     };
 
     VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
@@ -130,11 +135,6 @@ void EngineDescriptorManager::updatePrimaryImageDescriptors(const ImageDescripto
     accumImageInfo.imageView = params.accumImage->getImageView();
     accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-    VkDescriptorImageInfo directLightInfo{};
-    if (params.directLightImage) {
-        directLightInfo.imageView = params.directLightImage->getImageView();
-        directLightInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    }
     VkDescriptorImageInfo normDepthInfo{};
     if (params.normalDepthImage) {
         normDepthInfo.imageView = params.normalDepthImage->getImageView();
@@ -146,9 +146,29 @@ void EngineDescriptorManager::updatePrimaryImageDescriptors(const ImageDescripto
         mvImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     }
 
+    const VkImageView rgba16FallbackView = (normDepthInfo.imageView != VK_NULL_HANDLE)
+        ? normDepthInfo.imageView
+        : accumImageInfo.imageView;
+
     VkDescriptorImageInfo causticInfo{};
-    causticInfo.imageView = params.filteredCausticImage ? params.filteredCausticImage->getImageView() : accumImageInfo.imageView;
+    causticInfo.imageView = params.filteredCausticImage ? params.filteredCausticImage->getImageView() : rgba16FallbackView;
     causticInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo mlAlbedoInfo{};
+    mlAlbedoInfo.imageView = params.mlAlbedoRoughnessImage ? params.mlAlbedoRoughnessImage->getImageView() : rgba16FallbackView;
+    mlAlbedoInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo mlSpecMotionInfo{};
+    mlSpecMotionInfo.imageView = params.mlSpecularMotionImage ? params.mlSpecularMotionImage->getImageView() : rgba16FallbackView;
+    mlSpecMotionInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo mlDiffInfo{};
+    mlDiffInfo.imageView = params.mlDiffuseImage ? params.mlDiffuseImage->getImageView() : rgba16FallbackView;
+    mlDiffInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+    VkDescriptorImageInfo mlSpecInfo{};
+    mlSpecInfo.imageView = params.mlSpecularImage ? params.mlSpecularImage->getImageView() : rgba16FallbackView;
+    mlSpecInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     std::array<VkDescriptorImageInfo, MAX_FRAMES_IN_FLIGHT> frameImageInfos;
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -172,15 +192,7 @@ void EngineDescriptorManager::updatePrimaryImageDescriptors(const ImageDescripto
                 writes.push_back(w0);
             }
 
-            if (params.directLightImage && params.normalDepthImage) {
-                VkWriteDescriptorSet w11{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                w11.dstSet = m_rtDescSets[i];
-                w11.dstBinding = 11;
-                w11.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                w11.descriptorCount = 1;
-                w11.pImageInfo = &directLightInfo;
-                writes.push_back(w11);
-
+            if (params.normalDepthImage) {
                 VkWriteDescriptorSet w12{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
                 w12.dstSet = m_rtDescSets[i];
                 w12.dstBinding = 12;
@@ -209,6 +221,19 @@ void EngineDescriptorManager::updatePrimaryImageDescriptors(const ImageDescripto
                 w15.pImageInfo = &causticInfo;
                 writes.push_back(w15);
             }
+
+            if (mlAlbedoInfo.imageView != VK_NULL_HANDLE) {
+                writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlAlbedoInfo, nullptr, nullptr });
+            }
+            if (mlSpecMotionInfo.imageView != VK_NULL_HANDLE) {
+                writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecMotionInfo, nullptr, nullptr });
+            }
+            if (mlDiffInfo.imageView != VK_NULL_HANDLE) {
+                writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlDiffInfo, nullptr, nullptr });
+            }
+            if (mlSpecInfo.imageView != VK_NULL_HANDLE) {
+                writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecInfo, nullptr, nullptr });
+            }
         }
     }
 
@@ -224,6 +249,10 @@ void EngineDescriptorManager::updatePrimarySceneDescriptors(const SceneDescripto
     VkDescriptorBufferInfo sphereBufferInfo{ params.sphereBuffer->getBuffer(), 0, params.sphereBuffer->getSize() };
     VkDescriptorBufferInfo matBufferInfo{ params.materialBuffer->getBuffer(), 0, params.materialBuffer->getSize() };
     VkDescriptorBufferInfo lightBufferInfo{ params.lightBuffer->getBuffer(), 0, params.lightBuffer->getSize() };
+    Buffer* actualLightTree = params.lightTreeBuffer ? params.lightTreeBuffer : params.lightBuffer;
+    Buffer* actualInstances = params.instanceBuffer ? params.instanceBuffer : params.triangleBuffer;
+    VkDescriptorBufferInfo lightTreeBufferInfo{ actualLightTree->getBuffer(), 0, actualLightTree->getSize() };
+    VkDescriptorBufferInfo instanceBufferInfo{ actualInstances->getBuffer(), 0, actualInstances->getSize() };
 
     VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
     asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -233,6 +262,8 @@ void EngineDescriptorManager::updatePrimarySceneDescriptors(const SceneDescripto
 
     VkDescriptorImageInfo envInfo = params.environmentMap ? params.environmentMap->getDescriptorInfo() : 
                                     (params.dummyWhite ? params.dummyWhite->getDescriptorInfo() : VkDescriptorImageInfo{});
+    VkDescriptorImageInfo bnInfo = params.blueNoiseTexture ? params.blueNoiseTexture->getDescriptorInfo() : 
+                                   (params.dummyWhite ? params.dummyWhite->getDescriptorInfo() : VkDescriptorImageInfo{});
 
     std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
     for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
@@ -253,9 +284,9 @@ void EngineDescriptorManager::updatePrimarySceneDescriptors(const SceneDescripto
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, m_rtDescSets[i], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr });
-        VkDescriptorImageInfo bnInfo = params.blueNoiseTexture ? params.blueNoiseTexture->getDescriptorInfo() : 
-                                      (params.dummyWhite ? params.dummyWhite->getDescriptorInfo() : VkDescriptorImageInfo{});
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &bnInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeBufferInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_rtDescSets[i], 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceBufferInfo, nullptr });
     }
     if (!writes.empty()) {
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
@@ -324,16 +355,14 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            params.positionBuffer ? params.positionBuffer->getBuffer() : VK_NULL_HANDLE,
-            params.ffxDirectDiffuseImage ? params.ffxDirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
-            params.ffxDirectSpecularImage ? params.ffxDirectSpecularImage->getImageView() : VK_NULL_HANDLE,
-            params.ffxIndirectDiffuseImage ? params.ffxIndirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
-            params.ffxIndirectSpecularImage ? params.ffxIndirectSpecularImage->getImageView() : VK_NULL_HANDLE
+            params.prevNormalDepthImage ? params.prevNormalDepthImage->getImageView() : VK_NULL_HANDLE
         );
     }
 
     if (params.nrcManager) {
-        VkImageView mlDiffView = params.mlDiffuseImage ? params.mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlDiffView = params.mlDiffuseImage
+            ? params.mlDiffuseImage->getImageView()
+            : (params.normalDepthImage ? params.normalDepthImage->getImageView() : VK_NULL_HANDLE);
         for (uint32_t slot = 0; slot < 2; ++slot) {
             if (params.frameImages[slot]) {
                 params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView(), mlDiffView);
@@ -347,16 +376,22 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
         return;
     }
 
-    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 32 :
-                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 28 : 40;
-    VkDeviceSize bufferSize = static_cast<VkDeviceSize>(params.width) * params.height * bytesPerPixel;
+    constexpr VkDeviceSize kDummyTransferSize = 65536;
+    const bool mgpuSharedActive = params.mgpu && params.mgpu->isSecondaryInitialized() &&
+                                  (params.mgpu->isZeroCopyActive() || params.mgpu->isP2PDirectBarActive());
+    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 64 :
+                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 60 : 72;
+    VkDeviceSize bufferSize = mgpuSharedActive
+        ? params.mgpu->getSharedBufferSize()
+        : ((params.mgpu && params.mgpu->isSecondaryInitialized())
+            ? (static_cast<VkDeviceSize>(params.width) * params.height * bytesPerPixel)
+            : kDummyTransferSize);
 
     for (uint32_t slot = 0; slot < 2; ++slot) {
         VkBuffer secBuffer = VK_NULL_HANDLE;
         VkDeviceSize curSize = bufferSize;
 
-        if (params.mgpu && params.mgpu->isSecondaryInitialized() && 
-            (params.mgpu->isZeroCopyActive() || params.mgpu->isP2PDirectBarActive())) {
+        if (mgpuSharedActive) {
             secBuffer = params.mgpu->getPrimarySharedBuffer(slot);
             curSize = params.mgpu->getSharedBufferSize();
         }
@@ -381,7 +416,11 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
             params.motionVectorImage,
             params.normalDepthImage,
             params.width, params.height,
-            params.accumFormat
+            params.accumFormat,
+            params.mlDiffuseImage,
+            params.mlSpecularImage,
+            params.mlAlbedoRoughnessImage,
+            params.mlSpecularMotionImage
         );
     }
 }

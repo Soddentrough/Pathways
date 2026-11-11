@@ -1,331 +1,334 @@
 #version 460
-#extension GL_KHR_shader_subgroup_shuffle : require
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
-#extension GL_EXT_shader_16bit_storage : require
-#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_float_e4m3 : require
 
 #include "upways_common.glsl"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f)  uniform readonly image2D  uCurrentDiffuse;
-layout(set = 0, binding = 1, rgba16f)  uniform readonly image2D  uCurrentSpecular;
-layout(set = 0, binding = 2, rgba16f)  uniform readonly image2D  uNormalDepth;
-layout(set = 0, binding = 3, rgba16f)  uniform readonly image2D  uPrevNormalDepth;
-layout(set = 0, binding = 4, rgba16f)  uniform readonly image2D  uMotionVectors;
-layout(set = 0, binding = 5, rgba16f)  uniform readonly image2D  uAlbedoRoughness;
-layout(set = 0, binding = 6, rgba16f)  uniform readonly image2D  uSpecularMotion;
-layout(set = 0, binding = 7, rgba16f)  uniform readonly image2D  uPrevSpecularMotion;
-layout(set = 0, binding = 8, rg32ui)   uniform readonly uimage2D uHistoryDiffuseIn;
-layout(set = 0, binding = 9, rg32ui)   uniform readonly uimage2D uHistorySpecularIn;
-layout(set = 0, binding = 10, rgba16f) uniform readonly image2D  uHistoryMomentsIn;
+// Current render-resolution G-buffers
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uCurrentDiffuse;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D uCurrentSpecular;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D uAlbedoRoughness;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D uNormalDepth;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uMotionVectors;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uSpecularMotion;
+layout(set = 0, binding = 6, rgba16f) uniform readonly image2D uAuxMetadata;
 
-layout(set = 0, binding = 11, rgba32ui) uniform writeonly uimage2D uTemporalDiffuseOut;
-layout(set = 0, binding = 12, rgba32ui) uniform writeonly uimage2D uTemporalSpecularOut;
-layout(set = 0, binding = 13, rgba16f)  uniform writeonly image2D  uReprojDiffuseOut;
-layout(set = 0, binding = 14, rgba16f)  uniform writeonly image2D  uReprojSpecularOut;
-layout(set = 0, binding = 15, rgba16f)  uniform writeonly image2D  uHistoryMomentsOut;
+// Hardware-sampled previous-frame history & geometry (VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+layout(set = 0, binding = 7)  uniform sampler2D      uPrevIrrDiffHr;
+layout(set = 0, binding = 8)  uniform sampler2D      uPrevIrrSpecHr;
+layout(set = 0, binding = 9)  uniform sampler2D      uPrevGeomNd;
+layout(set = 0, binding = 10) uniform sampler2D      uPrevGeomHitT;
+layout(set = 0, binding = 11) uniform sampler2DArray uPrevNeuralHidden;
 
-layout(std430, set = 0, binding = 16) writeonly buffer NeuralFeaturesOutBuffer {
-    uvec4 features4[];
-} uNeuralFeaturesOut;
+// Current-frame render-resolution geometry history & transient buffers
+layout(set = 0, binding = 12, rgba16f) uniform writeonly image2D uCurrGeomNd;
+layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D uCurrGeomHitT;
+layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D tLogDiff;
+layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D tLogSpec;
+layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D tGuideDiff;
+layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D tGuideSpec;
+layout(set = 0, binding = 18, rgba16f) uniform writeonly image2D tDilatedMv;
+layout(set = 0, binding = 19, rgba16f) uniform writeonly image2D tTemporalConf;
 
-layout(push_constant) uniform TemporalPushConstants {
-    uint renderWidth;
-    uint renderHeight;
-    uint resetHistory;
-    float minAlphaDiffuse;
-    float minAlphaSpecular;
-} pc;
+// FP8 E4M3 activation pyramid buffer (writes PYR_X0 [8x fe4m3vec4] and PYR_HW0 [4x fe4m3vec4] at L0)
+layout(set = 0, binding = 20, std430) writeonly buffer PyramidFp8Buf {
+    fe4m3vec4 pyr4[];
+};
 
-const float MAX_LOG1P_IRRADIANCE = 11.09035489;
-const float INV_MAX_LOG1P_IRRADIANCE = 1.0 / 11.09035489;
-
-void computeBilinearCoords(
-    vec2 uv,
-    ivec2 texSize,
-    out ivec2 p00,
-    out ivec2 p10,
-    out ivec2 p01,
-    out ivec2 p11,
-    out vec2 f
-) {
-    vec2 cUv   = clamp(uv, vec2(0.0), vec2(1.0));
-    vec2 pos   = cUv * vec2(texSize) - vec2(0.5);
-    vec2 rPos  = round(pos);
-    pos        = mix(pos, rPos, lessThan(abs(pos - rPos), vec2(1e-5)));
-    ivec2 base = ivec2(floor(pos));
-    f          = pos - vec2(base);
-    ivec2 maxP = texSize - ivec2(1);
-
-    p00 = clamp(base + ivec2(0, 0), ivec2(0), maxP);
-    p10 = clamp(base + ivec2(1, 0), ivec2(0), maxP);
-    p01 = clamp(base + ivec2(0, 1), ivec2(0), maxP);
-    p11 = clamp(base + ivec2(1, 1), ivec2(0), maxP);
+floate4m3_t toFp8E4M3(float v) {
+    if (isnan(v)) return floate4m3_t(0.0);
+    if (isinf(v)) return floate4m3_t(v > 0.0 ? FP8_E4M3_MAX : -FP8_E4M3_MAX);
+    return floate4m3_t(clamp(v, -FP8_E4M3_MAX, FP8_E4M3_MAX));
 }
 
-#define UNPACK_IRR_P1(p) \
-    vec3( \
-        unpackHalf2x16((((p) & 0x7FFu) << 1u) + 0x3C00u | (((((p) >> 11u) & 0x7FFu) << 17u) + 0x3C000000u)), \
-        unpackHalf2x16((((p) >> 22u) << 2u) + 0x3C00u).x \
-    )
+fe4m3vec4 packFp8Vec4(float v0, float v1, float v2, float v3) {
+    return fe4m3vec4(toFp8E4M3(v0), toFp8E4M3(v1), toFp8E4M3(v2), toFp8E4M3(v3));
+}
 
-#define SAMPLE_BILINEAR_HIST_BOTH(img, p00, p10, p01, p11, f, outDiff, outSpec) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            uvec2 h00_ = imageLoad(img, p00).xy; \
-            outDiff = unpackIrr11_11_10(h00_.x); \
-            outSpec = unpackIrr11_11_10(h00_.y); \
-        } else { \
-            uvec2 h00_ = imageLoad(img, p00).xy; \
-            uvec2 h10_ = imageLoad(img, p10).xy; \
-            uvec2 h01_ = imageLoad(img, p01).xy; \
-            uvec2 h11_ = imageLoad(img, p11).xy; \
-            vec3 d00_  = UNPACK_IRR_P1(h00_.x); \
-            vec3 d10_  = UNPACK_IRR_P1(h10_.x); \
-            vec3 d01_  = UNPACK_IRR_P1(h01_.x); \
-            vec3 d11_  = UNPACK_IRR_P1(h11_.x); \
-            vec3 s00_  = UNPACK_IRR_P1(h00_.y); \
-            vec3 s10_  = UNPACK_IRR_P1(h10_.y); \
-            vec3 s01_  = UNPACK_IRR_P1(h01_.y); \
-            vec3 s11_  = UNPACK_IRR_P1(h11_.y); \
-            outDiff = max(vec3(f16vec3(mix(mix(d00_, d10_, (f).x), mix(d01_, d11_, (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-            outSpec = max(vec3(f16vec3(mix(mix(s00_, s10_, (f).x), mix(s01_, s11_, (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-        } \
-    } while (false)
+// 18x18 halo tile for 3x3 closest-depth silhouette MV dilation (6.48 KB LDS)
+shared float s_z[18 * 18];
+shared vec2  s_surfMv[18 * 18];
+shared vec2  s_effSpecMv[18 * 18];
 
-#define SAMPLE_BILINEAR_HIST_COMP(img, compIdx, p00, p10, p01, p11, f, outRgb) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            outRgb = unpackIrr11_11_10(imageLoad(img, p00)[compIdx]); \
-        } else { \
-            uint c00_ = imageLoad(img, p00)[compIdx]; \
-            uint c10_ = imageLoad(img, p10)[compIdx]; \
-            uint c01_ = imageLoad(img, p01)[compIdx]; \
-            uint c11_ = imageLoad(img, p11)[compIdx]; \
-            vec3 v00_ = UNPACK_IRR_P1(c00_); \
-            vec3 v10_ = UNPACK_IRR_P1(c10_); \
-            vec3 v01_ = UNPACK_IRR_P1(c01_); \
-            vec3 v11_ = UNPACK_IRR_P1(c11_); \
-            outRgb = max(vec3(f16vec3(mix(mix(v00_, v10_, (f).x), mix(v01_, v11_, (f).x), (f).y) - vec3(1.0))), vec3(0.0)); \
-        } \
-    } while (false)
+void loadHaloEntry(uint idx, ivec2 tileBase, ivec2 maxCoord) {
+    int hy = int(idx / 18u);
+    int hx = int(idx - uint(hy) * 18u);
+    ivec2 np = clamp(tileBase + ivec2(hx - 1, hy - 1), ivec2(0), maxCoord);
 
-#define SAMPLE_BILINEAR_VEC4(img, p00, p10, p01, p11, f, outVec4) \
-    do { \
-        if ((f).x == 0.0 && (f).y == 0.0) { \
-            outVec4 = imageLoad(img, p00); \
-        } else { \
-            vec4 v00_ = imageLoad(img, p00); \
-            vec4 v10_ = imageLoad(img, p10); \
-            vec4 v01_ = imageLoad(img, p01); \
-            vec4 v11_ = imageLoad(img, p11); \
-            outVec4 = mix(mix(v00_, v10_, (f).x), mix(v01_, v11_, (f).x), (f).y); \
-        } \
-    } while (false)
+    float zn = sanitizeScalar(imageLoad(uNormalDepth, np).w, 65504.0);
+    float roughN = clamp(sanitizeScalar(imageLoad(uAlbedoRoughness, np).a, 65504.0), 0.0, 1.0);
+    vec2 surfMvN = sanitizeVec4Input(imageLoad(uMotionVectors, np)).xy;
+    vec4 smN = sanitizeVec4Input(imageLoad(uSpecularMotion, np));
+    float specDistN = smN.w;
+
+    float validSpecHitN = (specDistN > 1e-4 && specDistN < SPEC_SKY_DIST_THRESHOLD) ? 1.0 : 0.0;
+    float tSpecN = clamp((0.35 - roughN) * 5.0, 0.0, 1.0);
+    float wSpecMvN = (tSpecN * tSpecN * (3.0 - 2.0 * tSpecN)) * validSpecHitN;
+    vec2 effSpecMvN = surfMvN + wSpecMvN * (smN.xy - surfMvN);
+
+    s_z[idx] = zn;
+    s_surfMv[idx] = surfMvN;
+    s_effSpecMv[idx] = effSpecMvN;
+}
 
 void main() {
-    uint tid     = gl_LocalInvocationIndex;
-    uint waveId  = tid >> 6u;
-    uint qInWave = (tid >> 2u) & 15u;
-    uint subId   = tid & 3u;
-    uint lx      = (((waveId & 1u) << 2u) | (qInWave & 3u)) << 1u | (subId & 1u);
-    uint ly      = (((waveId >> 1u) << 2u) | (qInWave >> 2u)) << 1u | (subId >> 1u);
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint tid = ly * 16u + lx;
+    ivec2 tileBase = ivec2(gl_WorkGroupID.xy) * 16;
+    ivec2 maxCoord = ivec2(int(pc.renderWidth) - 1, int(pc.renderHeight) - 1);
 
-    ivec2 renderSize = ivec2(int(pc.renderWidth), int(pc.renderHeight));
-    ivec2 p  = ivec2(gl_WorkGroupID.xy * 16u + uvec2(lx, ly));
-    ivec2 gp = clamp(p, ivec2(0), renderSize - ivec2(1));
+    loadHaloEntry(tid, tileBase, maxCoord);
+    if (tid + 256u < 324u) {
+        loadHaloEntry(tid + 256u, tileBase, maxCoord);
+    }
+    barrier();
 
-    // 1. Issue All Current-Frame G-Buffer & History VMEM Loads First Before Demodulation ALU
-    ivec2 histSize   = imageSize(uHistorySpecularIn);
-    vec4 rawD        = imageLoad(uCurrentDiffuse, gp);
-    vec4 rawS        = imageLoad(uCurrentSpecular, gp);
-    vec4 rawArLoad   = imageLoad(uAlbedoRoughness, gp);
-    vec4 ndCenter    = imageLoad(uNormalDepth, gp);
-    vec2 rawMvLoad   = imageLoad(uMotionVectors, gp).xy;
-
-    bool activeHist   = ((pc.resetHistory & 1u) == 0u);
-    float roughness   = clamp(rawArLoad.a, 0.0, 1.0);
-    vec2 mvSurf       = activeHist ? rawMvLoad : vec2(0.0);
-    vec2 effSpecMv    = mvSurf;
-    bool hasSpecHit   = false;
-    vec4 wPrevNd      = vec4(0.0);
-    vec4 wPrevSm      = vec4(0.0);
-    vec3 wDiffLr      = vec3(0.0);
-    vec3 wSpecLr      = vec3(0.0);
-    float validSurfLr = 0.0;
-
-    vec4 rawSmCurr    = vec4(0.0);
-    if (activeHist) {
-        rawSmCurr = imageLoad(uSpecularMotion, gp);
-        // RTXPT DenoiseSpecHitT: 3x3 bilateral spatial filter on glossy specular Hit-T & VMV
-        if (roughness < 0.25 && ndCenter.w < 9999.0 &&
-            (roughness > 0.015 || rawSmCurr.w <= 1e-4) &&
-            (rawSmCurr.w < 999.0)) {
-            bool centerValid = (rawSmCurr.w > 1e-4);
-            vec4 smAccum = centerValid ? rawSmCurr : vec4(0.0);
-            float wSum = centerValid ? 1.0 : 0.0;
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) continue;
-                    ivec2 qp = clamp(gp + ivec2(dx, dy), ivec2(0), renderSize - ivec2(1));
-                    vec4 qSm = imageLoad(uSpecularMotion, qp);
-                    if (qSm.w > 1e-4 && qSm.w < 999.0) {
-                        vec4 qNd = imageLoad(uNormalDepth, qp);
-                        float relZ = abs(ndCenter.w - qNd.w) / max(max(ndCenter.w, qNd.w), 0.1);
-                        float nSim = max(dot(ndCenter.xyz, qNd.xyz), 0.0);
-                        float nSim2 = nSim * nSim;
-                        float nSim4 = nSim2 * nSim2;
-                        float w = exp(-relZ * 20.0) * (nSim4 * nSim4);
-                        smAccum += qSm * w;
-                        wSum += w;
-                    }
-                }
-            }
-            if (wSum > 1e-3) {
-                rawSmCurr = smAccum / wSum;
-            }
-        }
-        float surfMvMag2 = dot(mvSurf, mvSurf);
-        hasSpecHit = (rawSmCurr.w > 1e-4 && rawSmCurr.w < 999.0 &&
-                      roughness < 0.25 && (roughness < 0.14 || surfMvMag2 > 1e-7));
-        if (hasSpecHit) {
-            effSpecMv = rawSmCurr.xy;
-        }
-
-        vec2 uv         = (vec2(gp) + vec2(0.5)) / vec2(renderSize);
-        vec2 prevUvSurf = uv - mvSurf;
-        float inBSurf   = (prevUvSurf.x >= 0.0 && prevUvSurf.x <= 1.0 && prevUvSurf.y >= 0.0 && prevUvSurf.y <= 1.0) ? 1.0 : 0.0;
-
-        if (inBSurf > 0.0) {
-            ivec2 hs00, hs10, hs01, hs11;
-            vec2  fHSurf;
-            computeBilinearCoords(prevUvSurf, histSize, hs00, hs10, hs01, hs11, fHSurf);
-            SAMPLE_BILINEAR_HIST_BOTH(uHistorySpecularIn, hs00, hs10, hs01, hs11, fHSurf, wDiffLr, wSpecLr);
-            SAMPLE_BILINEAR_VEC4(uPrevNormalDepth, hs00, hs10, hs01, hs11, fHSurf, wPrevNd);
-            if (effSpecMv == mvSurf && hasSpecHit) {
-                SAMPLE_BILINEAR_VEC4(uPrevSpecularMotion, hs00, hs10, hs01, hs11, fHSurf, wPrevSm);
-            }
-        }
-        if (effSpecMv != mvSurf) {
-            vec2 prevUvSpec = uv - effSpecMv;
-            float inBSpec   = (prevUvSpec.x >= 0.0 && prevUvSpec.x <= 1.0 && prevUvSpec.y >= 0.0 && prevUvSpec.y <= 1.0) ? 1.0 : 0.0;
-            if (inBSpec > 0.0) {
-                ivec2 sp00, sp10, sp01, sp11;
-                vec2  fHSpec;
-                computeBilinearCoords(prevUvSpec, histSize, sp00, sp10, sp01, sp11, fHSpec);
-                SAMPLE_BILINEAR_HIST_COMP(uHistorySpecularIn, 1, sp00, sp10, sp01, sp11, fHSpec, wSpecLr);
-                if (hasSpecHit) {
-                    SAMPLE_BILINEAR_VEC4(uPrevSpecularMotion, sp00, sp10, sp01, sp11, fHSpec, wPrevSm);
-                }
-            } else {
-                wSpecLr = vec3(0.0);
-            }
-        }
-        validSurfLr = inBSurf;
+    ivec2 p = tileBase + ivec2(int(lx), int(ly));
+    if (p.x >= int(pc.renderWidth) || p.y >= int(pc.renderHeight)) {
+        return;
     }
 
-    // 2. Demodulate Current Frame into Log1p Irradiance (Exact FP16 Grid Alignment)
-    vec3 arRgb      = clamp(rawArLoad.rgb, vec3(0.0), vec3(1.0));
-    float metallic  = clamp(rawS.a, 0.0, 1.0);
+    // 1. Load & sanitize current-frame G-buffers (strictly point-wise — zero spatial pre-filtering)
+    vec4 diffVec4 = sanitizeVec4Input(imageLoad(uCurrentDiffuse, p));
+    vec4 specVec4 = sanitizeVec4Input(imageLoad(uCurrentSpecular, p));
+    vec4 arVec4   = sanitizeVec4Input(imageLoad(uAlbedoRoughness, p));
+    vec4 ndVec4   = sanitizeVec4Input(imageLoad(uNormalDepth, p));
+    vec4 mvVec4   = sanitizeVec4Input(imageLoad(uMotionVectors, p));
+    vec4 smVec4   = sanitizeVec4Input(imageLoad(uSpecularMotion, p));
 
-    vec3 fDiff      = denoiseDemodulationFactor(arRgb, ndCenter.w);
-    vec3 fSpec      = denoiseSpecularModulationFactor(arRgb, metallic, roughness, ndCenter.z, ndCenter.w);
-    vec3 rawDiffIrr = sanitizeVec3(rawD.rgb) / fDiff;
-    vec3 rawSpecIrr = sanitizeVec3(rawS.rgb) / fSpec;
+    vec3 albedo = clamp(arVec4.rgb, vec3(0.0), vec3(1.0));
+    float roughness = clamp(arVec4.a, 0.0, 1.0);
+    vec3 viewNormal = ndVec4.xyz;
+    float z = ndVec4.w;
+    vec2 surfaceMv = mvVec4.xy;
+    vec2 specularMv = smVec4.xy;
+    float specHitDist = smVec4.w;
 
-    vec3 logDiff    = vec3(f16vec3(clamp(log(vec3(1.0) + rawDiffIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
-    vec3 logSpec    = vec3(f16vec3(clamp(log(vec3(1.0) + rawSpecIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
-    float denomZ    = max(max(ndCenter.w, wPrevNd.w), 0.1);
-    float dollyTol  = (0.03 + 0.8 * length(mvSurf)) * denomZ;
-    float dzSigned  = ndCenter.w - wPrevNd.w;
-    float dzDisocc  = max(dzSigned, max(-dzSigned - dollyTol, 0.0));
-    float relDz     = activeHist ? float(float16_t(clamp(dzDisocc / denomZ, 0.0, 2.0))) : 1.0;
-    float nDot      = activeHist ? float(float16_t(clamp(dot(ndCenter.xyz, wPrevNd.xyz), -1.0, 1.0))) : 0.0;
-    float specHitT  = rawSmCurr.w;
-    float denomRefl = max(max(specHitT, wPrevSm.w), 0.1);
-    float skySlip   = (specHitT >= 999.0) ? (16.0 * length(rawSmCurr.xy - mvSurf)) : 0.0;
-    float relDRefl  = activeHist
-        ? ((hasSpecHit && wPrevSm.w > 1e-4)
-            ? float(float16_t(clamp(abs(specHitT - wPrevSm.w) / denomRefl, 0.0, 2.0)))
-            : float(float16_t(clamp(relDz + skySlip, 0.0, 2.0))))
-        : 1.0;
+    float rawCh7 = (diffVec4.a > 0.5) ? 2.0 : specVec4.a;
+    float metallic = 0.0;
+    float isEmissive = 0.0;
+    decodeMetallicAndEmissive(rawCh7, albedo, metallic, isEmissive);
+    metallic   = float(float16_t(metallic));
+    isEmissive = float(float16_t(isEmissive));
 
-    // 3. Zero-LDS Subgroup DPP Quad Average Pooling for Stage 2 Multi-Scale U-Net
-    vec4 q0 = vec4(f16vec4(
-        float16_t(logDiff.r * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(logDiff.g * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(logDiff.b * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(logSpec.r * INV_MAX_LOG1P_IRRADIANCE)
-    ));
-    vec4 q1 = vec4(f16vec4(
-        float16_t(logSpec.g * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(logSpec.b * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(wDiffLr.r * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(wDiffLr.g * INV_MAX_LOG1P_IRRADIANCE)
-    ));
-    vec4 q2 = vec4(f16vec4(
-        float16_t(wDiffLr.b * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(wSpecLr.r * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(wSpecLr.g * INV_MAX_LOG1P_IRRADIANCE),
-        float16_t(wSpecLr.b * INV_MAX_LOG1P_IRRADIANCE)
-    ));
-    vec4 q3 = vec4(f16vec4(
-        float16_t(relDz * 0.5),
-        float16_t(nDot),
-        float16_t(roughness),
-        float16_t(validSurfLr)
-    ));
-
-    q0 += subgroupShuffleXor(q0, 1u);
-    q1 += subgroupShuffleXor(q1, 1u);
-    q2 += subgroupShuffleXor(q2, 1u);
-    q3 += subgroupShuffleXor(q3, 1u);
-
-    q0 = (q0 + subgroupShuffleXor(q0, 2u)) * 0.25;
-    q1 = (q1 + subgroupShuffleXor(q1, 2u)) * 0.25;
-    q2 = (q2 + subgroupShuffleXor(q2, 2u)) * 0.25;
-    q3 = (q3 + subgroupShuffleXor(q3, 2u)) * 0.25;
-
-    bool inBounds = (p.x < renderSize.x && p.y < renderSize.y);
-    if (inBounds && subId == 0u) {
-        uint qW         = (pc.renderWidth + 1u) >> 1u;
-        uint qx         = uint(p.x) >> 1u;
-        uint qy         = uint(p.y) >> 1u;
-        uint qLinearIdx = qy * qW + qx;
-
-        uvec4 f0 = uvec4(
-            packHalf2x16(q0.xy),
-            packHalf2x16(q0.zw),
-            packHalf2x16(q1.xy),
-            packHalf2x16(q1.zw)
-        );
-        uvec4 f1 = uvec4(
-            packHalf2x16(q2.xy),
-            packHalf2x16(q2.zw),
-            packHalf2x16(q3.xy),
-            packHalf2x16(q3.zw)
-        );
-
-        uNeuralFeaturesOut.features4[qLinearIdx * 2u + 0u] = f0;
-        uNeuralFeaturesOut.features4[qLinearIdx * 2u + 1u] = f1;
+    ivec2 auxSize = imageSize(uAuxMetadata);
+    vec4 auxVec4 = sanitizeVec4Input(imageLoad(uAuxMetadata, min(p, auxSize - ivec2(1))));
+    float restirM = 0.04;
+    float restirW = 0.04;
+    float reactive = 0.0;
+    if (auxVec4.w > 0.5) {
+        restirM = auxVec4.x;
+        restirW = auxVec4.y;
+        reactive = clamp(auxVec4.z, 0.0, 1.0);
+    } else {
+        restirM = float(float16_t(0.04));
+        restirW = float(float16_t(0.04));
+        bool isDielectricPsr = (z > 1e-4) && (z < SKY_DEPTH_THRESHOLD) && (abs(mvVec4.w) < 1e-4);
+        reactive = float(float16_t(clamp(isDielectricPsr ? 0.85 : (isEmissive * 0.5), 0.0, 1.0)));
     }
 
-    if (inBounds) {
-        bool isSurf          = (ndCenter.w < UPWAYS_SKY_DEPTH);
-        bool hasCustomSpecMv = (effSpecMv != mvSurf);
-        imageStore(uTemporalDiffuseOut, p, uvec4(
-            packIrr11_11_10(logDiff),
-            packIrr11_11_10(logSpec),
-            packGuide11_11_10(fDiff),
-            packSpecGuide29(fSpec, isSurf, hasCustomSpecMv)
-        ));
-        imageStore(uTemporalSpecularOut, p, uvec4(
-            packHalf2x16(ndCenter.xy),
-            packHalf2x16(ndCenter.zw),
-            packHalf2x16(vec2(relDz, nDot)),
-            packHalf2x16(vec2(relDRefl, roughness))
-        ));
+    vec3 fDiffRaw = computeDemodulationFactor(albedo, z);
+    vec3 fSpecRaw = computeSpecularModulation(albedo, metallic, roughness, viewNormal.z, z);
+
+    float effExp = max(pc.preExposure, 1e-6);
+    vec3 rawDiffIrr = sanitizeRadiance(diffVec4.rgb * effExp) / fDiffRaw;
+    vec3 rawSpecIrr = sanitizeRadiance(specVec4.rgb * effExp) / fSpecRaw;
+
+    vec3 logDiffLr = vec3(f16vec3(clamp(upwaysLog1pVec3(rawDiffIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
+    vec3 logSpecLr = vec3(f16vec3(clamp(upwaysLog1pVec3(rawSpecIrr), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE))));
+    vec3 fDiffLr   = vec3(f16vec3(fDiffRaw));
+    vec3 fSpecLr   = vec3(f16vec3(fSpecRaw));
+
+    // 2. Smooth C1 Specular MV + Closest-Depth 3x3 Silhouette MV Dilation
+    float validSpecHit = (specHitDist > 1e-4 && specHitDist < SPEC_SKY_DIST_THRESHOLD) ? 1.0 : 0.0;
+    float tSpec = clamp((0.35 - roughness) * 5.0, 0.0, 1.0);
+    float wSpecMv = (tSpec * tSpec * (3.0 - 2.0 * tSpec)) * validSpecHit;
+
+    uint cHaloIdx = (ly + 1u) * 18u + (lx + 1u);
+    vec2 effSpecMv = s_effSpecMv[cHaloIdx];
+    float bestZ = s_z[cHaloIdx];
+    vec2 bestSurf = s_surfMv[cHaloIdx];
+    vec2 bestSpec = effSpecMv;
+
+    for (uint dy = 0u; dy < 3u; ++dy) {
+        for (uint dx = 0u; dx < 3u; ++dx) {
+            if (dy == 1u && dx == 1u) {
+                continue;
+            }
+            uint nIdx = (ly + dy) * 18u + (lx + dx);
+            float zn = s_z[nIdx];
+            if (zn > 1e-4 && zn < bestZ * 0.98) {
+                bestZ = zn;
+                bestSurf = s_surfMv[nIdx];
+                bestSpec = s_effSpecMv[nIdx];
+            }
+        }
+    }
+    vec2 dilatedSurfMv = vec2(f16vec2(bestSurf));
+    vec2 dilatedSpecMv = vec2(f16vec2(bestSpec));
+
+    // 3. Render-resolution history & 16-ch recurrent neural latent backward warp
+    vec3 wDiffLr = vec3(0.0);
+    vec3 wSpecLr = vec3(0.0);
+    float wHistDLr = 0.0;
+    float validHistDLr = 0.0;
+    float validHistSLr = 0.0;
+    float relDz = 1.0;
+    float nDot = 0.0;
+    float relDRefl = 1.0;
+    float hasHistory = 0.0;
+    vec4 warpedHidden[4];
+    warpedHidden[0] = vec4(0.0);
+    warpedHidden[1] = vec4(0.0);
+    warpedHidden[2] = vec4(0.0);
+    warpedHidden[3] = vec4(0.0);
+
+    uvec2 renderSize = uvec2(pc.renderWidth, pc.renderHeight);
+    if (pc.resetHistory == 0u) {
+        vec2 uv = (vec2(p) + 0.5) / vec2(renderSize);
+
+        vec2 prevUvDilSurf = uv - dilatedSurfMv;
+        bool inBSurf = (prevUvDilSurf.x >= 0.0 && prevUvDilSurf.x <= 1.0 &&
+                        prevUvDilSurf.y >= 0.0 && prevUvDilSurf.y <= 1.0);
+        if (inBSurf) {
+            vec4 wd4 = sampleHistoryAreaLr(uPrevIrrDiffHr, prevUvDilSurf, renderSize);
+            wDiffLr = wd4.rgb;
+            wHistDLr = wd4.a;
+        }
+
+        vec2 prevUvDilSpec = uv - dilatedSpecMv;
+        bool inBSpec = (prevUvDilSpec.x >= 0.0 && prevUvDilSpec.x <= 1.0 &&
+                        prevUvDilSpec.y >= 0.0 && prevUvDilSpec.y <= 1.0);
+        if (inBSpec) {
+            wSpecLr = sampleHistoryAreaLr(uPrevIrrSpecHr, prevUvDilSpec, renderSize).rgb;
+        }
+
+        vec2 prevUvSurf = uv - surfaceMv;
+        bool inBGeom = (prevUvSurf.x >= 0.0 && prevUvSurf.x <= 1.0 &&
+                        prevUvSurf.y >= 0.0 && prevUvSurf.y <= 1.0);
+        vec4 prevNd = inBGeom ? textureLod(uPrevGeomNd, prevUvSurf, 0.0) : vec4(0.0);
+        vec3 wPrevN = prevNd.xyz;
+        float wPrevZ = prevNd.w;
+
+        vec2 prevUvEffSpec = uv - effSpecMv;
+        bool inBHit = (prevUvEffSpec.x >= 0.0 && prevUvEffSpec.x <= 1.0 &&
+                       prevUvEffSpec.y >= 0.0 && prevUvEffSpec.y <= 1.0);
+        float wPrevHitT = inBHit ? textureLod(uPrevGeomHitT, prevUvEffSpec, 0.0).x : 0.0;
+
+        bool currIsSurf = (z > 1e-4) && (z < SKY_DEPTH_THRESHOLD);
+        bool prevIsSurf = (wPrevZ > 1e-4) && (wPrevZ < SKY_DEPTH_THRESHOLD);
+        bool bothSurf = currIsSurf && prevIsSurf;
+
+        validHistDLr = (bothSurf && inBSurf) ? 1.0 : 0.0;
+        validHistSLr = (bothSurf && inBSpec) ? 1.0 : 0.0;
+
+        float denomZ = max(max(z, wPrevZ), 0.1);
+        float zExpPrev = z + mvVec4.z;
+        float rawRelDz = clamp(abs(zExpPrev - wPrevZ) / denomZ, 0.0, 2.0);
+        relDz = bothSurf ? rawRelDz : 1.0;
+
+        float rawNDot = clamp(dot(viewNormal, wPrevN), -1.0, 1.0);
+        nDot = bothSurf ? rawNDot : 0.0;
+
+        float denomRefl = max(max(specHitDist, wPrevHitT), 0.1);
+        float specMvLen = sqrt(dot(effSpecMv, effSpecMv) + 1e-12);
+        float reflMotion = clamp(specMvLen * 40.0 + relDz * 4.0 + (1.0 - clamp(nDot, 0.0, 1.0)) * 4.0, 0.0, 1.0);
+        float rawRelDRefl = clamp(abs(specHitDist - wPrevHitT) / denomRefl, 0.0, 2.0) * reflMotion;
+        bool validSpecRefl = (wSpecMv > 0.5) && (wPrevHitT > 1e-4) && (wPrevHitT < SPEC_SKY_DIST_THRESHOLD);
+        vec2 mvDiff = specularMv - surfaceMv;
+        float skySlip = (specHitDist >= SPEC_SKY_DIST_THRESHOLD)
+            ? (8.0 * sqrt(dot(mvDiff, mvDiff) + 1e-12))
+            : 0.0;
+        relDRefl = validSpecRefl ? rawRelDRefl : clamp(relDz + skySlip, 0.0, 2.0);
+
+        float hidGate = validHistDLr * (inBSurf ? 1.0 : 0.0) * clamp(1.0 - relDz * 0.5, 0.0, 1.0);
+        if (hidGate > 0.0) {
+            for (int layer = 0; layer < 4; ++layer) {
+                vec4 hSample = textureLod(uPrevNeuralHidden, vec3(prevUvDilSurf, float(layer)), 0.0);
+                warpedHidden[layer] = vec4(f16vec4(clamp(hSample * hidGate, vec4(-1.0), vec4(1.0))));
+            }
+        }
+        hasHistory = 1.0;
+    }
+
+    relDz    = float(float16_t(relDz));
+    nDot     = float(float16_t(nDot));
+    relDRefl = float(float16_t(relDRefl));
+
+    // 4. Write current geometry history & transient render-resolution images (pre-rounded via RNE f16vec4)
+    imageStore(uCurrGeomNd,   p, vec4(f16vec4(vec4(viewNormal, z))));
+    imageStore(uCurrGeomHitT, p, vec4(f16vec4(vec4(specHitDist, 0.0, 0.0, 0.0))));
+
+    imageStore(tLogDiff,      p, vec4(f16vec4(vec4(logDiffLr, roughness))));
+    imageStore(tLogSpec,      p, vec4(f16vec4(vec4(logSpecLr, reactive))));
+    imageStore(tGuideDiff,    p, vec4(f16vec4(vec4(fDiffLr, validHistDLr))));
+    imageStore(tGuideSpec,    p, vec4(f16vec4(vec4(fSpecLr, validHistSLr))));
+    imageStore(tDilatedMv,    p, vec4(f16vec4(vec4(dilatedSurfMv, dilatedSpecMv))));
+    imageStore(tTemporalConf, p, vec4(f16vec4(vec4(relDz, nDot, relDRefl, 0.0))));
+
+    // 5. Pack 32-channel L0 input tensor x0 & 16-channel warped hidden hw0 via coalesced 32-bit fe4m3vec4 stores
+    PyramidLayout pl = computePyramidLayout(pc.renderWidth, pc.renderHeight);
+    uint pixIdx = uint(p.y) * pl.w0 + uint(p.x);
+    uint x0Base4  = (pl.offX0  >> 2u) + pixIdx * 8u;
+    uint hw0Base4 = (pl.offHw0 >> 2u) + pixIdx * 4u;
+
+    vec2 jitter = vec2(f16vec2(vec2(pc.jitterX, pc.jitterY)));
+    vec3 normClamped = clamp(viewNormal, vec3(-1.0), vec3(1.0));
+    float logZ   = upwaysLog1p(clamp(z, 0.0, 1000.0)) * (1.0 / 7.0);
+    float logHit = upwaysLog1p(clamp(specHitDist, 0.0, 1000.0)) * (1.0 / 7.0);
+    float logM   = upwaysLog1p(clamp(restirM, 0.0, 64.0)) * (1.0 / 4.2);
+    float logW   = upwaysLog1p(clamp(restirW, 0.0, 64.0)) * (1.0 / 4.2);
+    vec2 mvObs   = clamp(dilatedSurfMv * 4.0, vec2(-2.0), vec2(2.0));
+
+    float scaleX = float(pc.displayWidth)  / float(max(pc.renderWidth,  1u));
+    float scaleY = float(pc.displayHeight) / float(max(pc.renderHeight, 1u));
+    float sampleDensity = float(float16_t(1.0 / max(1.0, scaleX * scaleY)));
+    float histMaturity = validHistDLr * hasHistory * (0.25 + 0.75 * clamp(wHistDLr, 0.0, 1.0));
+
+    vec3 ldScaled = logDiffLr * INV_MAX_LOG1P_IRRADIANCE * FP8_ACT_SCALE;
+    vec3 lsScaled = logSpecLr * INV_MAX_LOG1P_IRRADIANCE * FP8_ACT_SCALE;
+    vec3 wdScaled = (wDiffLr * validHistDLr) * INV_MAX_LOG1P_IRRADIANCE * FP8_ACT_SCALE;
+    vec3 wsScaled = (wSpecLr * validHistSLr) * INV_MAX_LOG1P_IRRADIANCE * FP8_ACT_SCALE;
+
+    pyr4[x0Base4 + 0u] = packFp8Vec4(ldScaled.x, ldScaled.y, ldScaled.z, lsScaled.x);
+    pyr4[x0Base4 + 1u] = packFp8Vec4(lsScaled.y, lsScaled.z, wdScaled.x, wdScaled.y);
+    pyr4[x0Base4 + 2u] = packFp8Vec4(wdScaled.z, wsScaled.x, wsScaled.y, wsScaled.z);
+    pyr4[x0Base4 + 3u] = packFp8Vec4(
+        normClamped.x * FP8_ACT_SCALE,
+        normClamped.y * FP8_ACT_SCALE,
+        normClamped.z * FP8_ACT_SCALE,
+        logZ * FP8_ACT_SCALE
+    );
+    pyr4[x0Base4 + 4u] = packFp8Vec4(
+        roughness * FP8_ACT_SCALE,
+        metallic * FP8_ACT_SCALE,
+        isEmissive * FP8_ACT_SCALE,
+        logHit * FP8_ACT_SCALE
+    );
+    pyr4[x0Base4 + 5u] = packFp8Vec4(
+        logM * FP8_ACT_SCALE,
+        logW * FP8_ACT_SCALE,
+        (relDz * 0.5) * FP8_ACT_SCALE,
+        nDot * FP8_ACT_SCALE
+    );
+    pyr4[x0Base4 + 6u] = packFp8Vec4(
+        (relDRefl * 0.5) * FP8_ACT_SCALE,
+        reactive * FP8_ACT_SCALE,
+        jitter.x * FP8_ACT_SCALE,
+        jitter.y * FP8_ACT_SCALE
+    );
+    pyr4[x0Base4 + 7u] = packFp8Vec4(
+        histMaturity * FP8_ACT_SCALE,
+        sampleDensity * FP8_ACT_SCALE,
+        mvObs.x * FP8_ACT_SCALE,
+        mvObs.y * FP8_ACT_SCALE
+    );
+
+    for (uint l = 0u; l < 4u; ++l) {
+        vec4 hw = warpedHidden[l] * FP8_ACT_SCALE;
+        pyr4[hw0Base4 + l] = packFp8Vec4(hw.x, hw.y, hw.z, hw.w);
     }
 }
-

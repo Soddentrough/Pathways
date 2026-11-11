@@ -14,8 +14,9 @@ NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
                        uint32_t width, uint32_t height,
                        const std::vector<char>& inferSpv,
                        const std::vector<char>& trainSpv,
-                       const std::vector<char>& resolveSpv)
-    : m_device(device), m_allocator(allocator), m_width(width), m_height(height)
+                       const std::vector<char>& resolveSpv,
+                       VkPhysicalDevice physDevice)
+    : m_device(device), m_physDevice(physDevice), m_allocator(allocator), m_width(width), m_height(height)
 {
     initBuffers();
     initWeights();
@@ -57,10 +58,10 @@ const char* NRCManager::getActiveBackendName() const {
     if (m_ffxRcContext != nullptr) {
         return "AMD FSR Radiance Cache 0.9.0 (SDK Provider)";
     }
-    if (m_backend == NrcBackend::FfxRadianceCache || m_backend == NrcBackend::Auto) {
-        return "Native Wave32 WMMA Multi-Res Hash MLP";
+    if (m_backend == NrcBackend::FfxRadianceCache) {
+        return "Stub (No Native Vulkan Radiance Cache Provider)";
     }
-    return "Native Wave32 WMMA Multi-Res Hash MLP";
+    return "Native Wave32 WMMA Positional MLP";
 }
 
 void NRCManager::initFfxRadianceCacheContext() {
@@ -69,7 +70,11 @@ void NRCManager::initFfxRadianceCacheContext() {
         return;
     }
 #if defined(PATHWAYS_HAS_FFX_SDK)
-    auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, VK_NULL_HANDLE);
+    if (!FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache) ||
+        m_physDevice == VK_NULL_HANDLE) {
+        return;
+    }
+    auto backendDesc = FfxSdkRuntime::makeBackendVkDesc(m_device, m_physDevice);
     ffxCreateContextDescRadianceCache createRc{};
     createRc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_RADIANCECACHE;
     createRc.header.pNext = &backendDesc.header;

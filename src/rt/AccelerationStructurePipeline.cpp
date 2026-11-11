@@ -18,10 +18,10 @@ AccelerationStructurePipeline::~AccelerationStructurePipeline() {
 void AccelerationStructurePipeline::reset() {
     m_tlas.reset();
     m_blases.clear();
-    m_asIndexBuffer.reset();
     m_instanceBuffer.reset();
     m_asManager.reset();
     m_asInstances.clear();
+    m_initialShaderInstances.clear();
 }
 
 void AccelerationStructurePipeline::build(
@@ -33,24 +33,12 @@ void AccelerationStructurePipeline::build(
 ) {
     reset();
 
-    VkDeviceSize indexBufferSize = std::max(static_cast<VkDeviceSize>(sizeof(uint32_t) * 3 * numTriangles), static_cast<VkDeviceSize>(sizeof(uint32_t) * 3));
-    m_asIndexBuffer = std::make_unique<Buffer>(
-        m_allocator, indexBufferSize,
-        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        0
-    );
-    if (geomPipeline) {
-        geomPipeline->uploadIndexBuffer(*m_asIndexBuffer, numTriangles);
-    }
-
     m_asManager = std::make_unique<AccelerationStructureManager>(
         m_device, m_allocator, m_queue, m_queueFamily
     );
 
-    // 1. Instance Buffer (std430, binding 30)
-    std::vector<InstanceGPU> instanceUpload;
+    // 1. Instance Buffer (std430, binding 30) — pure DEVICE_LOCAL
+    std::vector<InstanceGPU>& instanceUpload = m_initialShaderInstances;
     if (!sceneData.instanceData.empty()) {
         instanceUpload = sceneData.instanceData;
         for (size_t i = 0; i < instanceUpload.size(); ++i) {
@@ -90,15 +78,15 @@ void AccelerationStructurePipeline::build(
         m_allocator, instanceBufferSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (geomPipeline) {
         geomPipeline->uploadToDeviceBuffer(*m_instanceBuffer, instanceUpload.data(), instanceBufferSize);
     }
 
-    // 2. Acceleration Structures
+    // 2. Acceleration Structures (Indexless VK_INDEX_TYPE_NONE_KHR + VK_KHR_ray_tracing_position_fetch)
     VkDeviceAddress vertexBaseAddr = positionBuffer ? positionBuffer->getDeviceAddress(m_device) : 0;
-    VkDeviceAddress indexBaseAddr = m_asIndexBuffer->getDeviceAddress(m_device);
+    constexpr VkDeviceSize kTriVertexBytes = 3 * sizeof(glm::vec4);
 
     if (!sceneData.blasRanges.empty()) {
         // Multi-BLAS path: Batch all BLAS builds into a single GPU dispatch & compaction pass
@@ -109,35 +97,35 @@ void AccelerationStructurePipeline::build(
             std::vector<ASGeometryInput> geoms;
             if (range.numOpaqueTriangles > 0) {
                 ASGeometryInput geomOpaque{};
-                geomOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * 3 * sizeof(uint32_t);
-                geomOpaque.vertexCount = 3 * (range.firstTriangle + range.numOpaqueTriangles);
+                geomOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle) * kTriVertexBytes;
+                geomOpaque.indexBufferAddress = 0;
+                geomOpaque.vertexCount = 3 * range.numOpaqueTriangles - 1;
                 geomOpaque.triangleCount = range.numOpaqueTriangles;
                 geomOpaque.vertexStride = sizeof(glm::vec4);
-                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomOpaque.isOpaque = true;
                 geoms.push_back(geomOpaque);
             }
             uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
             if (numNonOpaque > 0) {
                 ASGeometryInput geomNonOpaque{};
-                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * 3 * sizeof(uint32_t);
-                geomNonOpaque.vertexCount = 3 * (range.firstTriangle + range.triangleCount);
+                geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(range.firstTriangle + range.numOpaqueTriangles) * kTriVertexBytes;
+                geomNonOpaque.indexBufferAddress = 0;
+                geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
                 geomNonOpaque.triangleCount = numNonOpaque;
                 geomNonOpaque.vertexStride = sizeof(glm::vec4);
-                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomNonOpaque.isOpaque = false;
                 geoms.push_back(geomNonOpaque);
             }
             if (geoms.empty()) {
                 ASGeometryInput dummyGeom{};
                 dummyGeom.vertexBufferAddress = vertexBaseAddr;
-                dummyGeom.indexBufferAddress = indexBaseAddr;
-                dummyGeom.vertexCount = 3;
+                dummyGeom.indexBufferAddress = 0;
+                dummyGeom.vertexCount = 2;
                 dummyGeom.triangleCount = 1;
                 dummyGeom.vertexStride = sizeof(glm::vec4);
-                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }
@@ -184,22 +172,22 @@ void AccelerationStructurePipeline::build(
             std::vector<ASGeometryInput> geomsOpaque;
             ASGeometryInput geomOpaque{};
             geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = indexBaseAddr;
-            geomOpaque.vertexCount = 3 * numOpaqueTriangles;
+            geomOpaque.indexBufferAddress = 0;
+            geomOpaque.vertexCount = 3 * numOpaqueTriangles - 1;
             geomOpaque.triangleCount = numOpaqueTriangles;
             geomOpaque.vertexStride = sizeof(glm::vec4);
-            geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
             geomOpaque.isOpaque = true;
             geomsOpaque.push_back(geomOpaque);
 
             std::vector<ASGeometryInput> geomsNonOpaque;
             ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomNonOpaque.indexBufferAddress = indexBaseAddr + static_cast<VkDeviceSize>(numOpaqueTriangles) * 3 * sizeof(uint32_t);
-            geomNonOpaque.vertexCount = 3 * numTriangles;
+            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(numOpaqueTriangles) * kTriVertexBytes;
+            geomNonOpaque.indexBufferAddress = 0;
+            geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
             geomNonOpaque.triangleCount = numNonOpaque;
             geomNonOpaque.vertexStride = sizeof(glm::vec4);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
             geomNonOpaque.isOpaque = false;
             geomsNonOpaque.push_back(geomNonOpaque);
 
@@ -228,31 +216,31 @@ void AccelerationStructurePipeline::build(
             if (isPureOpaque) {
                 ASGeometryInput geomOpaque{};
                 geomOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomOpaque.indexBufferAddress = indexBaseAddr;
-                geomOpaque.vertexCount = 3 * numOpaqueTriangles;
+                geomOpaque.indexBufferAddress = 0;
+                geomOpaque.vertexCount = 3 * numOpaqueTriangles - 1;
                 geomOpaque.triangleCount = numOpaqueTriangles;
                 geomOpaque.vertexStride = sizeof(glm::vec4);
-                geomOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomOpaque.isOpaque = true;
                 geoms.push_back(geomOpaque);
             } else if (numNonOpaque > 0) {
                 ASGeometryInput geomNonOpaque{};
                 geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomNonOpaque.indexBufferAddress = indexBaseAddr;
-                geomNonOpaque.vertexCount = 3 * numTriangles;
+                geomNonOpaque.indexBufferAddress = 0;
+                geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
                 geomNonOpaque.triangleCount = numNonOpaque;
                 geomNonOpaque.vertexStride = sizeof(glm::vec4);
-                geomNonOpaque.indexType = VK_INDEX_TYPE_UINT32;
+                geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
                 geomNonOpaque.isOpaque = false;
                 geoms.push_back(geomNonOpaque);
             } else {
                 ASGeometryInput dummyGeom{};
                 dummyGeom.vertexBufferAddress = vertexBaseAddr;
-                dummyGeom.indexBufferAddress = indexBaseAddr;
-                dummyGeom.vertexCount = 3;
+                dummyGeom.indexBufferAddress = 0;
+                dummyGeom.vertexCount = 2;
                 dummyGeom.triangleCount = 1;
                 dummyGeom.vertexStride = sizeof(glm::vec4);
-                dummyGeom.indexType = VK_INDEX_TYPE_UINT32;
+                dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
                 dummyGeom.isOpaque = true;
                 geoms.push_back(dummyGeom);
             }

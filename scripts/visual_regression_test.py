@@ -246,7 +246,7 @@ TEST_CONFIGS = [
     },
     {
         "id": "upways_infinity_1080p",
-        # Experimental: Upways is disabled/not-yet-working; failures are informational, not --strict.
+        # In-development neural reconstructor (Upways 3.0); informational unless golden baseline is locked.
         "experimental": True,
         "name": "Upways Neural Reconstruction 1080p (Infinity Mirror)",
         "scene": "infinity-mirror",
@@ -268,7 +268,7 @@ TEST_CONFIGS = [
     },
     {
         "id": "cornell_upways_1080p",
-        # Experimental: Upways is disabled/not-yet-working; failures are informational, not --strict.
+        # In-development neural reconstructor (Upways 3.0); informational unless golden baseline is locked.
         "experimental": True,
         "name": "Cornell Box 1080p (Upways Neural Denoiser)",
         "scene": "Procedural Cornell Box",
@@ -287,7 +287,7 @@ TEST_CONFIGS = [
     },
     {
         "id": "upways_2x_infinity_1080p",
-        # Experimental: Upways is disabled/not-yet-working; failures are informational, not --strict.
+        # In-development neural reconstructor (Upways 3.0); informational unless golden baseline is locked.
         "experimental": True,
         "name": "Upways Neural 2x Super-Resolution 1080p (Infinity Mirror)",
         "scene": "infinity-mirror",
@@ -963,25 +963,33 @@ def main():
     print("====================================================================")
 
     # 1. If --render is passed, execute render commands
+    render_failures = set()
     if args.render:
         import subprocess
         for cfg in configs:
+            if os.path.exists(cfg["render_path"]):
+                os.remove(cfg["render_path"])
             print(f"[RENDER] {cfg['name']}...")
             res = subprocess.run(cfg["cmd"], capture_output=True, text=True)
             if res.returncode != 0:
-                print(f"\033[31m[FAIL]\033[0m Render failed for {cfg['id']}:\n{res.stderr[-500:]}")
+                render_failures.add(cfg["id"])
+                print(f"\033[31m[FAIL]\033[0m Render failed for {cfg['id']} (exit {res.returncode}):\n{res.stderr[-500:]}")
             else:
                 print(f"\033[32m[PASS]\033[0m Render complete: {cfg['render_path']}")
 
     # 2. If --update-baselines, copy current renders to golden reference directory
     if args.update_baselines:
+        if render_failures:
+            print(f"\033[31m[FAIL]\033[0m Refusing to update baselines cleanly for failed renders: {sorted(render_failures)}")
         print("\n[UPDATING BASELINES] Copying current renders to tests/references/...")
         for cfg in configs:
-            if os.path.exists(cfg["render_path"]):
+            if cfg["id"] not in render_failures and os.path.exists(cfg["render_path"]):
                 shutil.copyfile(cfg["render_path"], cfg["ref_path"])
                 print(f"  -> Updated golden reference: {cfg['ref_path']}")
             else:
                 print(f"\033[33m[WARN]\033[0m Render not found to copy: {cfg['render_path']}")
+        if render_failures:
+            sys.exit(1)
         print("\033[32m[SUCCESS]\033[0m Golden baselines updated successfully.")
         sys.exit(0)
 
@@ -991,6 +999,8 @@ def main():
 
     for cfg in configs:
         print(f"\n--- Checking {cfg['name']} ---")
+        if cfg["id"] in render_failures and not cfg.get("experimental"):
+            has_regressions = True
         comparison_path = cfg.get("comparison_path") or f"{OUTPUT_DIR}/visual_comparisons/{cfg['id']}_comparison.png"
         raw_path = cfg.get("raw_path")
         m = compute_metrics(

@@ -23,10 +23,13 @@ class MultiGpuManager;
 struct ImageDescriptorParams {
     Image* accumImage = nullptr;
     Image* outputImage = nullptr;
-    Image* directLightImage = nullptr;
     Image* normalDepthImage = nullptr;
     Image* motionVectorImage = nullptr;
     Image* filteredCausticImage = nullptr;
+    Image* mlAlbedoRoughnessImage = nullptr;
+    Image* mlSpecularMotionImage = nullptr;
+    Image* mlDiffuseImage = nullptr;
+    Image* mlSpecularImage = nullptr;
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
 };
 
@@ -35,6 +38,8 @@ struct SceneDescriptorParams {
     Buffer* sphereBuffer = nullptr;
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
+    Buffer* lightTreeBuffer = nullptr;
+    Buffer* instanceBuffer = nullptr;
     VkAccelerationStructureKHR tlasHandle = VK_NULL_HANDLE;
     Texture* environmentMap = nullptr;
     Texture* dummyWhite = nullptr;
@@ -50,7 +55,6 @@ struct WavefrontDescriptorParams {
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
     const std::array<std::unique_ptr<Buffer>, 2>* cameraUBOs = nullptr;
     Buffer* triangleBuffer = nullptr;
-    Buffer* positionBuffer = nullptr;
     Buffer* sphereBuffer = nullptr;
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
@@ -64,14 +68,11 @@ struct WavefrontDescriptorParams {
     const std::vector<std::unique_ptr<Texture>>* sceneTextures = nullptr;
     Image* motionVectorImage = nullptr;
     Image* normalDepthImage = nullptr;
+    Image* prevNormalDepthImage = nullptr;
     Image* mlAlbedoRoughnessImage = nullptr;
     Image* mlSpecularMotionImage = nullptr;
     Image* mlDiffuseImage = nullptr;
     Image* mlSpecularImage = nullptr;
-    Image* ffxDirectDiffuseImage = nullptr;
-    Image* ffxDirectSpecularImage = nullptr;
-    Image* ffxIndirectDiffuseImage = nullptr;
-    Image* ffxIndirectSpecularImage = nullptr;
     Image* filteredCausticImage = nullptr;
 };
 
@@ -80,6 +81,10 @@ struct MergeDescriptorParams {
     MultiGpuManager* mgpu = nullptr;
     Image* motionVectorImage = nullptr;
     Image* normalDepthImage = nullptr;
+    Image* mlDiffuseImage = nullptr;
+    Image* mlSpecularImage = nullptr;
+    Image* mlAlbedoRoughnessImage = nullptr;
+    Image* mlSpecularMotionImage = nullptr;
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
     uint32_t width = 0;
     uint32_t height = 0;

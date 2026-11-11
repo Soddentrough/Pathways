@@ -43,27 +43,29 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                 uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
                 uint matId = triangles[triIdx].materialId + inst.materialOffset;
                 uint arch = materialArchetypes[matId];
-                
+                ShadeMaterial sm = shadeMaterials[matId];
+
                 if (transparentShadows) {
                     if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
                         continue;
                     }
                     if (enableCaustics && arch == 2u) {
-                        if (materials[matId].thickness <= 0.001) {
+                        if (smIsThin(sm)) {
                             continue;
                         }
                     }
                 }
-                if (materials[matId].alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
-                    Material mat = materials[matId];
+                uint alphaMode = smGetAlphaMode(sm);
+                if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(RQ_OBJ, false);
                     Triangle ctri = triangles[triIdx];
                     vec2 cuv = getTriangleUV(ctri, bary);
-                    float calpha = mat.albedo.a;
-                    if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
-                        calpha *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, cuv).a;
+                    float calpha = sm.albedo.a;
+                    uint albTex = smGetAlbedoTex(sm);
+                    if (albTex > 0u && albTex <= 512u) {
+                        calpha *= SAMPLE_SCENE_TEXTURE(albTex, cuv).a;
                     }
-                    float cutoff = (mat.alphaMode == 1u) ? mat.alphaCutoff : 0.5;
+                    float cutoff = (alphaMode == 1u) ? smGetAlphaCutoff(sm) : 0.5;
                     if (calpha < cutoff) {
                         continue;
                     }
@@ -80,11 +82,12 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
         bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
         for (uint i = 0; i < numSpheres; ++i) {
             uint sMatId = spheres[i].materialId;
-            Material sMat = materials[sMatId];
-            bool isDielectric = ((sMat.type & MATERIAL_TYPE_MASK) == 2u || sMat.transmission > 0.05);
+            ShadeMaterial sMat = shadeMaterials[sMatId];
+            uint sType = smGetTypeFlags(sMat) & MATERIAL_TYPE_MASK;
+            bool isDielectric = (sType == 2u || smIsTransmissive(sMat));
             if (transparentShadows) {
-                if ((sMat.type & MATERIAL_TYPE_MASK) == 3u || (!enableCaustics && isDielectric)) continue;
-                if (enableCaustics && isDielectric && sMat.thickness <= 0.001) continue;
+                if (sType == 3u || (!enableCaustics && isDielectric)) continue;
+                if (enableCaustics && isDielectric && smIsThin(sMat)) continue;
             }
             float spT;
             vec3 spNorm;

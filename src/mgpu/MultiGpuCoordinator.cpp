@@ -151,25 +151,23 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         CameraUniform uboModified = params.ubo;
         uboModified.spp = plan.primSpp;
         plan.uboSec.spp = plan.secSpp;
-        plan.uboSec.frameIndex = params.frameIndex + 1000003u;
+        plan.uboSec.frameIndex = params.frameIndex + 1000000u;
 
-        bool isStationaryAccum = params.config.progressive_accumulation && !params.cameraMovedLastFrame && (inOutAccumulatedSamples > 1);
-        bool isDenoisingRenderRes = (params.config.denoiser_mode == DenoiserMode::Svgf ||
-                                     params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-        bool enableJitter = !isStationaryAccum && !isDenoisingRenderRes &&
-                            (params.config.upscaler_mode == UpscalerMode::FSR ||
-                             params.config.upscaler_mode == UpscalerMode::Upways ||
-                             params.config.upscaler_mode == UpscalerMode::Gateway ||
-                             params.config.denoiser_mode == DenoiserMode::Upways ||
-                             params.config.denoiser_mode == DenoiserMode::Gateway);
+        bool hasDenoiser = (params.config.denoiser_mode != DenoiserMode::None ||
+                            params.config.upscaler_mode == UpscalerMode::Upways);
+        bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
+        bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
+                              (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
+        bool enableJitter = !isStationaryAccum &&
+                            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes);
         if (enableJitter && params.camera) {
-            uint32_t phaseOffset = (params.config.mgpu_mode == MultiGpuMode::SampleParallel) ? 4 : 0;
             uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
                 ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
                 : 32u;
+            uint32_t phaseOffset = plan.isSampleBlendFsr3 ? (jitterSeqLen / 2u) : 0u;
             plan.uboSec = params.camera->getUniformData(params.frameIndex, plan.secSpp, params.activeBounces, params.flags,
                                                        true, plan.mgpuBaseW, plan.mgpuBaseH, phaseOffset, false, jitterSeqLen);
-            plan.uboSec.frameIndex = params.frameIndex + 1000003u;
+            plan.uboSec.frameIndex = params.frameIndex + 1000000u;
         }
 
         plan.totalCompositeSpp = (plan.activeMode == MultiGpuMode::SampleParallel && !plan.isSampleBlendFsr3) ? (plan.primSpp + plan.secSpp) : 0u;
@@ -191,19 +189,31 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     if (plan.isSampleBlendFsr3) {
         plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * 8;
     } else {
-        plan.frameBytes = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
-        bool needNormals = (params.config.upscaler_mode == UpscalerMode::Upways ||
-                            params.config.upscaler_mode == UpscalerMode::Gateway ||
-                            params.config.denoiser_mode == DenoiserMode::Upways ||
-                            params.config.denoiser_mode == DenoiserMode::Gateway ||
-                            params.config.denoiser_mode == DenoiserMode::Svgf ||
-                            params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+        auto align64k = [](size_t sz) -> size_t { return (sz + 65535u) & ~static_cast<size_t>(65535u); };
+        size_t radRaw = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
+        size_t planeAligned = align64k(static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 8u);
+        bool needMlGbuffers = (params.config.upscaler_mode == UpscalerMode::Upways ||
+                               params.config.denoiser_mode == DenoiserMode::Upways ||
+                               params.config.denoiser_mode == DenoiserMode::Svgf ||
+                               params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                               !params.config.capture_training_data_dir.empty());
+        bool needNormals = (needMlGbuffers ||
                             params.config.enable_restir ||
                             params.config.enable_caustics);
         bool needMvDepth = needNormals || (params.config.upscaler_mode == UpscalerMode::FSR);
         bool copyMvImage = needNormals || (needMvDepth && params.config.accum_format == AccumFormat::R11G11B10_UFLOAT);
-        if (plan.tileOffsetX_sec == 2u && copyMvImage) {
-            plan.frameBytes += static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * (needNormals ? 16 : 8);
+        if (plan.tileOffsetX_sec == 2u) {
+            if (needMlGbuffers) {
+                plan.frameBytes = align64k(radRaw) + 6u * planeAligned;
+            } else if (copyMvImage) {
+                plan.frameBytes = align64k(radRaw) + (needNormals ? 2u : 1u) * planeAligned;
+            } else {
+                plan.frameBytes = radRaw;
+            }
+        } else if (plan.mergeMode == 2u && needMlGbuffers) {
+            plan.frameBytes = align64k(radRaw) + 2u * planeAligned;
+        } else {
+            plan.frameBytes = radRaw;
         }
     }
     m_lastSecToPrimBytes = plan.frameBytes;
@@ -217,18 +227,20 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     // Launch secondary GPU concurrently for current frame
     if (!params.skipRayTracing && params.mgpu) {
         glm::vec2 jitterSec(0.0f);
-        bool isDenoisingRenderRes = (params.config.denoiser_mode == DenoiserMode::Svgf ||
-                                     params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-        if (!isDenoisingRenderRes &&
-            (params.config.upscaler_mode == UpscalerMode::FSR ||
-             params.config.upscaler_mode == UpscalerMode::Upways ||
-             params.config.upscaler_mode == UpscalerMode::Gateway)) {
-            if (!params.config.progressive_accumulation || params.cameraMovedLastFrame || inOutAccumulatedSamples <= 1) {
-                uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
-                    ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
-                    : 32u;
-                jitterSec = getHaltonJitter(params.frameIndex + 4, jitterSeqLen);
-            }
+        const bool hasDenoiser = (params.config.denoiser_mode != DenoiserMode::None ||
+                                  params.config.upscaler_mode == UpscalerMode::Upways);
+        const bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
+        const bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
+                                    (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
+        if (!isStationaryAccum &&
+            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes)) {
+            uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
+                ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
+                : 32u;
+            uint32_t phaseOffset = (plan.activeMode == MultiGpuMode::SampleParallel && plan.isSampleBlendFsr3)
+                ? (jitterSeqLen / 2u)
+                : 0u;
+            jitterSec = getHaltonJitter(params.frameIndex + phaseOffset, jitterSeqLen);
         }
         bool isSecMotion = params.cameraMovedThisFrame || params.cameraMovedLastFrame;
         params.mgpu->launchSecondaryWork(plan.uboSec, plan.slot, plan.tileOffsetX_sec, plan.tileOffsetY_sec, plan.mgpuBaseW, plan.mgpuBaseH,
@@ -341,11 +353,11 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
     rtSubmit.pCommandBufferInfos = &cmdSubmitInfo;
     rtSubmit.signalSemaphoreInfoCount = 1;
     rtSubmit.pSignalSemaphoreInfos = &signalInfo;
-    if (!params.skipRayTracing && params.mgpu && params.mgpu->isP2PDirectBarActive()) {
-        // Ensure the secondary GPU (DMA-BUF importer) submits before the primary GPU (DMA-BUF exporter).
-        // In Linux amdgpu, imported DMA-BUF BOs use implicit AMDGPU_SYNC_NE_OWNER synchronization while
-        // exported native BOs use AMDGPU_SYNC_EXPLICIT; submitting the importer first avoids a false
-        // dma_resv dependency on the primary GPU's ray tracing submission.
+    if (!params.skipRayTracing && params.mgpu &&
+        (params.mgpu->isP2PDirectBarActive() || params.mgpu->isCrossGpuSyncActive())) {
+        // Ensure the secondary GPU worker thread submits its command buffer (and signals the
+        // cross-GPU timeline semaphore / DMA-BUF fence) before the primary GPU submits work
+        // that waits on that timeline point or shares the exported resource.
         params.mgpu->waitWorkerIdle();
     }
     vkQueueSubmit2(queue, 1, &rtSubmit, VK_NULL_HANDLE);
@@ -357,14 +369,18 @@ void MultiGpuCoordinator::recordMergePass(
     const MultiGpuPlanParams& params,
     PostProcessPipeline* postProcess,
     Image* frameImage,
-    Image* mlDiffuseImage
+    Image* mlDiffuseImage,
+    Image* normalDepthImage,
+    Image* prevNormalDepthImage
 ) {
+    (void)frameImage;
+    (void)mlDiffuseImage;
     // Barrier: Ensure primary RT writes and secondary DMA host writes are visible before merge compute reads/writes
     VkMemoryBarrier2 rtToMergeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
-    rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT;
+    rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+    rtToMergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     rtToMergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    rtToMergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
 
     VkDependencyInfo rtToMergeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     rtToMergeDep.memoryBarrierCount = 1;
@@ -373,16 +389,20 @@ void MultiGpuCoordinator::recordMergePass(
 
     // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
-        bool needNormals = (params.config.upscaler_mode == UpscalerMode::Upways ||
-                            params.config.upscaler_mode == UpscalerMode::Gateway ||
-                            params.config.denoiser_mode == DenoiserMode::Upways ||
-                            params.config.denoiser_mode == DenoiserMode::Gateway ||
-                            params.config.denoiser_mode == DenoiserMode::Svgf ||
-                            params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+        const bool needMlGbuffers =
+            (params.config.upscaler_mode == UpscalerMode::Upways ||
+             params.config.denoiser_mode == DenoiserMode::Upways ||
+             params.config.denoiser_mode == DenoiserMode::Svgf ||
+             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+             !params.config.capture_training_data_dir.empty());
+        bool needNormals = (needMlGbuffers ||
                             params.config.enable_restir ||
                             params.config.enable_caustics);
         bool needMvDepth = needNormals || (params.config.upscaler_mode == UpscalerMode::FSR);
         uint32_t mergeGbuffersMode = needNormals ? 1u : (needMvDepth ? ((plan.formatMode != 2u) ? 3u : 2u) : 0u);
+        if (needMlGbuffers) {
+            mergeGbuffersMode |= 16u;
+        }
         glm::mat4 viewToWorldScaled = params.ubo.viewInverse;
         viewToWorldScaled[0] *= params.ubo.projInverse[0][0];
         viewToWorldScaled[1] *= params.ubo.projInverse[1][1];
@@ -406,68 +426,95 @@ void MultiGpuCoordinator::recordMergePass(
     VkMemoryBarrier2 mergeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     mergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     mergeBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    mergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    mergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    mergeBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+    mergeBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                 VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
 
     VkDependencyInfo mergeDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     mergeDep.memoryBarrierCount = 1;
     mergeDep.pMemoryBarriers = &mergeBarrier;
     vkCmdPipelineBarrier2(activeCmd, &mergeDep);
 
-    // Copy merged FP16 radiance into mlDiffuseImage for Upways/Gateway neural reconstruction / ReLAX SVGF / FFX denoiser
-    if (!params.skipRayTracing && mlDiffuseImage && frameImage && 
-        (params.config.upscaler_mode == UpscalerMode::Upways ||
-         params.config.upscaler_mode == UpscalerMode::Gateway ||
-         params.config.denoiser_mode == DenoiserMode::Upways ||
-         params.config.denoiser_mode == DenoiserMode::Gateway ||
-         params.config.denoiser_mode == DenoiserMode::Svgf ||
-         params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration)) {
-        VkImageCopy copyRegion{};
-        copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        copyRegion.extent = { plan.mgpuBaseW, plan.mgpuBaseH, 1 };
-        vkCmdCopyImage(activeCmd, frameImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
-                       mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &copyRegion);
+    // In CheckerboardTile mode, copy the merged full-screen normalDepthImage to prevNormalDepthImage
+    // so ReSTIR PT and Caustics temporal validation see fresh odd-tile normals & depths next frame.
+    if (!params.skipRayTracing && plan.activeMode == MultiGpuMode::CheckerboardTile &&
+        (params.config.enable_restir || params.config.enable_caustics) &&
+        normalDepthImage && prevNormalDepthImage) {
+        VkImageSubresourceRange ndRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageMemoryBarrier2 preCopyBarriers[2]{};
+        preCopyBarriers[0] = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        preCopyBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[0].image = normalDepthImage->getImage();
+        preCopyBarriers[0].subresourceRange = ndRange;
 
-        VkImageMemoryBarrier2 diffCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        diffCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
-        diffCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        diffCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-        diffCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-        diffCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        diffCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        diffCopyBarrier.image = mlDiffuseImage->getImage();
-        diffCopyBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        preCopyBarriers[1] = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        preCopyBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        preCopyBarriers[1].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        preCopyBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        preCopyBarriers[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        preCopyBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        preCopyBarriers[1].image = prevNormalDepthImage->getImage();
+        preCopyBarriers[1].subresourceRange = ndRange;
 
-        VkDependencyInfo diffCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-        diffCopyDep.imageMemoryBarrierCount = 1;
-        diffCopyDep.pImageMemoryBarriers = &diffCopyBarrier;
-        vkCmdPipelineBarrier2(activeCmd, &diffCopyDep);
+        VkDependencyInfo preCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        preCopyDep.imageMemoryBarrierCount = 2;
+        preCopyDep.pImageMemoryBarriers = preCopyBarriers;
+        vkCmdPipelineBarrier2(activeCmd, &preCopyDep);
+
+        VkImageCopy ndCopy{};
+        ndCopy.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        ndCopy.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        ndCopy.extent = {
+            std::min({ plan.mgpuBaseW, normalDepthImage->getWidth(), prevNormalDepthImage->getWidth() }),
+            std::min({ plan.mgpuBaseH, normalDepthImage->getHeight(), prevNormalDepthImage->getHeight() }),
+            1
+        };
+        vkCmdCopyImage(activeCmd, normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                       prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &ndCopy);
+
+        VkImageMemoryBarrier2 postCopyBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        postCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        postCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        postCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        postCopyBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        postCopyBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        postCopyBarrier.image = prevNormalDepthImage->getImage();
+        postCopyBarrier.subresourceRange = ndRange;
+
+        VkDependencyInfo postCopyDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        postCopyDep.imageMemoryBarrierCount = 1;
+        postCopyDep.pImageMemoryBarriers = &postCopyBarrier;
+        vkCmdPipelineBarrier2(activeCmd, &postCopyDep);
     }
 
     const bool needDecoupledPost = (params.config.denoiser_mode == DenoiserMode::Svgf ||
                                     params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                                     params.config.denoiser_mode == DenoiserMode::Upways ||
-                                    params.config.denoiser_mode == DenoiserMode::Gateway ||
                                     params.config.upscaler_mode == UpscalerMode::Upways ||
-                                    params.config.upscaler_mode == UpscalerMode::Gateway ||
                                     params.config.upscaler_mode == UpscalerMode::FSR);
     const bool isDenoisedWithoutRunningAvg =
         (params.config.denoiser_mode == DenoiserMode::Upways || params.config.upscaler_mode == UpscalerMode::Upways) ||
-        (params.config.denoiser_mode == DenoiserMode::Gateway || params.config.upscaler_mode == UpscalerMode::Gateway) ||
         ((params.config.denoiser_mode == DenoiserMode::Svgf || params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
          params.config.capture_training_data_dir.empty());
     const bool useFusedMgpuTonemap = !m_hasDedicatedAsyncCompute && !needDecoupledPost && !params.skipRayTracing && !plan.isSampleBlendFsr3 &&
                                      !params.config.visualize_mgpu_split && (plan.slot == params.currentFrame) &&
                                      postProcess && postProcess->hasFusedPipeline();
 
-    // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> FP32 Persistent History)
+    // Running Average Accumulation Pass for Multi-GPU (FP16 Merged Frame -> Persistent History)
     if (!params.skipRayTracing && !useFusedMgpuTonemap && !isDenoisedWithoutRunningAvg &&
         postProcess && postProcess->hasRunningAvgPipeline()) {
         PostProcessPipeline::RunningAvgPushConstants avgPC{};
         avgPC.width = plan.mgpuBaseW;
         avgPC.height = plan.mgpuBaseH;
-        avgPC.sampleCount = (params.config.progressive_accumulation && !params.accumReset) ? params.accumulatedSamples : 1u;
+        uint32_t rawSamples = (params.config.progressive_accumulation && !params.accumReset) ? params.accumulatedSamples : 1u;
+        avgPC.sampleCount = (rawSamples & 0x3FFFFFFFu) | (static_cast<uint32_t>(params.config.accum_format) << 30u);
         avgPC.invSpp = 1.0f;
 
         postProcess->recordRunningAvg(activeCmd, params.currentFrame, avgPC);
@@ -487,7 +534,9 @@ bool MultiGpuCoordinator::executeAsyncMerge(
     PostProcessPipeline* postProcess,
     Image* frameImage,
     Image* mlDiffuseImage,
-    VkSemaphore rtCompleteSemaphore
+    VkSemaphore rtCompleteSemaphore,
+    Image* normalDepthImage,
+    Image* prevNormalDepthImage
 ) {
     if (!m_hasDedicatedAsyncCompute || params.skipRayTracing || plan.isSampleBlendFsr3 || !postProcess) {
         return false;
@@ -517,7 +566,7 @@ bool MultiGpuCoordinator::executeAsyncMerge(
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, slot * 2 + 0);
     }
 
-    recordMergePass(cmd, plan, params, postProcess, frameImage, mlDiffuseImage);
+    recordMergePass(cmd, plan, params, postProcess, frameImage, mlDiffuseImage, normalDepthImage, prevNormalDepthImage);
 
     if (m_queryPool != VK_NULL_HANDLE) {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, slot * 2 + 1);
@@ -545,7 +594,7 @@ bool MultiGpuCoordinator::executeAsyncMerge(
 
     VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     signalInfo.semaphore = m_mergeCompleteSemaphores[slot];
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
     VkCommandBufferSubmitInfo cmdInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
     cmdInfo.commandBuffer = cmd;
@@ -574,14 +623,14 @@ void MultiGpuCoordinator::populatePostWaitSemaphores(
         uint32_t slot = currentFrame % MAX_FRAMES_IN_FLIGHT;
         VkSemaphoreSubmitInfo waitMerge{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
         waitMerge.semaphore = m_mergeCompleteSemaphores[slot];
-        waitMerge.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        waitMerge.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
         waitSemaphoreInfos.push_back(waitMerge);
         return;
     }
 
     VkSemaphoreSubmitInfo waitRt{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     waitRt.semaphore = rtCompleteSemaphore;
-    waitRt.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    waitRt.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     waitSemaphoreInfos.push_back(waitRt);
 
     if (mgpu && mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
@@ -590,7 +639,7 @@ void MultiGpuCoordinator::populatePostWaitSemaphores(
             VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
             waitSec.semaphore = secSem;
             waitSec.value = mgpu->getCurrentTimelineValue();
-            waitSec.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            waitSec.stageMask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
             waitSemaphoreInfos.push_back(waitSec);
         }
     }

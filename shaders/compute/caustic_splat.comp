@@ -63,10 +63,25 @@ void main() {
     vec3 ndc = clip.xyz / clip.w;
     if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) return; // Out of frustum
 
-    // Map NDC [-1, 1] to pixel coordinates [0, width-1] x [0, height-1]
-    ivec2 pixelCoord = ivec2((ndc.xy * 0.5 + 0.5) * vec2(pc.width, pc.height));
-    if (pixelCoord.x < 0 || pixelCoord.x >= int(pc.width) ||
-        pixelCoord.y < 0 || pixelCoord.y >= int(pc.height)) return;
+    // Map NDC [-1, 1] to pixel coordinates [0, fullWidth-1] x [0, height-1]
+    uint packedTile = floatBitsToUint(pc.targetBBoxMax.w);
+    uint fullWidth = (packedTile != 0u) ? (packedTile >> 16u) : pc.width;
+    uint cbTileSize = packedTile & 0xFFFFu;
+
+    ivec2 fullCoord = ivec2((ndc.xy * 0.5 + 0.5) * vec2(fullWidth, pc.height));
+    if (fullCoord.x < 0 || fullCoord.x >= int(fullWidth) ||
+        fullCoord.y < 0 || fullCoord.y >= int(pc.height)) return;
+
+    ivec2 pixelCoord = fullCoord;
+    if (cbTileSize > 0u) {
+        uint tx = uint(fullCoord.x) / cbTileSize;
+        uint ty = uint(fullCoord.y) / cbTileSize;
+        if (((tx + ty) & 1u) == 0u) {
+            return; // Even tile belongs to GPU 0
+        }
+        pixelCoord = ivec2(int((tx / 2u) * cbTileSize + (uint(fullCoord.x) % cbTileSize)), fullCoord.y);
+        if (pixelCoord.x >= int(pc.width)) return;
+    }
 
     // G-Buffer depth and normal verification
     vec4 gbuf = imageLoad(uNormalDepthImage, pixelCoord);
@@ -107,11 +122,13 @@ void main() {
     // Camera ray direction to hit point
     vec3 toCam = normalize(ubo.position.xyz - worldPos);
     float cosThetaCam = max(0.1, dot(worldNormal, toCam));
+    float cosAxis = max(0.1, dot(-toCam, camForward));
+    float cosAxis3 = cosAxis * cosAxis * cosAxis;
 
-    // Exact pixel footprint area on receiver surface
-    // In camera view space at unit distance, pixel width is 2*|projInverse[0][0]|/width, height is 2*|projInverse[1][1]|/height
-    float pixelSolidAngle = (4.0 * abs(ubo.projInverse[0][0] * ubo.projInverse[1][1])) / float(pc.width * pc.height);
-    float pixelArea = (photonCamDist * photonCamDist * pixelSolidAngle) / cosThetaCam;
+    // Exact pixel footprint area on receiver surface (including cos^3(theta) off-axis perspective Jacobian):
+    // dOmega = dA_{z=1} * cos^3(theta_axis), dA_surface = (r^2 * dOmega) / cos(theta_surface)
+    float pixelSolidAngle = (4.0 * abs(ubo.projInverse[0][0] * ubo.projInverse[1][1])) / float(fullWidth * pc.height);
+    float pixelArea = (photonCamDist * photonCamDist * pixelSolidAngle * cosAxis3) / cosThetaCam;
 
     // Physical irradiance: E = dPhi / dA
     // Clamping at 1e-7 avoids division by zero while preserving scale.

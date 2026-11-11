@@ -3,7 +3,9 @@
 #include <cmath>
 #include <random>
 #include <cassert>
+#include <cstring>
 #include <algorithm>
+#include <bit>
 #include <glm/glm.hpp>
 
 #include "rt/ReSTIRTypes.hpp"
@@ -370,44 +372,83 @@ int main() {
         };
         assert_true(sizeof(HitAtomTest) == 16, "Hit atom struct must strictly equal 16 bytes");
 
-        // 8b. 32-Byte GiReservoir layout verification with Hit atom packing
-        struct GiReservoirTest {
-            uint32_t hitInstanceId;
-            uint32_t hitPrimitiveId;
-            uint32_t hitBaryPacked;
-            uint32_t wSumBits;
-            uint32_t targetBits;
-            uint32_t radRG;
-            uint32_t radB_dSrc;
-            uint32_t flagsM; // [0] valid, [8:1] age, [24:9] M, [31:25] hitFlags
-        };
-        assert_true(sizeof(GiReservoirTest) == 32, "GiReservoir struct must strictly equal 32 bytes");
+        // 8b. 32-Byte GiReservoirGPU layout & bit-packing roundtrip verification (ReSTIRTypes.hpp)
+        assert_true(sizeof(pathways::GiReservoirGPU) == 32, "GiReservoirGPU struct must strictly equal 32 bytes");
 
-        // 8c. Bit-packing roundtrip verification for flagsM (zero bit collisions)
-        uint32_t testAge = 127u;
-        uint32_t testM = 1023u;
-        uint32_t testHitFlags = 2u; // 2-bit hit flags
+        auto restirPackOct16 = [](glm::vec3 n) -> uint32_t {
+            n /= (std::abs(n.x) + std::abs(n.y) + std::abs(n.z));
+            glm::vec2 e = (n.z >= 0.0f)
+                ? glm::vec2(n.x, n.y)
+                : (glm::vec2(1.0f) - glm::abs(glm::vec2(n.y, n.x))) *
+                  glm::vec2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+            uint32_t ux = static_cast<uint32_t>(std::clamp(std::round((e.x * 0.5f + 0.5f) * 255.0f), 0.0f, 255.0f));
+            uint32_t uy = static_cast<uint32_t>(std::clamp(std::round((e.y * 0.5f + 0.5f) * 255.0f), 0.0f, 255.0f));
+            return ux | (uy << 8u);
+        };
+        auto restirUnpackOct16 = [](uint32_t p) -> glm::vec3 {
+            glm::vec2 e(float(p & 0xFFu) / 255.0f * 2.0f - 1.0f,
+                        float((p >> 8u) & 0xFFu) / 255.0f * 2.0f - 1.0f);
+            glm::vec3 n(e.x, e.y, 1.0f - std::abs(e.x) - std::abs(e.y));
+            if (n.z < 0.0f) {
+                glm::vec2 w = (glm::vec2(1.0f) - glm::abs(glm::vec2(n.y, n.x))) *
+                              glm::vec2(n.x >= 0.0f ? 1.0f : -1.0f, n.y >= 0.0f ? 1.0f : -1.0f);
+                n.x = w.x;
+                n.y = w.y;
+            }
+            return glm::normalize(n);
+        };
+
+        // 8c. Bit-packing roundtrip verification for GiReservoirGPU (world-space x2 + targetCosBits + normalsPacked + dSrcFlagsM)
+        glm::vec3 testX2(12.345f, -6.789f, 45.125f);
+        float testWSum = 8.75f;
+        float testTarget = 2.625f;
         float testCosSrc = 0.715542f;
         uint32_t uCos = static_cast<uint32_t>(std::clamp(std::round(testCosSrc * 255.0f), 0.0f, 255.0f));
-        bool testValid = true;
+        glm::vec3 testN2 = glm::normalize(glm::vec3(0.42f, -0.76f, 0.49f));
+        glm::vec3 testX1Norm = glm::normalize(glm::vec3(-0.35f, 0.82f, 0.45f));
+        uint32_t octN2 = restirPackOct16(testN2);
+        uint32_t octN1 = restirPackOct16(testX1Norm);
+        float testDSrc = 3.5f;
+        uint32_t dSrcHalf = glm::packHalf2x16(glm::vec2(testDSrc, 0.0f)) & 0xFFFFu;
+        uint32_t testAge = 63u;  // 6-bit age (0..63)
+        uint32_t testM = 255u;   // 8-bit M (0..255)
 
-        uint32_t packedFlagsM = (testValid ? 1u : 0u) |
-                                ((testAge & 0xFFu) << 1u) |
-                                ((testM & 0x3FFu) << 9u) |
-                                ((testHitFlags & 0x3u) << 19u) |
-                                ((uCos & 0xFFu) << 21u);
+        pathways::GiReservoirGPU giRes{};
+        giRes.posXBits = std::bit_cast<uint32_t>(testX2.x);
+        giRes.posYBits = std::bit_cast<uint32_t>(testX2.y);
+        giRes.posZBits = std::bit_cast<uint32_t>(testX2.z);
+        giRes.wSumBits = std::bit_cast<uint32_t>(testWSum);
+        giRes.targetCosBits = (std::bit_cast<uint32_t>(testTarget) & 0xFFFFFF00u) | (uCos & 0xFFu);
+        giRes.radRgb9e5 = 0x483210FFu;
+        giRes.normalsPacked = (octN2 & 0xFFFFu) | ((octN1 & 0xFFFFu) << 16u);
+        giRes.dSrcFlagsM = dSrcHalf |
+                           (1u << 16u) /* valid */ |
+                           (1u << 17u) /* hasSurface */ |
+                           ((testAge & 0x3Fu) << 18u) |
+                           ((testM & 0xFFu) << 24u);
 
-        bool unpackedValid = (packedFlagsM & 1u) != 0u;
-        uint32_t unpackedAge = (packedFlagsM >> 1u) & 0xFFu;
-        uint32_t unpackedM = (packedFlagsM >> 9u) & 0x3FFu;
-        uint32_t unpackedHitFlags = (packedFlagsM >> 19u) & 0x3u;
-        float unpackedCosSrc = static_cast<float>((packedFlagsM >> 21u) & 0xFFu) / 255.0f;
+        glm::vec3 unpackedX2(std::bit_cast<float>(giRes.posXBits),
+                             std::bit_cast<float>(giRes.posYBits),
+                             std::bit_cast<float>(giRes.posZBits));
+        float unpackedTarget = std::bit_cast<float>(giRes.targetCosBits & 0xFFFFFF00u);
+        float unpackedCosSrc = static_cast<float>(giRes.targetCosBits & 0xFFu) / 255.0f;
+        glm::vec3 unpackedN2 = restirUnpackOct16(giRes.normalsPacked & 0xFFFFu);
+        glm::vec3 unpackedX1Norm = restirUnpackOct16((giRes.normalsPacked >> 16u) & 0xFFFFu);
+        float unpackedDSrc = glm::unpackHalf2x16(giRes.dSrcFlagsM & 0xFFFFu).x;
+        bool unpackedValid = ((giRes.dSrcFlagsM >> 16u) & 1u) != 0u;
+        bool unpackedHasSurface = ((giRes.dSrcFlagsM >> 17u) & 1u) != 0u;
+        uint32_t unpackedAge = (giRes.dSrcFlagsM >> 18u) & 0x3Fu;
+        uint32_t unpackedM = (giRes.dSrcFlagsM >> 24u) & 0xFFu;
 
-        assert_true(unpackedValid == testValid, "flagsM valid bit preserved");
-        assert_true(unpackedAge == testAge, "flagsM age (8-bit) preserved without overflow");
-        assert_true(unpackedM == testM, "flagsM M-confidence (10-bit) preserved without truncation");
-        assert_true(unpackedHitFlags == testHitFlags, "flagsM hit flags (2-bit) preserved without collision");
-        assert_near(unpackedCosSrc, testCosSrc, 1.0f / 255.0f, "flagsM cosSrc (8-bit unorm) preserved within quantization error");
+        assert_true(unpackedValid && unpackedHasSurface, "GiReservoirGPU dSrcFlagsM valid + hasSurface bits preserved");
+        assert_near(glm::distance(unpackedX2, testX2), 0.0f, 1e-6f, "GiReservoirGPU exact fp32 world-space x2 preserved");
+        assert_near(unpackedTarget, testTarget, 1e-4f, "GiReservoirGPU 24-bit fp32 target proxy preserved");
+        assert_near(unpackedCosSrc, testCosSrc, 1.0f / 255.0f, "GiReservoirGPU cosSrc (8-bit unorm) preserved within quantization error");
+        assert_near(unpackedDSrc, testDSrc, 2e-3f, "GiReservoirGPU fp16 |x2 - x1| distance preserved");
+        assert_true(unpackedAge == testAge, "GiReservoirGPU age (6-bit, 0..63) preserved without overflow");
+        assert_true(unpackedM == testM, "GiReservoirGPU M-confidence (8-bit, 0..255) preserved without truncation");
+        assert_true(glm::dot(unpackedN2, testN2) > 0.999f, "GiReservoirGPU oct16 world n2 roundtrip dot > 0.999");
+        assert_true(glm::dot(unpackedX1Norm, testX1Norm) > 0.999f, "GiReservoirGPU oct16 world x1Normal roundtrip dot > 0.999");
 
         // 8d. Barycentric unorm16 quantization precision verification
         auto packUnorm2x16 = [](float u, float v) -> uint32_t {
@@ -554,24 +595,64 @@ int main() {
     }
 
     // -------------------------------------------------------------------------
-    // TEST 10: Phase 3 Pure Path-Database Paradigm & Geometric Proxy Math (Approach B)
+    // TEST 10: Production Struct Alignment, 16-bit Light UV & X1Context Precision
     // -------------------------------------------------------------------------
-    std::cout << "\n[TEST 10] Pure Path-Database Paradigm & Geometric Proxy Math..." << std::endl;
+    std::cout << "\n[TEST 10] Production ReSTIR PT Struct Alignment, Light UV16 & X1Context..." << std::endl;
     {
-        // 10a. Static size & std430 alignment verification of Phase 3 structs
-        assert_true(sizeof(pathways::PathVertexGPU) == 32, "PathVertexGPU must strictly equal 32 bytes");
-        assert_true(sizeof(pathways::PathSampleGPU) == 160, "PathSampleGPU must strictly equal 160 bytes");
-        assert_true(sizeof(pathways::ReservoirPTGPU) == 32, "ReservoirPTGPU must strictly equal 32 bytes");
+        // 10a. Static size & std430 alignment verification of production ReSTIRTypes.hpp structs
+        assert_true(sizeof(pathways::DiReservoirGPU) == 32, "DiReservoirGPU must strictly equal 32 bytes");
         assert_true(sizeof(pathways::HitGPU) == 16, "HitGPU must strictly equal 16 bytes");
         assert_true(sizeof(pathways::GiReservoirGPU) == 32, "GiReservoirGPU must strictly equal 32 bytes");
-        assert_true(sizeof(pathways::ShadeRequestGPU) == 32, "ShadeRequestGPU must strictly equal 32 bytes");
-        assert_true(sizeof(pathways::ShadeResultGPU) == 16, "ShadeResultGPU must strictly equal 16 bytes");
-        assert_true(sizeof(pathways::DiReservoirGPU) == 28, "DiReservoirGPU must strictly equal 28 bytes");
         assert_true(sizeof(pathways::X1ContextGPU) == 24, "X1ContextGPU must strictly equal 24 bytes");
+        assert_true(sizeof(pathways::ShadeMaterialGPU) == 64, "ShadeMaterialGPU must strictly equal 64 bytes");
+        assert_true(sizeof(pathways::TriangleShadeGPU) == 64, "TriangleShadeGPU must strictly equal 64 bytes");
 
-        // Stride array alignment check: 4 reservoirs fit exactly into one 128B RDNA 4 vector cache line
-        pathways::ReservoirPTGPU resArray[4];
-        assert_true(sizeof(resArray) == 128, "4x ReservoirPTGPU fits exactly into one 128B RDNA 4 vector cache line");
+        // Stride array alignment check: 4 DI or GI reservoirs fit into one 128B RDNA 4 vector cache line
+        pathways::DiReservoirGPU diArray[4];
+        pathways::GiReservoirGPU giArray[4];
+        assert_true(sizeof(diArray) == 128, "4x DiReservoirGPU fits exactly into one 128B RDNA 4 vector cache line");
+        assert_true(sizeof(giArray) == 128, "4x GiReservoirGPU fits exactly into one 128B RDNA 4 vector cache line");
+
+        // 10a-2. DiReservoirGPU 16-bit area-light UV precision (packUnorm2x16 vs legacy 8-bit)
+        glm::vec2 trueUv(0.314159f, 0.718281f);
+        pathways::DiReservoirGPU diUvTest{};
+        diUvTest.lightUv16 = glm::packUnorm2x16(trueUv);
+        glm::vec2 recUv = glm::unpackUnorm2x16(diUvTest.lightUv16);
+        assert_near(recUv.x, trueUv.x, 1.0f / 65535.0f + 1e-6f, "DiReservoirGPU 16-bit light UV.x roundtrip");
+        assert_near(recUv.y, trueUv.y, 1.0f / 65535.0f + 1e-6f, "DiReservoirGPU 16-bit light UV.y roundtrip");
+
+        // 10a-3. X1ContextGPU 30-bit IEEE-754 qSelf + fp16 metallic roundtrip & zero squared-albedo bug
+        float trueQSelf = 0.284195f;
+        float trueMetallic = 0.35f;
+        glm::vec3 trueBaseColor(0.25f, 0.60f, 0.80f);
+        uint32_t qBits = 0;
+        std::memcpy(&qBits, &trueQSelf, sizeof(uint32_t));
+        pathways::X1ContextGPU ctx{};
+        ctx.albedoRG = glm::packHalf2x16(glm::vec2(trueBaseColor.r, trueBaseColor.g));
+        ctx.albedoB = glm::packHalf2x16(glm::vec2(trueBaseColor.b, trueMetallic));
+        ctx.flags = (qBits & ~3u) | 1u;
+
+        uint32_t recQBits = ctx.flags & ~3u;
+        float recQSelf = 0.0f;
+        std::memcpy(&recQSelf, &recQBits, sizeof(float));
+        float recMetallic = glm::unpackHalf2x16(ctx.albedoB).y;
+        assert_near(recQSelf, trueQSelf, 1e-6f, "X1ContextGPU 30-bit fp32 qSelf roundtrip (< 1e-6 error)");
+        assert_near(recMetallic, trueMetallic, 1e-3f, "X1ContextGPU fp16 metallic roundtrip");
+
+        // Zero squared-albedo verification: at M = 1, wSelf = pSelf / qSelf and giW = wSelf / (1 * pSelf) = 1 / qSelf,
+        // so fCos * L2 * giW == fCos * L2 / qSelf (single albedo power, never albedo^2).
+        glm::vec3 L2(2.4f, 1.8f, 1.2f);
+        float cosTheta = 0.72f;
+        float qCosine = cosTheta * (1.0f / 3.14159265359f);
+        glm::vec3 fCos = trueBaseColor * (1.0f - trueMetallic) * (1.0f / 3.14159265359f) * cosTheta;
+        float pSelf = glm::dot(fCos * L2, glm::vec3(0.2126f, 0.7152f, 0.0722f));
+        float wSelf = pSelf / qCosine;
+        float giW = wSelf / (1.0f * pSelf);
+        glm::vec3 restirEst = fCos * L2 * giW;
+        glm::vec3 mcEst = (fCos / qCosine) * L2;
+        assert_near(restirEst.r, mcEst.r, 1e-5f, "M=1 ReSTIR GI matches MC throughput*L2 exactly (R, no albedo^2)");
+        assert_near(restirEst.g, mcEst.g, 1e-5f, "M=1 ReSTIR GI matches MC throughput*L2 exactly (G, no albedo^2)");
+        assert_near(restirEst.b, mcEst.b, 1e-5f, "M=1 ReSTIR GI matches MC throughput*L2 exactly (B, no albedo^2)");
 
         // 10b. rho_max conservative admissibility & 8-bit unorm quantization precision
         pathways::MaterialGPU matDiffuse{};
@@ -670,53 +751,48 @@ int main() {
         float p_dark = evalPathTargetProxy(validPos, validNorm, validRho, 0.0f);
         assert_near(p_dark, 0.0f, 1e-9f, "Zero emitter luminance strictly evaluates to zero target proxy");
 
-        // 10e. Streaming ReservoirPT Unbiased Monte Carlo Convergence (100,000 Trials)
+        // 10e. Streaming GiReservoir Unbiased Monte Carlo Convergence (100,000 Trials)
         const int NUM_TRIALS = 100000;
         const int M = 4;
         double sumEstimates = 0.0;
         std::uniform_real_distribution<float> unitDist(0.0f, 1.0f);
 
         // Ground truth integral: int_0^1 4 * x^3 dx = 1.0
-        // Target proxy: p_hat(x) = x^2 (geometric coupling surrogate)
+        // Target proxy: p_hat(x) = x^2
         // Proposal q(x) = uniform on [0, 1] (q = 1.0)
         // True integrand: f(x) = 4 * x^3
         for (int t = 0; t < NUM_TRIALS; ++t) {
-            pathways::ReservoirPTGPU r{};
-            r.weightSum = 0.0f;
-            r.W = 0.0f;
-            r.M = 0.0f;
-            r.targetProxy = 0.0f;
-            r.pathIndex = 0xFFFFFFFFu;
-
+            float weightSum = 0.0f;
+            float countM = 0.0f;
+            float targetProxy = 0.0f;
             float selected_x = 0.0f;
 
             for (int c = 0; c < M; ++c) {
                 float x = unitDist(rng);
-                float p_hat = x * x; // Target proxy
-                float q = 1.0f;      // Uniform proposal
+                float p_hat = x * x;
+                float q = 1.0f;
                 float weight = p_hat / q;
 
-                float combinedWeight = r.weightSum + weight;
-                r.weightSum = combinedWeight;
-                r.M += 1.0f;
+                float combinedWeight = weightSum + weight;
+                weightSum = combinedWeight;
+                countM += 1.0f;
 
                 if (unitDist(rng) * combinedWeight < weight) {
-                    r.pathIndex = static_cast<uint32_t>(c);
-                    r.targetProxy = p_hat;
+                    targetProxy = p_hat;
                     selected_x = x;
                 }
             }
 
-            if (r.targetProxy > 1e-6f) {
-                r.W = r.weightSum / (r.M * r.targetProxy);
+            if (targetProxy > 1e-6f) {
+                float W = weightSum / (countM * targetProxy);
                 float f_val = 4.0f * selected_x * selected_x * selected_x;
-                sumEstimates += static_cast<double>(r.W * f_val);
+                sumEstimates += static_cast<double>(W * f_val);
             }
         }
 
         double meanIntegral = sumEstimates / NUM_TRIALS;
         assert_near(static_cast<float>(meanIntegral), 1.0f, 0.005f,
-                    "ReservoirPT streaming estimator unbiased convergence (analytical expectation: 1.0)");
+                    "GiReservoir streaming estimator unbiased convergence (analytical expectation: 1.0)");
 
         // 10f. ptApplyTap Exact Analytical Solid-Angle Jacobian & Shifted Target Proxy Verification
         std::cout << "\n[TEST 10f] ptApplyTap Solid-Angle Jacobian & Shifted Target Proxy..." << std::endl;
@@ -979,39 +1055,112 @@ int main() {
             assert_true(giEligible, "Rough surface eligible for ReSTIR GI x1Context");
         }
 
-        // 12e. Approach A Request/Result Queues Data Contract & Roundtrip (Fix 4)
-        pathways::ShadeRequestGPU req{};
-        req.hit.instanceId = 3;
-        req.hit.primitiveId = 42;
-        req.hit.baryPacked = 0x12345678u;
-        req.hit.flags = 2; // frontFace
-        req.wiOct = 0xAAAAAAAAu;
-        req.woOct = 0x55555555u;
-        req.resultSlot = 100;
-        req.matIdFlags = 7;
-        assert_true(sizeof(req) == 32, "ShadeRequestGPU strictly 32 bytes");
-
-        pathways::ShadeResultGPU res{};
-        glm::vec3 bsdfColor(0.75f, 0.5f, 0.25f);
-        float pdfFwd = 1.25f;
-        float pdfRev = 0.95f;
-        res.fRG = glm::packHalf2x16(glm::vec2(bsdfColor.r, bsdfColor.g));
-        res.fB_pdfFwd = glm::packHalf2x16(glm::vec2(bsdfColor.b, pdfFwd));
-        res.pdfRev_flags = glm::packHalf2x16(glm::vec2(pdfRev, 0.0f)) | (1u << 16);
-        res.pad = 0;
-        assert_true(sizeof(res) == 16, "ShadeResultGPU strictly 16 bytes");
-
-        // Unpack roundtrip verification
-        glm::vec2 unpackedRG = glm::unpackHalf2x16(res.fRG);
-        glm::vec2 unpackedB_fwd = glm::unpackHalf2x16(res.fB_pdfFwd);
-        glm::vec2 unpackedRev_flags = glm::unpackHalf2x16(res.pdfRev_flags);
-
-        assert_near(unpackedRG.x, bsdfColor.r, 1e-3f, "ShadeResult BSDF R fp16 roundtrip");
-        assert_near(unpackedRG.y, bsdfColor.g, 1e-3f, "ShadeResult BSDF G fp16 roundtrip");
-        assert_near(unpackedB_fwd.x, bsdfColor.b, 1e-3f, "ShadeResult BSDF B fp16 roundtrip");
-        assert_near(unpackedB_fwd.y, pdfFwd, 1e-3f, "ShadeResult forward pdf fp16 roundtrip");
-        assert_near(unpackedRev_flags.x, pdfRev, 1e-3f, "ShadeResult reverse pdf fp16 roundtrip");
+        // 12e. Signed Front-Face Jacobian Gate (Thin-Wall Back-Side Leak Rejection)
+        auto evalSignedGIJacobianGate = [](const glm::vec3& n1, const glm::vec3& n2c, const glm::vec3& dirNew) -> bool {
+            float cos1 = glm::dot(n1, dirNew);
+            float rawCosRc = glm::dot(n2c, -dirNew);
+            return (cos1 > 0.05f) && (rawCosRc > 1e-4f);
+        };
+        glm::vec3 receiverN(0.0f, 1.0f, 0.0f);
+        glm::vec3 dirUpRight = glm::normalize(glm::vec3(0.4f, 0.9f, 0.0f));
+        assert_true(evalSignedGIJacobianGate(receiverN, glm::vec3(0.0f, -1.0f, 0.0f), dirUpRight),
+                    "Front-facing secondary triangle accepted by signed Jacobian gate");
+        assert_true(!evalSignedGIJacobianGate(receiverN, glm::vec3(0.0f, 1.0f, 0.0f), dirUpRight),
+                    "Thin-wall back-side secondary triangle (rawCosRc < 0) strictly rejected");
         std::cout << "  [+] PASS: TEST 12 all assertions satisfied." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // TEST 13: Full-Sphere Partitioned Domain Unbiasedness (S^2 = Omega_GI u (S^2 \ Omega_GI))
+    // -------------------------------------------------------------------------
+    std::cout << "\n[TEST 13] Full-Sphere Partitioned Domain Unbiasedness (100,000 Trials)..." << std::endl;
+    {
+        // Domain [0, 1] partitioned into:
+        //   Omega_GI = [0, 0.65] (indirect diffuse triangle hits resampled via ReSTIR GI)
+        //   Omega_C  = (0.65, 1.0] (sky miss / area emitter / glass evaluated via MC,
+        //              contributing M = 1, wSelf = 0 to the GI reservoir).
+        // Integrand f(x) = 2*x on [0, 1] -> analytical integral = 1.0:
+        //   int_{Omega_GI} 2*x dx = 0.65^2 = 0.4225
+        //   int_{Omega_C}  2*x dx = 1 - 0.4225 = 0.5775
+        // Every pixel combines its own full-sphere sample (M_self = 1) with K = 3
+        // independent neighbor reservoirs drawn from the same full-sphere process.
+        std::mt19937 rng(202611);
+        std::uniform_real_distribution<float> u01(0.0f, 1.0f);
+        const float kSplit = 0.65f;
+        const int NUM_TRIALS = 100000;
+        const int K_NEIGHBORS = 3;
+
+        struct SimpleGiRes {
+            float x = 0.0f;
+            float wSum = 0.0f;
+            float pHat = 0.0f;
+            uint32_t M = 1u;
+            bool hasSample = false;
+        };
+
+        auto drawFullSphereCandidate = [&](float& outMcComp) -> SimpleGiRes {
+            SimpleGiRes r{};
+            float x = u01(rng); // q(x) = 1.0 on [0, 1]
+            r.M = 1u;
+            if (x <= kSplit) {
+                outMcComp = 0.0f;
+                r.x = x;
+                r.pHat = 2.0f * x;
+                r.wSum = r.pHat / 1.0f;
+                r.hasSample = (r.pHat > 0.0f);
+            } else {
+                // Lands in S^2 \ Omega_GI (e.g. ceiling emitter or sky):
+                // evaluated directly in MC, while GI records an empty M=1 trial!
+                outMcComp = 2.0f * x;
+                r.wSum = 0.0f;
+                r.pHat = 0.0f;
+                r.hasSample = false;
+            }
+            return r;
+        };
+
+        double sumTotal = 0.0;
+        double sumGiOnly = 0.0;
+        double sumCompOnly = 0.0;
+
+        for (int t = 0; t < NUM_TRIALS; ++t) {
+            float mcCompSelf = 0.0f;
+            SimpleGiRes r = drawFullSphereCandidate(mcCompSelf);
+
+            for (int k = 0; k < K_NEIGHBORS; ++k) {
+                float unusedNeighborMc = 0.0f;
+                SimpleGiRes tap = drawFullSphereCandidate(unusedNeighborMc);
+                float wTap = tap.hasSample ? tap.wSum : 0.0f;
+                uint32_t combinedM = r.M + tap.M;
+                float combinedW = (r.hasSample ? r.wSum : 0.0f) + wTap;
+                if (wTap > 0.0f && u01(rng) * combinedW < wTap) {
+                    r.x = tap.x;
+                    r.pHat = tap.pHat;
+                    r.wSum = combinedW;
+                    r.M = combinedM;
+                    r.hasSample = true;
+                } else {
+                    r.wSum = r.hasSample ? combinedW : 0.0f;
+                    r.M = combinedM;
+                }
+            }
+
+            float giContrib = 0.0f;
+            if (r.hasSample && r.pHat > 1e-8f) {
+                float W = r.wSum / (float(r.M) * r.pHat);
+                giContrib = (2.0f * r.x) * W;
+            }
+            sumGiOnly += giContrib;
+            sumCompOnly += mcCompSelf;
+            sumTotal += (giContrib + mcCompSelf);
+        }
+
+        assert_near(static_cast<float>(sumGiOnly / NUM_TRIALS), kSplit * kSplit, 0.004f,
+                    "Partitioned ReSTIR GI converges to exact int_{Omega_GI} f(x) dx = 0.4225");
+        assert_near(static_cast<float>(sumCompOnly / NUM_TRIALS), 1.0f - kSplit * kSplit, 0.004f,
+                    "Complementary MC path converges to exact int_{S^2 \\ Omega_GI} f(x) dx = 0.5775");
+        assert_near(static_cast<float>(sumTotal / NUM_TRIALS), 1.0f, 0.005f,
+                    "Combined ReSTIR PT + complementary MC estimator is 100% unbiased (integral = 1.0)");
     }
 
     std::cout << "\n================================================================================" << std::endl;

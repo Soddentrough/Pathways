@@ -1,5 +1,6 @@
 #version 460
 #extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_image_load_formatted : require
 
 // =============================================================================
 // PASS 1: Fused Edge-Aware Spatiotemporal Accumulator (E-SVGF)
@@ -40,8 +41,8 @@ layout(std140, set = 0, binding = 0) uniform CameraMatricesUBO {
     vec4 _padTail;                  // 16 bytes (offset 144)
 } uCamera;
 
-layout(set = 0, binding = 1,  rgba16f) readonly uniform image2D uCurrentDiffuse;   // RGB radiance, A emissive flag
-layout(set = 0, binding = 2,  rgba16f) readonly uniform image2D uCurrentSpecular;  // RGB radiance, A d_refl
+layout(set = 0, binding = 1)          readonly uniform image2D uCurrentDiffuse;   // RGB radiance, A emissive flag
+layout(set = 0, binding = 2)          readonly uniform image2D uCurrentSpecular;  // RGB radiance, A d_refl
 layout(set = 0, binding = 3,  rgba16f) readonly uniform image2D uMotionVectors;    // 2.5D MV: RG = UV delta, B = PrevLinearZ - CurrLinearZ
 layout(set = 0, binding = 4,  rgba16f) readonly uniform image2D uSpecularMotion;  // Reflection VMV (RG = uv delta, engine packs RG inside RGBA16F)
 layout(set = 0, binding = 5,  rgba16f) readonly uniform image2D uNormalDepth;
@@ -59,10 +60,6 @@ layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D uOutMoments;   
 layout(set = 0, binding = 16, rgba16f) writeonly uniform image2D uOutHistoryLength;// -> m_historyLength[currSlot]
 layout(set = 0, binding = 17, rg8)     writeonly uniform image2D uOutEdgeDensity;  // -> m_edgeDensity[currSlot]
 layout(set = 0, binding = 18, rgba16f) writeonly uniform image2D uOutNormalDepth;  // -> m_historyNormalDepth[currSlot]
-layout(set = 0, binding = 19, rgba16f) readonly uniform image2D uFfxDirectDiffuse;   // AMD FSR Ray Regeneration Signal 0
-layout(set = 0, binding = 20, rgba16f) readonly uniform image2D uFfxDirectSpecular;  // AMD FSR Ray Regeneration Signal 1
-layout(set = 0, binding = 21, rgba16f) readonly uniform image2D uFfxIndirectDiffuse; // AMD FSR Ray Regeneration Signal 2 (.a = hitT)
-layout(set = 0, binding = 22, rgba16f) readonly uniform image2D uFfxIndirectSpecular;// AMD FSR Ray Regeneration Signal 3 (.a = hitT)
 
 layout(push_constant) uniform PushConstants {
     uint  width;
@@ -82,20 +79,8 @@ layout(push_constant) uniform PushConstants {
     float depthThreshold;            // 0.08 static
     float dynamicDepthThreshold;     // 0.15 dynamic
     float mvDiscrepancyThreshold;    // 2.0 px
-    uint  isRayRegeneration;         // 1 = AMD FSR Ray Regeneration 4-Signal + HitT pipeline
-    float _pad[2];
+    float _pad[3];
 } pc;
-
-// AMD FidelityFX Denoiser (Ray Regeneration 1.2.1) split-sum BRDF demodulation factor
-vec3 ffxApproximateSpecBrdf(vec3 specAlbedo, float roughness, float NoV) {
-    const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
-    const vec4 c1 = vec4( 1.0,  0.0425,  1.04, -0.04);
-    vec4 r = roughness * c0 + c1;
-    float a004 = min(r.x * r.x, exp2(-9.28 * clamp(NoV, 0.0, 1.0))) * r.x + r.y;
-    vec2 AB = vec2(-1.04, 1.04) * a004 + r.zw;
-    vec3 f0 = mix(vec3(0.04), clamp(specAlbedo, vec3(0.04), vec3(1.0)), 0.5);
-    return max(f0 * AB.x + vec3(AB.y), vec3(0.05));
-}
 
 // -----------------------------------------------------------------------------
 // LDS: Structure of Arrays (SoA) layout with odd stride 23 to eliminate
@@ -411,9 +396,7 @@ void main() {
     vec3 demodAlb = denoiseDemodulationFactor(curAlb, curZ);
 
     vec4 curDiffTex = imageLoad(uCurrentDiffuse, clampedSelfCoord);
-    vec4 curSpecTex = (curRoughness < 0.70 || pc.isRayRegeneration != 0u)
-        ? imageLoad(uCurrentSpecular, clampedSelfCoord)
-        : vec4(0.0);
+    vec4 curSpecTex = imageLoad(uCurrentSpecular, clampedSelfCoord);
     vec3 rawCurrDiff = curDiffTex.rgb / demodAlb;
 
     ivec2 ldsCoord = ivec2(int(tx) + APRON, int(ty) + APRON);
@@ -458,9 +441,7 @@ void main() {
         if (ldsX >= 2 && ldsX <= 19 && ldsY >= 2 && ldsY <= 19) {
             vec3 bDemodAlb = denoiseDemodulationFactor(alb.rgb, normDepth.w);
             vec3 bDiff = imageLoad(uCurrentDiffuse, globalCoord).rgb / bDemodAlb;
-            vec3 bSpec = (alb.a < 0.70 || pc.isRayRegeneration != 0u)
-                ? imageLoad(uCurrentSpecular, globalCoord).rgb
-                : vec3(0.0);
+            vec3 bSpec = imageLoad(uCurrentSpecular, globalCoord).rgb;
             s_localDiffuseLum[ldsY][ldsX] = denoiseLuminance(bDiff);
             s_localSpecularLum[ldsY][ldsX] = denoiseLuminance(bSpec);
         }
@@ -644,7 +625,7 @@ void main() {
         if (sameSpecCoord && valid && !isDynamic && dRefl <= 1e-4) {
             // Fast path: non-dynamic primary pixel with no VMV offset reuses already-validated primary history
             validSpec = true;
-            float maxSpecFast = stationaryPixel ? 128.0 : min(pc.maxHistoryLength, (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+            float maxSpecFast = stationaryPixel ? 128.0 : min(pc.maxHistoryLength, 16.0);
             nSpec = min(prevHistLenPrimary.g + 1.0, maxSpecFast);
             dOutRefl = prevHistLenPrimary.b;
         } else {
@@ -671,7 +652,7 @@ void main() {
 
                 if ((currIsSky || normalClosenessSpec > 0.82) && reflectorDepthConsistent && hitDistConsistent) {
                     validSpec = true;
-                    float maxSpecMoving = min(pc.maxHistoryLength, (pc.isRayRegeneration != 0u ? 24.0 : 16.0));
+                    float maxSpecMoving = min(pc.maxHistoryLength, 16.0);
                     float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : maxSpecMoving);
                     nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
                     if (dOutRefl <= 1e-4) {
@@ -737,7 +718,7 @@ void main() {
             }
         }
 
-        float minAlphaDiff = hasMotion ? 0.03 : (pc.isRayRegeneration != 0u ? 0.004 : 0.005);
+        float minAlphaDiff = hasMotion ? 0.03 : 0.005;
         float alphaDiff = max(1.0 / nDiff, minAlphaDiff);
         accDiff = mix(prevDiffTex.rgb, currDiff, alphaDiff);
 
@@ -756,7 +737,7 @@ void main() {
         varDiff = varSpatialDiff;
     }
 
-    if (validSpec && stationaryPixel && curRoughness >= 0.70 && lumSpec <= 1e-5 && muNSpec <= 1e-5 && dRefl <= 1e-4) {
+    if (curRoughness >= 0.70 && lumSpec <= 1e-5 && muNSpec <= 1e-5 && dRefl <= 1e-4) {
         accSpec = vec3(0.0);
         accMom.z = 0.0;
         accMom.w = 0.0;
@@ -777,7 +758,7 @@ void main() {
             }
         }
 
-        float minAlphaSpec = hasSpecMotion ? (pc.isRayRegeneration != 0u ? 0.05 : 0.08) : (pc.isRayRegeneration != 0u ? 0.008 : 0.01);
+        float minAlphaSpec = hasSpecMotion ? 0.08 : 0.01;
         float alphaSpec = max(1.0 / nSpec, minAlphaSpec);
         accSpec = mix(prevSpecTex.rgb, currSpec, alphaSpec);
 
@@ -795,11 +776,6 @@ void main() {
 
     // ---------------- Dual-channel effective edge density ----------------
     float rhoEffective = rho * clamp(nDiff / 8.0, 0.25, 1.0);
-    if (pc.isRayRegeneration != 0u) {
-        float histFactor = clamp(nDiff / 12.0, 0.0, 1.0);
-        varDiff *= mix(1.35, 0.90, histFactor);
-        rhoEffective = rho * clamp(nDiff / 10.0, 0.20, 1.0);
-    }
 
     // ---------------- Outputs (finite FP16 range clamp prevents Inf) ----------------
     vec3 outDiff = clamp(accDiff, 0.0, 65000.0);
@@ -810,9 +786,7 @@ void main() {
     float packedVarDiff = hasSpecChannel ? -max(clampedVarDiff, 1e-5) : clampedVarDiff;
 
     imageStore(uOutDiffuse, coord, vec4(outDiff, packedVarDiff));
-    if (hasSpecChannel) {
-        imageStore(uOutSpecular, coord, vec4(outSpec, clampedVarSpec));
-    }
+    imageStore(uOutSpecular, coord, hasSpecChannel ? vec4(outSpec, clampedVarSpec) : vec4(0.0));
     imageStore(uOutMoments, coord, clamp(accMom, 0.0, 65000.0));
     imageStore(uOutHistoryLength, coord, vec4(nDiff, nSpec, dOutRefl, isDynamic ? 1.0 : 0.0));
     imageStore(uOutNormalDepth, coord, curND);

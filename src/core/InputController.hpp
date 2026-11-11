@@ -74,6 +74,8 @@ private:
 
     glm::vec3 m_centralTarget{ 0.0f };
     float m_focalRadius = 1.0f;
+    float m_lastGpuCenterDepth = 0.0f;
+    bool m_hasGpuCenterDepth = false;
     std::function<void()> m_onToggleFullscreen;
     std::function<void()> m_onScreenshot;
     std::function<void()> m_onToggleGui;

@@ -152,15 +152,15 @@ vec4 atrousFilterSpecular(
         return rawSpecData;
     }
 
-    float mirrorBypass = 1.0 - smoothstep(0.02, 0.08, roughness);
+    float mirrorBypass = 1.0 - smoothstep(0.005, 0.025, roughness);
     if (mirrorBypass >= 0.999) {
         return rawSpecData;
     }
 
     vec3 rawSpecular = rawSpecData.rgb;
-    float roughnessScale = clamp(roughness * roughness, 0.1, 1.0);
+    float roughnessScale = clamp(max(roughness * roughness, (roughness >= 0.03 && centerVar > 5e-4) ? 0.25 : 0.1), 0.1, 1.0);
     float effectivePhiNormal = min(phiNormal / max(roughness * roughness, 0.05), 256.0);
-    float effPhiLum = (roughness >= 0.50) ? (phiLuminance * 2.0) : phiLuminance;
+    float effPhiLum = (roughness >= 0.50) ? (phiLuminance * 2.0) : ((roughness >= 0.03 && centerVar > 2e-4) ? (phiLuminance * 2.5) : phiLuminance);
 
     const float centerW = 0.140625;
     vec3 specAcc = rawSpecular * centerW;
