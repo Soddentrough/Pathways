@@ -25,13 +25,27 @@ void SceneGeometryPipeline::updateSceneTransparency(
     bool& outHasNonOpaque,
     bool& outHasAlphaMask
 ) {
+    bool unusedAlphaShadow = false;
+    updateSceneTransparency(materials, outHasNonOpaque, outHasAlphaMask, unusedAlphaShadow);
+}
+
+void SceneGeometryPipeline::updateSceneTransparency(
+    const std::vector<MaterialGPU>& materials,
+    bool& outHasNonOpaque,
+    bool& outHasAlphaMask,
+    bool& outHasAlphaShadow
+) {
     outHasNonOpaque = false;
     outHasAlphaMask = false;
+    outHasAlphaShadow = false;
     for (const auto& mat : materials) {
-        if (mat.alphaMode != 0) {
-            outHasAlphaMask = true;
+        if (mat.alphaMode != ALPHA_MODE_OPAQUE) {
+            outHasAlphaShadow = true;
             outHasNonOpaque = true;
-        } else if (mat.transmission > 0.05f || mat.type == 2) {
+            if (mat.alphaMode == ALPHA_MODE_MASK) {
+                outHasAlphaMask = true;
+            }
+        } else if (mat.transmission > 0.05f || mat.type == MATERIAL_DIELECTRIC) {
             outHasNonOpaque = true;
         }
     }
@@ -40,6 +54,7 @@ void SceneGeometryPipeline::updateSceneTransparency(
 void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_t& outNumOpaqueTriangles) {
     outNumOpaqueTriangles = 0;
     sceneData.numOpaqueTriangles = 0;
+    sceneData.numSolidNonOpaqueTriangles = 0;
 
     if (!sceneData.triangles.empty()) {
         auto isOpaqueTriangle = [&sceneData](const TriangleGPU& tri) {
@@ -72,14 +87,26 @@ void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_
         }
         outNumOpaqueTriangles = totalOpaque;
         sceneData.numOpaqueTriangles = totalOpaque;
+        Logger::info("Geometry Partitioning: {} Opaque triangles, {} Non-Opaque triangles (Total: {})",
+                     outNumOpaqueTriangles, sceneData.triangles.size() - outNumOpaqueTriangles, sceneData.triangles.size());
     } else {
         auto it = std::stable_partition(sceneData.triangles.begin(), sceneData.triangles.end(), isOpaqueTriangle);
         outNumOpaqueTriangles = static_cast<uint32_t>(std::distance(sceneData.triangles.begin(), it));
         sceneData.numOpaqueTriangles = outNumOpaqueTriangles;
-    }
 
-        Logger::info("Geometry Partitioning: {} Opaque triangles, {} Non-Opaque triangles (Total: {})",
-                     outNumOpaqueTriangles, sceneData.triangles.size() - outNumOpaqueTriangles, sceneData.triangles.size());
+        auto isSolidNonOpaqueTriangle = [&sceneData](const TriangleGPU& tri) {
+            if (tri.materialId >= sceneData.materials.size()) {
+                return true;
+            }
+            return sceneData.materials[tri.materialId].alphaMode == ALPHA_MODE_OPAQUE;
+        };
+        auto itSolid = std::stable_partition(it, sceneData.triangles.end(), isSolidNonOpaqueTriangle);
+        sceneData.numSolidNonOpaqueTriangles = static_cast<uint32_t>(std::distance(it, itSolid));
+        uint32_t numAlphaNonOpaque = static_cast<uint32_t>(std::distance(itSolid, sceneData.triangles.end()));
+
+        Logger::info("Geometry Partitioning: {} Opaque, {} Solid Non-Opaque, {} Alpha Non-Opaque triangles (Total: {})",
+                     outNumOpaqueTriangles, sceneData.numSolidNonOpaqueTriangles, numAlphaNonOpaque, sceneData.triangles.size());
+    }
     }
 
     // Compute Dielectric Target Bounding Box for Caustic Photon Injection
@@ -179,6 +206,7 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
     struct ProtoBounds {
         glm::vec3 minBound{ 1e30f };
         glm::vec3 maxBound{ -1e30f };
+        bool hasAlphaCutout = false;
     };
     std::vector<ProtoBounds> protoBounds(scene.blasRanges.size());
     for (size_t b = 0; b < scene.blasRanges.size(); ++b) {
@@ -193,6 +221,10 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
                 protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v0.position));
                 protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v1.position));
                 protoBounds[b].maxBound = glm::max(protoBounds[b].maxBound, glm::vec3(tri.v2.position));
+                if (tri.materialId < scene.materials.size() &&
+                    scene.materials[tri.materialId].alphaMode != ALPHA_MODE_OPAQUE) {
+                    protoBounds[b].hasAlphaCutout = true;
+                }
             }
         }
     }
@@ -203,6 +235,7 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
         uint32_t bIdx;
         glm::vec3 worldCenter;
         uint32_t triCount;
+        bool hasAlphaCutout;
     };
     std::vector<InstInfo> instInfos;
     instInfos.reserve(scene.instances.size());
@@ -216,8 +249,26 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
         glm::vec3 localCenter = (pb.minBound + pb.maxBound) * 0.5f;
         glm::vec3 worldCenter = glm::vec3(inst.transform * glm::vec4(localCenter, 1.0f));
 
+        bool instHasAlpha = pb.hasAlphaCutout;
+        uint32_t matOffset = (i < scene.instanceData.size()) ? scene.instanceData[i].materialOffset : 0;
+        if (matOffset != 0) {
+            instHasAlpha = false;
+            const auto& range = scene.blasRanges[inst.blasIndex];
+            for (uint32_t t = 0; t < range.triangleCount; ++t) {
+                uint32_t triIdx = range.firstTriangle + t;
+                if (triIdx < scene.triangles.size()) {
+                    uint32_t matId = scene.triangles[triIdx].materialId + matOffset;
+                    if (matId < scene.materials.size() &&
+                        scene.materials[matId].alphaMode != ALPHA_MODE_OPAQUE) {
+                        instHasAlpha = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         uint32_t triCount = scene.blasRanges[inst.blasIndex].triangleCount;
-        instInfos.push_back({ i, inst.blasIndex, worldCenter, triCount });
+        instInfos.push_back({ i, inst.blasIndex, worldCenter, triCount, instHasAlpha });
         sceneMin = glm::min(sceneMin, worldCenter);
         sceneMax = glm::max(sceneMax, worldCenter);
     }
@@ -243,7 +294,9 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
         cells[gz * gridX + gx].push_back(k);
     }
 
-    // 4. Decide which cells to merge into Macro-BLASes vs keep unmerged
+    // 4. Decide which cells to merge into Macro-BLASes vs keep unmerged.
+    // Separate non-alpha-cutout (solid opaque / solid dielectric) from alpha-cutout
+    // instances so solid glass never inherits non-opaque BVH flags from nearby foliage.
     std::vector<std::vector<uint32_t>> macroClusters;
     std::vector<uint32_t> unmergedInstIndices;
     uint64_t accumulatedMacroTris = 0;
@@ -259,17 +312,38 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
             continue;
         }
 
-        std::vector<uint32_t> currentSubCluster;
-        uint32_t currentSubTris = 0;
+        for (int alphaPass = 0; alphaPass < 2; ++alphaPass) {
+            const bool wantAlpha = (alphaPass == 1);
+            std::vector<uint32_t> currentSubCluster;
+            uint32_t currentSubTris = 0;
 
-        for (uint32_t idx : cell) {
-            uint32_t instTris = instInfos[idx].triCount;
-            // Keep large structural instances (e.g. multi-thousand tri skyscrapers) as clean prototype references
-            if (instTris > config.macro_blas_max_prop_tris) {
-                unmergedInstIndices.push_back(idx);
-                continue;
+            for (uint32_t idx : cell) {
+                if (instInfos[idx].hasAlphaCutout != wantAlpha) {
+                    continue;
+                }
+                uint32_t instTris = instInfos[idx].triCount;
+                // Keep large structural instances (e.g. multi-thousand tri skyscrapers) as clean prototype references
+                if (instTris > config.macro_blas_max_prop_tris) {
+                    unmergedInstIndices.push_back(idx);
+                    continue;
+                }
+                if (currentSubTris + instTris > maxTrisPerMacroBlas && !currentSubCluster.empty()) {
+                    if (currentSubCluster.size() > 1 && (accumulatedMacroTris + currentSubTris <= maxMacroTrisBudget)) {
+                        macroClusters.push_back(currentSubCluster);
+                        accumulatedMacroTris += currentSubTris;
+                    } else {
+                        for (uint32_t id : currentSubCluster) {
+                            unmergedInstIndices.push_back(id);
+                        }
+                    }
+                    currentSubCluster.clear();
+                    currentSubTris = 0;
+                }
+                currentSubCluster.push_back(idx);
+                currentSubTris += instTris;
             }
-            if (currentSubTris + instTris > maxTrisPerMacroBlas && !currentSubCluster.empty()) {
+
+            if (!currentSubCluster.empty()) {
                 if (currentSubCluster.size() > 1 && (accumulatedMacroTris + currentSubTris <= maxMacroTrisBudget)) {
                     macroClusters.push_back(currentSubCluster);
                     accumulatedMacroTris += currentSubTris;
@@ -277,21 +351,6 @@ void SceneGeometryPipeline::clusterInstancesToMacroBlas(SceneData& scene, const 
                     for (uint32_t id : currentSubCluster) {
                         unmergedInstIndices.push_back(id);
                     }
-                }
-                currentSubCluster.clear();
-                currentSubTris = 0;
-            }
-            currentSubCluster.push_back(idx);
-            currentSubTris += instTris;
-        }
-
-        if (!currentSubCluster.empty()) {
-            if (currentSubCluster.size() > 1 && (accumulatedMacroTris + currentSubTris <= maxMacroTrisBudget)) {
-                macroClusters.push_back(currentSubCluster);
-                accumulatedMacroTris += currentSubTris;
-            } else {
-                for (uint32_t id : currentSubCluster) {
-                    unmergedInstIndices.push_back(id);
                 }
             }
         }

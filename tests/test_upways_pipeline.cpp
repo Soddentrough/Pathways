@@ -96,15 +96,15 @@ int main() {
     }
     std::cout << "  -> Co-designed diffuse and metallic-Fresnel specular demodulation/remodulation verified." << std::endl;
 
-    // 4. Verify Upways 3.0 (73,686 params = 89,536B FP8 E4M3 + FP32) Weights Topology
-    std::cout << "[TEST 4] Upways 3.0 (73,686 Params / 89,536B FP8+FP32) Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_PARAMETER_COUNT == 73686u, "TOTAL_PARAMETER_COUNT must be 73,686");
+    // 4. Verify Upways 3.0 (71,606 params = 87,232B FP8 E4M3 + FP32) Weights Topology
+    std::cout << "[TEST 4] Upways 3.0 (71,606 Params / 87,232B FP8+FP32) Weights Topology..." << std::endl;
+    check_true(upways::TOTAL_PARAMETER_COUNT == 71606u, "TOTAL_PARAMETER_COUNT must be 71,606");
     check_true(upways::FP8_WEIGHT_SECTION_OFFSET == 0u, "FP8_WEIGHT_SECTION_OFFSET must be 0");
-    check_true(upways::FP8_WEIGHT_SECTION_BYTES == 69632u, "FP8_WEIGHT_SECTION_BYTES must be 69,632");
-    check_true(upways::FP32_WEIGHT_SECTION_OFFSET == 69632u, "FP32_WEIGHT_SECTION_OFFSET must be 69,632 (256B aligned)");
+    check_true(upways::FP8_WEIGHT_SECTION_BYTES == 67584u, "FP8_WEIGHT_SECTION_BYTES must be 67,584");
+    check_true(upways::FP32_WEIGHT_SECTION_OFFSET == 67584u, "FP32_WEIGHT_SECTION_OFFSET must be 67,584 (256B aligned)");
     check_true((upways::FP32_WEIGHT_SECTION_OFFSET % 256u) == 0u, "FP32_WEIGHT_SECTION_OFFSET must be 256-byte aligned");
-    check_true(upways::FP32_WEIGHT_SECTION_BYTES == 19904u, "FP32_WEIGHT_SECTION_BYTES must be 19,904");
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 89536u, "TOTAL_WEIGHT_BUFFER_SIZE must be 89,536 bytes");
+    check_true(upways::FP32_WEIGHT_SECTION_BYTES == 19648u, "FP32_WEIGHT_SECTION_BYTES must be 19,648");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 87232u, "TOTAL_WEIGHT_BUFFER_SIZE must be 87,232 bytes");
     check_true(upways::ENC0_PW1_W_FP8_OFFSET == 0u, "ENC0_PW1_W_FP8_OFFSET must be 0");
     check_true(upways::REC_PROJ_W_FP8_OFFSET == 1024u, "REC_PROJ_W_FP8_OFFSET must be 1024");
     check_true(upways::ENC0_PW2_W_FP8_OFFSET == 1536u, "ENC0_PW2_W_FP8_OFFSET must be 1536");
@@ -113,13 +113,13 @@ int main() {
     check_true(upways::BOT2_PW1_W_FP8_OFFSET == 33280u, "BOT2_PW1_W_FP8_OFFSET must be 33280");
     check_true(upways::DEC1_PW1_W_FP8_OFFSET == 57856u, "DEC1_PW1_W_FP8_OFFSET must be 57856");
     check_true(upways::DEC0_PW1_W_FP8_OFFSET == 64000u, "DEC0_PW1_W_FP8_OFFSET must be 64000");
-    check_true(upways::DEC0_PW2_W_FP8_OFFSET == 66048u, "DEC0_PW2_W_FP8_OFFSET must be 66048");
-    check_true(upways::HEAD_OUT_W_FP8_OFFSET == 68096u, "HEAD_OUT_W_FP8_OFFSET must be 68096");
-    check_true(upways::HEAD_REC_W_FP8_OFFSET == 68608u, "HEAD_REC_W_FP8_OFFSET must be 68608");
-    check_true(upways::HEAD_REC_W_FP8_OFFSET + 1024u == upways::FP8_WEIGHT_SECTION_BYTES, "FP8 section end must match 69,632");
-    check_true(upways::SKIP_SCALE_F32_OFFSET == 4960u, "SKIP_SCALE_F32_OFFSET must be 4960");
-    check_true((upways::SKIP_SCALE_F32_OFFSET + 16u) * sizeof(float) == upways::FP32_WEIGHT_SECTION_BYTES, "FP32 section end must match 19,904");
-    std::cout << "  -> Upways 3.0 (73,686 params = 69,632B FP8 + 19,904B FP32 = 89,536B) verified." << std::endl;
+    check_true(upways::DEC0_PW2_W_FP8_OFFSET == 65024u, "DEC0_PW2_W_FP8_OFFSET must be 65024");
+    check_true(upways::HEAD_OUT_W_FP8_OFFSET == 66048u, "HEAD_OUT_W_FP8_OFFSET must be 66048");
+    check_true(upways::HEAD_REC_W_FP8_OFFSET == 66560u, "HEAD_REC_W_FP8_OFFSET must be 66560");
+    check_true(upways::HEAD_REC_W_FP8_OFFSET + 1024u == upways::FP8_WEIGHT_SECTION_BYTES, "FP8 section end must match 67,584");
+    check_true(upways::SKIP_SCALE_F32_OFFSET == 4896u, "SKIP_SCALE_F32_OFFSET must be 4896");
+    check_true((upways::SKIP_SCALE_F32_OFFSET + 16u) * sizeof(float) == upways::FP32_WEIGHT_SECTION_BYTES, "FP32 section end must match 19,648");
+    std::cout << "  -> Upways 3.0 (71,606 params = 67,584B FP8 + 19,648B FP32 = 87,232B) verified." << std::endl;
 
     // 5. Verify Exported Weights and Embedded Fallback Integrity
     std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
@@ -148,7 +148,7 @@ int main() {
     }
     if (!foundPath.empty()) {
         auto fileSize = std::filesystem::file_size(foundPath);
-        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must match TOTAL_WEIGHT_BUFFER_SIZE (89,536B)");
+        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must match TOTAL_WEIGHT_BUFFER_SIZE (87,232B)");
         std::cout << "  -> External weight file binary verified at: " << foundPath << " (" << fileSize << " bytes)." << std::endl;
     }
 

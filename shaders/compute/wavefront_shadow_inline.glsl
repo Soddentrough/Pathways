@@ -19,9 +19,9 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
 
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (ubo.flags & (1u << 6)) != 0u; // approximate light check
-    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
+    bool hasAlphaShadow = (ubo.flags & (1u << 27)) != 0u;
 
-    if (!hasAlphaMask && (!transparentShadows || !enableCaustics)) {
+    if (!hasAlphaShadow && (!transparentShadows || !enableCaustics)) {
         LOCAL_RQ_DECL
         rayQueryInitializeEXT(RQ_OBJ, topLevelAS,
                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
@@ -31,8 +31,9 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
         occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     } else {
         LOCAL_RQ_DECL
-        rayQueryInitializeEXT(RQ_OBJ, topLevelAS,
-                              gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        uint rqFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT
+                     | (transparentShadows ? gl_RayFlagsNoOpaqueEXT : 0u);
+        rayQueryInitializeEXT(RQ_OBJ, topLevelAS, rqFlags,
                               RAY_MASK_ALL, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         while (rayQueryProceedEXT(RQ_OBJ)) {
             if (rayQueryGetIntersectionTypeEXT(RQ_OBJ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -58,8 +59,10 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
                 uint alphaMode = smGetAlphaMode(sm);
                 if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(RQ_OBJ, false);
-                    Triangle ctri = triangles[triIdx];
-                    vec2 cuv = getTriangleUV(ctri, bary);
+                    float cw = 1.0 - bary.x - bary.y;
+                    vec2 cuv = cw * vec2(triangles[triIdx].uv0x, triangles[triIdx].uv0y)
+                             + bary.x * vec2(triangles[triIdx].uv1x, triangles[triIdx].uv1y)
+                             + bary.y * vec2(triangles[triIdx].uv2x, triangles[triIdx].uv2y);
                     float calpha = sm.albedo.a;
                     uint albTex = smGetAlbedoTex(sm);
                     if (albTex > 0u && albTex <= 512u) {

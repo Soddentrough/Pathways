@@ -337,7 +337,7 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
     m_numInstancedTriangles = totalInstTris;
 
     if (geomPipeline) {
-        geomPipeline->updateSceneTransparency(m_sceneData.materials, m_sceneHasNonOpaque, m_sceneHasAlphaMask);
+        geomPipeline->updateSceneTransparency(m_sceneData.materials, m_sceneHasNonOpaque, m_sceneHasAlphaMask, m_sceneHasAlphaShadow);
         geomPipeline->partitionSceneGeometry(m_sceneData, m_numOpaqueTriangles);
     }
 

@@ -228,19 +228,25 @@ public:
     uint64_t getCurrentTimelineValue() const { return m_currentTimelineValue.load(); }
     static constexpr uint32_t NUM_SHARED_BUFFERS = 2;
     VkBuffer getPrimarySharedBuffer(uint32_t slot = 0) const {
+        uint32_t idx = slot % NUM_SHARED_BUFFERS;
         if (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR) {
-            return m_p2pBufferPrimary[slot % NUM_SHARED_BUFFERS];
+            return (m_p2pBufferPrimary[idx] != VK_NULL_HANDLE) ? m_p2pBufferPrimary[idx] : m_p2pBufferPrimary[0];
         }
-        return m_sharedBufferPrimary[slot % NUM_SHARED_BUFFERS];
+        return (m_sharedBufferPrimary[idx] != VK_NULL_HANDLE) ? m_sharedBufferPrimary[idx] : m_sharedBufferPrimary[0];
     }
     VkBuffer getSecondarySharedBuffer(uint32_t slot = 0) const {
+        uint32_t idx = slot % NUM_SHARED_BUFFERS;
         if (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR) {
-            return m_p2pBufferSecondary[slot % NUM_SHARED_BUFFERS];
+            return (m_p2pBufferSecondary[idx] != VK_NULL_HANDLE) ? m_p2pBufferSecondary[idx] : m_p2pBufferSecondary[0];
         }
-        return m_sharedBufferSecondary[slot % NUM_SHARED_BUFFERS];
+        return (m_sharedBufferSecondary[idx] != VK_NULL_HANDLE) ? m_sharedBufferSecondary[idx] : m_sharedBufferSecondary[0];
     }
-    void* getSharedHostPointer(uint32_t slot = 0) const { return m_sharedHostPtr[slot % NUM_SHARED_BUFFERS]; }
+    void* getSharedHostPointer(uint32_t slot = 0) const {
+        uint32_t idx = slot % NUM_SHARED_BUFFERS;
+        return m_sharedHostPtr[idx] ? m_sharedHostPtr[idx] : m_sharedHostPtr[0];
+    }
     size_t getSharedBufferSize() const { return m_sharedBufferSize; }
+    uint64_t getSharedBufferGeneration() const noexcept { return m_sharedBufferGeneration; }
 
 private:
     struct SecondaryWorkPacket {
@@ -329,6 +335,7 @@ private:
     // Zero-copy host allocation imported into both GPUs via VK_EXT_external_memory_host (Double-buffered fallback)
     std::array<void*, NUM_SHARED_BUFFERS> m_sharedHostPtr = { nullptr, nullptr };
     size_t m_sharedBufferSize = 0;
+    uint64_t m_sharedBufferGeneration = 0;
     std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_sharedMemPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkBuffer, NUM_SHARED_BUFFERS> m_sharedBufferPrimary = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::array<VkDeviceMemory, NUM_SHARED_BUFFERS> m_sharedMemSecondary = { VK_NULL_HANDLE, VK_NULL_HANDLE };

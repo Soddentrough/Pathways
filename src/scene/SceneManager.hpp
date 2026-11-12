@@ -83,6 +83,7 @@ public:
     [[nodiscard]] uint32_t getNumLights() const noexcept { return m_numLights; }
     [[nodiscard]] bool hasNonOpaque() const noexcept { return m_sceneHasNonOpaque; }
     [[nodiscard]] bool hasAlphaMask() const noexcept { return m_sceneHasAlphaMask; }
+    [[nodiscard]] bool hasAlphaShadow() const noexcept { return m_sceneHasAlphaShadow; }
     [[nodiscard]] float getCachedDivergentAreaRatio() const noexcept { return m_cachedDivergentAreaRatio; }
     void setCachedDivergentAreaRatio(float r) noexcept { m_cachedDivergentAreaRatio = r; }
 
@@ -151,6 +152,7 @@ private:
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
     bool m_sceneHasAlphaMask = false;
+    bool m_sceneHasAlphaShadow = false;
     float m_cachedDivergentAreaRatio = -1.0f;
 
     // Scene GPU Buffers

@@ -12,10 +12,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace pathways {
@@ -103,6 +109,10 @@ UpwaysPipeline::~UpwaysPipeline() {
         if (m_upscalePipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_device, m_upscalePipeline, nullptr);
             m_upscalePipeline = VK_NULL_HANDLE;
+        }
+        if (m_pipelineCache != VK_NULL_HANDLE) {
+            vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+            m_pipelineCache = VK_NULL_HANDLE;
         }
 
         auto destroyLayouts = [this](VkPipelineLayout& pipeLayout, VkDescriptorSetLayout& descLayout) {
@@ -221,6 +231,24 @@ void UpwaysPipeline::initBuffers(const std::string& weightsPath) {
                 kUpwaysWeightsFp8Blob,
                 kUpwaysWeightsFp8Blob + sizeof(kUpwaysWeightsFp8Blob)
             );
+        }
+    }
+
+    // Pre-transpose each 16x16 FP8 WMMA weight tile (K x N row-major -> N x K column-major)
+    // so coopMatLoad(..., gl_CooperativeMatrixLayoutColumnMajor) emits 2 vectorized buffer_load_b32
+    // instructions per 16x16 tile on RDNA 4 instead of 16 strided scalar byte gathers.
+    if (weightBytes.size() >= upways::FP8_WEIGHT_SECTION_OFFSET + upways::FP8_WEIGHT_SECTION_BYTES) {
+        for (size_t tileOff = upways::FP8_WEIGHT_SECTION_OFFSET;
+             tileOff + 256u <= upways::FP8_WEIGHT_SECTION_OFFSET + upways::FP8_WEIGHT_SECTION_BYTES;
+             tileOff += 256u) {
+            std::array<uint8_t, 256> transposed{};
+            const uint8_t* srcTile = weightBytes.data() + tileOff;
+            for (size_t k = 0; k < 16u; ++k) {
+                for (size_t n = 0; n < 16u; ++n) {
+                    transposed[n * 16u + k] = srcTile[k * 16u + n];
+                }
+            }
+            std::memcpy(weightBytes.data() + tileOff, transposed.data(), 256u);
         }
     }
 
@@ -859,10 +887,78 @@ void UpwaysPipeline::createPipelines(
         return outLayout;
     };
 
+    const auto tCompileStart = std::chrono::steady_clock::now();
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(m_physDevice, &props);
+
+    std::filesystem::path cacheDir;
+    if (const char* envDir = std::getenv("PATHWAYS_PIPELINE_CACHE_DIR"); envDir && envDir[0] != '\0') {
+        cacheDir = envDir;
+    } else {
+#ifdef _WIN32
+        if (const char* localAppData = std::getenv("LOCALAPPDATA"); localAppData && localAppData[0] != '\0') {
+            cacheDir = std::filesystem::path(localAppData) / "pathways";
+        }
+#else
+        if (const char* xdgCache = std::getenv("XDG_CACHE_HOME"); xdgCache && xdgCache[0] != '\0') {
+            cacheDir = std::filesystem::path(xdgCache) / "pathways";
+        } else if (const char* homeDir = std::getenv("HOME"); homeDir && homeDir[0] != '\0') {
+            cacheDir = std::filesystem::path(homeDir) / ".cache" / "pathways";
+        }
+#endif
+    }
+
+    std::filesystem::path cachePath;
+    std::vector<char> initialCacheData;
+    bool loadedValidDiskCache = false;
+
+    if (!cacheDir.empty()) {
+        cachePath = cacheDir / std::format("upways_vk_pipeline_cache_{:04x}_{:04x}.bin", props.vendorID, props.deviceID);
+        std::error_code ec;
+        if (std::filesystem::exists(cachePath, ec) && !ec) {
+            std::ifstream inFile(cachePath, std::ios::binary | std::ios::ate);
+            if (inFile.is_open()) {
+                const auto fileEnd = inFile.tellg();
+                if (fileEnd >= static_cast<std::streamoff>(sizeof(VkPipelineCacheHeaderVersionOne))) {
+                    const size_t fileSize = static_cast<size_t>(fileEnd);
+                    initialCacheData.resize(fileSize);
+                    inFile.seekg(0, std::ios::beg);
+                    if (inFile.read(initialCacheData.data(), static_cast<std::streamsize>(fileSize))) {
+                        VkPipelineCacheHeaderVersionOne hdr{};
+                        std::memcpy(&hdr, initialCacheData.data(), sizeof(hdr));
+                        if (hdr.headerSize == sizeof(VkPipelineCacheHeaderVersionOne) &&
+                            hdr.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+                            hdr.vendorID == props.vendorID &&
+                            hdr.deviceID == props.deviceID &&
+                            std::memcmp(hdr.pipelineCacheUUID, props.pipelineCacheUUID, VK_UUID_SIZE) == 0) {
+                            loadedValidDiskCache = true;
+                        } else {
+                            initialCacheData.clear();
+                        }
+                    } else {
+                        initialCacheData.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    VkPipelineCacheCreateInfo cacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    if (loadedValidDiskCache) {
+        cacheInfo.initialDataSize = initialCacheData.size();
+        cacheInfo.pInitialData = initialCacheData.data();
+    }
+    if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS) {
+        Logger::warn("UpwaysPipeline: Failed to create VkPipelineCache; proceeding with uncached compilation.");
+        m_pipelineCache = VK_NULL_HANDLE;
+    }
+
     auto buildComputePipe = [this](
         VkShaderModule mod,
         VkPipelineLayout layout,
         bool requireWave32,
+        bool requireFullSubgroups = false,
         int32_t specStageId = -1
     ) {
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
@@ -892,11 +988,13 @@ void UpwaysPipeline::createPipelines(
         }
         if (requireWave32) {
             pipeInfo.stage.pNext = &subgroupSize32;
-            pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+            if (requireFullSubgroups) {
+                pipeInfo.stage.flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+            }
         }
 
         VkPipeline outPipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &outPipe) != VK_SUCCESS) {
+        if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipeInfo, nullptr, &outPipe) != VK_SUCCESS) {
             throw std::runtime_error("UpwaysPipeline: Failed to create compute pipeline!");
         }
         return outPipe;
@@ -911,11 +1009,47 @@ void UpwaysPipeline::createPipelines(
     VkShaderModule smP3 = createShaderModule(upscaleResolveSpv);
 
     try {
-        m_temporalPipeline = buildComputePipe(smP1, m_temporalPipeLayout, false);
+        std::mutex errMutex;
+        std::exception_ptr firstErr;
+        std::array<std::thread, 2 + NUM_NEURAL_STAGES> workers;
+
+        workers[0] = std::thread([&]() {
+            try {
+                m_temporalPipeline = buildComputePipe(smP1, m_temporalPipeLayout, true, false);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(errMutex);
+                if (!firstErr) firstErr = std::current_exception();
+            }
+        });
+
         for (uint32_t st = 0; st < NUM_NEURAL_STAGES; ++st) {
-            m_neuralGuidePipelines[st] = buildComputePipe(smP2, m_neuralGuidePipeLayout, true, static_cast<int32_t>(st));
+            workers[1 + st] = std::thread([&, st]() {
+                try {
+                    m_neuralGuidePipelines[st] = buildComputePipe(smP2, m_neuralGuidePipeLayout, true, true, static_cast<int32_t>(st));
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(errMutex);
+                    if (!firstErr) firstErr = std::current_exception();
+                }
+            });
         }
-        m_upscalePipeline = buildComputePipe(smP3, m_upscalePipeLayout, false);
+
+        workers[1 + NUM_NEURAL_STAGES] = std::thread([&]() {
+            try {
+                m_upscalePipeline = buildComputePipe(smP3, m_upscalePipeLayout, true, false);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(errMutex);
+                if (!firstErr) firstErr = std::current_exception();
+            }
+        });
+
+        for (auto& w : workers) {
+            if (w.joinable()) {
+                w.join();
+            }
+        }
+        if (firstErr) {
+            std::rethrow_exception(firstErr);
+        }
     } catch (...) {
         vkDestroyShaderModule(m_device, smP1, nullptr);
         vkDestroyShaderModule(m_device, smP2, nullptr);
@@ -926,6 +1060,46 @@ void UpwaysPipeline::createPipelines(
     vkDestroyShaderModule(m_device, smP1, nullptr);
     vkDestroyShaderModule(m_device, smP2, nullptr);
     vkDestroyShaderModule(m_device, smP3, nullptr);
+
+    if (m_pipelineCache != VK_NULL_HANDLE && !cachePath.empty()) {
+        size_t cacheBytes = 0;
+        if (vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheBytes, nullptr) == VK_SUCCESS &&
+            cacheBytes >= sizeof(VkPipelineCacheHeaderVersionOne)) {
+            std::vector<char> serialized(cacheBytes);
+            if (vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheBytes, serialized.data()) == VK_SUCCESS) {
+                std::error_code ec;
+                std::filesystem::create_directories(cacheDir, ec);
+                if (!ec) {
+                    const auto uniqueTag = std::chrono::steady_clock::now().time_since_epoch().count();
+                    const std::filesystem::path tmpPath = cacheDir / std::format(
+                        "upways_vk_pipeline_cache_{:04x}_{:04x}.tmp.{}",
+                        props.vendorID, props.deviceID, uniqueTag
+                    );
+                    std::ofstream outFile(tmpPath, std::ios::binary | std::ios::trunc);
+                    if (outFile.is_open()) {
+                        outFile.write(serialized.data(), static_cast<std::streamsize>(cacheBytes));
+                        outFile.close();
+                        if (outFile.good()) {
+                            std::filesystem::rename(tmpPath, cachePath, ec);
+                            if (ec) {
+                                std::filesystem::remove(tmpPath, ec);
+                            }
+                        } else {
+                            std::filesystem::remove(tmpPath, ec);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const double compileMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - tCompileStart
+    ).count();
+    Logger::info(
+        "UpwaysPipeline compiled {} compute pipelines in {:.1f} ms (disk cache: {}).",
+        2u + NUM_NEURAL_STAGES, compileMs, loadedValidDiskCache ? "warm hit" : "cold build -> saved"
+    );
 }
 
 void UpwaysPipeline::resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes) {
@@ -934,8 +1108,22 @@ void UpwaysPipeline::resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t 
     const uint32_t newOutW = std::max(outputWidth, 1u);
     const uint32_t newOutH = std::max(outputHeight, 1u);
 
+    const bool inputDimsChanged = (newInW != m_inputWidth || newInH != m_inputHeight);
+    if (inputDimsChanged) {
+        // Any previously bound render-space G-buffer views had dimensions m_inputWidth x m_inputHeight
+        // and may already have been destroyed by the caller prior to resizing Upways.
+        // Fall back to m_dummyBlackImage until updateDescriptors() binds the new render-space views.
+        m_cachedDemodDiffuseView = VK_NULL_HANDLE;
+        m_cachedDemodSpecularView = VK_NULL_HANDLE;
+        m_cachedNormalDepthView = VK_NULL_HANDLE;
+        m_cachedAlbedoRoughnessView = VK_NULL_HANDLE;
+        m_cachedSurfaceMotionView = VK_NULL_HANDLE;
+        m_cachedSpecularMotionView = VK_NULL_HANDLE;
+        m_cachedAuxMetadataView = VK_NULL_HANDLE;
+    }
+
     if (m_outputImage && newOutW == m_outputWidth && newOutH == m_outputHeight) {
-        if (newInW == m_inputWidth && newInH == m_inputHeight) {
+        if (!inputDimsChanged) {
             m_superRes = enableSuperRes;
             return;
         }

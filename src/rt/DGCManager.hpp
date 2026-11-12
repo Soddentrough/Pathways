@@ -76,21 +76,25 @@ public:
 
     // Material execution set support (Techniques A, B, C)
     bool isMaterialDGCSupported() const { return m_materialDGCSupported; }
-    VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSet; }
-    VkIndirectExecutionSetEXT getMaterialExecutionSetSecondary() const { return m_materialExecutionSetSecondary; }
+    VkIndirectExecutionSetEXT getMaterialExecutionSet() const { return m_materialExecutionSets[0]; }
+    VkIndirectExecutionSetEXT getMaterialExecutionSetSecondary() const { return m_materialExecutionSets[1]; }
+    VkIndirectExecutionSetEXT getMaterialExecutionSetByIndex(uint32_t idx) const {
+        return (idx < m_materialExecutionSets.size()) ? m_materialExecutionSets[idx] : VK_NULL_HANDLE;
+    }
     void initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines);
     void initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
                                    const std::vector<VkPipeline>& secondaryPipelines);
+    void initMaterialExecutionSets(const std::vector<std::vector<VkPipeline>>& pipelineSets);
     void recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                   Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
                                   uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
                                   VkDeviceAddress sequenceCountAddress = 0,
-                                  bool isSecondary = false);
+                                  uint32_t execSetIndex = 0);
     void recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
                                Buffer* argumentBuffer, VkDeviceSize argumentOffset = 0,
                                uint32_t sliceIndex = 0, uint32_t sequenceCount = 6,
                                bool isPreprocessed = true, VkDeviceAddress sequenceCountAddress = 0,
-                               bool isSecondary = false);
+                               uint32_t execSetIndex = 0);
 
 private:
     void loadFunctionPointers();
@@ -104,8 +108,9 @@ private:
     VkIndirectCommandsLayoutEXT m_indirectLayout = VK_NULL_HANDLE;
     VkIndirectExecutionSetEXT m_executionSet = VK_NULL_HANDLE;
     VkIndirectCommandsLayoutEXT m_materialIndirectLayout = VK_NULL_HANDLE;
-    VkIndirectExecutionSetEXT m_materialExecutionSet = VK_NULL_HANDLE;
-    VkIndirectExecutionSetEXT m_materialExecutionSetSecondary = VK_NULL_HANDLE;
+    std::array<VkIndirectExecutionSetEXT, 4> m_materialExecutionSets = {
+        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE
+    };
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;
     std::unique_ptr<Buffer> m_materialPreprocessBuffer;

@@ -32,19 +32,24 @@ layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D tGuideSpec;
 layout(set = 0, binding = 18, rgba16f) uniform writeonly image2D tDilatedMv;
 layout(set = 0, binding = 19, rgba16f) uniform writeonly image2D tTemporalConf;
 
-// FP8 E4M3 activation pyramid buffer (writes PYR_X0 [8x fe4m3vec4] and PYR_HW0 [4x fe4m3vec4] at L0)
+// FP8 E4M3 activation pyramid buffer (writes PYR_X0 [8x uint32 packed fp8x4] and PYR_HW0 [4x uint32 packed fp8x4] at L0)
 layout(set = 0, binding = 20, std430) writeonly buffer PyramidFp8Buf {
-    fe4m3vec4 pyr4[];
+    uint pyr4[];
 };
 
-floate4m3_t toFp8E4M3(float v) {
-    if (isnan(v)) return floate4m3_t(0.0);
-    if (isinf(v)) return floate4m3_t(v > 0.0 ? FP8_E4M3_MAX : -FP8_E4M3_MAX);
-    return floate4m3_t(clamp(v, -FP8_E4M3_MAX, FP8_E4M3_MAX));
+float sanitizeFp8Scalar(float v) {
+    float clean = isnan(v) ? 0.0 : v;
+    return clamp(clean, -FP8_E4M3_MAX, FP8_E4M3_MAX);
 }
 
-fe4m3vec4 packFp8Vec4(float v0, float v1, float v2, float v3) {
-    return fe4m3vec4(toFp8E4M3(v0), toFp8E4M3(v1), toFp8E4M3(v2), toFp8E4M3(v3));
+uint packFp8Vec4(float v0, float v1, float v2, float v3) {
+    u8vec4 b = u8vec4(
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v0))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v1))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v2))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v3)))
+    );
+    return pack32(b);
 }
 
 // 18x18 halo tile for 3x3 closest-depth silhouette MV dilation (6.48 KB LDS)

@@ -175,9 +175,11 @@ void main() {
         : uvec2(pc.displayWidth, pc.displayHeight);
 
     f16vec2 disoccF16;
+    f16vec2 staticF16;
     {
         float reactiveCenter = imageLoad(tLogSpec, anc).a;
         float mvSpeedLr = sqrt(dot(surfMv, surfMv) + 1e-12);
+        float specMvSpeedLr = sqrt(dot(specMv, specMv) + 1e-12);
         float reactiveDisocc = reactiveCenter * clamp(mvSpeedLr * 32.0, 0.0, 1.0);
         vec3 tConf = imageLoad(tTemporalConf, anc).xyz;
         float nDotPos = clamp(tConf.y, 0.0, 1.0);
@@ -185,6 +187,9 @@ void main() {
         float smoothLr = clamp(1.0 - roughCenter, 0.0, 1.0);
         float disoccS = clamp(max(disoccD, (smoothLr * smoothLr) * tConf.z), 0.0, 1.0);
         disoccF16 = f16vec2(disoccD, disoccS);
+        float staticD = clamp(1.0 - float(float16_t(disoccD)) * 16.0 - mvSpeedLr * 2048.0, 0.0, 1.0);
+        float staticS = clamp(1.0 - float(float16_t(disoccS)) * 16.0 - specMvSpeedLr * 2048.0, 0.0, 1.0);
+        staticF16 = f16vec2(staticD, staticS);
     }
 
     // 2. Scoped BRDF guide warp & subpixel jitter-locus HR guide accumulation
@@ -272,7 +277,9 @@ void main() {
 
         float disoccD = float(disoccF16.x);
         float vdHr = (pc.resetHistory == 0u) ? (float(validHistF16.x) * inBSurf * isSurfF) : 0.0;
-        float gammaD = vdHr * clamp(rawHd - kDisocc * disoccD, 0.0, 0.985);
+        float staticTrustD = float(staticF16.x) * clamp((rawHd - 0.5) * 2.0, 0.0, 1.0);
+        float effRawHd = rawHd + staticTrustD * (0.985 - rawHd);
+        float gammaD = vdHr * clamp(effRawHd - kDisocc * disoccD, 0.0, 0.985);
         float keptD = gammaD * prevHistLenD;
         float hWeightD = keptD / (1.0 + keptD);
         float nextHistNormD = clamp((1.0 + keptD) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
@@ -286,8 +293,10 @@ void main() {
         )));
         vec3 effSkipD = vec3(1.0) + (skipD - vec3(1.0)) * (1.0 - maturityD);
         vec3 baseLogD = upwaysLog1pVec3(max(effSkipD * currDiffLinHr, vec3(0.0)));
+        vec3 dzD = vec3(0.025) * (vec3(1.0) - clamp(baseLogD * 8.0, vec3(0.0), vec3(1.0)));
+        vec3 effResD = resD - clamp(resD, -dzD, dzD);
         vec3 refDiffHr = clamp(
-            max(baseLogD + resD * isSurfF * (1.0 - maturityD), vec3(0.0)),
+            max(baseLogD + effResD * isSurfF * (1.0 - maturityD), vec3(0.0)),
             vec3(0.0),
             vec3(MAX_LOG1P_IRRADIANCE)
         );
@@ -316,7 +325,9 @@ void main() {
 
         float disoccS = float(disoccF16.y);
         float vsHr = (pc.resetHistory == 0u) ? (float(validHistF16.y) * inBSpec * isSurfF) : 0.0;
-        float gammaS = vsHr * clamp(rawHs - kDisocc * disoccS, 0.0, 0.980);
+        float staticTrustS = float(staticF16.y) * clamp((rawHs - 0.5) * 2.0, 0.0, 1.0);
+        float effRawHs = rawHs + staticTrustS * (0.985 - rawHs);
+        float gammaS = vsHr * clamp(effRawHs - kDisocc * disoccS, 0.0, 0.985);
         float keptS = gammaS * prevHistLenS;
         float hWeightS = keptS / (1.0 + keptS);
         float nextHistNormS = clamp((1.0 + keptS) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
@@ -330,8 +341,10 @@ void main() {
         )));
         vec3 effSkipS = vec3(1.0) + (skipS - vec3(1.0)) * (1.0 - maturityS);
         vec3 baseLogS = upwaysLog1pVec3(max(effSkipS * currSpecLinHr, vec3(0.0)));
+        vec3 dzS = vec3(0.025) * (vec3(1.0) - clamp(baseLogS * 8.0, vec3(0.0), vec3(1.0)));
+        vec3 effResS = resS - clamp(resS, -dzS, dzS);
         vec3 refSpecHr = clamp(
-            max(baseLogS + resS * isSurfF * (1.0 - maturityS), vec3(0.0)),
+            max(baseLogS + effResS * isSurfF * (1.0 - maturityS), vec3(0.0)),
             vec3(0.0),
             vec3(MAX_LOG1P_IRRADIANCE)
         );

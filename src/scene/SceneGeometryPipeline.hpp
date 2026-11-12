@@ -27,8 +27,9 @@ public:
     /// Partitions scene triangles into opaque and non-opaque ranges for two-level ray traversal / any-hit bypassing.
     void partitionSceneGeometry(SceneData& sceneData, uint32_t& outNumOpaqueTriangles);
 
-    /// Checks if any material in the scene possesses non-opaque properties (transmission, dielectrics, alpha mask).
+    /// Checks if any material in the scene possesses non-opaque properties (transmission, dielectrics, alpha mask / alpha shadow).
     void updateSceneTransparency(const std::vector<MaterialGPU>& materials, bool& outHasNonOpaque, bool& outHasAlphaMask);
+    void updateSceneTransparency(const std::vector<MaterialGPU>& materials, bool& outHasNonOpaque, bool& outHasAlphaMask, bool& outHasAlphaShadow);
 
     /// Uploads arbitrary host data into a device-local Vulkan buffer in bounded 64 MB chunks using a staging buffer.
     void uploadToDeviceBuffer(Buffer& dstBuffer, const void* srcData, VkDeviceSize dataSize);

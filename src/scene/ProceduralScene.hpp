@@ -141,6 +141,11 @@ struct TextureData {
     std::vector<uint16_t> hdrPixels; // RGBA16F (HDR EXR / Radiance .hdr)
     bool isSrgb = false;
     bool isHdr = false;
+    uint8_t minAlpha = 255;
+    uint8_t maxAlpha = 255;
+    uint8_t maxRed = 255;
+    uint8_t minBlue = 0;
+    uint8_t maxBlue = 255;
 };
 
 struct MeshRange {
@@ -190,6 +195,7 @@ struct SceneData {
     std::vector<TextureData> textures;
     std::vector<MeshRange> meshRanges;
     uint32_t numOpaqueTriangles = 0;
+    uint32_t numSolidNonOpaqueTriangles = 0;
 
     // Multi-BLAS & Hardware Ray Tracing Instancing
     std::vector<BlasGeometryRange> blasRanges; // If empty, monolithic single-BLAS is used

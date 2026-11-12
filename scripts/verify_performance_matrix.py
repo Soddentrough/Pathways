@@ -16,8 +16,9 @@ Gate semantics (Oct 8 2026, review finding A2):
   are all read from the engine's own --dump-stats JSON (the engine is the source of truth).
 - An idle-system guard checks amdgpu gpu_busy_percent before measuring; a busy GPU
   (e.g. another workload sharing a UMA APU) aborts the run with a printed reason.
-- RADV_PROFILE_PSTATE=peak is pinned for all benchmark subprocesses so Mesa does not
-  downclock between runs.
+- RADV_PROFILE_PSTATE=peak is set for benchmark subprocesses, and 30 warmup frames are
+  executed by default so unprivileged runs (where amdgpu auto DPM ignores stable-pstate
+  requests without CAP_SYS_ADMIN) ramp to steady-state boost clocks after CPU scene loads.
 """
 
 import sys
@@ -91,19 +92,26 @@ def benchmark_env():
     """Subprocess environment with the Mesa P-state pinned for stable timing."""
     env = os.environ.copy()
     env.setdefault("RADV_PROFILE_PSTATE", "peak")
+    if os.path.isdir("/usr/lib64/openusd"):
+        ld_prev = env.get("LD_LIBRARY_PATH", "")
+        if "/usr/lib64/openusd" not in ld_prev.split(":"):
+            env["LD_LIBRARY_PATH"] = f"/usr/lib64/openusd:{ld_prev}" if ld_prev else "/usr/lib64/openusd"
     return env
 
-def probe_hardware(bin_path):
-    """Run one tiny --mgpu headless frame with --dump-stats and read device identity,
+def probe_hardware(bin_path, gpu_index=None, need_mgpu=True):
+    """Run one tiny headless frame with --dump-stats and read device identity,
     driver version, and dual-GPU capability straight from the engine's own JSON.
-
-    A single run suffices: the primary-GPU block is identical with or without --mgpu,
-    and --mgpu additionally tells us whether a second GPU is actually active
-    (secondary_gpu.active). No stdout is parsed — the engine is the source of truth.
     """
     probe_json = os.path.join(tempfile.gettempdir(), "pathways_perf_probe.json")
     cmd = [bin_path, "--headless", "--frames", "1", "--width", "320", "--height", "240",
-           "--spp", "1", "--mgpu", "--dump-stats", probe_json]
+           "--spp", "1"]
+    if need_mgpu:
+        cmd.append("--mgpu")
+    else:
+        cmd += ["--mgpu", "off"]
+        if gpu_index is not None:
+            cmd += ["--gpu", str(gpu_index)]
+    cmd += ["--dump-stats", probe_json]
     try:
         probe_res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True,
                                    timeout=20, env=benchmark_env())
@@ -133,8 +141,8 @@ def probe_hardware(bin_path):
     mgpu_available = bool(data.get("secondary_gpu", {}).get("active", False))
     return device or None, driver, mgpu_available, None
 
-def gpu_busy_percentages():
-    """Read amdgpu gpu_busy_percent for all DRM cards (empty list if unavailable)."""
+def gpu_busy_percentages(only_gpu=None):
+    """Read amdgpu gpu_busy_percent for DRM cards (filtered to only_gpu index when requested)."""
     busy = []
     for card in sorted(os.listdir("/sys/class/drm")):
         if not card.startswith("card") or not card[4:].isdigit():
@@ -145,6 +153,8 @@ def gpu_busy_percentages():
                 busy.append((card, int(f.read().strip())))
         except (OSError, ValueError):
             continue
+    if only_gpu is not None and 0 <= only_gpu < len(busy):
+        return [busy[only_gpu]]
     return busy
 
 def git_commit():
@@ -169,7 +179,7 @@ def load_baseline(baseline_path):
     return None, ("Baseline is in the legacy flat format (no hardware metadata). "
                   "Re-cut it on the reference hardware with --update-baseline."), None
 
-def run_single_benchmark(bin_path, scene, profile, frames, warmup, out_json):
+def run_single_benchmark(bin_path, scene, profile, frames, warmup, out_json, gpu_index=None):
     cmd = [
         bin_path,
         "--headless",
@@ -185,6 +195,10 @@ def run_single_benchmark(bin_path, scene, profile, frames, warmup, out_json):
     ]
     if profile["mgpu"]:
         cmd.append("--mgpu")
+    else:
+        cmd += ["--mgpu", "off"]
+        if gpu_index is not None:
+            cmd += ["--gpu", str(gpu_index)]
 
     res = subprocess.run(cmd, cwd=PATHWAYS_ROOT, capture_output=True, text=True, env=benchmark_env())
     if res.returncode != 0:
@@ -239,7 +253,9 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Bypass the idle-system guard and baseline device-match check (for re-cutting baselines on a loaded or non-reference host)")
     parser.add_argument("--max-gpu-busy", type=int, default=15,
-                        help="Idle-system guard: skip if any amdgpu card reports higher busy%% (default: 15)")
+                        help="Idle-system guard: skip if target amdgpu card reports higher busy%% (default: 15)")
+    parser.add_argument("--gpu", type=int, default=None,
+                        help="Vulkan GPU index for single-GPU profiles (e.g. 0 or 1)")
     args = parser.parse_args()
 
     bin_path = find_binary()
@@ -250,15 +266,19 @@ def main():
     if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
         return skip("Detected CI environment without dedicated benchmarking hardware. Skipping performance matrix.")
 
-    # Probe hardware: device identity, driver, and dual-GPU capability
-    device, driver, mgpu_available, probe_err = probe_hardware(bin_path)
-    if probe_err:
-        return skip(probe_err)
+    # Filter profiles upfront so single-GPU runs don't probe or busy-check unused GPUs
+    profile_filter = [p.strip().lower() for p in args.profiles.split(",") if p.strip()]
+    requested_profiles = [
+        prof for prof in PROFILES
+        if not profile_filter or any(f in prof["id"].lower() for f in profile_filter)
+    ]
+    any_mgpu_requested = any(p["mgpu"] for p in requested_profiles)
+    target_single_gpu = (args.gpu if args.gpu is not None else 0) if not any_mgpu_requested else None
 
-    # Idle-system guard: a GPU shared with other workloads (e.g. a 22 GB LLM server on a
-    # UMA APU) produces meaningless timings. Measure only on an idle GPU.
+    # Idle-system guard: check BEFORE probe_hardware() so our own 1-frame Vulkan probe
+    # does not spike amdgpu gpu_busy_percent and trip the idle check against itself.
     if not args.force:
-        busy = gpu_busy_percentages()
+        busy = gpu_busy_percentages(only_gpu=target_single_gpu)
         hot = [(c, p) for c, p in busy if p > args.max_gpu_busy]
         if hot:
             detail = ", ".join(f"{c} {p}%" for c, p in hot)
@@ -270,8 +290,15 @@ def main():
     else:
         print("\033[33m[WARN]\033[0m --force: idle-system guard and device-match checks bypassed.")
 
+    # Probe hardware: device identity, driver, and dual-GPU capability
+    device, driver, mgpu_available, probe_err = probe_hardware(
+        bin_path, gpu_index=args.gpu, need_mgpu=any_mgpu_requested
+    )
+    if probe_err:
+        return skip(probe_err)
+
     frames = args.frames if args.frames is not None else (5 if args.quick else 15)
-    warmup = args.warmup if args.warmup is not None else (4 if args.quick else 5)
+    warmup = args.warmup if args.warmup is not None else (8 if args.quick else 30)
 
     baseline_path = args.baseline_path if args.baseline_path else os.path.join(PATHWAYS_ROOT, "tests", "references", "performance_baseline.json")
     out_dir = os.path.abspath(args.output_dir)
@@ -295,12 +322,7 @@ def main():
                   f"(driver {baseline_meta.get('driver_version', '?')}, git {baseline_meta.get('git_commit', '?')}, "
                   f"{baseline_meta.get('date', '?')}) | Current: {device} (driver {driver})")
 
-    # Filter profiles if requested
-    profile_filter = [p.strip().lower() for p in args.profiles.split(",") if p.strip()]
-    profiles_to_run = []
-    for prof in PROFILES:
-        if not profile_filter or any(f in prof["id"].lower() for f in profile_filter):
-            profiles_to_run.append(prof)
+    profiles_to_run = list(requested_profiles)
 
     # Multi-GPU capability gate (review finding A2): skip *_mgpu profiles when the engine
     # cannot actually form a Dual GPU configuration on this host.
@@ -354,7 +376,7 @@ def main():
             tag = f"{sc_id}_{prof_id}"
             stat_file = os.path.join(out_dir, f"stats_{tag}.json")
 
-            res, err = run_single_benchmark(bin_path, sc, prof, frames, warmup, stat_file)
+            res, err = run_single_benchmark(bin_path, sc, prof, frames, warmup, stat_file, gpu_index=args.gpu)
             if err or not res:
                 failures.append((tag, err or "Unknown execution error"))
                 print(f"[{run_idx:02d}/{total_runs:02d}] | {sc['name']:<22} | {prof['label']:<14} | FAILED: {err[:40]}")

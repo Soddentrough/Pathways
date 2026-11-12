@@ -62,7 +62,7 @@ void main() {
 
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
+    bool hasAlphaShadow = (ubo.flags & (1u << 27)) != 0u;
     bool occluded = false;
 
     bool isSpecularPath = (isSpecular >= 1.5);
@@ -72,11 +72,11 @@ void main() {
     // cutouts, consistent with BSDF-sampled paths, which refract through/terminate on them.
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
 
-    // Fast path: no alpha cutout masks. In the default mode all geometry occludes, so
+    // Fast path: no alpha cutout/blend shadows. In the default mode all geometry occludes, so
     // the whole TLAS is traversed with gl_RayFlagsOpaqueEXT (no candidate loop). In the
     // transparent-shadow mode, dielectric instances are culled via RAY_MASK_OPAQUE (0x01)
     // when caustics are off or the ray is on a specular transmission path.
-    if (!hasAlphaMask && (!transparentShadows || !enableCaustics || isSpecularPath)) {
+    if (!hasAlphaShadow && (!transparentShadows || !enableCaustics || isSpecularPath)) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
                               gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
@@ -86,8 +86,9 @@ void main() {
         occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     } else {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS,
-                              gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+        uint rqFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT
+                     | (transparentShadows ? gl_RayFlagsNoOpaqueEXT : 0u);
+        rayQueryInitializeEXT(rq, topLevelAS, rqFlags,
                               RAY_MASK_ALL, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
         while (rayQueryProceedEXT(rq)) {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
@@ -113,8 +114,10 @@ void main() {
                 uint alphaMode = smGetAlphaMode(sm);
                 if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                    Triangle ctri = triangles[triIdx];
-                    vec2 cuv = getTriangleUV(ctri, bary);
+                    float cw = 1.0 - bary.x - bary.y;
+                    vec2 cuv = cw * vec2(triangles[triIdx].uv0x, triangles[triIdx].uv0y)
+                             + bary.x * vec2(triangles[triIdx].uv1x, triangles[triIdx].uv1y)
+                             + bary.y * vec2(triangles[triIdx].uv2x, triangles[triIdx].uv2y);
                     float calpha = sm.albedo.a;
                     uint albTex = smGetAlbedoTex(sm);
                     if (albTex > 0u && albTex <= 512u) {

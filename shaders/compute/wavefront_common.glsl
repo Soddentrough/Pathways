@@ -1085,11 +1085,11 @@ vec3 sampleCosineHemisphereCoherent(vec3 normal, inout uint seed, uint clusterSi
     // Advance PRNG for every lane (guarantees cross-bounce randomness)
     vec2 rLocal = randVec2(seed);
 
-    // Broadcast leader's coarse quadrant while preserving independent uniform sub-quadrant offset per lane
+    // Broadcast leader's tangent-space sample across the coherent cluster
     vec2 rLeader;
     rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
     rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
-    vec2 r = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
+    vec2 r = rLeader;
 
     // Continuous orthonormal basis projection (Duff et al.)
     float phi = TWO_PI * r.x;
@@ -1236,7 +1236,7 @@ vec3 sampleGGXCoherent(vec3 N, float alpha, inout uint seed, uint clusterSize, u
     vec2 rLeader;
     rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
     rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
-    vec2 xi = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
+    vec2 xi = rLeader;
 
     float a2 = max(alpha * alpha, 1e-6);
     float phi = TWO_PI * xi.x;
@@ -1259,7 +1259,7 @@ vec3 sampleAnisotropicGGXCoherent(vec3 N, vec3 T, vec3 B, float ax, float ay, in
     vec2 rLeader;
     rLeader.x = subgroupShuffle(rLocal.x, leaderLane);
     rLeader.y = subgroupShuffle(rLocal.y, leaderLane);
-    vec2 xi = floor(rLeader * 2.0) * 0.5 + fract(rLocal * 2.0) * 0.5;
+    vec2 xi = rLeader;
 
     float phi = atan(ay * sin(TWO_PI * xi.x), ax * cos(TWO_PI * xi.x));
     if (phi < 0.0) phi += TWO_PI;

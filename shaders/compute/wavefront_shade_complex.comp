@@ -101,11 +101,17 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
     LightTreeNode lightNodes[];
 };
 
+#ifndef ENABLE_RESTIR_PT
+#define ENABLE_RESTIR_PT 0
+#endif
+
 #define RESTIR_INCLUDE_SAMPLER_HELPERS
 #include "restir_common.glsl"
 #include "bsdf_standard.glsl"
 #include "mis_common.glsl"
 
+#if ENABLE_RESTIR_PT
+#if !IS_SECONDARY_BOUNCE
 layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
     DiReservoir currentReservoirs[];
 };
@@ -113,11 +119,11 @@ layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
 layout(std430, binding = 36) readonly buffer ReSTIRHistoryReservoirsBuffer {
     DiReservoir historyReservoirs[];
 };
+#endif
 
-// ReSTIR GI (path-space) state — docs/RESTIR_PT_DESIGN.md. Complex materials
-// only participate as X1 context producers (diffuse-lobe continuations);
-// their bounce-1 GI slot is always invalidated (x2 on a complex surface is
-// out of the GI scope for now).
+// ReSTIR GI (path-space) state — docs/RESTIR_PT_DESIGN.md. Complex primary
+// surfaces invalidate X1/GI; complex secondary hits from diffuse X1 surfaces
+// run GI reuse over the complementary domain in the IS_SECONDARY_BOUNCE variant.
 layout(std430, binding = 37) buffer X1ContextsBuffer {
     X1Context x1Contexts[];
 };
@@ -129,8 +135,9 @@ layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
 layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
     GiReservoir giHistoryReservoirs[];
 };
+#endif
 
-#if !IS_SECONDARY_BOUNCE
+#if IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
 #define ENABLE_RESTIR_GI 1
 #include "restir_gi_reuse.glsl"
 #else
@@ -191,10 +198,12 @@ void main() {
         uint bounce = pc.currentBounce;
         bool sampledSpecularLobe = false;
 
+#if ENABLE_RESTIR_PT
         // ReSTIR PT bookkeeping: complex primary surfaces stay in pure MC + DI;
         // complex secondary hits from diffuse X1 surfaces trigger GI reuse on
         // the complementary domain (M = 1, w_self = 0).
         bool enableRestirFlag = ((ubo.flags & (1u << 9)) != 0u);
+#if !IS_SECONDARY_BOUNCE
         if (enableRestirFlag && bounce == 0u) {
             x1Contexts[pixelIndex] = invalidX1Context();
             if (pc.sppSampleIndex == 0u) {
@@ -202,20 +211,7 @@ void main() {
                 giReservoirs[pixelIndex] = invalidGiReservoir();
             }
         }
-#if ENABLE_RESTIR_GI
-        if (enableRestirFlag && bounce == 1u) {
-            X1Context giCtx = x1Contexts[pixelIndex];
-            if (x1ContextValid(giCtx)) {
-                restirGiRunReuse(
-                    pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
-                    pc.restirMCap, pc.captureMlData, pc.indirectClamp,
-                    giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
-                    seed, hasGiShadowRay, giShadowCandidate
-                );
-            } else if (pc.sppSampleIndex == 0u) {
-                giReservoirs[pixelIndex] = invalidGiReservoir();
-            }
-        }
+#endif
 #endif
 
         if (hitType == 2u) {
@@ -488,6 +484,7 @@ void main() {
                 float chosenLightPdfEff = 1.0;
                 vec3 chosenLightEmission = vec3(0.0);
                 vec3 chosenNeeFCos = vec3(0.0);
+                vec3 chosenSpecFCos = vec3(0.0);
                 float chosenNeeBsdfPdf = 0.0;
                 float chosenTargetPdf = 0.0;
                 float weightSum = 0.0;
@@ -551,6 +548,7 @@ void main() {
                         chosenLightPdfEff = candPdfEff;
                         chosenLightEmission = candEmission;
                         chosenNeeFCos = candFCos;
+                        chosenSpecFCos = candSpecFCos;
                         chosenNeeBsdfPdf = candBsdfPdf;
                         chosenTargetPdf = targetPdf;
                         chosenValid = true;
@@ -569,9 +567,6 @@ void main() {
                 vec3 neeFCos = chosenNeeFCos;
                 if (validLight && chosenTargetPdf > 0.0) {
                     {
-                        float dummyPdf = 0.0;
-                        vec3 chosenSpecFCos = vec3(0.0);
-                        stdBsdfEvalSplit(bsdf, hitNormal, V, lightDir, dummyPdf, chosenSpecFCos);
                         float lightPdfEff = chosenLightPdfEff;
                         float risWeight = (weightSum / float(M)) / max(chosenTargetPdf, 1e-6);
                         float misWeight = (uint(light.position.w) == 0u) ? neeMisWeight(lightIdx, lightPdfEff, neeBsdfPdf, bounce + 1u < pc.maxBounces) : 1.0;
@@ -583,7 +578,8 @@ void main() {
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             bool keepShadow = true;
-                            if (bounce >= 2u && !isSpecularPath) {
+                            uint shadowRrMinBounce = (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u) ? 2u : 1u;
+                            if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                                 float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
                                 float prob = clamp(lum * 1.5, 0.20, 1.0);
                                 if (randFloat(seed) < prob) {
@@ -641,7 +637,9 @@ void main() {
 #else
             // Direct Lighting (Unified ReSTIR PT Inline Path Resampling & Stochastic NEE)
             f16vec3 secDirectL = f16vec3(0.0);
-            bool enableRestirPT = ((ubo.flags & (1 << 9)) != 0) && (roughness >= 0.10);
+#if ENABLE_RESTIR_PT
+            bool enableRestirPT = enableRestirFlag && (roughness >= 0.10);
+#endif
             if (enableDirect && !deltaBranch && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
@@ -654,6 +652,7 @@ void main() {
                                     hitPoint, hitNormal, hitT, proxyLumWeight,
                                     diffTrans, M, seed, r, sel);
 
+#if ENABLE_RESTIR_PT
                 if (enableRestirPT && bounce == 0u && ubo.frameIndex > 0u &&
                     (ubo.flags & (1 << 23)) == 0u) {
                     // 1. Temporal reuse (tap 0): center tap reprojected with motion vectors
@@ -685,9 +684,8 @@ void main() {
 
                     for (uint tap = 1u; tap <= 4u; ++tap) {
                         ivec2 base = RESTIR_TAP_OFFSETS[tap - 1u];
-                        for (uint rr = 0u; rr < rot; ++rr) {
-                            base = ivec2(-base.y, base.x);
-                        }
+                        if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
+                        if ((rot & 2u) != 0u) base = -base;
                         ivec2 tapCoord = prevCoord + base;
                         if (tapCoord.x < 0 || tapCoord.y < 0 ||
                             tapCoord.x >= int(pc.width) || tapCoord.y >= int(pc.height)) {
@@ -708,6 +706,7 @@ void main() {
                 } else if (bounce == 0u && enableRestirFlag && pc.sppSampleIndex == 0u) {
                     currentReservoirs[pixelIndex] = enableRestirPT ? r : invalidDiReservoir();
                 }
+#endif
 
                 // Local aliases consumed by the finalization block below
                 uint selectedLightIdx = sel.lightIdx;
@@ -756,11 +755,14 @@ void main() {
                         }
 
                         float risWeight = 1.0;
+#if ENABLE_RESTIR_PT
                         if (enableRestirPT && bounce == 0u) {
                             uint finalM = restirGetM(r.idxM);
                             risWeight = (finalM > 0u && selectedTarget > 1e-6) ? (r.wSum / (float(finalM) * selectedTarget)) : 0.0;
                             risWeight = clamp(risWeight, 0.0, 500.0);
-                        } else {
+                        } else
+#endif
+                        {
                             risWeight = r.wSum / (float(M) * max(selectedTarget, 1e-6));
                         }
 
@@ -777,7 +779,8 @@ void main() {
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             bool keepShadow = true;
-                            if (bounce >= 2u && !isSpecularPath) {
+                            uint shadowRrMinBounce = (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u) ? 2u : 1u;
+                            if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                                 float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
                                 float prob = clamp(lum * 1.5, 0.20, 1.0);
                                 if (randFloat(seed) < prob) {
@@ -840,11 +843,14 @@ void main() {
                     }
                 }
 
-            } else {
+            }
+#if ENABLE_RESTIR_PT
+            else {
                 if (bounce == 0u && enableRestirFlag && pc.sppSampleIndex == 0u) {
                     currentReservoirs[pixelIndex] = invalidDiReservoir();
                 }
             }
+#endif
 
             // (No ambient skylight term: environment light is integrated by the
             //  path itself on sky misses; an extra ambient term double counts it.)
@@ -934,7 +940,7 @@ void main() {
                     // clearcoat (prob ccProb), else base spec (specProb), else cosine
                     // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
 #if !IS_SECONDARY_BOUNCE
-                    bool useBounce0Sobol = true;
+                    bool useBounce0Sobol = (bounce == 0u) && (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u || pc.secondarySortMode < 2u);
                     uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                     float lobeSelect = useBounce0Sobol
                         ? sampleSobolOwen1D(pixelIndex, pc.width, sobolSampleIdx, 0u)
@@ -1049,6 +1055,21 @@ void main() {
             }
             }
         }
+#if ENABLE_RESTIR_GI
+        if (enableRestirFlag && bounce == 1u) {
+            X1Context giCtx = x1Contexts[pixelIndex];
+            if (x1ContextValid(giCtx)) {
+                restirGiRunReuse(
+                    pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
+                    pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                    giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
+                    seed, hasGiShadowRay, giShadowCandidate
+                );
+            } else if (pc.sppSampleIndex == 0u) {
+                giReservoirs[pixelIndex] = invalidGiReservoir();
+            }
+        }
+#endif
     }
 
     // Standard single-queue linear compaction for ray geometry and state

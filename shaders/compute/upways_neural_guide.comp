@@ -17,7 +17,7 @@ layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 layout(constant_id = 0) const uint SPEC_STAGE_ID = 6u;
 
 layout(set = 0, binding = 0, std430) readonly buffer WeightFp8Buf {
-    fe4m3vec4 w_fp8_4[];
+    uint w_fp8_4[];
 };
 
 layout(set = 0, binding = 1, std430) readonly buffer WeightFp32Buf {
@@ -25,7 +25,7 @@ layout(set = 0, binding = 1, std430) readonly buffer WeightFp32Buf {
 };
 
 layout(set = 0, binding = 2, std430) buffer PyramidFp8Buf {
-    fe4m3vec4 pyr4[];
+    uint pyr4[];
 };
 
 layout(set = 0, binding = 3, std430) writeonly buffer SubpixelParamsBuf {
@@ -36,44 +36,50 @@ layout(set = 0, binding = 4, rgba16f) uniform writeonly image2DArray uNextNeural
 
 const uint LDS_A_VEC4 = (SPEC_STAGE_ID == 0u) ? 1024u :
                         ((SPEC_STAGE_ID == 1u || SPEC_STAGE_ID == 2u || SPEC_STAGE_ID == 5u) ? 2048u : 4096u);
-const uint LDS_B_VEC4 = (SPEC_STAGE_ID == 0u) ? 1536u :
-                        ((SPEC_STAGE_ID == 1u || SPEC_STAGE_ID == 5u) ? 2048u :
+const uint LDS_B_VEC4 = (SPEC_STAGE_ID == 0u || SPEC_STAGE_ID == 5u) ? 1536u :
+                        ((SPEC_STAGE_ID == 1u) ? 2048u :
                         ((SPEC_STAGE_ID == 4u) ? 2880u : 4096u));
 
-shared fe4m3vec4 s_act_a[LDS_A_VEC4];
-shared fe4m3vec4 s_act_b[LDS_B_VEC4];
+shared uint s_act_a[LDS_A_VEC4];
+shared uint s_act_b[LDS_B_VEC4];
 
-floate4m3_t toFp8E4M3(float v) {
-    if (isnan(v) || v == 0.0) return floate4m3_t(0.0);
-    if (isinf(v)) return floate4m3_t(v > 0.0 ? FP8_E4M3_MAX : -FP8_E4M3_MAX);
-    return floate4m3_t(clamp(v, -FP8_E4M3_MAX, FP8_E4M3_MAX));
+float sanitizeFp8Scalar(float v) {
+    float clean = (isnan(v) || v == 0.0) ? 0.0 : v;
+    return clamp(clean, -FP8_E4M3_MAX, FP8_E4M3_MAX);
 }
 
-fe4m3vec4 packFp8Vec4(float v0, float v1, float v2, float v3) {
-    return fe4m3vec4(toFp8E4M3(v0), toFp8E4M3(v1), toFp8E4M3(v2), toFp8E4M3(v3));
+uint packFp8Vec4(float v0, float v1, float v2, float v3) {
+    u8vec4 b = u8vec4(
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v0))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v1))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v2))),
+        floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(v3)))
+    );
+    return pack32(b);
 }
 
-fe4m3vec4 quadPackClusterFp8(float val, uint lane) {
-    floate4m3_t q = toFp8E4M3(val);
-    uint u8 = uint(floate4m3BitsToUintEXT(q));
-    uint packed4 = subgroupClusteredOr(u8 << ((lane & 3u) * 8u), 4u);
-    return uintBitsToFloate4m3EXT(unpack8(packed4));
+vec4 unpackFp8Vec4(uint packed) {
+    return vec4(uintBitsToFloate4m3EXT(unpack8(packed)));
 }
 
-float fp8Comp(fe4m3vec4 v, uint comp) {
-    return (comp == 0u) ? float(v.x) : ((comp == 1u) ? float(v.y) : ((comp == 2u) ? float(v.z) : float(v.w)));
+uint quadPackClusterFp8(float val, uint lane) {
+    uint u8 = uint(floate4m3BitsToUintEXT(floate4m3_t(sanitizeFp8Scalar(val))));
+    return subgroupClusteredOr(u8 << ((lane & 3u) * 8u), 4u);
+}
+
+float fp8Comp(uint packed, uint comp) {
+    uint byteVal = bitfieldExtract(packed, int(comp * 8u), 8);
+    return float(uintBitsToFloate4m3EXT(uint8_t(byteVal)));
 }
 
 float clampHeadOut(float v) {
-    if (isnan(v)) return 0.0;
-    if (isinf(v)) return (v > 0.0) ? 32.0 : -32.0;
-    return v;
+    float clean = isnan(v) ? 0.0 : v;
+    return isinf(clean) ? ((clean > 0.0) ? 32.0 : -32.0) : clean;
 }
 
 float clampHeadRec(float v) {
-    if (isnan(v)) return 0.0;
-    if (isinf(v)) return (v > 0.0) ? 16.0 : -16.0;
-    return v;
+    float clean = isnan(v) ? 0.0 : v;
+    return isinf(clean) ? ((clean > 0.0) ? 16.0 : -16.0) : clean;
 }
 
 ivec2 pixelOffset16x8(uint pIdx) {
@@ -99,7 +105,7 @@ void wmmaDualFromActA(
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
-        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
         coopMatLoad(matA0, s_act_a, row0Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(matA1, s_act_a, row1Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
         acc0 = coopMatMulAdd(matA0, matB, acc0);
@@ -126,7 +132,7 @@ void wmmaDualFromActB(
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
         coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
-        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, w_fp8_4, wBase4 + ib * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
         coopMatLoad(matA0, s_act_b, row0Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(matA1, s_act_b, row1Base4 + ib * 4u, cIn4, gl_CooperativeMatrixLayoutRowMajor);
         acc0 = coopMatMulAdd(matA0, matB, acc0);
@@ -157,8 +163,8 @@ void main() {
         uint s0Off4  = pl.offS0  >> 2u;
         uint l1Off4  = pl.offL1In >> 2u;
 
-        // 0a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of x0 (1,440 = 11*128 + 32)
-        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+        // 0a. Pipelined constant-trip packed-fp8x4 load of 18x10 halo of x0 (1,440 = 11*128 + 32)
+        [[dont_unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint pix = idx4 >> 3u;
             uint cg = idx4 & 7u;
@@ -178,16 +184,11 @@ void main() {
         }
         barrier();
 
-        // 0b. Unrolled vectorized z0 = enc0_dw(x0) -> s_act_a[0..1023]
+        // 0b. Vectorized z0 = enc0_dw(x0) -> s_act_a[0..1023]
         {
             uint cg = tid & 7u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = ENC0_DW_W_F32_OFFSET + t * 32u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+            [[dont_unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
                 uint idx4 = tid + iter * 128u;
                 uint p = idx4 >> 3u;
                 uint lx = p & 15u;
@@ -196,7 +197,9 @@ void main() {
                 [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
                     uint rowOff = (ly + dy) * 18u + lx;
                     [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
-                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                        uint wBase = ENC0_DW_W_F32_OFFSET + (dy * 3u + dx) * 32u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dwTap;
                     }
                 }
                 s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
@@ -205,7 +208,7 @@ void main() {
         barrier();
 
         // 0c. Pipelined load of 16x8 center of hw0 (512 = 4*128) into s_act_b[0..511]
-        [[unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
+        [[dont_unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint p = idx4 >> 2u;
             uint cg = idx4 & 3u;
@@ -215,7 +218,7 @@ void main() {
         barrier();
 
         // 0d. m0 = lrelu(enc0_pw1(z0) + rec_proj(hw0)) -> s_act_b[512..1535]
-        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accZ0, accZ1;
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> accH0, accH1;
             wmmaDualFromActA(sg, 0u, 8u, ENC0_PW1_W_FP8_OFFSET, 2u, ob, accZ0, accZ1);
@@ -231,8 +234,8 @@ void main() {
                 uint m = mBase + i;
                 float v0 = leakyRelu01(accZ0[i] * sZ + bZ + accH0[i] * sH);
                 float v1 = leakyRelu01(accZ1[i] * sZ + bZ + accH1[i] * sH);
-                fe4m3vec4 q0 = quadPackClusterFp8(v0, lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(v1, lane);
+                uint q0 = quadPackClusterFp8(v0, lane);
+                uint q1 = quadPackClusterFp8(v1, lane);
                 if (comp == 0u) {
                     s_act_b[512u + (sg * 32u + m) * 8u + outCol4] = q0;
                     s_act_b[512u + (sg * 32u + 16u + m) * 8u + outCol4] = q1;
@@ -242,7 +245,7 @@ void main() {
         barrier();
 
         // 0e. s0 = lrelu(m0 + enc0_pw2(m0)) -> s_act_a[0..1023]
-        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActB(sg, 512u, 8u, ENC0_PW2_W_FP8_OFFSET, 2u, ob, acc0, acc1);
 
@@ -256,8 +259,8 @@ void main() {
                 uint p1 = p0 + 16u;
                 float sk0 = fp8Comp(s_act_b[512u + p0 * 8u + outCol4], comp);
                 float sk1 = fp8Comp(s_act_b[512u + p1 * 8u + outCol4], comp);
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     s_act_a[p0 * 8u + outCol4] = q0;
                     s_act_a[p1 * 8u + outCol4] = q1;
@@ -266,8 +269,8 @@ void main() {
         }
         barrier();
 
-        // 0f. Coalesced fe4m3vec4 store s0 -> pyr4[s0Off4] and 2x2 box-pool s0 -> pyr4[l1Off4]
-        [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+        // 0f. Coalesced uint32 store s0 -> pyr4[s0Off4] and 2x2 box-pool s0 -> pyr4[l1Off4]
+        [[dont_unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint p = idx4 >> 3u;
             uint cg = idx4 & 7u;
@@ -278,7 +281,7 @@ void main() {
         }
 
         ivec2 l1Origin = ivec2(gl_WorkGroupID.xy) * ivec2(8, 4);
-        [[unroll]] for (uint iter = 0u; iter < 2u; ++iter) {
+        [[dont_unroll]] for (uint iter = 0u; iter < 2u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint qp = idx4 >> 3u;
             uint cg = idx4 & 7u;
@@ -290,10 +293,10 @@ void main() {
                 uint ly0 = qly * 2u;
                 uint lx1 = uint(min(tileOrigin.x + int(lx0) + 1, max0.x) - tileOrigin.x);
                 uint ly1 = uint(min(tileOrigin.y + int(ly0) + 1, max0.y) - tileOrigin.y);
-                vec4 v00 = vec4(s_act_a[(ly0 * 16u + lx0) * 8u + cg]);
-                vec4 v01 = vec4(s_act_a[(ly0 * 16u + lx1) * 8u + cg]);
-                vec4 v10 = vec4(s_act_a[(ly1 * 16u + lx0) * 8u + cg]);
-                vec4 v11 = vec4(s_act_a[(ly1 * 16u + lx1) * 8u + cg]);
+                vec4 v00 = unpackFp8Vec4(s_act_a[(ly0 * 16u + lx0) * 8u + cg]);
+                vec4 v01 = unpackFp8Vec4(s_act_a[(ly0 * 16u + lx1) * 8u + cg]);
+                vec4 v10 = unpackFp8Vec4(s_act_a[(ly1 * 16u + lx0) * 8u + cg]);
+                vec4 v11 = unpackFp8Vec4(s_act_a[(ly1 * 16u + lx1) * 8u + cg]);
                 vec4 avg = 0.25 * (v00 + v01 + v10 + v11);
                 pyr4[l1Off4 + (uint(gq.y) * pl.w1 + uint(gq.x)) * 8u + cg] =
                     packFp8Vec4(avg.x, avg.y, avg.z, avg.w);
@@ -309,8 +312,8 @@ void main() {
         uint s1Off4 = pl.offS1   >> 2u;
         uint l2Off4 = pl.offL2In >> 2u;
 
-        // 1a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of l1_in (1,440 = 11*128 + 32)
-        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+        // 1a. Pipelined constant-trip packed-fp8x4 load of 18x10 halo of l1_in (1,440 = 11*128 + 32)
+        [[dont_unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint pix = idx4 >> 3u;
             uint cg = idx4 & 7u;
@@ -330,16 +333,11 @@ void main() {
         }
         barrier();
 
-        // 1b. Unrolled vectorized z1 = enc1_dw(l1_in) -> s_act_a[0..1023]
+        // 1b. Vectorized z1 = enc1_dw(l1_in) -> s_act_a[0..1023]
         {
             uint cg = tid & 7u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = ENC1_DW_W_F32_OFFSET + t * 32u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+            [[dont_unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
                 uint idx4 = tid + iter * 128u;
                 uint p = idx4 >> 3u;
                 uint lx = p & 15u;
@@ -348,7 +346,9 @@ void main() {
                 [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
                     uint rowOff = (ly + dy) * 18u + lx;
                     [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
-                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                        uint wBase = ENC1_DW_W_F32_OFFSET + (dy * 3u + dx) * 32u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dwTap;
                     }
                 }
                 s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
@@ -357,7 +357,7 @@ void main() {
         barrier();
 
         // 1c. m1 = lrelu(enc1_pw1(z1)) (32 -> 64) -> s_act_b[0..2047]
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActA(sg, 0u, 8u, ENC1_PW1_W_FP8_OFFSET, 2u, ob, acc0, acc1);
 
@@ -368,8 +368,8 @@ void main() {
 
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 uint p0 = sg * 32u + mBase + i;
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     s_act_b[p0 * 16u + outCol4] = q0;
                     s_act_b[(p0 + 16u) * 16u + outCol4] = q1;
@@ -379,7 +379,7 @@ void main() {
         barrier();
 
         // 1d. s1 = lrelu(m1 + enc1_pw2(m1)) (64 -> 64) -> s_act_a[0..2047]
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActB(sg, 0u, 16u, ENC1_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
 
@@ -393,8 +393,8 @@ void main() {
                 uint p1 = p0 + 16u;
                 float sk0 = fp8Comp(s_act_b[p0 * 16u + outCol4], comp);
                 float sk1 = fp8Comp(s_act_b[p1 * 16u + outCol4], comp);
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     s_act_a[p0 * 16u + outCol4] = q0;
                     s_act_a[p1 * 16u + outCol4] = q1;
@@ -403,8 +403,8 @@ void main() {
         }
         barrier();
 
-        // 1e. Coalesced fe4m3vec4 store s1 -> pyr4[s1Off4] and 2x2 box-pool s1 -> pyr4[l2Off4]
-        [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+        // 1e. Coalesced uint32 store s1 -> pyr4[s1Off4] and 2x2 box-pool s1 -> pyr4[l2Off4]
+        [[dont_unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint p = idx4 >> 4u;
             uint cg = idx4 & 15u;
@@ -415,7 +415,7 @@ void main() {
         }
 
         ivec2 l2Origin = ivec2(gl_WorkGroupID.xy) * ivec2(8, 4);
-        [[unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
+        [[dont_unroll]] for (uint iter = 0u; iter < 4u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint qp = idx4 >> 4u;
             uint cg = idx4 & 15u;
@@ -427,10 +427,10 @@ void main() {
                 uint ly0 = qly * 2u;
                 uint lx1 = uint(min(tileOrigin.x + int(lx0) + 1, max1.x) - tileOrigin.x);
                 uint ly1 = uint(min(tileOrigin.y + int(ly0) + 1, max1.y) - tileOrigin.y);
-                vec4 v00 = vec4(s_act_a[(ly0 * 16u + lx0) * 16u + cg]);
-                vec4 v01 = vec4(s_act_a[(ly0 * 16u + lx1) * 16u + cg]);
-                vec4 v10 = vec4(s_act_a[(ly1 * 16u + lx0) * 16u + cg]);
-                vec4 v11 = vec4(s_act_a[(ly1 * 16u + lx1) * 16u + cg]);
+                vec4 v00 = unpackFp8Vec4(s_act_a[(ly0 * 16u + lx0) * 16u + cg]);
+                vec4 v01 = unpackFp8Vec4(s_act_a[(ly0 * 16u + lx1) * 16u + cg]);
+                vec4 v10 = unpackFp8Vec4(s_act_a[(ly1 * 16u + lx0) * 16u + cg]);
+                vec4 v11 = unpackFp8Vec4(s_act_a[(ly1 * 16u + lx1) * 16u + cg]);
                 vec4 avg = 0.25 * (v00 + v01 + v10 + v11);
                 pyr4[l2Off4 + (uint(gq.y) * pl.w2 + uint(gq.x)) * 16u + cg] =
                     packFp8Vec4(avg.x, avg.y, avg.z, avg.w);
@@ -445,8 +445,8 @@ void main() {
         uint l2Off4 = pl.offL2In >> 2u;
         uint b1Off4 = pl.offB1   >> 2u;
 
-        // 2a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of l2_in (2,880 = 22*128 + 64)
-        [[unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
+        // 2a. Pipelined constant-trip packed-fp8x4 load of 18x10 halo of l2_in (2,880 = 22*128 + 64)
+        [[dont_unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint pix = idx4 >> 4u;
             uint cg = idx4 & 15u;
@@ -466,16 +466,11 @@ void main() {
         }
         barrier();
 
-        // 2b. Unrolled vectorized z2 = bot1_dw(l2_in) -> s_act_a[0..2047]
+        // 2b. Vectorized z2 = bot1_dw(l2_in) -> s_act_a[0..2047]
         {
             uint cg = tid & 15u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = BOT1_DW_W_F32_OFFSET + t * 64u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+            [[dont_unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
                 uint idx4 = tid + iter * 128u;
                 uint p = idx4 >> 4u;
                 uint lx = p & 15u;
@@ -484,7 +479,9 @@ void main() {
                 [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
                     uint rowOff = (ly + dy) * 18u + lx;
                     [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
-                        sum += vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dw[dy * 3u + dx];
+                        uint wBase = BOT1_DW_W_F32_OFFSET + (dy * 3u + dx) * 64u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dwTap;
                     }
                 }
                 s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
@@ -493,58 +490,52 @@ void main() {
         barrier();
 
         // 2c. m2 = lrelu(bot1_pw1(z2)) (64 -> 128) -> s_act_b[0..4095]
-        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
-            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
-                uint ob = obOuter * 4u + obInner;
-                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
-                wmmaDualFromActA(sg, 0u, 16u, BOT1_PW1_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+        [[dont_unroll]] for (uint ob = 0u; ob < 8u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 16u, BOT1_PW1_W_FP8_OFFSET, 4u, ob, acc0, acc1);
 
-                uint c = ob * 16u + col;
-                float sc = w_f32[BOT1_PW1_S_F32_OFFSET + c];
-                float bc = w_f32[BOT1_PW1_B_F32_OFFSET + c];
-                uint outCol4 = ob * 4u + col4;
+            uint c = ob * 16u + col;
+            float sc = w_f32[BOT1_PW1_S_F32_OFFSET + c];
+            float bc = w_f32[BOT1_PW1_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
 
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    uint p0 = sg * 32u + mBase + i;
-                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
-                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
-                    if (comp == 0u) {
-                        s_act_b[p0 * 32u + outCol4] = q0;
-                        s_act_b[(p0 + 16u) * 32u + outCol4] = q1;
-                    }
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_b[p0 * 32u + outCol4] = q0;
+                    s_act_b[(p0 + 16u) * 32u + outCol4] = q1;
                 }
             }
         }
         barrier();
 
         // 2d. b1 = lrelu(m2 + bot1_pw2(m2)) (128 -> 128) -> pyr4[b1Off4]
-        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
-            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
-                uint ob = obOuter * 4u + obInner;
-                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
-                wmmaDualFromActB(sg, 0u, 32u, BOT1_PW2_W_FP8_OFFSET, 8u, ob, acc0, acc1);
+        [[dont_unroll]] for (uint ob = 0u; ob < 8u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActB(sg, 0u, 32u, BOT1_PW2_W_FP8_OFFSET, 8u, ob, acc0, acc1);
 
-                uint c = ob * 16u + col;
-                float sc = w_f32[BOT1_PW2_S_F32_OFFSET + c];
-                float bc = w_f32[BOT1_PW2_B_F32_OFFSET + c];
-                uint outCol4 = ob * 4u + col4;
+            uint c = ob * 16u + col;
+            float sc = w_f32[BOT1_PW2_S_F32_OFFSET + c];
+            float bc = w_f32[BOT1_PW2_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
 
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    uint p0 = sg * 32u + mBase + i;
-                    uint p1 = p0 + 16u;
-                    float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
-                    float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
-                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
-                    if (comp == 0u) {
-                        ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
-                        if (gp0.x < int(pl.w2) && gp0.y < int(pl.h2)) {
-                            pyr4[b1Off4 + (uint(gp0.y) * pl.w2 + uint(gp0.x)) * 32u + outCol4] = q0;
-                        }
-                        ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
-                        if (gp1.x < int(pl.w2) && gp1.y < int(pl.h2)) {
-                            pyr4[b1Off4 + (uint(gp1.y) * pl.w2 + uint(gp1.x)) * 32u + outCol4] = q1;
-                        }
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
+                    if (gp0.x < int(pl.w2) && gp0.y < int(pl.h2)) {
+                        pyr4[b1Off4 + (uint(gp0.y) * pl.w2 + uint(gp0.x)) * 32u + outCol4] = q0;
+                    }
+                    ivec2 gp1 = tileOrigin + pixelOffset16x8(p1);
+                    if (gp1.x < int(pl.w2) && gp1.y < int(pl.h2)) {
+                        pyr4[b1Off4 + (uint(gp1.y) * pl.w2 + uint(gp1.x)) * 32u + outCol4] = q1;
                     }
                 }
             }
@@ -559,69 +550,61 @@ void main() {
         uint b1Off4 = pl.offB1   >> 2u;
         uint b2Off4 = pl.offB2   >> 2u;
 
-        // 3a. Pipelined 4x8 z3 = bot2_dw(b1, d=3) -> s_act_a[0..4095], center b1 -> s_act_b[0..4095]
+        // 3a. Pipelined z3 = bot2_dw(b1, d=3) -> s_act_a[0..4095], center b1 -> s_act_b[0..4095]
         {
             uint cg = tid & 31u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = BOT2_DW_W_F32_OFFSET + t * 128u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            for (uint blk = 0u; blk < 4u; ++blk) {
-                [[unroll]] for (uint sub = 0u; sub < 8u; ++sub) {
-                    uint idx4 = tid + (blk * 8u + sub) * 128u;
-                    uint p = idx4 >> 5u;
-                    ivec2 gp = tileOrigin + pixelOffset16x8(p);
-                    vec4 sum = vec4(0.0);
-                    fe4m3vec4 cB = fe4m3vec4(floate4m3_t(0.0));
-                    [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
-                        [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
-                            ivec2 np = clamp(gp + ivec2(dx * 3, dy * 3), ivec2(0), max2);
-                            fe4m3vec4 v = pyr4[b1Off4 + (uint(np.y) * pl.w2 + uint(np.x)) * 32u + cg];
-                            if (dx == 0 && dy == 0) {
-                                cB = v;
-                            }
-                            sum += vec4(v) * dw[uint(dy + 1) * 3u + uint(dx + 1)];
+            [[dont_unroll]] for (uint iter = 0u; iter < 32u; ++iter) {
+                uint idx4 = tid + iter * 128u;
+                uint p = idx4 >> 5u;
+                ivec2 gp = tileOrigin + pixelOffset16x8(p);
+                vec4 sum = vec4(0.0);
+                uint cB = 0u;
+                [[unroll]] for (int dy = -1; dy <= 1; ++dy) {
+                    [[unroll]] for (int dx = -1; dx <= 1; ++dx) {
+                        ivec2 np = clamp(gp + ivec2(dx * 3, dy * 3), ivec2(0), max2);
+                        uint v = pyr4[b1Off4 + (uint(np.y) * pl.w2 + uint(np.x)) * 32u + cg];
+                        if (dx == 0 && dy == 0) {
+                            cB = v;
                         }
+                        uint wBase = BOT2_DW_W_F32_OFFSET + (uint(dy + 1) * 3u + uint(dx + 1)) * 128u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(v) * dwTap;
                     }
-                    s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
-                    s_act_b[idx4] = cB;
                 }
+                s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
+                s_act_b[idx4] = cB;
             }
         }
         barrier();
 
         // 3b. m3 = lrelu(b1 + bot2_pw1(z3)) (128 -> 128) -> s_act_b[0..4095]
-        [[unroll]] for (uint obOuter = 0u; obOuter < 2u; ++obOuter) {
-            [[unroll]] for (uint obInner = 0u; obInner < 4u; ++obInner) {
-                uint ob = obOuter * 4u + obInner;
-                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
-                wmmaDualFromActA(sg, 0u, 32u, BOT2_PW1_W_FP8_OFFSET, 8u, ob, acc0, acc1);
+        [[dont_unroll]] for (uint ob = 0u; ob < 8u; ++ob) {
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
+            wmmaDualFromActA(sg, 0u, 32u, BOT2_PW1_W_FP8_OFFSET, 8u, ob, acc0, acc1);
 
-                uint c = ob * 16u + col;
-                float sc = w_f32[BOT2_PW1_S_F32_OFFSET + c];
-                float bc = w_f32[BOT2_PW1_B_F32_OFFSET + c];
-                uint outCol4 = ob * 4u + col4;
+            uint c = ob * 16u + col;
+            float sc = w_f32[BOT2_PW1_S_F32_OFFSET + c];
+            float bc = w_f32[BOT2_PW1_B_F32_OFFSET + c];
+            uint outCol4 = ob * 4u + col4;
 
-                [[unroll]] for (uint i = 0u; i < 8u; ++i) {
-                    uint p0 = sg * 32u + mBase + i;
-                    uint p1 = p0 + 16u;
-                    float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
-                    float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
-                    fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                    fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
-                    if (comp == 0u) {
-                        s_act_b[p0 * 32u + outCol4] = q0;
-                        s_act_b[p1 * 32u + outCol4] = q1;
-                    }
+            [[unroll]] for (uint i = 0u; i < 8u; ++i) {
+                uint p0 = sg * 32u + mBase + i;
+                uint p1 = p0 + 16u;
+                float sk0 = fp8Comp(s_act_b[p0 * 32u + outCol4], comp);
+                float sk1 = fp8Comp(s_act_b[p1 * 32u + outCol4], comp);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                if (comp == 0u) {
+                    s_act_b[p0 * 32u + outCol4] = q0;
+                    s_act_b[p1 * 32u + outCol4] = q1;
                 }
             }
         }
         barrier();
 
         // 3c. b2 = lrelu(l2_in + bot2_pw2(m3)) (128 -> 64) -> pyr4[b2Off4]
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActB(sg, 0u, 32u, BOT2_PW2_W_FP8_OFFSET, 8u, ob, acc0, acc1);
 
@@ -641,8 +624,8 @@ void main() {
                 uint gOff1 = (uint(gp1.y) * pl.w2 + uint(gp1.x)) * 16u + outCol4;
                 float sk0 = ok0 ? fp8Comp(pyr4[l2Off4 + gOff0], comp) : 0.0;
                 float sk1 = ok1 ? fp8Comp(pyr4[l2Off4 + gOff1], comp) : 0.0;
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     if (ok0) pyr4[b2Off4 + gOff0] = q0;
                     if (ok1) pyr4[b2Off4 + gOff1] = q1;
@@ -659,16 +642,16 @@ void main() {
         uint b2Off4 = pl.offB2 >> 2u;
         uint d1Off4 = pl.offD1 >> 2u;
 
-        // 4a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of u1 (2,880 = 22*128 + 64)
-        [[unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
+        // 4a. Pipelined constant-trip packed-fp8x4 load of 18x10 halo of u1 (2,880 = 22*128 + 64)
+        [[dont_unroll]] for (uint iter = 0u; iter < 22u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint pix = idx4 >> 4u;
             uint cg = idx4 & 15u;
             int hy = int(pix / 18u);
             int hx = int(pix - uint(hy) * 18u);
             ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
-            vec4 vs = vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
-            vec4 vb = vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
+            vec4 vs = unpackFp8Vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
+            vec4 vb = unpackFp8Vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
             vec4 u1 = 0.5 * (vs + vb);
             s_act_b[idx4] = packFp8Vec4(u1.x, u1.y, u1.z, u1.w);
         }
@@ -679,23 +662,18 @@ void main() {
             int hy = int(pix / 18u);
             int hx = int(pix - uint(hy) * 18u);
             ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max1);
-            vec4 vs = vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
-            vec4 vb = vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
+            vec4 vs = unpackFp8Vec4(pyr4[s1Off4 + (uint(np.y) * pl.w1 + uint(np.x)) * 16u + cg]);
+            vec4 vb = unpackFp8Vec4(pyr4[b2Off4 + (uint(np.y >> 1) * pl.w2 + uint(np.x >> 1)) * 16u + cg]);
             vec4 u1 = 0.5 * (vs + vb);
             s_act_b[idx4] = packFp8Vec4(u1.x, u1.y, u1.z, u1.w);
         }
         barrier();
 
-        // 4b. Unrolled vectorized z4 = dec1_dw(u1) -> s_act_a[0..2047], center u1 -> s_act_a[2048..4095]
+        // 4b. Vectorized z4 = dec1_dw(u1) -> s_act_a[0..2047], center u1 -> s_act_a[2048..4095]
         {
             uint cg = tid & 15u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = DEC1_DW_W_F32_OFFSET + t * 64u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            [[unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
+            [[dont_unroll]] for (uint iter = 0u; iter < 16u; ++iter) {
                 uint idx4 = tid + iter * 128u;
                 uint p = idx4 >> 4u;
                 uint lx = p & 15u;
@@ -704,7 +682,9 @@ void main() {
                 [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
                     uint rowOff = (ly + dy) * 18u + lx;
                     [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
-                        sum += vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dw[dy * 3u + dx];
+                        uint wBase = DEC1_DW_W_F32_OFFSET + (dy * 3u + dx) * 64u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(s_act_b[(rowOff + dx) * 16u + cg]) * dwTap;
                     }
                 }
                 s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
@@ -714,7 +694,7 @@ void main() {
         barrier();
 
         // 4c. m4 = lrelu(u1 + dec1_pw1(z4)) (64 -> 64) -> s_act_b[0..2047]
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActA(sg, 0u, 16u, DEC1_PW1_W_FP8_OFFSET, 4u, ob, acc0, acc1);
 
@@ -728,8 +708,8 @@ void main() {
                 uint p1 = p0 + 16u;
                 float sk0 = fp8Comp(s_act_a[2048u + p0 * 16u + outCol4], comp);
                 float sk1 = fp8Comp(s_act_a[2048u + p1 * 16u + outCol4], comp);
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     s_act_b[p0 * 16u + outCol4] = q0;
                     s_act_b[p1 * 16u + outCol4] = q1;
@@ -739,7 +719,7 @@ void main() {
         barrier();
 
         // 4d. d1 = lrelu(dec1_pw2(m4)) (64 -> 32) -> pyr4[d1Off4]
-        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+        [[dont_unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActB(sg, 0u, 16u, DEC1_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
 
@@ -751,8 +731,8 @@ void main() {
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 uint p0 = sg * 32u + mBase + i;
                 uint p1 = p0 + 16u;
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     ivec2 gp0 = tileOrigin + pixelOffset16x8(p0);
                     if (gp0.x < int(pl.w1) && gp0.y < int(pl.h1)) {
@@ -775,16 +755,16 @@ void main() {
         uint d1Off4  = pl.offD1  >> 2u;
         uint hw0Off4 = pl.offHw0 >> 2u;
 
-        // 5a. Pipelined constant-trip fe4m3vec4 load of 18x10 halo of u0 (1,440 = 11*128 + 32)
-        [[unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
+        // 5a. Pipelined constant-trip packed-fp8x4 load of 18x10 halo of u0 (1,440 = 11*128 + 32)
+        [[dont_unroll]] for (uint iter = 0u; iter < 11u; ++iter) {
             uint idx4 = tid + iter * 128u;
             uint pix = idx4 >> 3u;
             uint cg = idx4 & 7u;
             int hy = int(pix / 18u);
             int hx = int(pix - uint(hy) * 18u);
             ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
-            vec4 vs = vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
-            vec4 vd = vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
+            vec4 vs = unpackFp8Vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
+            vec4 vd = unpackFp8Vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
             vec4 u0 = 0.5 * (vs + vd);
             s_act_b[idx4] = packFp8Vec4(u0.x, u0.y, u0.z, u0.w);
         }
@@ -795,23 +775,18 @@ void main() {
             int hy = int(pix / 18u);
             int hx = int(pix - uint(hy) * 18u);
             ivec2 np = clamp(tileOrigin + ivec2(hx - 1, hy - 1), ivec2(0), max0);
-            vec4 vs = vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
-            vec4 vd = vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
+            vec4 vs = unpackFp8Vec4(pyr4[s0Off4 + (uint(np.y) * pl.w0 + uint(np.x)) * 8u + cg]);
+            vec4 vd = unpackFp8Vec4(pyr4[d1Off4 + (uint(np.y >> 1) * pl.w1 + uint(np.x >> 1)) * 8u + cg]);
             vec4 u0 = 0.5 * (vs + vd);
             s_act_b[idx4] = packFp8Vec4(u0.x, u0.y, u0.z, u0.w);
         }
         barrier();
 
-        // 5b. Unrolled vectorized z5 = dec0_dw(u0) -> s_act_a[0..1023], center u0 -> s_act_a[1024..2047]
+        // 5b. Vectorized z5 = dec0_dw(u0) -> s_act_a[0..1023], center u0 -> s_act_a[1024..2047]
         {
             uint cg = tid & 7u;
             uint c4 = cg << 2u;
-            vec4 dw[9];
-            [[unroll]] for (uint t = 0u; t < 9u; ++t) {
-                uint wBase = DEC0_DW_W_F32_OFFSET + t * 32u + c4;
-                dw[t] = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
-            }
-            [[unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
+            [[dont_unroll]] for (uint iter = 0u; iter < 8u; ++iter) {
                 uint idx4 = tid + iter * 128u;
                 uint p = idx4 >> 3u;
                 uint lx = p & 15u;
@@ -820,7 +795,9 @@ void main() {
                 [[unroll]] for (uint dy = 0u; dy < 3u; ++dy) {
                     uint rowOff = (ly + dy) * 18u + lx;
                     [[unroll]] for (uint dx = 0u; dx < 3u; ++dx) {
-                        sum += vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dw[dy * 3u + dx];
+                        uint wBase = DEC0_DW_W_F32_OFFSET + (dy * 3u + dx) * 32u + c4;
+                        vec4 dwTap = vec4(w_f32[wBase + 0u], w_f32[wBase + 1u], w_f32[wBase + 2u], w_f32[wBase + 3u]);
+                        sum += unpackFp8Vec4(s_act_b[(rowOff + dx) * 8u + cg]) * dwTap;
                     }
                 }
                 s_act_a[idx4] = packFp8Vec4(sum.x, sum.y, sum.z, sum.w);
@@ -829,8 +806,8 @@ void main() {
         }
         barrier();
 
-        // 5c. m5 = lrelu(dec0_pw1(z5)) (32 -> 64) -> s_act_b[0..2047]
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
+        // 5c. m5 = lrelu(dec0_pw1(z5)) (32 -> 32) -> s_act_b[0..1023]
+        [[dont_unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
             wmmaDualFromActA(sg, 0u, 8u, DEC0_PW1_W_FP8_OFFSET, 2u, ob, acc0, acc1);
 
@@ -841,20 +818,20 @@ void main() {
 
             [[unroll]] for (uint i = 0u; i < 8u; ++i) {
                 uint p0 = sg * 32u + mBase + i;
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
-                    s_act_b[p0 * 16u + outCol4] = q0;
-                    s_act_b[(p0 + 16u) * 16u + outCol4] = q1;
+                    s_act_b[p0 * 8u + outCol4] = q0;
+                    s_act_b[(p0 + 16u) * 8u + outCol4] = q1;
                 }
             }
         }
         barrier();
 
-        // 5d. d0 = lrelu(u0 + dec0_pw2(m5)) (64 -> 32) -> s_act_a[0..1023]
-        [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
+        // 5d. d0 = lrelu(u0 + dec0_pw2(m5)) (32 -> 32) -> s_act_a[0..1023]
+        [[dont_unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0, acc1;
-            wmmaDualFromActB(sg, 0u, 16u, DEC0_PW2_W_FP8_OFFSET, 4u, ob, acc0, acc1);
+            wmmaDualFromActB(sg, 0u, 8u, DEC0_PW2_W_FP8_OFFSET, 2u, ob, acc0, acc1);
 
             uint c = ob * 16u + col;
             float sc = w_f32[DEC0_PW2_S_F32_OFFSET + c];
@@ -866,8 +843,8 @@ void main() {
                 uint p1 = p0 + 16u;
                 float sk0 = fp8Comp(s_act_a[1024u + p0 * 8u + outCol4], comp);
                 float sk1 = fp8Comp(s_act_a[1024u + p1 * 8u + outCol4], comp);
-                fe4m3vec4 q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
-                fe4m3vec4 q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
+                uint q0 = quadPackClusterFp8(leakyRelu01(sk0 + acc0[i] * sc + bc), lane);
+                uint q1 = quadPackClusterFp8(leakyRelu01(sk1 + acc1[i] * sc + bc), lane);
                 if (comp == 0u) {
                     s_act_a[p0 * 8u + outCol4] = q0;
                     s_act_a[p1 * 8u + outCol4] = q1;

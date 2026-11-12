@@ -54,7 +54,12 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
     LightTreeNode lightNodes[];
 };
 
+#ifndef ENABLE_RESTIR_PT
+#define ENABLE_RESTIR_PT 0
+#endif
+
 #include "mis_common.glsl"
+#if ENABLE_RESTIR_PT
 #include "restir_common.glsl"
 #include "bsdf_standard.glsl"
 
@@ -75,6 +80,7 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
 };
 
 #include "restir_gi_reuse.glsl"
+#endif
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
 
@@ -83,9 +89,11 @@ DECLARE_SCENE_TEXTURES_BINDING(8)
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
+#if ENABLE_RESTIR_PT
 layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
 };
+#endif
 
 layout(std430, binding = 13) buffer IndirectCommand {
     DispatchCommand commands[];
@@ -111,191 +119,7 @@ layout(push_constant) uniform PushConstants {
     WavefrontShadePC pc;
 };
 
-#include "wavefront_shadow_inline.glsl"
 #include "shading_core.glsl"
-
-void accumDielectricInlineRadiance(ivec2 pixelCoord, vec3 contrib, bool toSpecular, uint bounce, inout uint seed) {
-    if (dot(contrib, contrib) <= 1e-12) return;
-    if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
-        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-        imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, contrib, seed), prev.a));
-    }
-    if (pc.captureMlData != 0u) {
-        if (toSpecular) {
-            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, contrib, seed), prevSpec.a));
-        } else {
-            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, contrib, seed), prevDiff.a));
-        }
-    }
-}
-
-void evalInlineDielectricReflection(
-    vec3 rOrigin,
-    vec3 rDir,
-    vec3 rThroughput,
-    uint bounce,
-    uint pixelIndex,
-    bool toSpecular,
-    bool causticApplied,
-    inout uint seed
-) {
-    if (pc.useHardwareRT == 0u || max(rThroughput.r, max(rThroughput.g, rThroughput.b)) <= 1e-5) {
-        return;
-    }
-    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-    bool enableDirect = (ubo.flags & (1u << 0)) != 0u;
-    bool enableShadows = (ubo.flags & (1u << 4)) != 0u;
-    float effClamp = (!toSpecular && bounce > 0u) ? min(pc.indirectClamp, 3.0) : pc.indirectClamp;
-    vec3 currO = rOrigin;
-    vec3 currD = rDir;
-    vec3 currT = rThroughput;
-
-    for (uint step = 0u; step < 3u; ++step) {
-        float closestT = 10000.0;
-        int closestTri = -1;
-        vec2 closestBary = vec2(0.0);
-        int closestSphere = -1;
-        vec3 spNormDummy = vec3(0.0, 1.0, 0.0);
-        uint hitInstIdxDummy = 0u;
-        uint hitInstMatOffset = 0u;
-        mat4x3 hitO2wDummy = mat4x3(1.0);
-        mat4x3 hitW2o = mat4x3(1.0);
-
-        traceClosestSceneHit(
-            currO, currD, EPSILON, 10000.0, pc.numSpheres,
-            closestT, closestTri, closestSphere, closestBary, spNormDummy,
-            hitInstIdxDummy, hitInstMatOffset, hitO2wDummy, hitW2o
-        );
-
-        if (closestTri < 0 && closestSphere < 0) {
-            vec3 skyColor;
-            if (pc.hasEnvMap == 1u) {
-                vec2 envUv = directionToEquirectangular(currD);
-                skyColor = texture(environmentMap, envUv).rgb * pc.envMapIntensity;
-            } else {
-                float t = 0.5 * (currD.y + 1.0);
-                skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
-            }
-            vec3 skyContrib = clampIndirectRadiance(currT * skyColor, effClamp);
-            accumDielectricInlineRadiance(pixelCoord, skyContrib, toSpecular, bounce, seed);
-            break;
-        }
-
-        vec3 hNormal;
-        vec2 hUv = vec2(0.0);
-        uint hMatId = 0u;
-        if (closestTri >= 0) {
-            Triangle tri = triangles[closestTri];
-            vec3 localNormal = getTriangleNormal(tri, closestBary);
-            hNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-            hUv = getTriangleUV(tri, closestBary);
-            hMatId = tri.materialId + hitInstMatOffset;
-        } else {
-            hNormal = spNormDummy;
-            hMatId = spheres[closestSphere].materialId;
-        }
-        bool hFront = dot(currD, hNormal) < 0.0;
-        hNormal = hFront ? hNormal : -hNormal;
-        vec3 hPt = currO + closestT * currD;
-
-        Material hMat = materials[min(hMatId, max(pc.numMaterials, 1u) - 1u)];
-        vec3 hEmissive = hMat.emissive.rgb;
-        if (hMat.emissiveTex > 0u && hMat.emissiveTex <= 512u) {
-            hEmissive *= SAMPLE_SCENE_TEXTURE_LOD(hMat.emissiveTex, hUv, 0.0).rgb;
-        }
-        bool suppressInlineCaustic = causticApplied && !toSpecular;
-        if (!suppressInlineCaustic && length(hEmissive) > 1e-3) {
-            vec3 emitContrib = clampIndirectRadiance(currT * hEmissive, effClamp);
-            accumDielectricInlineRadiance(pixelCoord, emitContrib, toSpecular, bounce, seed);
-        }
-        if ((hMat.type & MATERIAL_TYPE_MASK) == 3u) {
-            break;
-        }
-
-        vec3 hAlbedo = hMat.albedo.rgb;
-        if (hMat.albedoTex > 0u && hMat.albedoTex <= 512u) {
-            hAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(hMat.albedoTex, hUv, 0.0).rgb;
-        }
-
-        uint hArch = (hMatId < pc.numMaterials) ? materialArchetypes[hMatId] : MATERIAL_ARCHETYPE_DIFFUSE;
-        if (hArch == MATERIAL_ARCHETYPE_CONDUCTOR || (hMat.metallic > 0.85 && hMat.roughness <= 0.12)) {
-            float ndotv = clamp(dot(-currD, hNormal), 0.0, 1.0);
-            currT *= fresnelSchlickVec(ndotv, hAlbedo);
-            currD = reflect(currD, hNormal);
-            currO = offsetRayOrigin(hPt, hNormal);
-            continue;
-        }
-        if (hArch == MATERIAL_ARCHETYPE_DIELECTRIC) {
-            float hIor = hMat.ior > 0.0 ? hMat.ior : 1.5;
-            float hEta = hFront ? (1.0 / hIor) : hIor;
-            vec3 refrD = refract(currD, hNormal, hEta);
-            if (dot(refrD, refrD) > 1e-6) {
-                float hCos = min(dot(-currD, hNormal), 1.0);
-                float hRefl = fresnelDielectric(hCos, hEta);
-                currT *= (1.0 - hRefl) * hAlbedo;
-                currD = normalize(refrD);
-                currO = offsetRayOrigin(hPt, -hNormal);
-                continue;
-            }
-            break;
-        }
-
-        // Diffuse / rough surface direct illumination (1-tap NEE)
-        if (enableDirect && pc.numLights > 0u) {
-            uint lIdx = (pc.numLights > 1u) ? (min(uint(randFloat(seed) * float(pc.numLights)), pc.numLights - 1u)) : 0u;
-            float lSelPdf = 1.0 / float(pc.numLights);
-            Light light = lights[lIdx];
-            vec3 lDir = vec3(0.0, 1.0, 0.0);
-            float lDist = 0.0;
-            float lPdf = 1.0;
-            vec3 lEmission = light.emission.rgb;
-            bool lValid = false;
-            if (uint(light.position.w) == 0u) {
-                vec2 luv = sampleSobolOwen2D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, 7u + step);
-                vec3 lPt = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
-                vec3 toL = lPt - hPt;
-                lDist = length(toL);
-                lDir = toL / max(lDist, 1e-4);
-                float cosL = dot(-lDir, light.normal.xyz);
-                if (cosL > 0.0) {
-                    lPdf = (lDist * lDist) / max(light.emission.w * cosL, 1e-6);
-                    lValid = true;
-                }
-            } else if (uint(light.position.w) == 1u) {
-                vec3 toL = light.position.xyz - hPt;
-                lDist = length(toL);
-                lDir = toL / max(lDist, 1e-4);
-                float cosSpot = dot(-lDir, light.normal.xyz);
-                if (cosSpot >= light.v.w) {
-                    float spotFactor = clamp((cosSpot - light.v.w) / max(light.u.w - light.v.w, 1e-4), 0.0, 1.0);
-                    lEmission *= spotFactor / max(lDist * lDist, 1e-4);
-                    lValid = true;
-                }
-            } else if (uint(light.position.w) == 2u) {
-                lDir = normalize(light.normal.xyz);
-                lDist = 10000.0;
-                lValid = true;
-            }
-            float ndotl = max(dot(hNormal, lDir), 0.0);
-            if (lValid && ndotl > 0.0) {
-                bool occluded = false;
-                if (enableShadows) {
-                    occluded = traceShadowRayInline(offsetRayOrigin(hPt, hNormal), lDir, lDist,
-                                                    (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                }
-                if (!occluded) {
-                    vec3 diffColor = hAlbedo * (1.0 - hMat.metallic);
-                    vec3 neeContrib = currT * (diffColor * INV_PI * ndotl) * lEmission / max(lPdf * lSelPdf, 1e-6);
-                    neeContrib = clampIndirectRadiance(neeContrib, effClamp);
-                    accumDielectricInlineRadiance(pixelCoord, neeContrib, toSpecular, bounce, seed);
-                }
-            }
-        }
-        break;
-    }
-}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -305,8 +129,10 @@ void main() {
     vec3 nextDirection = vec3(0.0);
     RayGeometry nextGeom;
     RayState nextState;
+#if ENABLE_RESTIR_PT
     bool hasGiShadowRay = false;
     PackedShadowRay giShadowCandidate;
+#endif
 
     if (inRange) {
         uint rayIdx = materialIndices[2u * pc.maxQueueCapacity + idx];
@@ -332,6 +158,7 @@ void main() {
         uint bounce = pc.currentBounce;
         bool outIsSpecularPath = (bounce == 0u) ? true : isSpecularPath;
 
+#if ENABLE_RESTIR_PT
         // ReSTIR PT: primary dielectric surfaces invalidate DI/X1/GI; secondary
         // dielectric hits spawned from diffuse X1 surfaces run GI reuse over
         // the complementary domain (M = 1, w_self = 0).
@@ -356,6 +183,7 @@ void main() {
                 }
             }
         }
+#endif
 
         if (hitType == 2u) {
             // Environment sky miss
@@ -504,29 +332,12 @@ void main() {
                 nextDirection = vec3(0.0);
                 vec3 nextOrigin;
 
-                bool useDeterministicSplit = (!cannotRefract && pc.useHardwareRT == 1u && !isThinWalled);
-                bool reflected0 = false;
-                if (useDeterministicSplit) {
-                    if (reflectProb > 1e-4) {
-                        evalInlineDielectricReflection(
-                            offsetRayOrigin(hitPoint, hitNormal),
-                            reflect(rayDir, hitNormal),
-                            throughput * reflectProb,
-                            bounce,
-                            pixelIndex,
-                            outIsSpecularPath,
-                            causticApplied,
-                            seed
-                        );
-                    }
-                    throughput *= (1.0 - reflectProb);
-                    reflected0 = false;
-                } else {
-                    float rFlip = (pc.captureMlData != 0u) ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u) : ((pc.secondarySortMode >= 2u)
+                float rFlip = (pc.captureMlData != 0u)
+                    ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u)
+                    : ((pc.secondarySortMode >= 2u)
                         ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
                         : randFloat(seed));
-                    reflected0 = (cannotRefract || rFlip < reflectProb);
-                }
+                bool reflected0 = (cannotRefract || rFlip < reflectProb);
                 if (reflected0) {
                     // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(rayDir, hitNormal);
@@ -843,29 +654,10 @@ void main() {
                                     }
                                 }
 
-                                bool useDetInternal = (!dCannotRefract && !isThinWalledD && deltaEvents <= 2u);
-                                bool dReflected = false;
-                                if (useDetInternal) {
-                                    if (dReflectProb > 1e-4) {
-                                        evalInlineDielectricReflection(
-                                            offsetRayOrigin(dHitPoint, dHitNormal),
-                                            reflect(currDirection, dHitNormal),
-                                            throughput * dReflectProb,
-                                            bounce,
-                                            pixelIndex,
-                                            outIsSpecularPath,
-                                            causticApplied,
-                                            seed
-                                        );
-                                    }
-                                    throughput *= (1.0 - dReflectProb);
-                                    dReflected = false;
-                                } else {
-                                    float rFlipD = (pc.captureMlData != 0u)
-                                        ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + deltaEvents + 1u)
-                                        : randFloat(seed);
-                                    dReflected = (dCannotRefract || rFlipD < dReflectProb);
-                                }
+                                float rFlipD = (pc.captureMlData != 0u)
+                                    ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + deltaEvents + 1u)
+                                    : randFloat(seed);
+                                bool dReflected = (dCannotRefract || rFlipD < dReflectProb);
                                 if (dReflected) {
                                     if (enablePsrGuides) {
                                         psrXform = psrXform * buildReflectionMatrix(dHitNormal);
@@ -981,6 +773,7 @@ void main() {
         }
     }
 
+#if ENABLE_RESTIR_PT
     // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
     uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
     uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
@@ -1000,6 +793,7 @@ void main() {
             shadowRays[targetIdxGiShadow] = giShadowCandidate;
         }
     }
+#endif
 
     // Atomic workgroup retirement to prepare downstream dispatches directly
     memoryBarrierBuffer();

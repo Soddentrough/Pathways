@@ -36,8 +36,14 @@ layout(std430, binding = 4) readonly buffer MaterialsBuffer {
     Material materials[];
 };
 
+#ifndef ENABLE_ALPHA_MASK
+#define ENABLE_ALPHA_MASK 0
+#endif
+
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+#if ENABLE_ALPHA_MASK
 DECLARE_SCENE_TEXTURES_BINDING(8)
+#endif
 
 #include "shading_core.glsl"
 

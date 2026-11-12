@@ -96,6 +96,9 @@ private:
     // Telemetry export user notification banner
     std::string m_lastExportNotification;
     float m_exportNotificationTimer = 0.0f;
+
+    // Tracks explicit UI selection of the FSR 4 stub pass-through when native Vulkan FSR 4 is unavailable
+    bool m_fsr4StubSelected = false;
 };
 
 } // namespace pathways

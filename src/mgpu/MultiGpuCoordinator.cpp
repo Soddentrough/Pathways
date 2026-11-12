@@ -353,11 +353,11 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
     rtSubmit.pCommandBufferInfos = &cmdSubmitInfo;
     rtSubmit.signalSemaphoreInfoCount = 1;
     rtSubmit.pSignalSemaphoreInfos = &signalInfo;
-    if (!params.skipRayTracing && params.mgpu &&
-        (params.mgpu->isP2PDirectBarActive() || params.mgpu->isCrossGpuSyncActive())) {
-        // Ensure the secondary GPU worker thread submits its command buffer (and signals the
-        // cross-GPU timeline semaphore / DMA-BUF fence) before the primary GPU submits work
-        // that waits on that timeline point or shares the exported resource.
+    if (!params.skipRayTracing && params.mgpu && params.mgpu->isP2PDirectBarActive()) {
+        // Ensure the secondary GPU (DMA-BUF importer) submits before the primary GPU (DMA-BUF exporter).
+        // In Linux amdgpu, imported DMA-BUF BOs use implicit AMDGPU_SYNC_NE_OWNER synchronization while
+        // exported native BOs use AMDGPU_SYNC_EXPLICIT; submitting the importer first avoids a false
+        // dma_resv dependency on the primary GPU's ray tracing submission.
         params.mgpu->waitWorkerIdle();
     }
     vkQueueSubmit2(queue, 1, &rtSubmit, VK_NULL_HANDLE);
@@ -582,6 +582,9 @@ bool MultiGpuCoordinator::executeAsyncMerge(
     waitInfos.push_back(waitRt);
 
     if (params.mgpu && params.mgpu->isCrossGpuSyncActive()) {
+        // Primary RT is already submitted and running on GPU 0; ensure the secondary worker thread
+        // has submitted its timeline semaphore signal before submitting the async merge wait.
+        params.mgpu->waitWorkerIdle();
         VkSemaphore secSem = params.mgpu->getPrimaryImportedTimelineSemaphore();
         if (secSem != VK_NULL_HANDLE) {
             VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
@@ -634,6 +637,7 @@ void MultiGpuCoordinator::populatePostWaitSemaphores(
     waitSemaphoreInfos.push_back(waitRt);
 
     if (mgpu && mgpu->isCrossGpuSyncActive() && !skipRayTracing) {
+        mgpu->waitWorkerIdle();
         VkSemaphore secSem = mgpu->getPrimaryImportedTimelineSemaphore();
         if (secSem != VK_NULL_HANDLE) {
             VkSemaphoreSubmitInfo waitSec{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };

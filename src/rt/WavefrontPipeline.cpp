@@ -94,6 +94,13 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeDiffuseSecPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecPipeline, nullptr);
     if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
     if (m_tailMegakernelPipeline) vkDestroyPipeline(m_device, m_tailMegakernelPipeline, nullptr);
+    if (m_intersectAlphaPipeline) vkDestroyPipeline(m_device, m_intersectAlphaPipeline, nullptr);
+    if (m_shadeDiffuseRestirPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseRestirPipeline, nullptr);
+    if (m_shadeDiffuseSecRestirPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecRestirPipeline, nullptr);
+    if (m_shadeComplexRestirPipeline) vkDestroyPipeline(m_device, m_shadeComplexRestirPipeline, nullptr);
+    if (m_shadeComplexSecRestirPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecRestirPipeline, nullptr);
+    if (m_shadeDielectricRestirPipeline) vkDestroyPipeline(m_device, m_shadeDielectricRestirPipeline, nullptr);
+    if (m_shadeEmissiveRestirPipeline) vkDestroyPipeline(m_device, m_shadeEmissiveRestirPipeline, nullptr);
 
     if (m_classifyPipeline) vkDestroyPipeline(m_device, m_classifyPipeline, nullptr);
     if (m_intersectPipeline) vkDestroyPipeline(m_device, m_intersectPipeline, nullptr);
@@ -507,43 +514,6 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
         throw std::runtime_error("WavefrontPipeline: Failed to create pipeline layout!");
     }
 
-    // Explicit Wave32 execution mode on RDNA 4 + Vulkan 1.4 maintenance5 inline VkShaderModuleCreateInfo
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
-    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    auto buildComputePipeline = [&](const std::vector<char>& code, const char* name) -> VkPipeline {
-        VkShaderModuleCreateInfo moduleInfo{};
-        moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        moduleInfo.pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
-        moduleInfo.codeSize = code.size();
-        moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-        VkPipelineShaderStageCreateInfo stage{};
-        stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        stage.pNext = &moduleInfo;
-        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = VK_NULL_HANDLE;
-        stage.pName = "main";
-
-        VkPipelineCreateFlags2CreateInfo flags2Info{};
-        flags2Info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
-        flags2Info.pNext = nullptr;
-        flags2Info.flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
-
-        VkComputePipelineCreateInfo compInfo{};
-        compInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-        compInfo.pNext = &flags2Info;
-        compInfo.stage = stage;
-        compInfo.layout = m_pipelineLayout;
-
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &pipe) != VK_SUCCESS) {
-            throw std::runtime_error(std::string("WavefrontPipeline: Failed to create compute pipeline ") + name);
-        }
-        return pipe;
-    };
-
     m_classifyPipeline  = buildComputePipeline(classifyCode, "classify");
     m_intersectPipeline = buildComputePipeline(intersectCode, "intersect");
     m_shadePipeline     = buildComputePipeline(shadeCode, "shade");
@@ -606,6 +576,99 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
         };
 
         m_dgcManager->initMaterialExecutionSets(m_primaryMatPipelines, m_secondaryMatPipelines);
+    }
+}
+
+VkPipeline WavefrontPipeline::buildComputePipeline(const std::vector<char>& code, const char* name) {
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
+    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+    subgroupSize32.requiredSubgroupSize = 32;
+
+    VkShaderModuleCreateInfo moduleInfo{};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
+    moduleInfo.codeSize = code.size();
+    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+    VkPipelineShaderStageCreateInfo stage{};
+    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stage.pNext = &moduleInfo;
+    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    stage.module = VK_NULL_HANDLE;
+    stage.pName = "main";
+
+    VkPipelineCreateFlags2CreateInfo flags2Info{};
+    flags2Info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
+    flags2Info.pNext = nullptr;
+    flags2Info.flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+
+    VkComputePipelineCreateInfo compInfo{};
+    compInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    compInfo.pNext = &flags2Info;
+    compInfo.stage = stage;
+    compInfo.layout = m_pipelineLayout;
+
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &pipe) != VK_SUCCESS) {
+        throw std::runtime_error(std::string("WavefrontPipeline: Failed to create compute pipeline ") + name);
+    }
+    return pipe;
+}
+
+void WavefrontPipeline::initSpecializedVariants(
+    const std::vector<char>& intersectAlphaCode,
+    const std::vector<char>& shadeDiffuseRestirCode,
+    const std::vector<char>& shadeDiffuseSecRestirCode,
+    const std::vector<char>& shadeComplexRestirCode,
+    const std::vector<char>& shadeComplexSecRestirCode,
+    const std::vector<char>& shadeDielectricRestirCode,
+    const std::vector<char>& shadeEmissiveRestirCode) {
+    if (!intersectAlphaCode.empty() && m_intersectAlphaPipeline == VK_NULL_HANDLE) {
+        m_intersectAlphaPipeline = buildComputePipeline(intersectAlphaCode, "intersect_alpha");
+    }
+    if (!shadeDiffuseRestirCode.empty() && m_shadeDiffuseRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeDiffuseRestirPipeline = buildComputePipeline(shadeDiffuseRestirCode, "shade_diffuse_restir");
+    }
+    if (!shadeDiffuseSecRestirCode.empty() && m_shadeDiffuseSecRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeDiffuseSecRestirPipeline = buildComputePipeline(shadeDiffuseSecRestirCode, "shade_diffuse_sec_restir");
+    }
+    if (!shadeComplexRestirCode.empty() && m_shadeComplexRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeComplexRestirPipeline = buildComputePipeline(shadeComplexRestirCode, "shade_complex_restir");
+    }
+    if (!shadeComplexSecRestirCode.empty() && m_shadeComplexSecRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeComplexSecRestirPipeline = buildComputePipeline(shadeComplexSecRestirCode, "shade_complex_sec_restir");
+    }
+    if (!shadeDielectricRestirCode.empty() && m_shadeDielectricRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeDielectricRestirPipeline = buildComputePipeline(shadeDielectricRestirCode, "shade_dielectric_restir");
+    }
+    if (!shadeEmissiveRestirCode.empty() && m_shadeEmissiveRestirPipeline == VK_NULL_HANDLE) {
+        m_shadeEmissiveRestirPipeline = buildComputePipeline(shadeEmissiveRestirCode, "shade_emissive_restir");
+    }
+
+    if (m_shadeDiffuseRestirPipeline && m_shadeComplexRestirPipeline &&
+        m_shadeDielectricRestirPipeline && m_shadeEmissiveRestirPipeline) {
+        m_restirPrimaryMatPipelines = {
+            m_shadeDiffuseRestirPipeline,
+            m_shadeComplexRestirPipeline,
+            m_shadeDielectricRestirPipeline,
+            m_shadeEmissiveRestirPipeline
+        };
+        VkPipeline secDiffRestir = m_shadeDiffuseSecRestirPipeline ? m_shadeDiffuseSecRestirPipeline : m_shadeDiffuseRestirPipeline;
+        VkPipeline secCompRestir = m_shadeComplexSecRestirPipeline ? m_shadeComplexSecRestirPipeline : m_shadeComplexRestirPipeline;
+        m_restirBounce1MatPipelines = {
+            secDiffRestir,
+            secCompRestir,
+            m_shadeDielectricRestirPipeline,
+            m_shadeEmissiveRestirPipeline
+        };
+        if (m_dgcManager && !m_primaryMatPipelines.empty()) {
+            m_dgcManager->initMaterialExecutionSets({
+                m_primaryMatPipelines,
+                m_secondaryMatPipelines,
+                m_restirPrimaryMatPipelines,
+                m_restirBounce1MatPipelines
+            });
+        }
     }
 }
 
@@ -855,19 +918,40 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             if (useMaterialSort) {
                 bool isRestirGI = (sceneData.cameraFlags & (1u << 9)) != 0;
-                bool isSecondary = (b >= 1 && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty() && !(b == 1 && isRestirGI));
-                const auto& matPipelines = isSecondary ? m_secondaryMatPipelines : m_primaryMatPipelines;
+                uint32_t execSetIdx = 0u;
+                const std::vector<VkPipeline>* matPipelinesPtr = &m_primaryMatPipelines;
+                if (isRestirGI && !m_restirPrimaryMatPipelines.empty()) {
+                    if (b == 0u) {
+                        execSetIdx = 2u;
+                        matPipelinesPtr = &m_restirPrimaryMatPipelines;
+                    } else if (b == 1u) {
+                        if (sceneData.streamlineSecondaryShading && !m_restirBounce1MatPipelines.empty()) {
+                            execSetIdx = 3u;
+                            matPipelinesPtr = &m_restirBounce1MatPipelines;
+                        } else {
+                            execSetIdx = 2u;
+                            matPipelinesPtr = &m_restirPrimaryMatPipelines;
+                        }
+                    } else if (sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty()) {
+                        execSetIdx = 1u;
+                        matPipelinesPtr = &m_secondaryMatPipelines;
+                    }
+                } else if (b >= 1u && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty()) {
+                    execSetIdx = 1u;
+                    matPipelinesPtr = &m_secondaryMatPipelines;
+                }
+                const auto& matPipelines = *matPipelinesPtr;
 
                 VkDeviceSize shadeOffset = static_cast<VkDeviceSize>(b * 16 + 0) * 16;
                 uint32_t numMatPipes = static_cast<uint32_t>(matPipelines.size());
                 uint32_t sliceIdx = DGCManager::getFrameSliceIndex(frameSlot, dgcMatDispatchOrdinal++);
                 VkDeviceAddress seqCountAddr = m_queueCounters[frameSlot]->getDeviceAddress(m_device) + offsetof(QueueCountersBuffer, activeMaterialSequenceCount);
                 if (m_dgcManager->isSupported() && m_dgcManager->isMaterialDGCSupported()) {
-                    m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, isSecondary);
+                    m_dgcManager->recordMaterialPreprocess(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, seqCountAddr, execSetIdx);
                     m_dgcManager->recordPreprocessBarrier(cmd, sliceIdx);
-                    m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr, isSecondary);
+                    m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_dgcStream[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, true /* isPreprocessed */, seqCountAddr, execSetIdx);
                 } else {
-                    m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr, isSecondary);
+                    m_dgcManager->recordMaterialExecute(cmd, matPipelines, m_indirectArgs[frameSlot].get(), shadeOffset, sliceIdx, numMatPipes, false /* isPreprocessed */, seqCountAddr, execSetIdx);
                 }
             } else {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadePipeline);
@@ -962,9 +1046,12 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
             // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
             if (b + 1 < cutoffBounce) {
+                VkPipeline intersectPipe = (((sceneData.cameraFlags & (1u << 10)) != 0u) && m_intersectAlphaPipeline != VK_NULL_HANDLE)
+                    ? m_intersectAlphaPipeline
+                    : m_intersectPipeline;
                 if (sceneData.secondarySortMode == 1 && useMaterialSort) {
                     // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipe);
 
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectStart);
 
@@ -980,7 +1067,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectEnd);
                 } else {
                     // Secondary sort disabled / single-queue indirect dispatch
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_intersectPipeline);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipe);
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), &intersectPC);
 
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectStart);

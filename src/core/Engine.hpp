@@ -367,6 +367,7 @@ private:
     uint32_t m_lastTileSize = 64;
     uint32_t m_lastBatchCount = 0;
     uint32_t m_lastBatchPixels = 0;
+    uint64_t m_lastMergedSharedGen = 0;
 
     // Available scenes and dynamic selection
     std::vector<SceneEntry> m_availableScenes;
@@ -383,6 +384,7 @@ private:
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
     bool m_sceneHasAlphaMask = false;
+    bool m_sceneHasAlphaShadow = false;
     std::unique_ptr<SceneGeometryPipeline> m_geometryPipeline;
     void updateSceneTransparencyFlag();
     void partitionSceneGeometry();

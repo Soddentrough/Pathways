@@ -13,6 +13,10 @@
 //   - lights[], lightNodes[], bsdf_standard.glsl, mis_common.glsl
 // =============================================================================
 
+#ifndef ENABLE_ALPHA_MASK
+#define ENABLE_ALPHA_MASK 1
+#endif
+
 #ifndef SHADING_CORE_SKIP_SCENE_HIT
 void traceClosestSceneHit(
     vec3 origin,
@@ -40,8 +44,9 @@ void traceClosestSceneHit(
     hitO2w = mat4x3(1.0);
     hitW2o = mat4x3(1.0);
 
-    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
     rayQueryEXT rq;
+#if ENABLE_ALPHA_MASK
+    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
     if (!hasAlphaMask) {
         rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, RAY_MASK_ALL, origin, tMin, dir, closestT);
         rayQueryProceedEXT(rq);
@@ -54,12 +59,14 @@ void traceClosestSceneHit(
                 uint cPrimIdx = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
                 InstanceGPU cInst = instances[cInstIdx];
                 uint cTriIdx = cInst.firstTriangle + ((cGeomIdx == 0u) ? cPrimIdx : (cPrimIdx + cInst.numOpaqueTriangles));
-                Triangle cTri = triangles[cTriIdx];
-                uint cMatId = cTri.materialId + cInst.materialOffset;
+                uint cMatId = triangles[cTriIdx].materialId + cInst.materialOffset;
                 ShadeMaterial sm = shadeMaterials[cMatId];
                 if (smGetAlphaMode(sm) == 1u /* ALPHA_MODE_MASK */) {
                     vec2 cBary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                    vec2 cUv = getTriangleUV(cTri, cBary);
+                    float cw = 1.0 - cBary.x - cBary.y;
+                    vec2 cUv = cw * vec2(triangles[cTriIdx].uv0x, triangles[cTriIdx].uv0y)
+                             + cBary.x * vec2(triangles[cTriIdx].uv1x, triangles[cTriIdx].uv1y)
+                             + cBary.y * vec2(triangles[cTriIdx].uv2x, triangles[cTriIdx].uv2y);
                     float cAlpha = sm.albedo.a;
                     uint albTex = smGetAlbedoTex(sm);
                     if (albTex > 0u && albTex <= 512u) {
@@ -73,6 +80,10 @@ void traceClosestSceneHit(
             }
         }
     }
+#else
+    rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsOpaqueEXT, RAY_MASK_ALL, origin, tMin, dir, closestT);
+    rayQueryProceedEXT(rq);
+#endif
 
     if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
         closestT = rayQueryGetIntersectionTEXT(rq, true);

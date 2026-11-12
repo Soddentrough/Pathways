@@ -323,12 +323,15 @@ int main(int argc, char* argv[]) {
 
                     cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
                     if (!stepAndVerify("6d. FSR 4.1 ML (0.67x) + E-SVGF", 4, expectedFsr4, "SVGF")) return 1;
+                }
 
-                    // Verify live transition from coupled FSR 4.1 ML + Upways Denoiser -> Upways SR -> Native Upways Denoiser
+                if (initStats.has_fp8_coop_matrix) {
+                    // Verify live transition -> Upways SR (0.67x) -> Native Upways Denoiser (1.0x)
                     cfg.upscaler_mode = pathways::UpscalerMode::Upways;
                     cfg.upways_superres = true;
+                    cfg.render_scale = 0.6666667f;
                     cfg.denoiser_mode = pathways::DenoiserMode::Upways;
-                    if (!stepAndVerify("6e. Switch FSR4+Upways -> Upways SR (0.67x)", 4, "Upways", "Upways")) return 1;
+                    if (!stepAndVerify("6e. Switch -> Upways SR (0.67x) + Upways Denoiser", 4, "Upways", "Upways")) return 1;
 
                     cfg.upscaler_mode = pathways::UpscalerMode::None;
                     cfg.upways_superres = false;

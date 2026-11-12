@@ -458,6 +458,7 @@ SceneData cloneLightweightSceneMetadata(const SceneData& src) {
     }
     dst.meshRanges = src.meshRanges;
     dst.numOpaqueTriangles = src.numOpaqueTriangles;
+    dst.numSolidNonOpaqueTriangles = src.numSolidNonOpaqueTriangles;
     dst.blasRanges = src.blasRanges;
     dst.instances = src.instances;
     dst.instanceData = src.instanceData;
@@ -523,6 +524,7 @@ void Engine::syncScenePointers() {
         m_numLights = m_sceneManager->getNumLights();
         m_sceneHasNonOpaque = m_sceneManager->hasNonOpaque();
         m_sceneHasAlphaMask = m_sceneManager->hasAlphaMask();
+        m_sceneHasAlphaShadow = m_sceneManager->hasAlphaShadow();
         m_sceneData = cloneLightweightSceneMetadata(m_sceneManager->getSceneData());
         m_currentSceneIndex = m_sceneManager->getCurrentSceneIndex();
         m_availableScenes = m_sceneManager->getAvailableScenes();
@@ -550,6 +552,7 @@ void Engine::syncScenePointers() {
         m_numLights = 0;
         m_sceneHasNonOpaque = false;
         m_sceneHasAlphaMask = false;
+        m_sceneHasAlphaShadow = false;
     }
 }
 
@@ -880,7 +883,7 @@ bool Engine::loadScene(const std::string& filepath) {
 
 void Engine::updateSceneTransparencyFlag() {
     if (m_geometryPipeline) {
-        m_geometryPipeline->updateSceneTransparency(m_sceneData.materials, m_sceneHasNonOpaque, m_sceneHasAlphaMask);
+        m_geometryPipeline->updateSceneTransparency(m_sceneData.materials, m_sceneHasNonOpaque, m_sceneHasAlphaMask, m_sceneHasAlphaShadow);
     }
 }
 
@@ -1087,6 +1090,15 @@ void Engine::initPipelines() {
         m_context->hasSubgroupSizeControl(),
         initBatchPixels,
         wfTailMegakernelCode
+    );
+    m_rtOrchestrator->initWavefrontSpecializedVariants(
+        loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+        loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv")
     );
 
     // 6c. Neural Radiance Caching (NRC) Manager (Wave32 WMMA — lazily allocated when enabled)
@@ -1481,6 +1493,9 @@ void Engine::updateMergeDescriptors() {
     mergeParams.concurrentQueues = getConcurrentQueueFamilies();
 
     m_descriptorManager->updateMergeDescriptors(mergeParams);
+    if (m_mgpu && m_mgpu->isSecondaryInitialized()) {
+        m_lastMergedSharedGen = m_mgpu->getSharedBufferGeneration();
+    }
     syncDescriptorPointers();
 }
 
@@ -1868,9 +1883,10 @@ void Engine::renderFrame() {
 
     if (m_pendingMgpuModeChange || m_pendingMgpuUpscaleModeChange || m_pendingAccumFormatChange ||
         m_pendingDoubleBufferChange || m_pendingTileSizeChange || scalingOrUpscalerChanged || batchingChanged) {
-        VkDevice dev = m_context->getDevice();
-        VmaAllocator alloc = m_context->getAllocator();
-        vkDeviceWaitIdle(dev);
+        if (m_mgpu) {
+            m_mgpu->waitWorkerIdle();
+        }
+        vkDeviceWaitIdle(device);
         if (m_mgpu && m_mgpu->getSecondaryContext()) {
             vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
         }
@@ -1908,6 +1924,9 @@ void Engine::renderFrame() {
         }
 
         if (m_pendingMgpuModeChange) {
+            if (m_mgpu) {
+                m_mgpu->waitWorkerIdle();
+            }
             vkDeviceWaitIdle(device);
             if (m_mgpu && m_mgpu->getSecondaryContext()) {
                 vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
@@ -1981,6 +2000,39 @@ void Engine::renderFrame() {
             m_lastRenderScale = 0.5f;
         }
 
+        // Resize render-space G-buffers & ML guides first so Upways, FSR, Denoiser, and RT
+        // descriptors never bind stale or soon-to-be-destroyed G-buffer VkImageViews.
+        {
+            const uint32_t targetGbW = getEffectiveGbufferWidth();
+            const uint32_t targetGbH = getEffectiveGbufferHeight();
+            if (m_renderTargets &&
+                (m_renderTargets->getRenderTargetWidth() != targetGbW ||
+                 m_renderTargets->getRenderTargetHeight() != targetGbH)) {
+                auto concurrentQueues = getConcurrentQueueFamilies();
+                m_renderTargets->resizeRenderSpaceTargets(
+                    targetGbW, targetGbH, concurrentQueues, m_commandBuffers[0]
+                );
+                syncRenderTargetPointers();
+                if (m_causticsPipeline) {
+                    m_causticsPipeline->resize(targetGbW, targetGbH, [this](auto recordFn) {
+                        VkCommandBuffer c = m_commandBuffers[0];
+                        vkResetCommandBuffer(c, 0);
+                        VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                        vkBeginCommandBuffer(c, &bi);
+                        recordFn(c);
+                        vkEndCommandBuffer(c);
+                        VkCommandBufferSubmitInfo csi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                        csi.commandBuffer = c;
+                        VkSubmitInfo2 si{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                        si.commandBufferInfoCount = 1;
+                        si.pCommandBufferInfos = &csi;
+                        vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &si, VK_NULL_HANDLE);
+                        vkQueueWaitIdle(m_context->getGraphicsQueue());
+                    });
+                }
+            }
+        }
+
         if (m_superResolution) {
             m_superResolution->releaseInactivePipelines(m_config);
             if (m_config.upscaler_mode != UpscalerMode::None ||
@@ -1992,8 +2044,6 @@ void Engine::renderFrame() {
                     m_postProcess.get(), m_commandBuffers[0],
                     m_config.fsr_version
                 );
-                updateUpwaysDescriptors();
-                updateFsrDescriptors();
             }
         }
 
@@ -2003,7 +2053,6 @@ void Engine::renderFrame() {
             if (m_denoiser->getWidth() != denoiseW || m_denoiser->getHeight() != denoiseH) {
                 m_denoiser->resize(denoiseW, denoiseH, m_config.accum_format, m_commandBuffers[0]);
                 m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
-                updateFsrDescriptors();
             }
         }
 
@@ -2013,9 +2062,13 @@ void Engine::renderFrame() {
             m_rtOrchestrator->resize(traceW, traceH, m_config);
             m_currentBatchCount = m_rtOrchestrator->getCurrentBatchCount();
             m_currentBatchPixels = m_rtOrchestrator->getCurrentBatchPixels();
-            updateWavefrontSceneDescriptors();
         }
 
+        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            m_mgpu->setConfig(m_config);
+        }
+
+        updateAllImageDescriptors();
         updateMergeDescriptors();
         m_resetAccumulation = true;
         m_frameTimesMs.clear();
@@ -2199,6 +2252,7 @@ void Engine::renderFrame() {
     if (m_config.enable_shadows)        flags |= (1 << 4);
     if (m_sceneHasNonOpaque)            flags |= (1 << 5);
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
+    if (m_sceneHasAlphaShadow)          flags |= (1 << 27);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
     if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty())) flags |= (1 << 7);
     if (m_config.enable_caustics) {
@@ -2241,6 +2295,9 @@ void Engine::renderFrame() {
     if (m_renderTargets &&
         (m_renderTargets->getRenderTargetWidth() != targetGbW ||
          m_renderTargets->getRenderTargetHeight() != targetGbH)) {
+        if (m_mgpu) {
+            m_mgpu->waitWorkerIdle();
+        }
         vkDeviceWaitIdle(device);
         auto concurrentQueues = getConcurrentQueueFamilies();
         m_renderTargets->resizeRenderSpaceTargets(
@@ -2662,7 +2719,15 @@ void Engine::renderFrame() {
                     );
                 }
             }
+            const VkBuffer prevSharedBuf0 = (m_mgpu && m_mgpu->isSecondaryInitialized())
+                ? m_mgpu->getPrimarySharedBuffer(0)
+                : VK_NULL_HANDLE;
             mgpuPlan = m_mgpuCoordinator->planAndLaunchSecondary(planParams, m_accumulatedSamples, accumReset);
+            if (m_mgpu && m_mgpu->isSecondaryInitialized() &&
+                (m_mgpu->getPrimarySharedBuffer(0) != prevSharedBuf0 ||
+                 m_mgpu->getSharedBufferGeneration() != m_lastMergedSharedGen)) {
+                updateMergeDescriptors();
+            }
 
             auto onPreRecord = [this](VkCommandBuffer c) {
                 // GPU-Timeline TLAS Update / Refit & Dynamic Light Upload (Tier 3)
@@ -2993,7 +3058,6 @@ void Engine::renderFrame() {
         vkQueueSubmit2(queue, 1, &submitInfo, inFlightFence);
     }
 
-
     if (m_presentation) {
         m_presentation->present(queue, imageIndex, [this](uint32_t w, uint32_t h, bool f) { onResize(w, h, f); });
     }
@@ -3158,15 +3222,21 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
         return;
     }
 
+    VkDevice device = m_context->getDevice();
+    VkQueue queue = m_context->getGraphicsQueue();
+
+    if (m_mgpu) {
+        m_mgpu->waitWorkerIdle();
+    }
+    vkDeviceWaitIdle(device);
+    if (m_mgpu && m_mgpu->getSecondaryContext()) {
+        vkDeviceWaitIdle(m_mgpu->getSecondaryContext()->getDevice());
+    }
+
     if (m_presentation) {
         m_presentation->onResize(newWidth, newHeight, m_config, forceRecreate);
         syncPresentationPointers();
     }
-
-    VkDevice device = m_context->getDevice();
-    VkQueue queue = m_context->getGraphicsQueue();
-
-    vkDeviceWaitIdle(device);
 
     if (m_gui && m_swapchain) {
         m_gui->updateSwapchainFormat(
@@ -3582,7 +3652,8 @@ void Engine::run() {
 
     // Wake GPU SMU(s) out of post-scene-load deep idle sleep and warm instruction/BVH caches
     // for bounded/benchmark runs (never block interactive viewport startup).
-    if ((m_config.headless || m_config.benchmark || m_config.frame_limit >= 10) && m_config.warmup_frames == 0 && m_wavefrontPipeline) {
+    if ((m_config.headless || m_config.benchmark || m_config.frame_limit >= 10) &&
+        (m_config.warmup_frames == 0 || m_config.benchmark) && m_wavefrontPipeline) {
         uint32_t savedWarmup = m_config.warmup_frames;
         bool savedBenchmark = m_config.benchmark;
         bool savedCameraMotion = m_config.camera_motion;

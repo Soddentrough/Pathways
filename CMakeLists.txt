@@ -226,6 +226,40 @@ add_custom_command(
 )
 list(APPEND SPV_FILES ${SEC_COMPLEX_SPV})
 
+# Alpha-mask specialized secondary intersection shader (zero texture/UV overhead on opaque scenes)
+set(INTERSECT_ALPHA_SPV ${SPV_OUTPUT_DIR}/wavefront_intersect_alpha.comp.spv)
+set(BIN_INTERSECT_ALPHA_SPV ${BIN_SPV_DIR}/wavefront_intersect_alpha.comp.spv)
+add_custom_command(
+    OUTPUT ${INTERSECT_ALPHA_SPV}
+    COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DENABLE_ALPHA_MASK=1 -O ${SHADER_DIR}/compute/wavefront_intersect.comp -o ${INTERSECT_ALPHA_SPV}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${INTERSECT_ALPHA_SPV} ${BIN_INTERSECT_ALPHA_SPV}
+    DEPENDS ${SHADER_DIR}/compute/wavefront_intersect.comp ${SHADER_INCLUDE_DEPS}
+    COMMENT "Compiling alpha-mask intersection shader wavefront_intersect_alpha.comp to SPIR-V"
+)
+list(APPEND SPV_FILES ${INTERSECT_ALPHA_SPV})
+
+# ReSTIR PT specialized material shading variants (isolates reservoir VGPR pressure from non-ReSTIR paths)
+function(add_specialized_wf_shader OUT_NAME SRC_FILE)
+    set(EXTRA_DEFS ${ARGN})
+    set(OUT_SPV ${SPV_OUTPUT_DIR}/${OUT_NAME}.spv)
+    set(BIN_OUT_SPV ${BIN_SPV_DIR}/${OUT_NAME}.spv)
+    add_custom_command(
+        OUTPUT ${OUT_SPV}
+        COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 ${EXTRA_DEFS} -O ${SHADER_DIR}/compute/${SRC_FILE} -o ${OUT_SPV}
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OUT_SPV} ${BIN_OUT_SPV}
+        DEPENDS ${SHADER_DIR}/compute/${SRC_FILE} ${SHADER_INCLUDE_DEPS}
+        COMMENT "Compiling specialized shader ${OUT_NAME} to SPIR-V"
+    )
+    set(SPV_FILES ${SPV_FILES} ${OUT_SPV} PARENT_SCOPE)
+endfunction()
+
+add_specialized_wf_shader(wavefront_shade_diffuse_restir.comp wavefront_shade_diffuse.comp -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_diffuse_sec_restir.comp wavefront_shade_diffuse.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_complex_restir.comp wavefront_shade_complex.comp -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_complex_sec_restir.comp wavefront_shade_complex.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_restir.comp wavefront_shade_dielectric.comp -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_emissive_restir.comp wavefront_shade_emissive.comp -DENABLE_RESTIR_PT=1)
+
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 
 # Engine sources
@@ -534,9 +568,19 @@ add_custom_target(package_upways_weights
         -DPATHWAYS_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
         -DUPWAYS_DIR="${UPWAYS_DIR}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackageUpwaysWeights.cmake"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin/data/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights.bin"
     BYPRODUCTS
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_weights.hpp"
+        "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights.bin"
     COMMENT "Checking and packaging updated Upways neural weights"
 )
 
@@ -553,6 +597,10 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
              DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
     endif()
     add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+            "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
         COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"

@@ -109,6 +109,28 @@ void RayTracingOrchestrator::initWavefrontPipeline(
     Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 }
 
+void RayTracingOrchestrator::initWavefrontSpecializedVariants(
+    const std::vector<char>& intersectAlphaCode,
+    const std::vector<char>& shadeDiffuseRestirCode,
+    const std::vector<char>& shadeDiffuseSecRestirCode,
+    const std::vector<char>& shadeComplexRestirCode,
+    const std::vector<char>& shadeComplexSecRestirCode,
+    const std::vector<char>& shadeDielectricRestirCode,
+    const std::vector<char>& shadeEmissiveRestirCode
+) {
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->initSpecializedVariants(
+            intersectAlphaCode,
+            shadeDiffuseRestirCode,
+            shadeDiffuseSecRestirCode,
+            shadeComplexRestirCode,
+            shadeComplexSecRestirCode,
+            shadeDielectricRestirCode,
+            shadeEmissiveRestirCode
+        );
+    }
+}
+
 void RayTracingOrchestrator::initNRC(
     uint32_t width,
     uint32_t height,
@@ -464,10 +486,9 @@ void RayTracingOrchestrator::recordRayTracing(
                             config.denoiser_mode == DenoiserMode::Upways ||
                             config.denoiser_mode == DenoiserMode::Svgf ||
                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                            params.isRestirActive ||
                             config.enable_caustics ||
                             !config.capture_training_data_dir.empty());
-        bool needGbuffers = needNormals || (config.upscaler_mode == UpscalerMode::FSR);
+        bool needGbuffers = needNormals || params.isRestirActive || (config.upscaler_mode == UpscalerMode::FSR);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
                           config.denoiser_mode == DenoiserMode::Svgf ||
                           config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||

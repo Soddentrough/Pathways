@@ -109,13 +109,11 @@ DGCManager::~DGCManager() {
         pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_executionSet, nullptr);
         m_executionSet = VK_NULL_HANDLE;
     }
-    if (m_materialExecutionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
-        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);
-        m_materialExecutionSet = VK_NULL_HANDLE;
-    }
-    if (m_materialExecutionSetSecondary && pfn_vkDestroyIndirectExecutionSetEXT) {
-        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSetSecondary, nullptr);
-        m_materialExecutionSetSecondary = VK_NULL_HANDLE;
+    for (auto& execSet : m_materialExecutionSets) {
+        if (execSet && pfn_vkDestroyIndirectExecutionSetEXT) {
+            pfn_vkDestroyIndirectExecutionSetEXT(m_device, execSet, nullptr);
+            execSet = VK_NULL_HANDLE;
+        }
     }
     m_preprocessBuffer.reset();
     m_materialPreprocessBuffer.reset();
@@ -305,18 +303,27 @@ void DGCManager::recordExecute(VkCommandBuffer cmd, VkPipeline pipeline, Buffer*
 }
 
 void DGCManager::initMaterialExecutionSet(const std::vector<VkPipeline>& materialPipelines) {
-    initMaterialExecutionSets(materialPipelines, {});
+    initMaterialExecutionSets(std::vector<std::vector<VkPipeline>>{materialPipelines});
 }
 
 void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primaryPipelines,
-                                         const std::vector<VkPipeline>& secondaryPipelines) {
+                                           const std::vector<VkPipeline>& secondaryPipelines) {
+    if (secondaryPipelines.empty()) {
+        initMaterialExecutionSets(std::vector<std::vector<VkPipeline>>{primaryPipelines});
+    } else {
+        initMaterialExecutionSets(std::vector<std::vector<VkPipeline>>{primaryPipelines, secondaryPipelines});
+    }
+}
+
+void DGCManager::initMaterialExecutionSets(const std::vector<std::vector<VkPipeline>>& pipelineSets) {
     // Kill-switch policy centralized in Config::dgcExecSetRequested():
     // --dgc-execset / --no-dgc-execset, PATHWAYS_DGC_EXECSET, and legacy overrides.
     const bool enableMaterialDGC = Config::dgcExecSetRequested();
-    if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || primaryPipelines.empty()) {
+    const bool hasPrimary = !pipelineSets.empty() && !pipelineSets[0].empty();
+    if (!enableMaterialDGC || !m_supported || !m_materialIndirectLayout || !hasPrimary) {
         m_materialDGCSupported = false;
-        Logger::info("Material microkernels active via GPU multi-dispatch indirect queues ({} specialized pipelines).",
-                     primaryPipelines.size());
+        Logger::info("Material microkernels active via GPU multi-dispatch indirect queues ({} specialized pipelines, {} variant sets).",
+                     hasPrimary ? pipelineSets[0].size() : 0u, pipelineSets.size());
         return;
     }
 
@@ -351,60 +358,52 @@ void DGCManager::initMaterialExecutionSets(const std::vector<VkPipeline>& primar
 
     m_materialPreprocessBuffer.reset();
     m_materialSliceSize = 0;
-    if (m_materialExecutionSet && pfn_vkDestroyIndirectExecutionSetEXT) {
-        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSet, nullptr);
-        m_materialExecutionSet = VK_NULL_HANDLE;
-    }
-    if (m_materialExecutionSetSecondary && pfn_vkDestroyIndirectExecutionSetEXT) {
-        pfn_vkDestroyIndirectExecutionSetEXT(m_device, m_materialExecutionSetSecondary, nullptr);
-        m_materialExecutionSetSecondary = VK_NULL_HANDLE;
+    for (auto& execSet : m_materialExecutionSets) {
+        if (execSet && pfn_vkDestroyIndirectExecutionSetEXT) {
+            pfn_vkDestroyIndirectExecutionSetEXT(m_device, execSet, nullptr);
+            execSet = VK_NULL_HANDLE;
+        }
     }
 
-    m_materialExecutionSet = createExecSet(primaryPipelines, "primary material");
-
-    if (!secondaryPipelines.empty()) {
-        m_materialExecutionSetSecondary = createExecSet(secondaryPipelines, "secondary material");
-        Logger::info("Initialized primary and secondary VkIndirectExecutionSetEXT ({} primary, {} secondary pipelines).",
-                     primaryPipelines.size(), secondaryPipelines.size());
-    } else {
-        Logger::info("Initialized material VkIndirectExecutionSetEXT with {} specialized material pipelines.", primaryPipelines.size());
+    static constexpr const char* kSetNames[4] = {
+        "primary material", "secondary material", "ReSTIR primary material", "ReSTIR bounce-1 material"
+    };
+    uint32_t createdSets = 0;
+    for (size_t s = 0; s < pipelineSets.size() && s < m_materialExecutionSets.size(); ++s) {
+        if (!pipelineSets[s].empty()) {
+            m_materialExecutionSets[s] = createExecSet(pipelineSets[s], kSetNames[s]);
+            createdSets++;
+        }
     }
+
+    Logger::info("Initialized {} VkIndirectExecutionSetEXT material sets ({} pipelines per set).",
+                 createdSets, pipelineSets[0].size());
     Logger::info("DGC Material Execution Set active (enabled via --dgc-execset / PATHWAYS_DGC_EXECSET). Use --no-dgc-execset to return to default multi-dispatch indirect.");
 
-    ensureMaterialPreprocessBuffer(static_cast<uint32_t>(primaryPipelines.size()));
+    ensureMaterialPreprocessBuffer(static_cast<uint32_t>(pipelineSets[0].size()));
 }
 
 void DGCManager::ensureMaterialPreprocessBuffer(uint32_t maxSequenceCount) {
-    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSet) return;
+    if (!m_supported || !m_materialDGCSupported || !m_materialIndirectLayout || !m_materialExecutionSets[0]) return;
     if (m_materialPreprocessBuffer) return;
 
     uint32_t targetSequenceCount = std::max(maxSequenceCount, 6u);
 
-    VkGeneratedCommandsMemoryRequirementsInfoEXT memInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
-    memInfo.pNext = nullptr;
-    memInfo.indirectExecutionSet = m_materialExecutionSet;
-    memInfo.indirectCommandsLayout = m_materialIndirectLayout;
-    memInfo.maxSequenceCount = targetSequenceCount;
-    memInfo.maxDrawCount = 0;
+    VkDeviceSize reqSize = 1024;
+    VkDeviceSize align = 256;
+    for (VkIndirectExecutionSetEXT execSet : m_materialExecutionSets) {
+        if (!execSet) continue;
+        VkGeneratedCommandsMemoryRequirementsInfoEXT memInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
+        memInfo.pNext = nullptr;
+        memInfo.indirectExecutionSet = execSet;
+        memInfo.indirectCommandsLayout = m_materialIndirectLayout;
+        memInfo.maxSequenceCount = targetSequenceCount;
+        memInfo.maxDrawCount = 0;
 
-    VkMemoryRequirements2 memReqs{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-    pfn_vkGetGeneratedCommandsMemoryRequirementsEXT(m_device, &memInfo, &memReqs);
-
-    VkDeviceSize reqSize = std::max<VkDeviceSize>(memReqs.memoryRequirements.size, 1024);
-    VkDeviceSize align = std::max<VkDeviceSize>(memReqs.memoryRequirements.alignment, 256);
-
-    if (m_materialExecutionSetSecondary) {
-        VkGeneratedCommandsMemoryRequirementsInfoEXT secMemInfo{ VK_STRUCTURE_TYPE_GENERATED_COMMANDS_MEMORY_REQUIREMENTS_INFO_EXT };
-        secMemInfo.pNext = nullptr;
-        secMemInfo.indirectExecutionSet = m_materialExecutionSetSecondary;
-        secMemInfo.indirectCommandsLayout = m_materialIndirectLayout;
-        secMemInfo.maxSequenceCount = targetSequenceCount;
-        secMemInfo.maxDrawCount = 0;
-
-        VkMemoryRequirements2 secMemReqs{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
-        pfn_vkGetGeneratedCommandsMemoryRequirementsEXT(m_device, &secMemInfo, &secMemReqs);
-        reqSize = std::max<VkDeviceSize>(reqSize, secMemReqs.memoryRequirements.size);
-        align = std::max<VkDeviceSize>(align, secMemReqs.memoryRequirements.alignment);
+        VkMemoryRequirements2 memReqs{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        pfn_vkGetGeneratedCommandsMemoryRequirementsEXT(m_device, &memInfo, &memReqs);
+        reqSize = std::max<VkDeviceSize>(reqSize, memReqs.memoryRequirements.size);
+        align = std::max<VkDeviceSize>(align, memReqs.memoryRequirements.alignment);
     }
 
     m_materialSliceSize = ((reqSize + align - 1) / align) * align;
@@ -422,12 +421,14 @@ void DGCManager::ensureMaterialPreprocessBuffer(uint32_t maxSequenceCount) {
 }
 
 void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
-                                        Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                        uint32_t sliceIndex, uint32_t sequenceCount,
-                                        VkDeviceAddress sequenceCountAddress,
-                                        bool isSecondary) {
+                                          Buffer* argumentBuffer, VkDeviceSize argumentOffset,
+                                          uint32_t sliceIndex, uint32_t sequenceCount,
+                                          VkDeviceAddress sequenceCountAddress,
+                                          uint32_t execSetIndex) {
     if (!m_supported || !m_explicitPreprocess || !argumentBuffer || pipelines.empty()) return;
-    VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
+    VkIndirectExecutionSetEXT targetSet = (execSetIndex < m_materialExecutionSets.size() && m_materialExecutionSets[execSetIndex])
+        ? m_materialExecutionSets[execSetIndex]
+        : m_materialExecutionSets[0];
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet) return;
 
     ensureMaterialPreprocessBuffer(sequenceCount);
@@ -453,13 +454,15 @@ void DGCManager::recordMaterialPreprocess(VkCommandBuffer cmd, const std::vector
 }
 
 void DGCManager::recordMaterialExecute(VkCommandBuffer cmd, const std::vector<VkPipeline>& pipelines,
-                                      Buffer* argumentBuffer, VkDeviceSize argumentOffset,
-                                      uint32_t sliceIndex, uint32_t sequenceCount,
-                                      bool isPreprocessed, VkDeviceAddress sequenceCountAddress,
-                                      bool isSecondary) {
+                                       Buffer* argumentBuffer, VkDeviceSize argumentOffset,
+                                       uint32_t sliceIndex, uint32_t sequenceCount,
+                                       bool isPreprocessed, VkDeviceAddress sequenceCountAddress,
+                                       uint32_t execSetIndex) {
     if (!argumentBuffer || pipelines.empty()) return;
 
-    VkIndirectExecutionSetEXT targetSet = (isSecondary && m_materialExecutionSetSecondary) ? m_materialExecutionSetSecondary : m_materialExecutionSet;
+    VkIndirectExecutionSetEXT targetSet = (execSetIndex < m_materialExecutionSets.size() && m_materialExecutionSets[execSetIndex])
+        ? m_materialExecutionSets[execSetIndex]
+        : m_materialExecutionSets[0];
 
     if (!m_materialDGCSupported || !m_materialIndirectLayout || !targetSet || (m_explicitPreprocess && !isPreprocessed)) {
         // Direct multi-dispatch indirect (16 bytes stride per DispatchCommand)

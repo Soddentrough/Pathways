@@ -15,7 +15,7 @@ const float FP8_ACT_SCALE             = 16.0;
 const float FP8_ACT_INV_SCALE         = 0.0625;
 
 // Exact Section 1 (FP8 E4M3 WMMA 16x16 blocks) & Section 2 (FP32 scales, biases, 3x3 DW, skip_scale) offsets
-// Generated deterministically by upways.export.compute_shader_weight_offsets() (89,536 bytes total)
+// Generated deterministically by upways.export.compute_shader_weight_offsets() (87,232 bytes total)
 const uint ENC0_PW1_W_FP8_OFFSET      = 0u;
 const uint ENC0_PW1_S_F32_OFFSET      = 0u;
 const uint ENC0_PW1_B_F32_OFFSET      = 32u;
@@ -50,24 +50,24 @@ const uint DEC1_PW2_S_F32_OFFSET      = 1440u;
 const uint DEC1_PW2_B_F32_OFFSET      = 1472u;
 const uint DEC0_PW1_W_FP8_OFFSET      = 64000u;
 const uint DEC0_PW1_S_F32_OFFSET      = 1504u;
-const uint DEC0_PW1_B_F32_OFFSET      = 1568u;
-const uint DEC0_PW2_W_FP8_OFFSET      = 66048u;
-const uint DEC0_PW2_S_F32_OFFSET      = 1632u;
-const uint DEC0_PW2_B_F32_OFFSET      = 1664u;
-const uint HEAD_OUT_W_FP8_OFFSET      = 68096u;
-const uint HEAD_OUT_S_F32_OFFSET      = 1696u;
-const uint HEAD_OUT_B_F32_OFFSET      = 1712u;
-const uint HEAD_REC_W_FP8_OFFSET      = 68608u;
-const uint HEAD_REC_S_F32_OFFSET      = 1728u;
-const uint HEAD_REC_B_F32_OFFSET      = 1760u;
+const uint DEC0_PW1_B_F32_OFFSET      = 1536u;
+const uint DEC0_PW2_W_FP8_OFFSET      = 65024u;
+const uint DEC0_PW2_S_F32_OFFSET      = 1568u;
+const uint DEC0_PW2_B_F32_OFFSET      = 1600u;
+const uint HEAD_OUT_W_FP8_OFFSET      = 66048u;
+const uint HEAD_OUT_S_F32_OFFSET      = 1632u;
+const uint HEAD_OUT_B_F32_OFFSET      = 1648u;
+const uint HEAD_REC_W_FP8_OFFSET      = 66560u;
+const uint HEAD_REC_S_F32_OFFSET      = 1664u;
+const uint HEAD_REC_B_F32_OFFSET      = 1696u;
 
-const uint ENC0_DW_W_F32_OFFSET       = 1792u;
-const uint ENC1_DW_W_F32_OFFSET       = 2080u;
-const uint BOT1_DW_W_F32_OFFSET       = 2368u;
-const uint BOT2_DW_W_F32_OFFSET       = 2944u;
-const uint DEC1_DW_W_F32_OFFSET       = 4096u;
-const uint DEC0_DW_W_F32_OFFSET       = 4672u;
-const uint SKIP_SCALE_F32_OFFSET      = 4960u;
+const uint ENC0_DW_W_F32_OFFSET       = 1728u;
+const uint ENC1_DW_W_F32_OFFSET       = 2016u;
+const uint BOT1_DW_W_F32_OFFSET       = 2304u;
+const uint BOT2_DW_W_F32_OFFSET       = 2880u;
+const uint DEC1_DW_W_F32_OFFSET       = 4032u;
+const uint DEC0_DW_W_F32_OFFSET       = 4608u;
+const uint SKIP_SCALE_F32_OFFSET      = 4896u;
 
 layout(push_constant) uniform UpwaysPushConstants {
     uint renderWidth;
@@ -135,9 +135,8 @@ PyramidLayout computePyramidLayout(uint w0, uint h0) {
 }
 
 float sanitizeScalar(float x, float posInfReplacement) {
-    if (isnan(x)) return 0.0;
-    if (isinf(x)) return (x > 0.0) ? posInfReplacement : 0.0;
-    return x;
+    float clean = isnan(x) ? 0.0 : x;
+    return isinf(clean) ? ((clean > 0.0) ? posInfReplacement : 0.0) : clean;
 }
 
 vec3 sanitizeVec3Input(vec3 v) {

@@ -1062,10 +1062,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (!hwMl && config.fsr_version == FsrVersion::Fsr4) {
                     config.upscaler_mode = UpscalerMode::None;
                     config.render_scale = 1.0f;
+                    m_fsr4StubSelected = true;
                 } else if (!stats.supports_fsr3 && config.fsr_version == FsrVersion::Fsr3) {
                     config.upscaler_mode = UpscalerMode::None;
                     config.render_scale = 1.0f;
                 }
+            }
+            if (config.upscaler_mode != UpscalerMode::None || hwMl) {
+                m_fsr4StubSelected = false;
             }
             if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration && !stats.supports_fsr_rr) {
                 config.denoiser_mode = DenoiserMode::None;
@@ -1074,16 +1078,22 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             // --- Row 1: Upscaler 1-Click Selector ---
             ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Upscaler:");
             const float upBtnW = (availW - spacingX * 3.0f) / 4.0f;
-            auto drawQuickUpscalerBtn = [&](const char* label, bool isSelected, bool isSupported, const char* tooltip, auto onClick) {
+            auto drawQuickUpscalerBtn = [&](const char* label, bool isSelected, bool isSupported, bool isStubStyle, const char* tooltip, auto onClick) {
                 if (!isSupported) {
                     ImGui::BeginDisabled(true);
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.16f, 0.16f, 0.18f, 0.35f));
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.44f, 0.48f, 0.55f));
+                } else if (isSelected && isStubStyle) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.72f, 0.46f, 0.10f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.82f, 0.54f, 0.14f, 1.0f));
                 } else if (isSelected) {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.58f, 0.38f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.68f, 0.46f, 1.0f));
+                } else if (isStubStyle) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.19f, 0.12f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.34f, 0.26f, 0.16f, 1.0f));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
@@ -1104,38 +1114,51 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
             };
 
-            const bool isFsr4Selected = (config.upscaler_mode == UpscalerMode::FSR) && hwMl &&
-                                        (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Auto);
+            const bool isFsr4Selected = hwMl
+                ? ((config.upscaler_mode == UpscalerMode::FSR) &&
+                   (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Auto))
+                : m_fsr4StubSelected;
             const bool isFsr3Selected = (config.upscaler_mode == UpscalerMode::FSR) && stats.supports_fsr3 &&
                                         (config.fsr_version == FsrVersion::Fsr3 || (config.fsr_version == FsrVersion::Auto && !hwMl));
 
-            drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None, true,
+            drawQuickUpscalerBtn("Native 1.0x", config.upscaler_mode == UpscalerMode::None && !m_fsr4StubSelected, true, false,
                 "Render at full native display resolution (no upscaling).", [&]() {
+                    m_fsr4StubSelected = false;
                     config.upscaler_mode = UpscalerMode::None;
                     config.upways_superres = false;
                     config.render_scale = 1.0f;
                 });
             ImGui::SameLine();
-            drawQuickUpscalerBtn("FSR 4.1 ML", isFsr4Selected, hwMl,
+            drawQuickUpscalerBtn(hwMl ? "FSR 4.1 ML" : "FSR 4 (Stub)", isFsr4Selected, true, !hwMl,
                 hwMl ? "AMD FidelityFX Super Resolution 4.1.2 (Native Vulkan ML Cooperative Matrix Super-Resolution)."
-                     : "Unavailable on Linux Vulkan: AMD FidelityFX SDK 2.4.0 ships FSR 4 only as closed-source Windows DX12/relocated DLL; native Vulkan provider stub active.", [&]() {
-                    config.upscaler_mode = UpscalerMode::FSR;
-                    config.fsr_version = FsrVersion::Fsr4;
-                    config.upways_superres = false;
-                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                     : "FSR 4 Native Vulkan Stub (Native 1.0x Pass-Through): AMD FidelityFX SDK 2.4.0 ships FSR 4 only as a closed-source Windows DX12/relocated DLL; no native Linux Vulkan FSR 4 provider exists yet.", [&]() {
+                    if (hwMl) {
+                        m_fsr4StubSelected = false;
+                        config.upscaler_mode = UpscalerMode::FSR;
+                        config.fsr_version = FsrVersion::Fsr4;
+                        config.upways_superres = false;
+                        if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                    } else {
+                        m_fsr4StubSelected = true;
+                        config.upscaler_mode = UpscalerMode::None;
+                        config.upways_superres = false;
+                        config.render_scale = 1.0f;
+                    }
                 });
             ImGui::SameLine();
-            drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected, stats.supports_fsr3,
+            drawQuickUpscalerBtn("FSR 3.1", isFsr3Selected, stats.supports_fsr3, false,
                 stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (Native C++ Vulkan SDK Super-Resolution)."
                                     : "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk).", [&]() {
+                    m_fsr4StubSelected = false;
                     config.upscaler_mode = UpscalerMode::FSR;
                     config.fsr_version = FsrVersion::Fsr3;
                     config.upways_superres = false;
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
-            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
+            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix && stats.has_fp8_coop_matrix, false,
                 "Upways 3.0 RDNA 4 FP8 WMMA Spatiotemporal Backbone + Continuous Subpixel Resolve (requires VK_EXT_shader_float8 + VK_KHR_cooperative_matrix).", [&]() {
+                    m_fsr4StubSelected = false;
                     config.upscaler_mode = UpscalerMode::Upways;
                     config.denoiser_mode = DenoiserMode::Upways;
                     config.upways_superres = true;
@@ -1171,12 +1194,19 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 uint32_t rW = config.getRenderWidth();
                 uint32_t rH = config.getRenderHeight();
                 const char* activeUpscalerDesc =
-                    isFsr4Selected ? "AMD FSR 4.1.2 ML" :
+                    (hwMl && isFsr4Selected) ? "AMD FSR 4.1.2 ML" :
                     isFsr3Selected ? "AMD FSR 3.1.6" :
                     (config.upscaler_mode == UpscalerMode::Upways) ? "Upways 3.0 FP8 Neural SR" : "Disabled";
                 ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
                                    "Active: %s  |  %ux%u -> %ux%u (%.0f%% Scale)",
                                    activeUpscalerDesc, rW, rH, config.width, config.height, config.render_scale * 100.0f);
+            } else if (m_fsr4StubSelected && !hwMl) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.26f, 1.0f));
+                ImGui::TextWrapped(
+                    "Stub Active (Native 1.0x Pass-Through, %ux%u): AMD FidelityFX SDK 2.4.0 has no native Linux Vulkan FSR 4 provider yet.",
+                    config.width, config.height
+                );
+                ImGui::PopStyleColor();
             }
 
             ImGui::Spacing();
@@ -2029,22 +2059,44 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::PopStyleColor();
             }
 
+            const bool hwMl = stats.supports_fsr4;
+            const bool isFsr4ComboSelected = hwMl
+                ? ((config.upscaler_mode == UpscalerMode::FSR) &&
+                   (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Auto))
+                : (config.upscaler_mode == UpscalerMode::None && m_fsr4StubSelected);
+            const bool isFsr3ComboSelected = (config.upscaler_mode == UpscalerMode::FSR) && stats.supports_fsr3 &&
+                                             (config.fsr_version == FsrVersion::Fsr3 || (config.fsr_version == FsrVersion::Auto && !hwMl));
+
+            enum class UpscalerChoiceId : uint8_t {
+                NativeNone = 0,
+                Fsr4 = 1,
+                Fsr3 = 2,
+                UpwaysSr = 3
+            };
             struct UpscalerComboItem {
-                UpscalerMode mode;
+                UpscalerChoiceId choice;
                 const char* label;
+                bool selected;
                 bool supported;
                 const char* disabledReason;
             };
             const UpscalerComboItem upscalerItems[] = {
-                { UpscalerMode::None, "None (Native Resolution)", true, nullptr },
-                { UpscalerMode::FSR, "AMD FSR (SDK Super-Resolution)", stats.supports_fsr3 || stats.supports_fsr4,
+                { UpscalerChoiceId::NativeNone, "None (Native 1.0x)",
+                  config.upscaler_mode == UpscalerMode::None && !m_fsr4StubSelected, true, nullptr },
+                { UpscalerChoiceId::Fsr4,
+                  hwMl ? "AMD FSR 4.1 ML (SDK ML Super-Resolution)"
+                       : "AMD FSR 4.1 ML [Stub — Native 1.0x Pass-Through]",
+                  isFsr4ComboSelected, true, nullptr },
+                { UpscalerChoiceId::Fsr3, "AMD FSR 3.1 (SDK Super-Resolution)",
+                  isFsr3ComboSelected, stats.supports_fsr3,
                   "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk)." },
-                { UpscalerMode::Upways, "Upways 3.0 SR (FP8 Neural Subpixel Super-Resolution)", stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
+                { UpscalerChoiceId::UpwaysSr, "Upways 3.0 SR (FP8 Neural Subpixel Super-Resolution)",
+                  config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
                   "Unavailable: Requires VK_EXT_shader_float8 + VK_KHR_cooperative_matrix support." }
             };
             const char* curUpscalerLabel = upscalerItems[0].label;
             for (const auto& item : upscalerItems) {
-                if (config.upscaler_mode == item.mode) {
+                if (item.selected) {
                     curUpscalerLabel = item.label;
                     break;
                 }
@@ -2052,22 +2104,47 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::BeginCombo("Upscaler Mode", curUpscalerLabel)) {
                 for (const auto& item : upscalerItems) {
                     if (!item.supported) ImGui::BeginDisabled(true);
-                    const bool isSelected = (config.upscaler_mode == item.mode);
-                    if (ImGui::Selectable(item.label, isSelected) && item.supported) {
-                        config.upscaler_mode = item.mode;
-                        config.upways_superres = (item.mode == UpscalerMode::Upways);
-                        if (item.mode == UpscalerMode::Upways) {
-                            config.denoiser_mode = DenoiserMode::Upways;
-                        }
-                        if (config.upscaler_mode != UpscalerMode::None && config.render_scale >= 0.999f) {
-                            config.render_scale = 0.6666667f; // Default to Quality (1.5x)
-                        } else if (config.upscaler_mode == UpscalerMode::None) {
-                            config.render_scale = 1.0f;
+                    if (ImGui::Selectable(item.label, item.selected) && item.supported) {
+                        switch (item.choice) {
+                            case UpscalerChoiceId::NativeNone:
+                                m_fsr4StubSelected = false;
+                                config.upscaler_mode = UpscalerMode::None;
+                                config.upways_superres = false;
+                                config.render_scale = 1.0f;
+                                break;
+                            case UpscalerChoiceId::Fsr4:
+                                if (hwMl) {
+                                    m_fsr4StubSelected = false;
+                                    config.upscaler_mode = UpscalerMode::FSR;
+                                    config.fsr_version = FsrVersion::Fsr4;
+                                    config.upways_superres = false;
+                                    if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                                } else {
+                                    m_fsr4StubSelected = true;
+                                    config.upscaler_mode = UpscalerMode::None;
+                                    config.upways_superres = false;
+                                    config.render_scale = 1.0f;
+                                }
+                                break;
+                            case UpscalerChoiceId::Fsr3:
+                                m_fsr4StubSelected = false;
+                                config.upscaler_mode = UpscalerMode::FSR;
+                                config.fsr_version = FsrVersion::Fsr3;
+                                config.upways_superres = false;
+                                if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                                break;
+                            case UpscalerChoiceId::UpwaysSr:
+                                m_fsr4StubSelected = false;
+                                config.upscaler_mode = UpscalerMode::Upways;
+                                config.denoiser_mode = DenoiserMode::Upways;
+                                config.upways_superres = true;
+                                if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
+                                break;
                         }
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
                     }
-                    if (isSelected) ImGui::SetItemDefaultFocus();
+                    if (item.selected) ImGui::SetItemDefaultFocus();
                     if (!item.supported) {
                         ImGui::EndDisabled();
                         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled) && item.disabledReason) {
@@ -2076,6 +2153,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::EndCombo();
+            }
+
+            if (m_fsr4StubSelected && !hwMl) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.26f, 1.0f));
+                ImGui::TextWrapped(
+                    "Stub Active: Native 1.0x Pass-Through (AMD FidelityFX SDK 2.4.0 ships FSR 4 only as a closed-source Windows DX12/relocated DLL; native Linux Vulkan FSR 4 provider is not yet available)."
+                );
+                ImGui::PopStyleColor();
             }
 
             if (config.upscaler_mode == UpscalerMode::FSR) {
@@ -2094,6 +2179,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.52f, 0.90f, 1.0f));
                     }
                     if (ImGui::SmallButton(lbl) && isSupported) {
+                        m_fsr4StubSelected = false;
                         config.fsr_version = ver;
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
@@ -2114,14 +2200,29 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 drawFsrVerBtn(FsrVersion::Fsr3, "FSR 3.1", stats.supports_fsr3,
                               stats.supports_fsr3 ? "AMD FidelityFX Super Resolution 3.1.6 (Native C++ Vulkan SDK Super-Resolution)."
                                                   : "Unavailable: Requires amd_fidelityfx_upscaler_vk.");
-                drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML", stats.supports_fsr4,
-                              stats.supports_fsr4 ? "AMD FidelityFX Super Resolution 4.1.2 (Native Vulkan ML Super-Resolution)."
-                                                  : "Unavailable on Linux Vulkan: AMD FidelityFX SDK 2.4.0 ships FSR 4 only as closed-source Windows DX12/relocated DLL; native Vulkan provider stub active.");
+                if (hwMl) {
+                    drawFsrVerBtn(FsrVersion::Fsr4, "FSR 4.1 ML", true,
+                                  "AMD FidelityFX Super Resolution 4.1.2 (Native Vulkan ML Super-Resolution).");
+                } else {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.28f, 0.21f, 0.12f, 1.0f));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.40f, 0.30f, 0.16f, 1.0f));
+                    if (ImGui::SmallButton("FSR 4 (Stub)")) {
+                        m_fsr4StubSelected = true;
+                        config.upscaler_mode = UpscalerMode::None;
+                        config.upways_superres = false;
+                        config.render_scale = 1.0f;
+                        settingsChanged = true;
+                        if (actions) actions->resetAccumulation = true;
+                    }
+                    ImGui::PopStyleColor(2);
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", "Switch to FSR 4 Native Vulkan Stub (Native 1.0x Pass-Through).");
+                    }
+                }
 
                 ImGui::NewLine();
                 ImGui::PopID();
 
-                const bool hwMl = stats.supports_fsr4;
                 const bool useFsr4 = hwMl && (config.fsr_version == FsrVersion::Fsr4 || config.fsr_version == FsrVersion::Auto);
                 const bool useFsr3 = !useFsr4 && stats.supports_fsr3 && (config.fsr_version == FsrVersion::Fsr3 || config.fsr_version == FsrVersion::Auto);
                 ImGui::PushStyleColor(ImGuiCol_Text, useFsr4 ? ImVec4(0.3f, 0.95f, 0.55f, 1.0f) : ImVec4(0.35f, 0.90f, 1.0f, 1.0f));

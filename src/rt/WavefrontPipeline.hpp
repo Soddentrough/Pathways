@@ -124,6 +124,15 @@ public:
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
 
+    void initSpecializedVariants(
+        const std::vector<char>& intersectAlphaCode,
+        const std::vector<char>& shadeDiffuseRestirCode,
+        const std::vector<char>& shadeDiffuseSecRestirCode,
+        const std::vector<char>& shadeComplexRestirCode,
+        const std::vector<char>& shadeComplexSecRestirCode,
+        const std::vector<char>& shadeDielectricRestirCode,
+        const std::vector<char>& shadeEmissiveRestirCode);
+
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,
                      const WavefrontSceneData& sceneData);
@@ -202,6 +211,7 @@ private:
                          const std::vector<char>& shadeComplexSecCode = {},
                          const std::vector<char>& tailMegakernelCode = {});
 
+    VkPipeline buildComputePipeline(const std::vector<char>& code, const char* name);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -250,9 +260,18 @@ private:
     VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;
+    VkPipeline m_intersectAlphaPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseSecRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexSecRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeEmissiveRestirPipeline = VK_NULL_HANDLE;
 
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
+    std::vector<VkPipeline> m_restirPrimaryMatPipelines;
+    std::vector<VkPipeline> m_restirBounce1MatPipelines;
 
     struct BatchBounceTimestamps {
         uint64_t shadeStart = 0;

@@ -108,7 +108,24 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             if (rawPixels && w > 0 && h > 0) {
                 texData.width = static_cast<uint32_t>(w);
                 texData.height = static_cast<uint32_t>(h);
-                texData.pixels.assign(rawPixels, rawPixels + (w * h * 4));
+                const size_t pixelCount = static_cast<size_t>(w) * static_cast<size_t>(h);
+                uint8_t minA = 255, maxA = 0, maxR = 0, minB = 255, maxB = 0;
+                for (size_t p = 0; p < pixelCount; ++p) {
+                    const uint8_t r = rawPixels[p * 4 + 0];
+                    const uint8_t b = rawPixels[p * 4 + 2];
+                    const uint8_t a = rawPixels[p * 4 + 3];
+                    if (r > maxR) maxR = r;
+                    if (b < minB) minB = b;
+                    if (b > maxB) maxB = b;
+                    if (a < minA) minA = a;
+                    if (a > maxA) maxA = a;
+                }
+                texData.minAlpha = (comp >= 4) ? minA : 255;
+                texData.maxAlpha = (comp >= 4) ? maxA : 255;
+                texData.maxRed = maxR;
+                texData.minBlue = minB;
+                texData.maxBlue = maxB;
+                texData.pixels.assign(rawPixels, rawPixels + (pixelCount * 4));
                 stbi_image_free(rawPixels);
             }
         }
@@ -307,6 +324,47 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             gpuMat.specularFactor = mat.specular.specular_factor * std::clamp(specColorMax, 0.0f, 2.0f);
             if (mat.specular.specular_texture.texture) {
                 gpuMat.specularTex = static_cast<uint32_t>(cgltf_texture_index(data, mat.specular.specular_texture.texture)) + 1;
+            }
+        }
+
+        // Canonicalize Lumberyard / FBX-to-glTF ORM maps mis-exported into KHR_materials_specular:
+        // Lumberyard Bistro packs Roughness in G, Metallic in B, R = 0, and Alpha = 255 inside *_Specular.png,
+        // leaving metallicRoughnessTexture unbound with roughnessFactor = 0.5.
+        if (gpuMat.mrTex == 0 && gpuMat.specularTex > 0 &&
+            gpuMat.specularTex <= outScene.textures.size() &&
+            gpuMat.transmission <= 0.05f && gpuMat.type != MATERIAL_DIELECTRIC) {
+            const auto& specTex = outScene.textures[gpuMat.specularTex - 1];
+            if (!specTex.pixels.empty() && specTex.minAlpha == 255 && specTex.maxRed == 0) {
+                gpuMat.mrTex = gpuMat.specularTex;
+                gpuMat.specularTex = 0;
+                gpuMat.roughness = 1.0f;
+                if (specTex.maxBlue == 0) {
+                    gpuMat.metallic = 0.0f;
+                    gpuMat.type = MATERIAL_DIFFUSE;
+                } else if (specTex.minBlue >= 128) {
+                    gpuMat.metallic = 1.0f;
+                    gpuMat.type = MATERIAL_METALLIC;
+                } else {
+                    gpuMat.metallic = 1.0f;
+                    gpuMat.type = MATERIAL_DIFFUSE;
+                }
+            }
+        }
+
+        // Canonicalize ALPHA_MODE_MASK / ALPHA_MODE_BLEND materials whose effective alpha is 100% opaque
+        // (e.g. 58/62 BLEND materials in bistro_interior.glb and 120/132 in bistro_exterior.glb have alpha == 255 everywhere).
+        if (gpuMat.alphaMode != ALPHA_MODE_OPAQUE) {
+            float texMinAlpha = 1.0f;
+            if (gpuMat.albedoTex > 0 && gpuMat.albedoTex <= outScene.textures.size()) {
+                const auto& albTex = outScene.textures[gpuMat.albedoTex - 1];
+                if (!albTex.pixels.empty()) {
+                    texMinAlpha = static_cast<float>(albTex.minAlpha) * (1.0f / 255.0f);
+                }
+            }
+            const float minEffAlpha = gpuMat.albedo.a * texMinAlpha;
+            if ((gpuMat.alphaMode == ALPHA_MODE_MASK && minEffAlpha >= gpuMat.alphaCutoff) ||
+                (gpuMat.alphaMode == ALPHA_MODE_BLEND && minEffAlpha >= (254.5f / 255.0f))) {
+                gpuMat.alphaMode = ALPHA_MODE_OPAQUE;
             }
         }
 

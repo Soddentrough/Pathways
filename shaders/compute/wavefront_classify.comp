@@ -243,12 +243,9 @@ void main() {
                         imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
                     }
                 }
-                if ((ubo.flags & (1u << 9)) != 0u) {
-                    x1Contexts[pixelIndex] = invalidX1Context();
-                    if (pc.sppSampleIndex == 0u) {
-                        currentReservoirs[pixelIndex] = invalidDiReservoir();
-                        giReservoirs[pixelIndex] = invalidGiReservoir();
-                    }
+                if ((ubo.flags & (1u << 9)) != 0u && pc.sppSampleIndex == 0u) {
+                    currentReservoirs[pixelIndex] = invalidDiReservoir();
+                    giReservoirs[pixelIndex] = invalidGiReservoir();
                 }
             }
         } else {

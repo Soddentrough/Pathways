@@ -201,13 +201,13 @@ void restirGiRunReuse(
     if (canReuseHistory && abs(mvData.x) < 1.5 && abs(mvData.y) < 1.5) {
         uint tapHash = (pixelIndex * 0x9E3779B9u) ^ (frameIndex * 0x85EBCA6Bu);
         uint rot = (tapHash >> 30u) & 3u;
+        uint tapBase = (tapHash >> 28u) & 2u;
         uint spatialMCap = min(restirMCap, 8u);
 
-        for (uint tap = 0u; tap < 4u; ++tap) {
-            ivec2 base = RESTIR_TAP_OFFSETS[tap];
-            for (uint rr = 0u; rr < rot; ++rr) {
-                base = ivec2(-base.y, base.x);
-            }
+        for (uint tap = 0u; tap < 2u; ++tap) {
+            ivec2 base = RESTIR_TAP_OFFSETS[tapBase + tap];
+            if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
+            if ((rot & 2u) != 0u) base = -base;
             ivec2 giCoord = giPrev + base;
             if (giCoord.x < 0 || giCoord.y < 0 || giCoord.x >= int(width) || giCoord.y >= int(height)) {
                 continue;

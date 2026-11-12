@@ -308,11 +308,11 @@ bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMa
 // by default every non-cutout surface occludes; UBO bit 26 enables --transparent-shadows fast mode)
 bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
-    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
+    bool hasAlphaShadow = (ubo.flags & (1u << 27)) != 0u;
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
 
-    if (!hasAlphaMask && (!transparentShadows || !enableCaustics)) {
+    if (!hasAlphaShadow && (!transparentShadows || !enableCaustics)) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
                                gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
@@ -324,7 +324,9 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
         }
     } else {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topLevelAS, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT, 0xFFu, origin, tMin, dir, tMax);
+        uint rqFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT
+                     | (transparentShadows ? gl_RayFlagsNoOpaqueEXT : 0u);
+        rayQueryInitializeEXT(rq, topLevelAS, rqFlags, 0xFFu, origin, tMin, dir, tMax);
         while (rayQueryProceedEXT(rq)) {
             if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
                 uint cInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
@@ -345,8 +347,10 @@ bool isShadowOccluded(vec3 origin, vec3 dir, float tMin, float tMax) {
                 }
                 if (mat.alphaMode == 1u /* MASK */ || mat.alphaMode == 2u /* BLEND */) {
                     vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
-                    Triangle ctri = triangles[triIdx];
-                    vec2 cuv = getTriangleUV(ctri, bary);
+                    float cw = 1.0 - bary.x - bary.y;
+                    vec2 cuv = cw * vec2(triangles[triIdx].uv0x, triangles[triIdx].uv0y)
+                             + bary.x * vec2(triangles[triIdx].uv1x, triangles[triIdx].uv1y)
+                             + bary.y * vec2(triangles[triIdx].uv2x, triangles[triIdx].uv2y);
                     float calpha = mat.albedo.a;
                     if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                         calpha *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, cuv).a;

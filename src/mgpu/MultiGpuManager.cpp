@@ -20,6 +20,7 @@
     #include <io.h>
 #else
     #include <unistd.h>
+    #include <sys/mman.h>
 #endif
 
 namespace pathways {
@@ -114,6 +115,53 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
 
     // 1. Instance buffer (std430, binding 30)
     std::vector<InstanceGPU> instanceUpload;
+    struct MonoBucket {
+        uint32_t firstTri = 0;
+        uint32_t triCount = 0;
+        uint32_t numOpaqueField = 0;
+        bool isGeomOpaque = true;
+        uint8_t mask = 0x01;
+    };
+
+    auto buildMonolithicBuckets = [&]() -> std::vector<MonoBucket> {
+        std::vector<MonoBucket> buckets;
+        const uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
+        uint32_t numSolidNonOpaque = 0;
+        if (numNonOpaque > 0) {
+            if (scene.numSolidNonOpaqueTriangles > 0) {
+                numSolidNonOpaque = std::min(scene.numSolidNonOpaqueTriangles, numNonOpaque);
+            } else if (!scene.triangles.empty()) {
+                const uint32_t endTri = std::min<uint32_t>(numTriangles, static_cast<uint32_t>(scene.triangles.size()));
+                for (uint32_t t = scene.numOpaqueTriangles; t < endTri; ++t) {
+                    const uint32_t matId = scene.triangles[t].materialId;
+                    if (matId < scene.materials.size() &&
+                        scene.materials[matId].alphaMode != ALPHA_MODE_OPAQUE) {
+                        break;
+                    }
+                    ++numSolidNonOpaque;
+                }
+            }
+        }
+        const uint32_t numAlphaNonOpaque = numNonOpaque - numSolidNonOpaque;
+
+        if (numTriangles > 0 && scene.numOpaqueTriangles > 0) {
+            buckets.push_back({ 0, scene.numOpaqueTriangles, scene.numOpaqueTriangles, true, 0x01 });
+        }
+        if (numSolidNonOpaque > 0) {
+            buckets.push_back({ scene.numOpaqueTriangles, numSolidNonOpaque, 0, true, 0x02 });
+        }
+        if (numAlphaNonOpaque > 0) {
+            buckets.push_back({ scene.numOpaqueTriangles + numSolidNonOpaque, numAlphaNonOpaque, 0, false, 0x02 });
+        }
+        if (buckets.empty()) {
+            buckets.push_back({ 0, 0, 0, true, 0x02 });
+        }
+        return buckets;
+    };
+
+    const std::vector<MonoBucket> monoBuckets =
+        (scene.instanceData.empty() || scene.blasRanges.empty()) ? buildMonolithicBuckets() : std::vector<MonoBucket>{};
+
     if (!scene.instanceData.empty()) {
         instanceUpload = scene.instanceData;
         for (size_t i = 0; i < instanceUpload.size(); ++i) {
@@ -123,28 +171,14 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
             }
         }
     } else {
-        uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
-        if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
-            InstanceGPU instOpaque{};
-            instOpaque.firstTriangle = 0;
-            instOpaque.numOpaqueTriangles = scene.numOpaqueTriangles;
-            instOpaque.materialOffset = 0;
-            instOpaque.flags = 0;
-            instanceUpload.push_back(instOpaque);
-
-            InstanceGPU instNonOpaque{};
-            instNonOpaque.firstTriangle = scene.numOpaqueTriangles;
-            instNonOpaque.numOpaqueTriangles = 0;
-            instNonOpaque.materialOffset = 0;
-            instNonOpaque.flags = 0;
-            instanceUpload.push_back(instNonOpaque);
-        } else {
-            InstanceGPU defaultInst{};
-            defaultInst.firstTriangle = 0;
-            defaultInst.numOpaqueTriangles = (numTriangles > 0) ? scene.numOpaqueTriangles : 0;
-            defaultInst.materialOffset = 0;
-            defaultInst.flags = 0;
-            instanceUpload.push_back(defaultInst);
+        instanceUpload.reserve(monoBuckets.size());
+        for (const auto& b : monoBuckets) {
+            InstanceGPU inst{};
+            inst.firstTriangle = b.firstTri;
+            inst.numOpaqueTriangles = b.numOpaqueField;
+            inst.materialOffset = 0;
+            inst.flags = 0;
+            instanceUpload.push_back(inst);
         }
     }
 
@@ -161,13 +195,46 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     VkDeviceAddress vertexBaseAddr = secNode.positionBuffer ? secNode.positionBuffer->getDeviceAddress(secDevice) : 0;
     constexpr VkDeviceSize kTriVertexBytes = 3 * sizeof(glm::vec4);
 
+    auto subrangeHasAlphaCutout = [&scene](uint32_t firstTri, uint32_t count, uint32_t matOffset) -> bool {
+        const uint32_t endTri = std::min<uint32_t>(firstTri + count, static_cast<uint32_t>(scene.triangles.size()));
+        for (uint32_t t = firstTri; t < endTri; ++t) {
+            const uint32_t matId = scene.triangles[t].materialId + matOffset;
+            if (matId < scene.materials.size() &&
+                scene.materials[matId].alphaMode != ALPHA_MODE_OPAQUE) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     std::vector<ASInstanceInput> asInstances;
     if (!scene.blasRanges.empty()) {
         // Multi-BLAS path: Batch all BLAS builds into a single GPU dispatch & compaction pass
         secNode.asManager->resetStats();
+        std::vector<bool> blasHasAlphaCutout(scene.blasRanges.size(), false);
+        for (size_t b = 0; b < scene.blasRanges.size(); ++b) {
+            const auto& range = scene.blasRanges[b];
+            const uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
+            if (numNonOpaque > 0 && subrangeHasAlphaCutout(range.firstTriangle + range.numOpaqueTriangles, numNonOpaque, 0)) {
+                blasHasAlphaCutout[b] = true;
+            }
+        }
+        for (size_t i = 0; i < scene.instances.size(); ++i) {
+            const uint32_t bIdx = scene.instances[i].blasIndex;
+            const uint32_t matOffset = (i < scene.instanceData.size()) ? scene.instanceData[i].materialOffset : 0;
+            if (matOffset != 0 && bIdx < scene.blasRanges.size() && !blasHasAlphaCutout[bIdx]) {
+                const auto& range = scene.blasRanges[bIdx];
+                const uint32_t numNonOpaque = (range.triangleCount > range.numOpaqueTriangles) ? (range.triangleCount - range.numOpaqueTriangles) : 0;
+                if (numNonOpaque > 0 && subrangeHasAlphaCutout(range.firstTriangle + range.numOpaqueTriangles, numNonOpaque, matOffset)) {
+                    blasHasAlphaCutout[bIdx] = true;
+                }
+            }
+        }
+
         std::vector<std::vector<ASGeometryInput>> allBlasGeoms;
         allBlasGeoms.reserve(scene.blasRanges.size());
-        for (const auto& range : scene.blasRanges) {
+        for (size_t b = 0; b < scene.blasRanges.size(); ++b) {
+            const auto& range = scene.blasRanges[b];
             std::vector<ASGeometryInput> geoms;
             if (range.numOpaqueTriangles > 0) {
                 ASGeometryInput geomOpaque{};
@@ -189,7 +256,7 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
                 geomNonOpaque.triangleCount = numNonOpaque;
                 geomNonOpaque.vertexStride = sizeof(glm::vec4);
                 geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-                geomNonOpaque.isOpaque = false;
+                geomNonOpaque.isOpaque = !blasHasAlphaCutout[b];
                 geoms.push_back(geomNonOpaque);
             }
             if (geoms.empty()) {
@@ -234,93 +301,48 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
         Logger::info("Secondary GPU Multi-BLAS Acceleration Structures initialized successfully ({} BLASes, {} TLAS Instances).",
                      secNode.blases.size(), asInstances.size());
     } else {
-        // Monolithic scene path
-        uint32_t numNonOpaque = (numTriangles > scene.numOpaqueTriangles) ? (numTriangles - scene.numOpaqueTriangles) : 0;
+        // Monolithic scene path (up to 3 BLAS buckets: Opaque, Solid Non-Opaque, Alpha Non-Opaque)
+        secNode.asManager->resetStats();
 
-        if (numTriangles > 0 && scene.numOpaqueTriangles > 0 && numNonOpaque > 0) {
-            std::vector<ASGeometryInput> geomsOpaque;
-            ASGeometryInput geomOpaque{};
-            geomOpaque.vertexBufferAddress = vertexBaseAddr;
-            geomOpaque.indexBufferAddress = 0;
-            geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles - 1;
-            geomOpaque.triangleCount = scene.numOpaqueTriangles;
-            geomOpaque.vertexStride = sizeof(glm::vec4);
-            geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomOpaque.isOpaque = true;
-            geomsOpaque.push_back(geomOpaque);
-
-            std::vector<ASGeometryInput> geomsNonOpaque;
-            ASGeometryInput geomNonOpaque{};
-            geomNonOpaque.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(scene.numOpaqueTriangles) * kTriVertexBytes;
-            geomNonOpaque.indexBufferAddress = 0;
-            geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
-            geomNonOpaque.triangleCount = numNonOpaque;
-            geomNonOpaque.vertexStride = sizeof(glm::vec4);
-            geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-            geomNonOpaque.isOpaque = false;
-            geomsNonOpaque.push_back(geomNonOpaque);
-
-            secNode.blases = secNode.asManager->buildBLASBatch({ geomsOpaque, geomsNonOpaque });
-
-            ASInstanceInput inst0{};
-            inst0.blasAddress = secNode.blases[0]->getDeviceAddress();
-            inst0.transform = glm::mat4(1.0f);
-            inst0.customIndex = 0;
-            inst0.mask = 0x01; // RAY_MASK_OPAQUE
-            inst0.hitGroupId = 0;
-            inst0.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-            asInstances.push_back(inst0);
-
-            ASInstanceInput inst1{};
-            inst1.blasAddress = secNode.blases[1]->getDeviceAddress();
-            inst1.transform = glm::mat4(1.0f);
-            inst1.customIndex = 1;
-            inst1.mask = 0x02; // RAY_MASK_NON_OPAQUE
-            inst1.hitGroupId = 0;
-            inst1.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-            asInstances.push_back(inst1);
-        } else {
+        std::vector<std::vector<ASGeometryInput>> allMonoGeoms;
+        allMonoGeoms.reserve(monoBuckets.size());
+        for (const auto& b : monoBuckets) {
             std::vector<ASGeometryInput> geoms;
-            bool isPureOpaque = (numTriangles > 0 && scene.numOpaqueTriangles > 0);
-            if (isPureOpaque) {
-                ASGeometryInput geomOpaque{};
-                geomOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomOpaque.indexBufferAddress = 0;
-                geomOpaque.vertexCount = 3 * scene.numOpaqueTriangles - 1;
-                geomOpaque.triangleCount = scene.numOpaqueTriangles;
-                geomOpaque.vertexStride = sizeof(glm::vec4);
-                geomOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-                geomOpaque.isOpaque = true;
-                geoms.push_back(geomOpaque);
-            } else if (numNonOpaque > 0) {
-                ASGeometryInput geomNonOpaque{};
-                geomNonOpaque.vertexBufferAddress = vertexBaseAddr;
-                geomNonOpaque.indexBufferAddress = 0;
-                geomNonOpaque.vertexCount = 3 * numNonOpaque - 1;
-                geomNonOpaque.triangleCount = numNonOpaque;
-                geomNonOpaque.vertexStride = sizeof(glm::vec4);
-                geomNonOpaque.indexType = VK_INDEX_TYPE_NONE_KHR;
-                geomNonOpaque.isOpaque = false;
-                geoms.push_back(geomNonOpaque);
+            ASGeometryInput geom{};
+            if (b.triCount > 0) {
+                geom.vertexBufferAddress = vertexBaseAddr + static_cast<VkDeviceSize>(b.firstTri) * kTriVertexBytes;
+                geom.indexBufferAddress = 0;
+                geom.vertexCount = 3 * b.triCount - 1;
+                geom.triangleCount = b.triCount;
+                geom.vertexStride = sizeof(glm::vec4);
+                geom.indexType = VK_INDEX_TYPE_NONE_KHR;
+                geom.isOpaque = b.isGeomOpaque;
             } else {
-                ASGeometryInput dummyGeom{};
-                dummyGeom.vertexBufferAddress = vertexBaseAddr;
-                dummyGeom.indexBufferAddress = 0;
-                dummyGeom.vertexCount = 2;
-                dummyGeom.triangleCount = 1;
-                dummyGeom.vertexStride = sizeof(glm::vec4);
-                dummyGeom.indexType = VK_INDEX_TYPE_NONE_KHR;
-                dummyGeom.isOpaque = true;
-                geoms.push_back(dummyGeom);
+                geom.vertexBufferAddress = vertexBaseAddr;
+                geom.indexBufferAddress = 0;
+                geom.vertexCount = 2;
+                geom.triangleCount = 1;
+                geom.vertexStride = sizeof(glm::vec4);
+                geom.indexType = VK_INDEX_TYPE_NONE_KHR;
+                geom.isOpaque = true;
             }
+            geoms.push_back(geom);
+            allMonoGeoms.push_back(std::move(geoms));
+        }
 
-            secNode.blases.push_back(secNode.asManager->buildBLAS(geoms));
+        if (allMonoGeoms.size() == 1) {
+            secNode.blases.push_back(secNode.asManager->buildBLAS(allMonoGeoms[0]));
+        } else {
+            secNode.blases = secNode.asManager->buildBLASBatch(allMonoGeoms);
+        }
 
+        asInstances.reserve(monoBuckets.size());
+        for (size_t idx = 0; idx < monoBuckets.size(); ++idx) {
             ASInstanceInput inst{};
-            inst.blasAddress = secNode.blases[0]->getDeviceAddress();
+            inst.blasAddress = secNode.blases[idx]->getDeviceAddress();
             inst.transform = glm::mat4(1.0f);
-            inst.customIndex = 0;
-            inst.mask = isPureOpaque ? 0x01 : 0x02;
+            inst.customIndex = static_cast<uint32_t>(idx);
+            inst.mask = monoBuckets[idx].mask;
             inst.hitGroupId = 0;
             inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
             asInstances.push_back(inst);
@@ -809,6 +831,7 @@ bool MultiGpuManager::initSharedP2PBuffer(VkDeviceSize bufferSize) {
         m_sharedBufferSize = alignedSize;
         m_transferMode = InterGpuTransferMode::P2P_Direct_BAR;
         m_useZeroCopyHost = false;
+        ++m_sharedBufferGeneration;
         Logger::info("Inter-GPU: Activated P2P Direct BAR Transfer via Linux DMA-BUF (2x {:.2f} MB, zero host copies).",
                      static_cast<double>(alignedSize) / (1024.0 * 1024.0));
         return true;
@@ -859,6 +882,15 @@ void MultiGpuManager::destroySharedHostBuffer() {
 }
 
 void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
+    if (m_p2pBufferPrimary[0] != VK_NULL_HANDLE || m_sharedBufferPrimary[0] != VK_NULL_HANDLE) {
+        waitWorkerIdle();
+        if (m_primaryContext && m_primaryContext->getDevice() != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(m_primaryContext->getDevice());
+        }
+        if (!m_devices.empty() && m_devices[0]->context && m_devices[0]->context->getDevice() != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(m_devices[0]->context->getDevice());
+        }
+    }
     destroySharedHostBuffer();
 
     // Query BAR-visible VRAM size on Primary Device (Dev 0)
@@ -928,8 +960,15 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     props2_1.pNext = &hostExtProps1;
     vkGetPhysicalDeviceProperties2(phys1, &props2_1);
 
+    // On Linux amdgpu/radv, every vkQueueSubmit2 validates userptr page mappings via hmm_range_fault.
+    // Aligning host allocations to 2 MiB PMD boundaries and advising MADV_HUGEPAGE collapses 512x 4 KiB
+    // PTE walks into contiguous Transparent Huge Pages, eliminating CPU submission bottlenecks.
     VkDeviceSize hostAlignment = std::max({
-        static_cast<VkDeviceSize>(65536),
+#if !defined(_WIN32)
+        static_cast<VkDeviceSize>(2u * 1024u * 1024u),
+#else
+        static_cast<VkDeviceSize>(65536u),
+#endif
         hostExtProps0.minImportedHostPointerAlignment,
         hostExtProps1.minImportedHostPointerAlignment
     });
@@ -948,8 +987,9 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     vkGetPhysicalDeviceMemoryProperties(phys0, &memProps0);
     vkGetPhysicalDeviceMemoryProperties(phys1, &memProps1);
 
+    const uint32_t activeSlots = m_config.double_buffered_shared_mem ? NUM_SHARED_BUFFERS : 1u;
     bool allSucceeded = true;
-    for (uint32_t slot = 0; slot < NUM_SHARED_BUFFERS; ++slot) {
+    for (uint32_t slot = 0; slot < activeSlots; ++slot) {
 #if defined(_WIN32)
         m_sharedHostPtr[slot] = _aligned_malloc(m_sharedBufferSize, hostAlignment);
         if (!m_sharedHostPtr[slot]) {
@@ -963,6 +1003,9 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
             allSucceeded = false;
             break;
         }
+#ifdef MADV_HUGEPAGE
+        madvise(m_sharedHostPtr[slot], m_sharedBufferSize, MADV_HUGEPAGE);
+#endif
 #endif
         std::memset(m_sharedHostPtr[slot], 0, m_sharedBufferSize);
 
@@ -1100,8 +1143,10 @@ void MultiGpuManager::initSharedHostBuffer(VkDeviceSize bufferSize) {
     if (allSucceeded) {
         m_useZeroCopyHost = true;
         m_transferMode = InterGpuTransferMode::ZeroCopy_HostMemory;
-        Logger::info("{} Zero-Copy Inter-GPU Host Buffers initialized via VK_EXT_external_memory_host (2x {:.2f} MB).",
+        ++m_sharedBufferGeneration;
+        Logger::info("{} Zero-Copy Inter-GPU Host Buffers initialized via VK_EXT_external_memory_host ({}x {:.2f} MB).",
                      m_config.double_buffered_shared_mem ? "Double-Buffered" : "Single-Buffered (Double-Buffering Disabled)",
+                     activeSlots,
                      static_cast<double>(m_sharedBufferSize) / (1024.0 * 1024.0));
     } else {
         destroySharedHostBuffer();
@@ -1114,27 +1159,59 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
         return (sz + 65535) & ~static_cast<VkDeviceSize>(65535);
     };
 
-    VkDeviceSize displayAligned = align64k(static_cast<VkDeviceSize>(width) * height * 8);
+    const bool isSampleBlendFsr =
+        (m_config.upscaler_mode == UpscalerMode::FSR &&
+         m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
+         m_config.denoiser_mode != DenoiserMode::Svgf &&
+         m_config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
+    if (isSampleBlendFsr) {
+        return align64k(static_cast<VkDeviceSize>(width) * height * 8);
+    }
 
-    uint32_t maxTileSize = 128u;
-    uint32_t numTilesX = (width + maxTileSize - 1u) / maxTileSize;
-    uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
-    uint32_t cbWidth = maxTilesPerGpuX * maxTileSize;
+    const uint32_t renderW = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+        ? m_config.getRenderWidth() : width;
+    const uint32_t renderH = (m_config.upscaler_mode != UpscalerMode::None && m_config.render_scale < 1.0f)
+        ? m_config.getRenderHeight() : height;
 
-    uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
-                   (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
+    const uint32_t tileSize = (m_config.tile_size == 0u) ? 64u : m_config.tile_size;
+    const uint32_t numTilesX = (renderW + tileSize - 1u) / tileSize;
+    const uint32_t maxTilesPerGpuX = (numTilesX + 1u) / 2u;
+    const uint32_t cbWidth = maxTilesPerGpuX * tileSize;
 
-    // SampleParallel: radiance + mlDiffuse + mlSpecular (each 64 KiB-aligned)
-    VkDeviceSize sampleParallelAligned = align64k(static_cast<VkDeviceSize>(width) * height * bpp);
-    VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(width) * height * 8);
-    VkDeviceSize sampleParallelTotal = sampleParallelAligned + 2 * spPlaneAligned;
+    const uint32_t bpp = (m_config.accum_format == AccumFormat::RGBA16_SFLOAT) ? 8 :
+                         (m_config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? 4 : 16;
 
-    // CheckerboardTile: radiance + 6 RGBA16F planes (mv, nd, mlDiffuse, mlSpecular, mlAlbedoRoughness, mlSpecularMotion)
-    VkDeviceSize cbRadOffsetAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * height * bpp);
-    VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * height * 8);
-    VkDeviceSize cbTotalSize = cbRadOffsetAligned + 6 * cbPlaneAligned;
+    const bool needMl = needSecondaryMlGuides();
+    const bool needNormals = needMl || m_config.enable_restir || m_config.enable_caustics;
+    const bool needMvDepth = needNormals || (m_config.upscaler_mode == UpscalerMode::FSR);
+    const bool copyMv = needNormals || (needMvDepth && m_config.accum_format == AccumFormat::R11G11B10_UFLOAT);
 
-    return std::max({ displayAligned, sampleParallelTotal, cbTotalSize });
+    // CheckerboardTile: radiance + only the active auxiliary G-buffer planes
+    const VkDeviceSize cbRadAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * bpp);
+    const VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * 8);
+    VkDeviceSize cbTotalSize = cbRadAligned;
+    if (needMl) {
+        cbTotalSize += 6 * cbPlaneAligned;
+    } else if (copyMv) {
+        cbTotalSize += (needNormals ? 2 : 1) * cbPlaneAligned;
+    }
+
+    // SampleParallel: radiance (+ mlDiffuse + mlSpecular only when ML guides are active)
+    const VkDeviceSize spRadAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * bpp);
+    const VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * 8);
+    const VkDeviceSize spTotalSize = spRadAligned + (needMl ? 2 * spPlaneAligned : 0);
+
+    const MultiGpuMode effectiveMode = (m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : m_mode;
+    if (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off) {
+        return cbTotalSize;
+    }
+    if (effectiveMode == MultiGpuMode::SampleParallel) {
+        return spTotalSize;
+    }
+    if (m_config.adaptive_spp) {
+        return std::max(cbTotalSize, spTotalSize);
+    }
+    return (m_config.spp > 1) ? spTotalSize : cbTotalSize;
 }
 
 void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData& scene) {
@@ -1720,6 +1797,15 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 secNode->context->hasSubgroupSizeControl(),
                 0,
                 wfTailMegakernelCode
+            );
+            secNode->wavefrontPipeline->initSpecializedVariants(
+                loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv")
             );
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
             if (config.enable_restir && config.mgpu_mode != MultiGpuMode::Off) {
@@ -3086,9 +3172,39 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             initSharedHostBuffer(bufferSize);
         }
 
+        if (node->mlDiffuseImage &&
+            (node->mlDiffuseImage->getWidth() != secWidth || node->mlDiffuseImage->getHeight() != secHeight)) {
+            node->mlDiffuseImage.reset();
+            node->mlSpecularImage.reset();
+            node->mlAlbedoRoughnessImage.reset();
+            node->mlSpecularMotionImage.reset();
+        }
+
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, node->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+        const bool hasValidMlGuides = (node->mlDiffuseImage && node->mlSpecularImage &&
+                                       node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage);
+        VkDescriptorImageInfo albInfo{
+            VK_NULL_HANDLE,
+            hasValidMlGuides ? node->mlAlbedoRoughnessImage->getImageView() : node->normalDepthImage->getImageView(),
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+        VkDescriptorImageInfo smvInfo{
+            VK_NULL_HANDLE,
+            hasValidMlGuides ? node->mlSpecularMotionImage->getImageView() : node->normalDepthImage->getImageView(),
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+        VkDescriptorImageInfo diffInfo{
+            VK_NULL_HANDLE,
+            hasValidMlGuides ? node->mlDiffuseImage->getImageView() : node->normalDepthImage->getImageView(),
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+        VkDescriptorImageInfo specInfo{
+            VK_NULL_HANDLE,
+            hasValidMlGuides ? node->mlSpecularImage->getImageView() : node->normalDepthImage->getImageView(),
+            VK_IMAGE_LAYOUT_GENERAL
+        };
 
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
             VkDescriptorImageInfo accumImageInfo{};
@@ -3100,10 +3216,10 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr }
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr }
             };
             vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 
@@ -3145,6 +3261,7 @@ void MultiGpuManager::setConfig(const Config& config) {
                            (config.fsr_version != m_config.fsr_version) ||
                            (config.mgpu_upscale_mode != m_config.mgpu_upscale_mode);
     bool formatChanged = (config.accum_format != m_config.accum_format);
+    bool doubleBufChanged = (config.double_buffered_shared_mem != m_config.double_buffered_shared_mem);
     bool targetLayoutChanged = upscalerChanged || formatChanged ||
                                (config.mgpu_mode != m_config.mgpu_mode) ||
                                (config.tile_size != m_config.tile_size) ||
@@ -3174,8 +3291,13 @@ void MultiGpuManager::setConfig(const Config& config) {
             }
         }
         VkDeviceSize reqSharedSize = calculateSharedBufferSize(m_config.width, m_config.height);
-        if (m_sharedBufferSize < reqSharedSize) {
+        constexpr VkDeviceSize kShrinkAlign = 2u * 1024u * 1024u;
+        VkDeviceSize alignedReq = (reqSharedSize + kShrinkAlign - 1u) & ~(kShrinkAlign - 1u);
+        if (m_sharedBufferSize < reqSharedSize || m_sharedBufferSize > alignedReq * 2u || doubleBufChanged) {
             waitWorkerIdle();
+            if (m_primaryContext && m_primaryContext->getDevice() != VK_NULL_HANDLE) {
+                vkDeviceWaitIdle(m_primaryContext->getDevice());
+            }
             vkDeviceWaitIdle(secNode->context->getDevice());
             initSharedHostBuffer(reqSharedSize);
         }

@@ -314,7 +314,8 @@ private:
     VkDescriptorSet m_neuralGuideDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    // Compute pipeline layouts & stage-specialized pipelines
+    // Compute pipeline cache, layouts & stage-specialized pipelines
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     VkPipelineLayout m_temporalPipeLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_neuralGuidePipeLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_upscalePipeLayout = VK_NULL_HANDLE;

@@ -118,11 +118,13 @@ void main() {
                     uint cPrimIdx = rayQueryGetIntersectionPrimitiveIndexEXT(g_rq, false);
                     InstanceGPU cInst = instances[cInstIdx];
                     uint cTriIdx = cInst.firstTriangle + ((cGeomIdx == 0u) ? cPrimIdx : (cPrimIdx + cInst.numOpaqueTriangles));
-                    Triangle cTri = triangles[cTriIdx];
-                    ShadeMaterial sm = shadeMaterials[cTri.materialId + cInst.materialOffset];
+                    ShadeMaterial sm = shadeMaterials[triangles[cTriIdx].materialId + cInst.materialOffset];
                     if (smGetAlphaMode(sm) == 1u) {
                         vec2 cBary = rayQueryGetIntersectionBarycentricsEXT(g_rq, false);
-                        vec2 cUv = getTriangleUV(cTri, cBary);
+                        float cw = 1.0 - cBary.x - cBary.y;
+                        vec2 cUv = cw * vec2(triangles[cTriIdx].uv0x, triangles[cTriIdx].uv0y)
+                                 + cBary.x * vec2(triangles[cTriIdx].uv1x, triangles[cTriIdx].uv1y)
+                                 + cBary.y * vec2(triangles[cTriIdx].uv2x, triangles[cTriIdx].uv2y);
                         float cAlpha = sm.albedo.a;
                         uint albTex = smGetAlbedoTex(sm);
                         if (albTex > 0u && albTex <= 512u) {

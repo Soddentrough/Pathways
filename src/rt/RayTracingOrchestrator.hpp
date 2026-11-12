@@ -92,6 +92,16 @@ public:
         const std::vector<char>& tailMegakernelCode
     );
 
+    void initWavefrontSpecializedVariants(
+        const std::vector<char>& intersectAlphaCode,
+        const std::vector<char>& shadeDiffuseRestirCode,
+        const std::vector<char>& shadeDiffuseSecRestirCode,
+        const std::vector<char>& shadeComplexRestirCode,
+        const std::vector<char>& shadeComplexSecRestirCode,
+        const std::vector<char>& shadeDielectricRestirCode,
+        const std::vector<char>& shadeEmissiveRestirCode
+    );
+
     /// Initializes NRCManager.
     void initNRC(
         uint32_t width,
