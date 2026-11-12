@@ -22,13 +22,11 @@ import subprocess
 import sys
 import time
 
-os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-
-import cv2  # noqa: E402
 import numpy as np  # noqa: E402
+import OpenImageIO as oiio  # noqa: E402  (OpenCV builds without OpenEXR cannot read engine dumps)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "build", "bin", "pathways")
+BIN = os.environ.get("PATHWAYS_BIN", os.path.join(ROOT, "build", "linux-release", "bin", "pathways"))
 FPS = 60.0
 
 SCENES = {
@@ -36,11 +34,20 @@ SCENES = {
                     "scenes/living-room/living_room_flight.json"),
     "classroom": (["--scene", "scenes/classroom/classroom_extended.glb"],
                   "scenes/classroom/classroom_flight.json"),
+    "cyber-city": (["--scene", "cyber-city"],
+                   "scenes/cyber_city/cyber_city_flight.json"),
 }
 
 CONFIGS = {
     "base": [],
     "restir": ["--restir"],
+    "svgf": ["--denoiser", "svgf"],
+    "upways": ["--denoiser", "upways"],
+    "restir_svgf": ["--restir", "--denoiser", "svgf"],
+    "restir_upways": ["--restir", "--denoiser", "upways"],
+    "nrc": ["--nrc"],
+    "nrc_b1": ["--nrc", "--nrc-bounce", "1"],
+    "nrc_b1_svgf": ["--nrc", "--nrc-bounce", "1", "--denoiser", "svgf"],
 }
 
 COMMON = ["--headless", "--no-validation", "--accum-format", "fp32",
@@ -58,10 +65,11 @@ def run(cmd, log_path, out_path):
 
 
 def load_luma(path):
-    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise RuntimeError(f"cannot read {path}")
-    rgb = np.nan_to_num(img[..., :3][..., ::-1].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    buf = oiio.ImageBuf(path)
+    if buf.has_error:
+        raise RuntimeError(f"cannot read {path}: {buf.geterror()}")
+    img = np.asarray(buf.get_pixels(oiio.FLOAT))
+    rgb = np.nan_to_num(img[..., :3].astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
     return rgb @ LUMA
 
 
@@ -77,13 +85,26 @@ def metrics(x, r):
     err = (x - r) ** 2 / (r ** 2 + 1e-2)
     trimmed = np.sort(err.ravel())[: int(err.size * 0.999)]
     bx, br = tile_means(x, 8), tile_means(r, 8)
+    tm = lambda v: v / (1.0 + v)
     return {
         "relmse": float(err.mean()),
         "relmse_trim": float(trimmed.mean()),          # top 0.1% fireflies removed
         "relmse_8x": float(np.mean((bx - br) ** 2 / (br ** 2 + 1e-2))),  # low-frequency error
+        "tm_mae": float(np.mean(np.abs(tm(x) - tm(r)))),  # display-space (Reinhard) error
         "tile_bias": float(np.mean((tx[m] - tr[m]) / tr[m])),
         "lum_ratio": float(x.mean() / max(r.mean(), 1e-12)),
     }
+
+
+def gpu_ms(stats_path):
+    """Average primary GPU frame time from --dump-stats JSON (None if unavailable)."""
+    try:
+        with open(stats_path) as f:
+            perf = json.load(f).get("performance", {})
+        v = perf.get("primary_gpu_time_ms") or perf.get("avg_frame_time_ms")
+        return float(v) if v is not None else None
+    except (OSError, ValueError):
+        return None
 
 
 def main():
@@ -113,13 +134,17 @@ def main():
             ref = load_luma(ref_p)
             for cfg in args.configs.split(","):
                 p = os.path.join(args.out, f"{tag}_{cfg}.exr")
-                dt = run([*base, *CONFIGS[cfg], "--realtime", "--frames", str(k), "--dump-hdr", p], p + ".log", p)
+                sp = p + ".stats.json"
+                dt = run([*base, *CONFIGS[cfg], "--realtime", "--frames", str(k), "--dump-hdr", p,
+                          "--dump-stats", sp], p + ".log", p)
                 m = metrics(load_luma(p), ref)
                 m["render_s"] = round(dt, 2)
+                m["gpu_ms"] = gpu_ms(sp)
                 results.setdefault(scene, {}).setdefault(f"k{k}", {})[cfg] = m
-                print(f"[{tag}] {cfg:14s} relMSE={m['relmse']:.4f} trim={m['relmse_trim']:.4f} "
-                      f"8x={m['relmse_8x']:.5f} tile_bias={m['tile_bias']:+.4f} "
-                      f"lum_ratio={m['lum_ratio']:.4f}", flush=True)
+                gms = f"{m['gpu_ms']:.2f}" if m["gpu_ms"] is not None else "n/a"
+                print(f"[{tag}] {cfg:14s} tmMAE={m['tm_mae']:.4f} relMSE={m['relmse']:.4f} "
+                      f"trim={m['relmse_trim']:.4f} 8x={m['relmse_8x']:.5f} "
+                      f"tile_bias={m['tile_bias']:+.4f} lum_ratio={m['lum_ratio']:.4f} gpu_ms={gms}", flush=True)
 
     out = os.path.join(args.out, f"summary_{w}x{h}.json")
     with open(out, "w") as f:

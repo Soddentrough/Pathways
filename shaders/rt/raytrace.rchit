@@ -733,7 +733,7 @@ void main() {
     if (length(emissive) > 1e-3) {
         float misWeight = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, effBounce)
             ? 0.0
-            : (isPrimary ? 1.0 : emitterHitMisWeight(0u, primID, gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, inPdfCode, pc.numLights));
+            : (isPrimary ? 1.0 : emitterHitMisWeight(0u, primID, gl_InstanceCustomIndexEXT, gl_WorldRayOriginEXT, gl_WorldRayDirectionEXT, gl_HitTEXT, inPdfCode, pc.numLights));
         accumRadiance = emissive * misWeight;
         accumSpecular = emissive * misWeight;
         if ((mat.type & MATERIAL_TYPE_MASK) == 3u /* Emissive */) {

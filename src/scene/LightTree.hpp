@@ -37,17 +37,22 @@ inline LightPrimInfo makePrimInfo(uint32_t idx, const LightGPU& light) {
     uint32_t type = static_cast<uint32_t>(light.position.w);
     glm::vec3 pos(light.position);
 
-    if (type == LIGHT_AREA_QUAD) {
+    if (type == LIGHT_AREA_QUAD || type == LIGHT_AREA_TRIANGLE) {
         glm::vec3 u(light.u);
         glm::vec3 v(light.v);
         glm::vec3 p0 = pos;
         glm::vec3 p1 = pos + u;
         glm::vec3 p2 = pos + v;
-        glm::vec3 p3 = pos + u + v;
-
-        info.bboxMin = glm::min(glm::min(p0, p1), glm::min(p2, p3)) - glm::vec3(0.005f);
-        info.bboxMax = glm::max(glm::max(p0, p1), glm::max(p2, p3)) + glm::vec3(0.005f);
-        info.centroid = 0.25f * (p0 + p1 + p2 + p3);
+        if (type == LIGHT_AREA_TRIANGLE) {
+            info.bboxMin = glm::min(glm::min(p0, p1), p2) - glm::vec3(0.005f);
+            info.bboxMax = glm::max(glm::max(p0, p1), p2) + glm::vec3(0.005f);
+            info.centroid = (p0 + p1 + p2) / 3.0f;
+        } else {
+            glm::vec3 p3 = pos + u + v;
+            info.bboxMin = glm::min(glm::min(p0, p1), glm::min(p2, p3)) - glm::vec3(0.005f);
+            info.bboxMax = glm::max(glm::max(p0, p1), glm::max(p2, p3)) + glm::vec3(0.005f);
+            info.centroid = 0.25f * (p0 + p1 + p2 + p3);
+        }
         info.coneAxis = glm::normalize(glm::vec3(light.normal));
         info.coneAngleCos = 0.0f; // Front hemisphere emission (cos 90 deg = 0.0)
     } else if (type == LIGHT_SPOT) {

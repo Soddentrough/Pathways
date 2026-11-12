@@ -12,7 +12,8 @@ namespace pathways {
 enum LightType : uint32_t {
     LIGHT_AREA_QUAD = 0,
     LIGHT_SPOT = 1,
-    LIGHT_DIRECTIONAL = 2
+    LIGHT_DIRECTIONAL = 2,
+    LIGHT_AREA_TRIANGLE = 3
 };
 
 // 128-byte record: exactly one RDNA 4 vector cache line per light, so
@@ -34,12 +35,13 @@ inline float calculateLightFlux(const LightGPU& light) {
     float lum = 0.2126f * light.emission.r + 0.7152f * light.emission.g + 0.0722f * light.emission.b;
     if (lum <= 0.0f) return 0.0f;
     uint32_t type = static_cast<uint32_t>(light.position.w);
-    if (type == LIGHT_AREA_QUAD) {
+    if (type == LIGHT_AREA_QUAD || type == LIGHT_AREA_TRIANGLE) {
         float area = light.emission.w;
         if (area <= 0.0f) {
             glm::vec3 u(light.u);
             glm::vec3 v(light.v);
             area = glm::length(glm::cross(u, v));
+            if (type == LIGHT_AREA_TRIANGLE) area *= 0.5f;
         }
         return lum * area * 3.14159265359f;
     } else if (type == LIGHT_SPOT) {

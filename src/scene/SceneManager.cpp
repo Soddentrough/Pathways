@@ -2,6 +2,7 @@
 #include "core/Logger.hpp"
 #include "scene/SceneGeometryPipeline.hpp"
 #include "scene/LightMapping.hpp"
+#include "scene/EmissiveGeometryLights.hpp"
 #include "scene/LightTree.hpp"
 
 #include <algorithm>
@@ -339,6 +340,17 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
     if (geomPipeline) {
         geomPipeline->updateSceneTransparency(m_sceneData.materials, m_sceneHasNonOpaque, m_sceneHasAlphaMask, m_sceneHasAlphaShadow);
         geomPipeline->partitionSceneGeometry(m_sceneData, m_numOpaqueTriangles);
+    }
+    if (config.emissive_geometry_lights) {
+        EmissiveGeometryLightStats egl = appendEmissiveGeometryLights(m_sceneData);
+        if (egl.skipReason) {
+            Logger::info("Emissive geometry lights: not applied ({})", egl.skipReason);
+        } else {
+            Logger::info("Emissive geometry lights: {} prototype quads -> {} MIS area lights "
+                         "({} unpaired + {} non-constant-emission triangles left BSDF-only)",
+                         egl.protoQuads, egl.addedLights, egl.unpairedTriangles, egl.textured);
+        }
+        m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
     }
 
     if (m_numInstancedTriangles > m_numTriangles) {
@@ -706,6 +718,9 @@ SceneData SceneManager::reloadPreparedSceneData(const std::string& filepath, con
         uint32_t numOpaque = 0;
         geomPipeline->updateSceneTransparency(prepared.materials, hasNonOpaque, hasAlphaMask);
         geomPipeline->partitionSceneGeometry(prepared, numOpaque);
+    }
+    if (config.emissive_geometry_lights) {
+        appendEmissiveGeometryLights(prepared);
     }
     std::vector<uint32_t> triLightMap;
     buildEmissiveLightMapping(prepared, triLightMap);

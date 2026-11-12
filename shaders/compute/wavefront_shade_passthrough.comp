@@ -253,9 +253,15 @@ void main() {
                         vec3 lightEmission = light.emission.rgb;
                         bool validLightSample = false;
 
-                        if (uint(light.position.w) == 0u /* AREA QUAD */) {
+                        uint lightType = uint(light.position.w);
+                        if (lightType == 0u || lightType == 3u /* AREA QUAD / TRIANGLE */) {
                             vec2 luv = randVec2(seed);
-                            lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+                            vec2 uv = luv;
+                            if (lightType == 3u) {
+                                float r1 = sqrt(luv.x);
+                                uv = vec2(1.0 - r1, luv.y * r1);
+                            }
+                            lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
                             vec3 toLight = lightPoint - hitPoint;
                             lightDist = length(toLight);
                             lightDir = toLight / max(lightDist, 1e-4);
@@ -266,7 +272,7 @@ void main() {
                                 lightPdf = (lightDist * lightDist) / (area * cosLight);
                                 validLightSample = true;
                             }
-                        } else if (uint(light.position.w) == 1u /* SPOT */) {
+                        } else if (lightType == 1u /* SPOT */) {
                             vec3 toLight = light.position.xyz - hitPoint;
                             lightDist = length(toLight);
                             lightDir = toLight / max(lightDist, 1e-4);
@@ -291,14 +297,14 @@ void main() {
                         if (validLightSample && NdotL > 0.0) {
                             float bsdfPdf = NdotL * INV_PI;
                             float misWeight = 1.0;
-                            if (uint(light.position.w) == 0u) {
+                            if (lightType == 0u || lightType == 3u) {
                                 float lightPdfEff = lightPdf * lightSelectPdf;
                                 misWeight = lightPdfEff / (lightPdfEff + bsdfPdf);
                             }
 
                             vec3 candidateContrib = diffuseColor * INV_PI * lightEmission * NdotL * misWeight;
                             float target = dot(candidateContrib, vec3(0.2126, 0.7152, 0.0722));
-                            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
+                            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-20);
                             float weight = target / sourcePdf;
 
                             totalWeightSum += weight;

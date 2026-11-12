@@ -397,7 +397,7 @@ struct Light {
                 outIdx = floatBitsToUint(samp_.y); \
                 outPdf = lights[outIdx].sampling.z; \
             } \
-            outPdf = max(outPdf, 1e-6); \
+            outPdf = max(outPdf, 1e-20); \
         } \
     } while(false)
 
@@ -479,7 +479,7 @@ float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode n
             if (lightNodes[nodeIdx_].children.z == 1u) { \
                 outIdx = lightNodes[nodeIdx_].children.x; \
             } \
-            outPdf = max(pathProb_, 1e-6); \
+            outPdf = max(pathProb_, 1e-20); \
         } \
     } while(false)
 

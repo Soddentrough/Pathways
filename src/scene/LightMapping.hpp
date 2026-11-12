@@ -37,6 +37,7 @@ namespace pathways {
 
 constexpr uint32_t TRI_LIGHT_NONE = 0u;
 constexpr uint32_t TRI_LIGHT_NEE_ONLY = 0xFFFFFFFFu;
+constexpr uint32_t TRI_LIGHT_INSTANCED_BIT = 0x80000000u; // low 31 bits: proto emissive quad index
 constexpr uint32_t LIGHT_FLAG_MIS = 1u;
 
 inline uint32_t getLightFlags(const LightGPU& l) { return std::bit_cast<uint32_t>(l.pad0.x); }
@@ -58,15 +59,20 @@ struct AreaLightPlane {
     float area;
     float uu, uv, vv, invDet;
     glm::vec3 bmin, bmax;
+    bool isTriangle = false;
 };
 
-inline bool insideParallelogram(const AreaLightPlane& L, const glm::vec3& p, float planeEps, float uvEps) {
+inline bool insideLightSurface(const AreaLightPlane& L, const glm::vec3& p, float planeEps, float uvEps) {
     glm::vec3 d = p - L.p0;
     if (std::abs(glm::dot(d, L.n)) > planeEps) return false;
     float du = glm::dot(d, L.u), dv = glm::dot(d, L.v);
     float a = (L.vv * du - L.uv * dv) * L.invDet;
     float b = (L.uu * dv - L.uv * du) * L.invDet;
-    return a >= -uvEps && a <= 1.0f + uvEps && b >= -uvEps && b <= 1.0f + uvEps;
+    if (a < -uvEps || b < -uvEps) return false;
+    if (L.isTriangle) {
+        return (a + b) <= 1.0f + uvEps;
+    }
+    return a <= 1.0f + uvEps && b <= 1.0f + uvEps;
 }
 
 inline bool isEmissive(const MaterialGPU& m) {
@@ -100,9 +106,18 @@ inline LightMappingStats buildEmissiveLightMapping(SceneData& scene, std::vector
     for (uint32_t i = 0; i < scene.lights.size(); ++i) {
         LightGPU& l = scene.lights[i];
         setLightFlags(l, 0u);
-        if (static_cast<uint32_t>(l.position.w) != LIGHT_AREA_QUAD) continue;
+        if (l.pad0.w > 0.5f) {
+            // Emissive-geometry light (EmissiveGeometryLights.hpp): MIS-capable by
+            // construction; its triangles are resolved on the GPU via instance tables.
+            setLightFlags(l, LIGHT_FLAG_MIS);
+            stats.misLights++;
+            continue;
+        }
+        uint32_t type = static_cast<uint32_t>(l.position.w);
+        if (type != LIGHT_AREA_QUAD && type != LIGHT_AREA_TRIANGLE) continue;
         detail::AreaLightPlane P{};
         P.index = i;
+        P.isTriangle = (type == LIGHT_AREA_TRIANGLE);
         P.p0 = glm::vec3(l.position);
         P.u = glm::vec3(l.u);
         P.v = glm::vec3(l.v);
@@ -110,7 +125,7 @@ inline LightMappingStats buildEmissiveLightMapping(SceneData& scene, std::vector
         float len = glm::length(c);
         if (len < 1e-10f) continue;
         P.n = c / len;
-        P.area = len;
+        P.area = P.isTriangle ? (0.5f * len) : len;
         P.uu = glm::dot(P.u, P.u);
         P.uv = glm::dot(P.u, P.v);
         P.vv = glm::dot(P.v, P.v);
@@ -118,8 +133,12 @@ inline LightMappingStats buildEmissiveLightMapping(SceneData& scene, std::vector
         if (std::abs(det) < 1e-20f) continue;
         P.invDet = 1.0f / det;
         glm::vec3 q[4] = {P.p0, P.p0 + P.u, P.p0 + P.v, P.p0 + P.u + P.v};
-        P.bmin = glm::min(glm::min(q[0], q[1]), glm::min(q[2], q[3]));
-        P.bmax = glm::max(glm::max(q[0], q[1]), glm::max(q[2], q[3]));
+        int numVerts = P.isTriangle ? 3 : 4;
+        P.bmin = P.bmax = q[0];
+        for (int vi = 1; vi < numVerts; ++vi) {
+            P.bmin = glm::min(P.bmin, q[vi]);
+            P.bmax = glm::max(P.bmax, q[vi]);
+        }
         planes.push_back(P);
     }
 
@@ -192,9 +211,9 @@ inline LightMappingStats buildEmissiveLightMapping(SceneData& scene, std::vector
                         const auto& P = planes[pi];
                         if (std::abs(glm::dot(tn, P.n)) < 0.999f) continue;
                         float eps = 1e-3f * std::max(scale, std::sqrt(P.area));
-                        if (detail::insideParallelogram(P, w0, eps, 1e-3f) &&
-                            detail::insideParallelogram(P, w1, eps, 1e-3f) &&
-                            detail::insideParallelogram(P, w2, eps, 1e-3f)) {
+                        if (detail::insideLightSurface(P, w0, eps, 1e-3f) &&
+                            detail::insideLightSurface(P, w1, eps, 1e-3f) &&
+                            detail::insideLightSurface(P, w2, eps, 1e-3f)) {
                             match = P.index + 1u;
                             matchedArea[P.index] += 0.5 * twiceArea;
                             if (!detail::emissionMatchesLight(scene.materials[mid], scene.lights[P.index])) {
@@ -237,6 +256,12 @@ inline LightMappingStats buildEmissiveLightMapping(SceneData& scene, std::vector
         uint32_t m = perTri[t];
         if (m == UNSEEN) m = TRI_LIGHT_NONE;
         if (m != TRI_LIGHT_NONE && m != TRI_LIGHT_NEE_ONLY && !lightMis[m - 1u]) m = TRI_LIGHT_NEE_ONLY;
+        if (t < scene.instancedEmissiveTriQuad.size() && scene.instancedEmissiveTriQuad[t] != 0xFFFFFFFFu) {
+            // Emissive-geometry light: the GPU resolves the light via the instance table.
+            // appendEmissiveGeometryLights() refuses scenes whose explicit area lights cover
+            // emissive geometry, so no explicit mapping is overridden here.
+            m = TRI_LIGHT_INSTANCED_BIT | scene.instancedEmissiveTriQuad[t];
+        }
         if (m == TRI_LIGHT_NEE_ONLY) stats.neeOnlyTriangles++;
         else if (m != TRI_LIGHT_NONE) stats.matchedTriangles++;
         triLightMap[t] = m;

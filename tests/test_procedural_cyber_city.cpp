@@ -98,8 +98,16 @@ int main() {
               << totalInstancedTriangles << " total instanced triangles)." << std::endl;
 
     // 5. Physical Light Sources & Sampling Structures
-    check_true(scene.lights.size() >= 1800, "Light source count must be >= 1800");
-    std::cout << "[PASS] Active physical light count: " << scene.lights.size() << " (>= 1500)." << std::endl;
+    // Emissive prototype geometry (beacons, billboards, holo projectors, skybridge strips) is the
+    // light source for those surfaces; the scene must not add analytic area-light proxies that
+    // duplicate it (double counting + no NEE/BSDF MIS). Analytic lights are the spot streetlights.
+    size_t numAreaProxies = 0;
+    for (const auto& light : scene.lights) {
+        if (static_cast<uint32_t>(light.position.w) == LIGHT_AREA_QUAD) ++numAreaProxies;
+    }
+    check_true(numAreaProxies == 0, "No analytic area-light proxies duplicating emissive geometry");
+    check_true(scene.lights.size() >= 100, "Spot streetlight count must be >= 100");
+    std::cout << "[PASS] Active analytic light count: " << scene.lights.size() << " (spot), 0 area proxies." << std::endl;
 
     for (size_t l = 0; l < scene.lights.size(); ++l) {
         const auto& light = scene.lights[l];

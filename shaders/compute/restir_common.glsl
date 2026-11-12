@@ -171,8 +171,14 @@ bool reconnectDirectPath(
 ) {
     lightEmission = light.emission.rgb;
     cosLight = 1.0;
-    if (uint(light.position.w) == 0u /* AREA QUAD */) {
-        vec3 lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+    uint lightType = uint(light.position.w);
+    if (lightType == 0u || lightType == 3u /* AREA QUAD / TRIANGLE */) {
+        vec2 uv = luv;
+        if (lightType == 3u) {
+            float r1 = sqrt(luv.x);
+            uv = vec2(1.0 - r1, luv.y * r1);
+        }
+        vec3 lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
         vec3 toLight = lightPoint - hitPoint;
         lightDist = length(toLight);
         if (lightDist < 1e-4) return false;
@@ -180,7 +186,7 @@ bool reconnectDirectPath(
         cosLight = dot(-lightDir, light.normal.xyz);
         if (cosLight <= 0.0) return false;
         return true;
-    } else if (uint(light.position.w) == 1u /* SPOT */) {
+    } else if (lightType == 1u /* SPOT */) {
         vec3 toLight = light.position.xyz - hitPoint;
         lightDist = length(toLight);
         if (lightDist < 1e-4) return false;
@@ -284,9 +290,15 @@ void restirDiFreshStream(
         vec2 luv = vec2(0.5);
         float cosLight = 1.0;
 
-        if (uint(light.position.w) == 0u /* AREA QUAD */) {
+        uint lightType = uint(light.position.w);
+        if (lightType == 0u || lightType == 3u /* AREA QUAD / TRIANGLE */) {
             luv = randVec2(seed);
-            vec3 lightPoint = light.position.xyz + luv.x * light.u.xyz + luv.y * light.v.xyz;
+            vec2 uv = luv;
+            if (lightType == 3u) {
+                float r1 = sqrt(luv.x);
+                uv = vec2(1.0 - r1, luv.y * r1);
+            }
+            vec3 lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
             vec3 toLight = lightPoint - hitPoint;
             lightDist = length(toLight);
             lightDir = toLight / max(lightDist, 1e-4);
@@ -297,7 +309,7 @@ void restirDiFreshStream(
                 lightPdf = (lightDist * lightDist) / (area * cosLight);
                 validLightSample = true;
             }
-        } else if (uint(light.position.w) == 1u /* SPOT */) {
+        } else if (lightType == 1u /* SPOT */) {
             vec3 toLight = light.position.xyz - hitPoint;
             lightDist = length(toLight);
             lightDir = toLight / max(lightDist, 1e-4);
@@ -324,7 +336,7 @@ void restirDiFreshStream(
         if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
             float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
             float target = max(dot(lightEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
-            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-6);
+            float sourcePdf = max(lightPdf * lightSelectPdf, 1e-20);
             float weight = target / sourcePdf;
 
             totalWeightSum += weight;

@@ -1954,7 +1954,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                 float lenN = glm::length(n);
                 if (lenN > 1e-6f) {
                     LightGPU light{};
-                    light.position = glm::vec4(p0, LIGHT_AREA_QUAD);
+                    light.position = glm::vec4(p0, LIGHT_AREA_TRIANGLE);
                     light.u = glm::vec4(u, 0.0f);
                     light.v = glm::vec4(v, 0.0f);
                     light.normal = glm::vec4(n / lenN, 0.0f);

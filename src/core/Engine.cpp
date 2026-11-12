@@ -2280,6 +2280,21 @@ void Engine::renderFrame() {
     if (m_config.reference_mode) flags |= (1 << 25); // Ground truth: NEE weight 0 on hittable (MIS) lights
     if (m_config.transparent_shadows && !m_config.reference_mode) flags |= (1 << 26); // Fast mode: dielectrics do not occlude NEE
     if (m_config.enable_delta_unroll) flags |= (1 << 11);
+    {
+        // Diagnostics only: PATHWAYS_DEBUG_STRATEGY=no-bsdf-emit|no-nee suppresses one light-transport
+        // estimator (see shaders/compute/mis_common.glsl) to measure per-strategy energy and variance.
+        static const uint32_t s_dbgStrategyFlags = []() -> uint32_t {
+            const char* v = std::getenv("PATHWAYS_DEBUG_STRATEGY");
+            if (!v) return 0u;
+            const std::string s(v);
+            uint32_t f = 0u;
+            if (s.find("no-bsdf-emit") != std::string::npos) f |= (1u << 28);
+            if (s.find("no-nee") != std::string::npos) f |= (1u << 29);
+            if (f) Logger::warn("PATHWAYS_DEBUG_STRATEGY='{}': diagnostic estimator suppression active (biased)", s);
+            return f;
+        }();
+        flags |= s_dbgStrategyFlags;
+    }
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
     }

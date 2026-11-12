@@ -182,6 +182,7 @@ struct Config {
     bool reference_mode = false;   // --reference: ground-truth integrator (UBO flag bit 25)
     bool transparent_shadows = false; // --transparent-shadows: dielectrics don't occlude NEE (biased fast mode, UBO bit 26)
     uint32_t rng_seed = 0;         // --seed: RNG frame-counter offset (seed << 20) for independent runs
+    bool emissive_geometry_lights = true; // Register emissive instanced geometry as MIS area lights (disable via --no-emissive-geometry-lights)
     bool enable_light_tree = true;       // Hierarchical Light Tree importance sampling for many-light scenes [Default: true]
     bool enable_delta_unroll = true;     // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: true]
     uint32_t max_delta_events = 4;       // Maximum internal delta events to unroll per dielectric vertex (default: 4)

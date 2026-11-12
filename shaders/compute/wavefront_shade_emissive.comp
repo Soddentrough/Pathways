@@ -273,7 +273,7 @@ void main() {
             // MIS weight against NEE at the spawning vertex (mis_common.glsl).
             uint inPdfCode = unpackRayPdfCode(state);
             float emitMisW = (pc.currentBounce == 0u) ? 1.0
-                : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, inPdfCode, pc.numLights);
+                : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights);
             vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (pc.currentBounce > 0u) {
                 float effClamp = (!isSpecularPath && inPdfCode == 0u && pc.currentBounce >= 2u)

@@ -1233,6 +1233,14 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.streamline_secondary_shading = false;
             continue;
         }
+        if (arg == "--no-emissive-geometry-lights") {
+            cfg.emissive_geometry_lights = false;
+            continue;
+        }
+        if (arg == "--emissive-geometry-lights") {
+            cfg.emissive_geometry_lights = true;
+            continue;
+        }
         if (arg == "--no-distance-clamping" || arg == "--no-ray-clamping") {
             cfg.distance_clamping = false;
             continue;

@@ -180,8 +180,12 @@ bool evalStandardDirectNEE(
                 candPdfSolidAngle = 1.0;
                 validCand = true;
             }
-        } else /* AREA QUAD */ {
+        } else /* AREA QUAD or AREA TRIANGLE */ {
             vec2 ruv = randVec2(seed);
+            if (lightType == 3u /* AREA TRIANGLE */) {
+                float r1 = sqrt(ruv.x);
+                ruv = vec2(1.0 - r1, ruv.y * r1);
+            }
             vec3 lightPos = light.position.xyz + light.u.xyz * ruv.x + light.v.xyz * ruv.y;
             vec3 toLight = lightPos - hitPoint;
             float distSq = max(dot(toLight, toLight), 1e-4);
@@ -201,8 +205,8 @@ bool evalStandardDirectNEE(
         vec3 totalFCos = stdBsdfEvalSplit(bsdf, hitNormal, V, lightDir, bsdfPdf, specFCos);
         if (dot(totalFCos, totalFCos) <= 1e-14) continue;
 
-        float sourcePdf = max(candPdfSolidAngle * lightPickPdf, 1e-6);
-        float misW = (lightType == 0u)
+        float sourcePdf = max(candPdfSolidAngle * lightPickPdf, 1e-20);
+        float misW = (lightType == 0u || lightType == 3u)
             ? neeMisWeight(lightIdx, sourcePdf, bsdfPdf, canContinue)
             : 1.0;
         if (misW <= 0.0) continue;

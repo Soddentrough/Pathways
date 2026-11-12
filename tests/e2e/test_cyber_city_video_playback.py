@@ -32,7 +32,16 @@ CLR_BOLD = "\033[1m"
 
 def run_pathways(args_list, timeout_sec=60):
     """Executes pathways binary and returns (returncode, stdout, stderr, elapsed_sec)"""
-    cmd = ["./build/bin/pathways"] + args_list
+    bin_path = os.environ.get("PATHWAYS_BIN")
+    if not bin_path or not os.path.exists(bin_path):
+        for candidate in ["./build/linux-release/bin/pathways", "./build/bin/pathways", "./bin/pathways"]:
+            full = os.path.join(PROJECT_ROOT, candidate)
+            if os.path.exists(full):
+                bin_path = full
+                break
+    if not bin_path:
+        bin_path = "./build/bin/pathways"
+    cmd = [bin_path] + args_list
     t0 = time.time()
     try:
         res = subprocess.run(cmd, cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=timeout_sec)

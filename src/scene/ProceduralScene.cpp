@@ -2146,8 +2146,21 @@ SceneData ProceduralScene::createCyberCityScene() {
         scene.instanceData.push_back(instGPU);
     };
 
+    // Hand-placed analytic "proxy" area lights for emissive prototype geometry (portal beacons,
+    // billboards, holo projectors, skybridge strips). Disabled: every call site duplicates an
+    // emissive surface of the instanced prototype, offset by a few cm and with a different
+    // emission, so (a) that surface's light was counted twice (BSDF hits on the geometry + NEE on
+    // the proxy) and (b) the proxies are invisible to BSDF rays, so NEE/BSDF MIS was impossible.
+    // Measured at the canyon pose: these lights carried ~4.5% of lit-surface energy but ~96% of
+    // its 1-spp variance (glossy-highlight fireflies up to 5e4 luminance). The emissive geometry
+    // itself is the light source; engine-side registration of emissive geometry for NEE is what
+    // provides light sampling for it.
+    constexpr bool kCyberCityProxyAreaLights = false;
     auto addBillboardLight = [&](const glm::mat4& xform, glm::vec3 localCorner, glm::vec3 localU, glm::vec3 localV,
                                  glm::vec3 emissionColor, float intensity) {
+        if constexpr (!kCyberCityProxyAreaLights) {
+            return;
+        }
         glm::vec3 worldCorner = glm::vec3(xform * glm::vec4(localCorner, 1.0f));
         glm::vec3 worldU = glm::vec3(xform * glm::vec4(localU, 0.0f));
         glm::vec3 worldV = glm::vec3(xform * glm::vec4(localV, 0.0f));

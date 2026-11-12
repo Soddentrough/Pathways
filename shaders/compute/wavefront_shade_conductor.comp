@@ -228,7 +228,7 @@ void main() {
             }
             float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
                 ? 0.0
-                : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, origin, rayDir, hitT, inPdfCode, pc.numLights));
+                : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights));
             if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                 vec3 emissiveContrib = vec3(throughput) * emissive * emitMisW;
                 if (bounce > 0u) {

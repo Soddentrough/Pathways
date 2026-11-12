@@ -73,13 +73,20 @@ void main() {
     float lightArea = light.emission.w;
     vec3 emission = light.emission.rgb;
 
-    if (light.position.w == 0.0 /* Area Quad Light */) {
+    uint lightType = uint(light.position.w);
+    bool isAreaLight = (lightType == 0u || lightType == 3u);
+    if (isAreaLight /* Area Quad / Triangle */) {
         vec2 uv = randVec2(seed);
+        if (lightType == 3u) {
+            float r1 = sqrt(uv.x);
+            uv = vec2(1.0 - r1, uv.y * r1);
+        }
         lightPos = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
         if (lightArea <= 0.0) {
-            lightArea = length(cross(light.u.xyz, light.v.xyz));
+            float a = length(cross(light.u.xyz, light.v.xyz));
+            lightArea = (lightType == 3u) ? (0.5 * a) : a;
         }
-    } else if (uint(light.position.w) == 1u /* Spot Light */) {
+    } else if (lightType == 1u /* Spot Light */) {
         lightPos = light.position.xyz;
         lightArea = 1.0;
     } else {
@@ -118,16 +125,16 @@ void main() {
 
         dir = normalize(right * (cos(phi) * sinTheta) + forward * (sin(phi) * sinTheta) + coneAxis * cosTheta);
         float coneSolidAngle = TWO_PI * (1.0 - cosThetaMax);
-        float cosLight = (light.position.w == 0.0) ? max(0.0, dot(lightNormal, dir)) : 1.0;
-        if (cosLight <= 0.0 && light.position.w == 0.0) {
+        float cosLight = isAreaLight ? max(0.0, dot(lightNormal, dir)) : 1.0;
+        if (cosLight <= 0.0 && isAreaLight) {
             return; // Emitted away from area light forward face
         }
         dirFluxWeight = cosLight * coneSolidAngle;
     } else {
         // Cosine hemisphere emission from area light: pdf(omega) = cosLight / PI, so cosLight cancels!
         dir = sampleCosineHemisphere(lightNormal, seed);
-        float cosLight = (light.position.w == 0.0) ? max(0.0, dot(lightNormal, dir)) : 1.0;
-        if (cosLight <= 0.0 && light.position.w == 0.0) {
+        float cosLight = isAreaLight ? max(0.0, dot(lightNormal, dir)) : 1.0;
+        if (cosLight <= 0.0 && isAreaLight) {
             return;
         }
         dirFluxWeight = PI;

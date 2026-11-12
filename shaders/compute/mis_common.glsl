@@ -33,11 +33,16 @@
 
 #define TRI_LIGHT_NONE        0u
 #define TRI_LIGHT_NEE_ONLY    0xFFFFFFFFu
+#define TRI_LIGHT_INSTANCED_BIT 0x80000000u // low 31 bits: quad index within the prototype
 #define LIGHT_FLAG_MIS        1u
 #define UBO_FLAG_DIRECT_LIGHT (1u << 0)
 #define UBO_FLAG_INDIRECT_LIGHT (1u << 1)
 #define UBO_FLAG_LIGHT_TREE   (1u << 7)
 #define UBO_FLAG_REFERENCE    (1u << 25)
+// Diagnostics only (PATHWAYS_DEBUG_STRATEGY env var, Engine.cpp): suppress one
+// estimator so per-strategy energy / variance can be measured. Biased by design.
+#define UBO_FLAG_DBG_NO_BSDF_EMIT (1u << 28) // drop emission found by BSDF-sampled rays (pdfCode != 0)
+#define UBO_FLAG_DBG_NO_NEE_AREA  (1u << 29) // drop NEE to area lights
 
 // ---- BSDF pdf codec (shared by NEE and the ray state) -----------------------
 // code 0 is reserved for "no MIS at the previous vertex" (camera ray, delta
@@ -92,7 +97,7 @@ float lightTreeSelectPdf(uint lightIdx, vec3 x) {
     }
     LightTreeNode leaf = lightNodes[node];
     if (leaf.children.z != 1u || leaf.children.x != lightIdx) return 0.0;
-    return max(p, 1e-6);
+    return max(p, 1e-20);
 }
 
 float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
@@ -100,7 +105,7 @@ float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
     if ((ubo.flags & UBO_FLAG_LIGHT_TREE) != 0u) {
         return lightTreeSelectPdf(lightIdx, x);
     }
-    return max(lights[lightIdx].sampling.z, 1e-6);
+    return max(lights[lightIdx].sampling.z, 1e-20);
 }
 
 // ---- NEE side ------------------------------------------------------------------
@@ -114,6 +119,7 @@ float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
 // weight 1 (they are NEE'd at every vertex in the reference as well).
 // With indirect lighting disabled there is no BSDF strategy -> weight 1.
 float neeMisWeight(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool canContinue) {
+    if ((ubo.flags & UBO_FLAG_DBG_NO_NEE_AREA) != 0u) return 0.0;
     if (!lightUsesMis(lightIdx)) return 1.0;
     if ((ubo.flags & UBO_FLAG_INDIRECT_LIGHT) == 0u) return 1.0;
     if (!canContinue) return 0.0;
@@ -125,15 +131,27 @@ float neeMisWeight(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool 
 // ---- BSDF-hit side ------------------------------------------------------------
 // Weight of emission found by a BSDF-sampled ray (origin, dir, hitT) whose
 // previous vertex encoded its sampling pdf as pdfCode.
-float emitterHitMisWeight(uint hitType, uint primId, vec3 origin, vec3 dir, float hitT,
+float emitterHitMisWeight(uint hitType, uint primId, uint instId, vec3 origin, vec3 dir, float hitT,
                           uint pdfCode, uint numLights) {
     if (hitType != 0u || pdfCode == 0u) return 1.0;
+    if ((ubo.flags & UBO_FLAG_DBG_NO_BSDF_EMIT) != 0u) return 0.0;
     if ((ubo.flags & UBO_FLAG_DIRECT_LIGHT) == 0u || numLights == 0u) return 1.0;
     uint m = triangles[primId].padding0;
     if (m == TRI_LIGHT_NONE) return 1.0;
     if (m == TRI_LIGHT_NEE_ONLY) return 0.0;
-    uint li = m - 1u;
-    if (li >= numLights) return 1.0;
+    uint li;
+    if ((m & TRI_LIGHT_INSTANCED_BIT) != 0u) {
+        // Emissive-geometry light (EmissiveGeometryLights.hpp): one light per emitting quad per
+        // instance. InstanceGPU::flags holds (firstLightOfInstance + 1); the low 31 bits of the
+        // triangle tag are the quad's index within its prototype.
+        uint base = instances[instId].flags;
+        if (base == 0u) return 1.0;
+        li = base - 1u + (m & ~TRI_LIGHT_INSTANCED_BIT);
+        if (li >= numLights) return 1.0;
+    } else {
+        li = m - 1u;
+        if (li >= numLights) return 1.0;
+    }
     Light L = lights[li];
     float cosL = dot(-dir, L.normal.xyz);
     if (cosL <= 0.0) return 1.0;       // back side: NEE never samples it

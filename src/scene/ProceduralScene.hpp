@@ -202,6 +202,9 @@ struct SceneData {
     std::vector<SceneInstance> instances;      // If empty, 1 identity instance is generated
     std::vector<InstanceGPU> instanceData;     // Uploaded to InstancesBuffer (binding 30)
     std::vector<AnimatedInstance> animatedInstances; // Dynamic kinematic animators
+    // Per-triangle prototype quad index for emissive-geometry lights
+    // (EmissiveGeometryLights.hpp); UINT32_MAX = triangle not covered by such a light.
+    std::vector<uint32_t> instancedEmissiveTriQuad;
 
     // Mineshaft Coaster 500m / 30s Real-Time Ride State
     struct CoasterTrackLight {
