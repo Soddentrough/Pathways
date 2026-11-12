@@ -2,12 +2,12 @@
 
 ## Vulkan Specification Alignment & Next-Gen Pipeline Modernization (Spec 1.4.341 → 1.4.363+)
 
-Following the review of the Vulkan 1.4 specification updates (through 1.4.363), the following architectural upgrades and optimizations are planned once the host SDK is updated beyond 1.4.341.0.
+Following the review of the Vulkan 1.4 specification updates (through 1.4.363), the following architectural upgrades and optimizations remain open. The host SDK is now 1.4.357.0, so extensions ratified through 1.4.357 are available; items introduced in 1.4.361+ still require a further SDK upgrade.
 
 ---
 
 ### 1. Direct Buffer Device Address Commands (`VK_KHR_device_address_commands`)
-- [ ] **Status:** Evaluated / Deprecated / Partially Redundant (Ratified in Vulkan 1.4.346)
+- [ ] **Status:** Evaluated / Partially Redundant / SDK Available (Ratified in Vulkan 1.4.346; host SDK 1.4.357)
 - [ ] **Target Component:** `src/rt/DGCManager.cpp`, `src/rt/WavefrontPipeline.cpp`
 - [ ] **Objective:** Evaluate `vkCmdDispatchIndirect2KHR` across indirect compute dispatch paths.
 - [ ] **Architectural Assessment & Notes (September 2026):**
@@ -15,25 +15,11 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
   - **Indirect Fallback**: Replacing `vkCmdDispatchIndirect` with `vkCmdDispatchIndirect2KHR` in the non-DGC fallback path generates byte-for-byte identical hardware PM4 packets on AMD Command Processors; CPU recording savings are negligible (< 0.001 ms).
   - **ReSTIR / NRC Clarification**: `ReSTIRManager` and `NRCManager` execute direct compute dispatches (`vkCmdDispatch`), not indirect dispatches. Their buffer bindings use descriptor sets (`VkDescriptorBufferInfo`). Eliminating buffer handles in ReSTIR/NRC requires Buffer Device Address (BDA) via Push Constants or `VK_EXT_descriptor_buffer`, not `VK_KHR_device_address_commands`.
 - [ ] **Revised Tasks:**
-  - [ ] If desired for API consistency once SDK > 1.4.346 is installed, swap `vkCmdDispatchIndirect` fallback calls in `DGCManager.cpp` and `WavefrontPipeline.cpp` to `vkCmdDispatchIndirect2KHR`.
+  - [ ] Optional (API consistency only): swap `vkCmdDispatchIndirect` fallback calls in `DGCManager.cpp` and `WavefrontPipeline.cpp` to `vkCmdDispatchIndirect2KHR`.
 
 ---
 
-### 2. Compute Latency Hiding via Split Barriers (`VK_EXT_shader_split_barrier`)
-- [ ] **Status:** Evaluated / Rejected for Wavefront Classify (Introduced in Vulkan 1.4.351)
-- [ ] **Target Component:** Multi-wave compute filters / Denoiser spatial passes with shared LDS
-- [ ] **Objective:** Overlap inter-subgroup synchronization with independent math in multi-subgroup compute workgroups.
-- [ ] **Architectural Assessment & Notes (September 2026):**
-  - **Causal Dataflow Violation in Classify**: In `wavefront_classify.comp`, 2D Morton Z-curve mapping is the input coordinate generator for primary ray direction, BVH query traversal, and hit evaluation. SoA ray queue stores (`outGeoms`, `outHits`, `outStates`) happen after traversal. It is physically impossible to overlap queue writes with Morton ALU because Morton ALU must finish hundreds of cycles before ray traversal can even launch.
-  - **Single-Wave Workgroup (Wave32)**: `wavefront_classify.comp` uses `local_size_x = 8, local_size_y = 4` (32 threads). On AMD RDNA 3.5 / RDNA 4 (`gfx1151`, `gfx1201`), this maps to a single Wave32 wave where all threads execute in SIMD lockstep. There are zero inter-subgroup barriers within the workgroup; all inter-lane sharing uses hardware subgroup intrinsics (`subgroupBallot`, `subgroupShuffle`).
-  - **Control vs. Memory Barriers**: `VK_EXT_shader_split_barrier` splits workgroup control barriers (`OpControlBarrierArriveEXT` / `OpControlBarrierWaitEXT`). It cannot split global memory barriers (`memoryBarrierBuffer()`). Global stores are already non-blocking fire-and-forget instructions handled by hardware L0/L1 write buffers.
-- [ ] **Revised Scope & Tasks:**
-  - [ ] Drop `wavefront_classify.comp` from split barrier optimization.
-  - [ ] Re-evaluate split barriers only if authoring wide multi-wave filter kernels ($\ge 256$ threads per workgroup) utilizing shared memory (LDS).
-
----
-
-### 3. Modular Material Pipeline Libraries (`VK_KHR_pipeline_library_group_handles`)
+### 2. Modular Material Pipeline Libraries (`VK_KHR_pipeline_library_group_handles`)
 - [ ] **Status:** Proposed / Pending SDK Upgrade (Introduced in Vulkan 1.4.362)
 - [ ] **Target Component:** `src/rt/RTPipeline.cpp`, `src/rt/WavefrontPipeline.cpp`
 - [ ] **Objective:** Support dynamic composition of material evaluation microkernels using pipeline libraries without invalidating Shader Binding Table (SBT) entries.
@@ -45,32 +31,19 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 
 ---
 
-### 4. GPU-Side Assertions & Telemetry Diagnostics (`VK_KHR_shader_abort` & `VK_KHR_device_fault`)
-- [ ] **Status:** Proposed / Pending SDK Upgrade (Introduced in Vulkan 1.4.347)
+### 3. GPU-Side Assertions & Telemetry Diagnostics (`VK_KHR_shader_abort` & `VK_KHR_device_fault`)
+- [ ] **Status:** Proposed / SDK Available (Introduced in Vulkan 1.4.347; host SDK 1.4.357)
 - [ ] **Target Component:** `src/core/Logger.hpp`, `src/vulkan/VulkanContext.cpp`, `shaders/compute/*`
 - [ ] **Objective:** Implement reliable GPU hang diagnosis and shader assertions during autonomous DGC execution.
 - [ ] **Tasks:**
   - [ ] Enable `VK_KHR_device_fault` and configure `VkDeviceFaultAddressInfoEXT` dump handler in `VulkanContext`.
   - [ ] Enable `VK_KHR_shader_abort` in debug builds to trap out-of-bounds queue indices and invalid NaN/Inf radiance vectors directly on the GPU.
   - [ ] Integrate structured fault logs (faulting memory address, pipeline, shader stage) into Pathways telemetry.
+  - [ ] Enable `VK_KHR_shader_constant_data` solely as the `VK_KHR_shader_abort` dependency for compile-time assertion messages (evaluated and rejected for sampling tables: divergent table indexing causes VGPR bloat vs. the zero-memory PCG RNG).
 
 ---
 
-### 5. Embedded Sampling Tables via Constant Data (`VK_KHR_shader_constant_data`)
-- [ ] **Status:** Evaluated / Rejected for Sampling Tables (Introduced in Vulkan 1.4.347)
-- [ ] **Target Component:** `src/vulkan/VulkanContext.cpp` (prerequisite for `VK_KHR_shader_abort`)
-- [ ] **Objective:** Utilize `OpConstantDataKHR` for static diagnostic strings and debug assertions.
-- [ ] **Architectural Assessment & Notes (September 2026):**
-  - **Microarchitectural Inversion (VGPR Bloat)**: Embedding multi-kilobyte constant tables (Sobol matrices, Halton permutations) into shader binaries causes severe VGPR pressure. Because sampling indices vary per pixel and per bounce (divergent across the wave), the compiler cannot keep tables in scalar registers (SGPRs); it must load them into VGPRs or spill to private scratch memory, degrading Wave32 CU occupancy.
-  - **Pathways Baseline is Already Zero-Descriptor & Zero-Memory**: Pathways uses an analytical PCG random number generator (`pcg_hash` in `wavefront_common.glsl`), which requires 0 descriptor slots, 0 bytes of VRAM, and exactly 1 `uint` state register in VGPR. Embedding constant tables would strictly regress performance and register usage.
-  - **QMC Best Practice**: If low-discrepancy sampling (e.g. PMJ02bn or Cranley-Patterson rotated Sobol) is adopted in the future, standard practice is binding a small $64 \times 64$ or $128 \times 128$ tileable blue-noise / scramble texture or compact 32-element direction array via existing bindless textures, utilizing hardware L0/L1 texture caches with high spatial locality.
-- [ ] **Revised Scope & Tasks:**
-  - [ ] Retain `VK_KHR_shader_constant_data` solely as a dependency for `VK_KHR_shader_abort` to embed compile-time assertion messages and diagnostic string tables.
-  - [ ] Do not embed divergent numerical sampling matrices into shader constants.
-
----
-
-### 6. Command Buffer Lifecycle Optimization (Vulkan 1.4.361 / Issue 2782)
+### 4. Command Buffer Lifecycle Optimization (Vulkan 1.4.361 / Issue 2782)
 - [ ] **Status:** Proposed / Pending SDK Upgrade
 - [ ] **Target Component:** `src/vulkan/VulkanContext.cpp`, `src/mgpu/MultiGpuManager.cpp`
 - [ ] **Objective:** Streamline command buffer re-recording without explicit `vkResetCommandBuffer` calls.
@@ -82,7 +55,7 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 
 ## Physical Material System & Light Transport Roadmap
 
-### 7. Subsurface Scattering (BSSRDF & Volumetric Light Transport)
+### 5. Subsurface Scattering (BSSRDF & Volumetric Light Transport)
 - [ ] **Status:** Proposed / Architectural Design Phase
 - [ ] **Target Component:** `src/scene/Material.hpp`, `src/rt/WavefrontPipeline.cpp`, `shaders/compute/wavefront_shade_*.comp`, `shaders/compute/wavefront_sss.comp`
 - [ ] **Objective:** Implement physical Subsurface Scattering (SSS) for translucent and organic materials (skin, marble, wax, jade, milk, foliage) beyond current thin-walled diffuse transmission.
@@ -119,7 +92,7 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
 
 ## Interactive Dynamics & Physics Simulation Roadmap
 
-### 8. Rigid-Body Physics Engine Integration (Box3D) & Dynamic Bouncing Balls Showcase
+### 6. Rigid-Body Physics Engine Integration (Box3D) & Dynamic Bouncing Balls Showcase
 - [ ] **Status:** Proposed / Architectural Design Phase
 - [ ] **Target Component:** `src/physics/` (new), `src/core/Engine.cpp`, `src/scene/ProceduralScene.cpp`, CMake build system
 - [ ] **Objective:** Integrate Erin Catto's **Box3D** (C17 3D rigid-body engine) to drive dynamic physical simulations in real-time, showcasing hardware ray-traced reflections, caustics, and shadows across hundreds of colliding rigid bodies.
@@ -145,3 +118,20 @@ Following the review of the Vulkan 1.4 specification updates (through 1.4.363), 
   - [ ] Wire fixed-timestep update in `Engine::renderFrame()` to sync Box3D body transforms into `Engine::updateInstanceTransform()`.
   - [ ] Add ImGui controls in `GuiManager` for physics reset, ball spawn rate, gravity, and restitution.
 
+---
+
+## Testing & Validation Roadmap
+
+### 7. Upscaler Quality Validation (FSR 3.1 / FSR 4.1 ML / Upways SR)
+- [ ] **Status:** Proposed
+- [ ] **Target Component:** `tests/test_fidelityfx_features.cpp`
+- [ ] **Background (November 2026):**
+  - The former `edgeRetention` metric (renamed `gradientEnergyRatio`) is the ratio of summed Sobel gradient magnitude in the test image vs. the 256-SPP reference on reference edge pixels. It is not an edge-fidelity measure: it ignores edge position, orientation and shape, and residual Monte Carlo noise, ringing, over-sharpening and aliasing all *increase* it (raw unaccumulated 1-SPP scored highest at 1.214).
+  - The `FSR 4.1 ML > FSR 3.1 + 0.03` assertion was removed because it was effectively ranking residual 1-SPP grain, not upscaling quality. The ratio is retained only as a crude blur/black-frame guard.
+  - Current runs feed 1-SPP input into a static Cornell Box for 12 frames, so upscalers act mostly as temporal denoisers on content they are not tuned for.
+- [ ] **Tasks:**
+  - [ ] Isolate upscaling from denoising: feed well-converged (high-SPP or accumulated) input at the internal render resolution.
+  - [ ] Compare against a converged native-resolution reference using full-reference perceptual/structural metrics (NVIDIA FLIP, SSIM/MS-SSIM) and per-pixel gradient error |∇img − ∇ref| instead of gradient-sum ratios.
+  - [ ] Add camera motion and scenes with fine, diagonal and high-frequency detail (thin geometry, textures, specular highlights) to exercise reprojection, disocclusion and anti-aliasing.
+  - [ ] Evaluate temporal stability (frame-to-frame flicker / temporal FLIP) separately from single-frame quality.
+  - [ ] Report scores as informational with tolerance bounds vs. the reference; avoid hard "upscaler A must beat upscaler B" assertions.

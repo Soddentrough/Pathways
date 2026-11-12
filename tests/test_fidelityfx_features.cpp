@@ -33,7 +33,7 @@ struct ImageMetrics {
     double meanLuminance = 0.0;
     double nonBlackRatio = 0.0;
     double laplacianNoiseVar = 0.0;
-    double edgeRetention = 1.0;
+    double gradientEnergyRatio = 1.0;
     double psnrVsRefDb = 0.0;
     double rmseVsRef = 0.0;
 };
@@ -184,7 +184,9 @@ static ImageMetrics evaluateImageQuality(const std::string& pngPath, const std::
         m.rmseVsRef = std::sqrt(mse);
         m.psnrVsRefDb = (mse > 1e-10) ? (10.0 * std::log10(1.0 / mse)) : 99.0;
 
-        // Evaluate structural edge retention on coherent reference geometric edges, using a 3x3 smoothed
+        // Gradient energy ratio (crude blur/black-frame guard, NOT an edge-fidelity metric): sum of image Sobel
+        // magnitude / reference Sobel magnitude on reference edge pixels. Noise, ringing and aliasing raise it.
+        // Edge-pixel selection uses a 3x3 smoothed
         // reference gradient for edge-pixel selection so residual MC grain is never mistaken for an edge.
         auto refSmoothAt = [&](int x, int y) -> double {
             double s = 0.0;
@@ -222,7 +224,7 @@ static ImageMetrics evaluateImageQuality(const std::string& pngPath, const std::
                 }
             }
         }
-        m.edgeRetention = (sumRefEdge > 1e-6) ? (sumImgEdge / sumRefEdge) : 1.0;
+        m.gradientEnergyRatio = (sumRefEdge > 1e-6) ? (sumImgEdge / sumRefEdge) : 1.0;
     }
 
     stbi_image_free(data);
@@ -331,6 +333,7 @@ int main(int argc, char** argv) {
 #if defined(PATHWAYS_HAS_FFX_SDK)
     const bool hasUpscalerProvider = FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler);
     const bool expectsFsr4 = hasUpscalerProvider && FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u);
+    const bool supportsUpways = FfxSdkRuntime::supportsHardwareFloat8(targetPhys);
     auto upscaleVersions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, targetPhys);
     if (hasUpscalerProvider) {
         check_true(!upscaleVersions.empty(), "Upscale effect versions must not be empty when Upscaler Vulkan provider is loaded");
@@ -379,8 +382,6 @@ int main(int argc, char** argv) {
         std::cout << "  -> Vulkan Radiance Cache Provider (amd_fidelityfx_radiancecache_vk): NOT PRESENT in SDK 2.4.0 (honestly reported as unsupported)" << std::endl;
     }
 #endif
-
-    vkDestroyInstance(instance, nullptr);
 
     // -------------------------------------------------------------------------
     // TEST 3: CLI Configuration Parsing for All FidelityFX Features
@@ -544,15 +545,15 @@ int main(int argc, char** argv) {
 
     // 8. Render Upways SR (Quality 0.67x)
     FeatureRunResult upwaysSrRun = runFeatureConfig(
-        "07a_upways_sr_quality", "Upways SR (Quality 0.67x)", "--upscaler upways --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);
+        "07a_upways_sr_quality", supportsUpways ? "Upways SR (Quality 0.67x)" : "Upways SR (Gated -> Off)", "--upscaler upways --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);
 
     // 9. Render Standalone Denoisers at Native 1.0x & Coupled with FSR 3.1 / FSR 4.1 ML (0.67x)
     FeatureRunResult upwaysDenRun = runFeatureConfig(
-        "07c_upways_denoiser", "Denoiser: Upways (Native 1.0x)", "--upscaler none --denoiser upways --spp 1", &refPixels, refW, refH);
+        "07c_upways_denoiser", supportsUpways ? "Denoiser: Upways (Native 1.0x)" : "Denoiser: Upways (Gated -> Off)", "--upscaler none --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr3UpwaysDenRun = runFeatureConfig(
-        "07c1_fsr3_upways_denoiser", "FSR 3.1 + Upways Denoiser", "--upscaler fsr3 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
+        "07c1_fsr3_upways_denoiser", supportsUpways ? "FSR 3.1 + Upways Denoiser" : "FSR 3.1 + Upways (Gated -> Off)", "--upscaler fsr3 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr4UpwaysDenRun = runFeatureConfig(
-        "07c2_fsr4_upways_denoiser", "FSR 4.1 ML + Upways Denoiser", "--upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
+        "07c2_fsr4_upways_denoiser", supportsUpways ? "FSR 4.1 ML + Upways Denoiser" : "FSR 4.1 ML + Upways (Gated -> Off)", "--upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr4SvgfDenRun = runFeatureConfig(
         "07c3_fsr4_esvgf_denoiser", "FSR 4.1 ML + E-SVGF Denoiser", "--upscaler fsr4 --render-scale 0.67 --denoiser svgf --spp 1", &refPixels, refW, refH);
 
@@ -586,7 +587,7 @@ int main(int argc, char** argv) {
               << std::setw(10) << "FPS"
               << std::setw(11) << "MeanLum"
               << std::setw(12) << "NoiseVar"
-              << std::setw(10) << "EdgeRet"
+              << std::setw(10) << "GradRatio"
               << std::setw(11) << "PSNR(dB)" << "\n";
     std::cout << "-------------------------------------------------------------------------------------------------------------------------------\n";
     for (const auto& r : allRuns) {
@@ -598,7 +599,7 @@ int main(int argc, char** argv) {
                   << std::setprecision(1) << std::setw(10) << r.avgFps
                   << std::setprecision(4) << std::setw(11) << r.visual.meanLuminance
                   << std::setprecision(6) << std::setw(12) << r.visual.laplacianNoiseVar
-                  << std::setprecision(3) << std::setw(10) << r.visual.edgeRetention
+                  << std::setprecision(3) << std::setw(10) << r.visual.gradientEnergyRatio
                   << std::setprecision(2) << std::setw(11) << r.visual.psnrVsRefDb << "\n";
     }
     std::cout << "-------------------------------------------------------------------------------------------------------------------------------\n";
@@ -616,8 +617,13 @@ int main(int argc, char** argv) {
                    "Hardware ML capable GPU with FSR 4 Upscaler provider must report supports_fsr4_ml == true");
         check_true(fsr4Run.reportedUpscaler == "FSR 4.1 ML",
                    "FSR 4.1 ML run must report upscaler_mode == 'FSR 4.1 ML' without falling back to FSR 3.1, got '" + fsr4Run.reportedUpscaler + "'");
-        check_true(fsr4UpwaysDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4UpwaysDenRun.reportedDenoiser == "Upways",
-                   "FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'Upways'");
+        if (supportsUpways) {
+            check_true(fsr4UpwaysDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4UpwaysDenRun.reportedDenoiser == "Upways",
+                       "FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'Upways'");
+        } else {
+            check_true(fsr4UpwaysDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4UpwaysDenRun.reportedDenoiser == "None",
+                       "Without RDNA 4 FP8, FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'None'");
+        }
         check_true(fsr4SvgfDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4SvgfDenRun.reportedDenoiser == "SVGF",
                    "FSR 4.1 ML + E-SVGF Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'SVGF'");
         check_true(combinedRun.reportedUpscaler == "FSR 4.1 ML",
@@ -640,11 +646,20 @@ int main(int argc, char** argv) {
     check_true(svgfRun.reportedDenoiser == "SVGF",
                "E-SVGF run must report denoiser_mode == 'SVGF', got '" + svgfRun.reportedDenoiser + "'");
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
-    check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
-    check_true(upwaysDenRun.reportedDenoiser == "Upways", "Upways Denoiser run must report denoiser_mode == 'Upways'");
-    if (hasUpscalerProvider) {
-        check_true(fsr3UpwaysDenRun.reportedUpscaler == "FSR 3.1" && fsr3UpwaysDenRun.reportedDenoiser == "Upways",
-                   "FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'Upways'");
+    if (supportsUpways) {
+        check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
+        check_true(upwaysDenRun.reportedDenoiser == "Upways", "Upways Denoiser run must report denoiser_mode == 'Upways'");
+        if (hasUpscalerProvider) {
+            check_true(fsr3UpwaysDenRun.reportedUpscaler == "FSR 3.1" && fsr3UpwaysDenRun.reportedDenoiser == "Upways",
+                       "FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'Upways'");
+        }
+    } else {
+        check_true(upwaysSrRun.reportedUpscaler == "None", "Without RDNA 4 FP8, Upways SR run must report upscaler_mode == 'None'");
+        check_true(upwaysDenRun.reportedDenoiser == "None", "Without RDNA 4 FP8, Upways Denoiser run must report denoiser_mode == 'None'");
+        if (hasUpscalerProvider) {
+            check_true(fsr3UpwaysDenRun.reportedUpscaler == "FSR 3.1" && fsr3UpwaysDenRun.reportedDenoiser == "None",
+                       "Without RDNA 4 FP8, FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'None'");
+        }
     }
 
     // Assertions: Visual Quality, Energy Conservation, Edge Retention & Image Integrity
@@ -659,36 +674,49 @@ int main(int argc, char** argv) {
         const double maxLumRatio = isUnaccum1Spp ? 1.25 : 1.15;
         check_true(lumRatio >= minLumRatio && lumRatio <= maxLumRatio,
                    r.name + " mean luminance must preserve scene energy within tight bounds relative to 256-SPP Reference MC (ratio=" + std::to_string(lumRatio) + ")");
-        check_true(r.visual.edgeRetention >= 0.40,
-                   r.name + " structural edge retention must be >= 0.40 (got " + std::to_string(r.visual.edgeRetention) + ")");
+        check_true(r.visual.gradientEnergyRatio >= 0.40,
+                   r.name + " gradient energy ratio must be >= 0.40 (blur/black-frame guard) (got " + std::to_string(r.visual.gradientEnergyRatio) + ")");
         const double minPsnrDb = isUnaccum1Spp ? 12.0 : 20.0;
         check_true(r.visual.psnrVsRefDb >= minPsnrDb,
                    r.name + " PSNR vs 256-SPP Reference MC must be >= " + std::to_string(minPsnrDb) + " dB (got " + std::to_string(r.visual.psnrVsRefDb) + " dB)");
     }
 
     // Assertions: Surface-Guided & ML Edge Retention
-    check_true(upwaysDenRun.visual.edgeRetention >= 0.70 && svgfRun.visual.edgeRetention >= 0.70,
-               "Surface-guided native denoisers (Upways, E-SVGF) must retain >= 70% of strong geometric edge gradients");
-    check_true(upwaysSrRun.visual.edgeRetention >= 0.70,
-               "Upways SR must retain >= 70% of strong geometric edge gradients (got " + std::to_string(upwaysSrRun.visual.edgeRetention) + ")");
+    check_true(svgfRun.visual.gradientEnergyRatio >= 0.70,
+               "Surface-guided native denoiser (E-SVGF) must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
+    if (supportsUpways) {
+        check_true(upwaysDenRun.visual.gradientEnergyRatio >= 0.70,
+                   "Surface-guided native denoiser (Upways) must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
+        check_true(upwaysSrRun.visual.gradientEnergyRatio >= 0.70,
+                   "Upways SR must keep >= 70% of reference gradient energy on edge pixels (blur guard) (got " + std::to_string(upwaysSrRun.visual.gradientEnergyRatio) + ")");
+    }
     if (expectsFsr4) {
-        check_true(fsr4Run.visual.edgeRetention > fsr3Run.visual.edgeRetention + 0.25,
-                   "FSR 4.1 ML must preserve significantly sharper structural edges than analytical FSR 3.1");
-        check_true(fsr4UpwaysDenRun.visual.edgeRetention >= 0.70 && fsr4SvgfDenRun.visual.edgeRetention >= 0.70,
-                   "Coupled FSR 4.1 ML + Upways/E-SVGF Denoiser must retain >= 70% of strong geometric edge gradients");
+        // NOTE: No comparative FSR 4.1 ML vs FSR 3.1 quality assertion. gradientEnergyRatio only measures
+        // total gradient magnitude on reference edge pixels; residual noise, ringing and aliasing inflate it,
+        // so it cannot rank upscaler fidelity. See TODO.md (Upscaler Quality Validation).
+        if (supportsUpways) {
+            check_true(fsr4UpwaysDenRun.visual.gradientEnergyRatio >= 0.70,
+                       "Coupled FSR 4.1 ML + Upways Denoiser must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
+        }
+        check_true(fsr4SvgfDenRun.visual.gradientEnergyRatio >= 0.70,
+                   "Coupled FSR 4.1 ML + E-SVGF Denoiser must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
     }
 
     // Assertions: Denoiser Visual Noise Reduction & Coupled Upscaler+Denoiser Assessment
     const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : svgfRun;
     check_true(activeDenoiserRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
                "Active denoiser must reduce 1-SPP high-frequency noise variance by >80%");
-    check_true(upwaysDenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
-               "Upways standalone denoiser must reduce 1-SPP high-frequency noise variance by >80%");
-    check_true(upwaysSrRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
-               "Upways SR coupled upscaler+denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+    if (supportsUpways) {
+        check_true(upwaysDenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
+                   "Upways standalone denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+        check_true(upwaysSrRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
+                   "Upways SR coupled upscaler+denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+    }
     if (expectsFsr4) {
-        check_true(fsr4UpwaysDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
-                   "Coupling FSR 4.1 ML with Upways Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
+        if (supportsUpways) {
+            check_true(fsr4UpwaysDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
+                       "Coupling FSR 4.1 ML with Upways Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
+        }
         check_true(fsr4SvgfDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
                    "Coupling FSR 4.1 ML with E-SVGF Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
     }
@@ -730,11 +758,13 @@ int main(int argc, char** argv) {
                   << " | Upways SR=" << upwaysSrFlicker
                   << " | FSR 4.1 ML + Upways Denoiser=" << fsr4UpwaysFlicker << std::endl;
 
-        check_true(upwaysSrFlicker < rawFlicker * 0.30,
-                   "Upways SR must reduce frame-to-frame temporal flicker RMSE by >70% vs raw 1-SPP MC");
-        if (expectsFsr4) {
-            check_true(fsr4UpwaysFlicker < rawFlicker * 0.30,
-                       "FSR 4.1 ML + Upways Denoiser must reduce frame-to-frame temporal flicker RMSE by >70% vs raw 1-SPP MC");
+        if (supportsUpways) {
+            check_true(upwaysSrFlicker < rawFlicker * 0.30,
+                       "Upways SR must reduce frame-to-frame temporal flicker RMSE by >70% vs raw 1-SPP MC");
+            if (expectsFsr4) {
+                check_true(fsr4UpwaysFlicker < rawFlicker * 0.30,
+                           "FSR 4.1 ML + Upways Denoiser must reduce frame-to-frame temporal flicker RMSE by >70% vs raw 1-SPP MC");
+            }
         }
     }
 
@@ -767,22 +797,29 @@ int main(int argc, char** argv) {
                       << " | FPS=" << std::fixed << std::setprecision(1) << std::setw(7) << mr.avgFps
                       << " | MeanLum=" << std::setprecision(4) << mr.visual.meanLuminance
                       << " | NoiseVar=" << std::setprecision(6) << mr.visual.laplacianNoiseVar
-                      << " | EdgeRet=" << std::setprecision(3) << mr.visual.edgeRetention
+                      << " | GradRatio=" << std::setprecision(3) << mr.visual.gradientEnergyRatio
                       << " | PSNR=" << std::setprecision(2) << mr.visual.psnrVsRefDb << " dB\n";
             check_true(mr.visual.nonBlackRatio > 0.75, mr.name + " must not produce black/corrupted frames under camera motion");
             const double lumRatio = mr.visual.meanLuminance / std::max(motionRefRun.visual.meanLuminance, 1e-4);
             check_true(lumRatio >= 0.80 && lumRatio <= 1.20,
                        mr.name + " must preserve scene energy under continuous camera motion (ratio=" + std::to_string(lumRatio) + ")");
-            check_true(mr.visual.edgeRetention >= 0.65,
-                       mr.name + " must retain structural edges without severe motion ghosting blur (EdgeRet=" + std::to_string(mr.visual.edgeRetention) + ")");
+            check_true(mr.visual.gradientEnergyRatio >= 0.65,
+                       mr.name + " must keep >= 65% reference gradient energy under motion (blur guard) (GradRatio=" + std::to_string(mr.visual.gradientEnergyRatio) + ")");
         }
-        check_true(motionUpwaysSr.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
-                   motionUpwaysSr.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
-                   "Motion Upways SR must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
+        if (supportsUpways) {
+            check_true(motionUpwaysSr.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
+                       motionUpwaysSr.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
+                       "Motion Upways SR must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
+            if (expectsFsr4) {
+                check_true(motionFsr4Upways.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
+                           motionFsr4Upways.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
+                           "Motion FSR 4.1 ML + Upways Denoiser must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
+            }
+        }
         if (expectsFsr4) {
-            check_true(motionFsr4Upways.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
-                       motionFsr4Upways.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
-                       "Motion FSR 4.1 ML + Upways Denoiser must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
+            check_true(motionFsr4Svgf.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
+                       motionFsr4Svgf.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
+                       "Motion FSR 4.1 ML + E-SVGF Denoiser must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
         }
     }
 
@@ -844,6 +881,8 @@ int main(int argc, char** argv) {
     if (const char* keepEnv = std::getenv("PATHWAYS_KEEP_TEST_OUTPUT"); !keepEnv || std::string(keepEnv) != "1") {
         std::filesystem::remove_all(outDir, ec);
     }
+
+    vkDestroyInstance(instance, nullptr);
 
     std::cout << "==================================================================" << std::endl;
     std::cout << "  ALL FIDELITYFX SDK 2.4 FEATURE & VISUAL/PERF TESTS PASSED!      " << std::endl;
