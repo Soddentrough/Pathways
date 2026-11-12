@@ -72,6 +72,8 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     style.Colors[ImGuiCol_PopupBg]          = ImVec4(0.07f, 0.09f, 0.13f, 0.88f);
     style.Colors[ImGuiCol_Border]           = ImVec4(0.25f, 0.35f, 0.45f, 0.55f);
 
+    applyStyleAndDpiScale(computeUiScale());
+
     // High-DPI font initialization:
     // When fractional display scaling is active (e.g. 1.25x on 5120x2160),
     // Dear ImGui's default 13px bitmap font is resampled with bilinear filtering,
@@ -129,8 +131,40 @@ GuiManager::GuiManager(SDL_Window* window, VkInstance instance, VkPhysicalDevice
     }
 
     m_initialized = true;
-    Logger::info("Dear ImGui initialized with dynamic rendering (HDR mode: {}, paperWhite: {:.0f} nits).",
-                 static_cast<uint32_t>(m_hdrMode), m_paperWhiteNits);
+    Logger::info("Dear ImGui initialized with dynamic rendering (UI DPI scale: {:.2f}x, HDR mode: {}, paperWhite: {:.0f} nits).",
+                 m_uiScale, static_cast<uint32_t>(m_hdrMode), m_paperWhiteNits);
+}
+
+float GuiManager::computeUiScale() const {
+    if (!m_window) return 1.0f;
+    float displayScale = SDL_GetWindowDisplayScale(m_window);
+    if (displayScale <= 0.0f) displayScale = 1.0f;
+    float pixelDensity = SDL_GetWindowPixelDensity(m_window);
+    if (pixelDensity <= 0.0f) pixelDensity = 1.0f;
+    return std::clamp(displayScale / pixelDensity, 0.5f, 4.0f);
+}
+
+void GuiManager::applyStyleAndDpiScale(float uiScale) {
+    m_uiScale = std::clamp(uiScale, 0.5f, 4.0f);
+
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();
+    ImGui::StyleColorsDark(&style);
+
+    style.WindowRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.Colors[ImGuiCol_WindowBg]         = ImVec4(0.06f, 0.08f, 0.12f, 0.76f);
+    style.Colors[ImGuiCol_TitleBg]          = ImVec4(0.04f, 0.06f, 0.09f, 0.82f);
+    style.Colors[ImGuiCol_TitleBgActive]    = ImVec4(0.08f, 0.14f, 0.22f, 0.88f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.04f, 0.06f, 0.09f, 0.60f);
+    style.Colors[ImGuiCol_PopupBg]          = ImVec4(0.07f, 0.09f, 0.13f, 0.88f);
+    style.Colors[ImGuiCol_Border]           = ImVec4(0.25f, 0.35f, 0.45f, 0.55f);
+
+    if (std::abs(m_uiScale - 1.0f) > 0.001f) {
+        style.ScaleAllSizes(m_uiScale);
+    }
+    style.FontScaleDpi = m_uiScale;
 }
 
 bool GuiManager::needsPipelineUpdate(VkFormat colorFormat, HdrDisplayMode hdrMode, float paperWhiteNits) const {
@@ -201,6 +235,14 @@ GuiManager::~GuiManager() {
 
 bool GuiManager::processEvent(const SDL_Event& event) {
     if (m_initialized) {
+        if (event.type == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED ||
+            event.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED) {
+            float newScale = computeUiScale();
+            if (std::abs(newScale - m_uiScale) > 0.005f) {
+                Logger::info("ImGui DPI UI scale updated: {:.2f}x -> {:.2f}x", m_uiScale, newScale);
+                applyStyleAndDpiScale(newScale);
+            }
+        }
         return ImGui_ImplSDL3_ProcessEvent(&event);
     }
     return false;
@@ -208,6 +250,11 @@ bool GuiManager::processEvent(const SDL_Event& event) {
 
 void GuiManager::newFrame() {
     if (!m_initialized) return;
+    float currentScale = computeUiScale();
+    if (std::abs(currentScale - m_uiScale) > 0.005f) {
+        Logger::info("ImGui DPI UI scale synchronized on frame start: {:.2f}x -> {:.2f}x", m_uiScale, currentScale);
+        applyStyleAndDpiScale(currentScale);
+    }
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();
@@ -249,7 +296,7 @@ void GuiManager::resetHistory() {
 
 // Renders an unobtrusive, stylish visual indicator at the bottom edge of an informational panel's
 // bounding box whenever lower content is obscured/clipped, with click-to-scroll and pulse animations.
-static void renderMoreDataBelowIndicator(const char* panelId) {
+static void renderMoreDataBelowIndicator(const char* panelId, float s = 1.0f) {
     (void)panelId;
     float scrollY = ImGui::GetScrollY();
     float scrollMaxY = ImGui::GetScrollMaxY();
@@ -261,7 +308,7 @@ static void renderMoreDataBelowIndicator(const char* panelId) {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
 
         // 1. Subtle bottom edge fade-out gradient to soften obscured content at the boundary
-        float fadeH = 26.0f;
+        float fadeH = 26.0f * s;
         ImVec2 fadeMin(winPos.x + 2.0f, winPos.y + winSize.y - fadeH - 2.0f);
         ImVec2 fadeMax(winPos.x + winSize.x - 2.0f, winPos.y + winSize.y - 2.0f);
         drawList->AddRectFilledMultiColor(
@@ -273,10 +320,10 @@ static void renderMoreDataBelowIndicator(const char* panelId) {
         );
 
         // 2. Centered small visual icon pill pinned to the bottom of the bounding box
-        float pillW = 44.0f;
-        float pillH = 18.0f;
+        float pillW = 44.0f * s;
+        float pillH = 18.0f * s;
         float centerX = winPos.x + winSize.x * 0.5f;
-        float pillBottomY = winPos.y + winSize.y - 6.0f;
+        float pillBottomY = winPos.y + winSize.y - 6.0f * s;
         float pillTopY = pillBottomY - pillH;
 
         ImVec2 pillMin(centerX - pillW * 0.5f, pillTopY);
@@ -299,26 +346,26 @@ static void renderMoreDataBelowIndicator(const char* panelId) {
             pillBorder = IM_COL32(100, 240, 255, 255);
             arrowColor = IM_COL32(255, 255, 255, 255);
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-                ImGui::SetScrollY(std::min(scrollMaxY, scrollY + 140.0f));
+                ImGui::SetScrollY(std::min(scrollMaxY, scrollY + 140.0f * s));
             }
             ImGui::SetTooltip("More content below (use mouse scroll wheel)");
         }
 
         // Rounded pill background & border
-        drawList->AddRectFilled(pillMin, pillMax, pillBg, 9.0f);
-        drawList->AddRect(pillMin, pillMax, pillBorder, 9.0f, 0, 1.2f);
+        drawList->AddRectFilled(pillMin, pillMax, pillBg, 9.0f * s);
+        drawList->AddRect(pillMin, pillMax, pillBorder, 9.0f * s, 0, 1.2f * s);
 
         // Crisp down chevron icon
-        float arrowCenterY = (pillMin.y + pillMax.y) * 0.5f - 1.0f;
-        float arrowHalfW = 6.0f;
-        float arrowH = 5.0f;
+        float arrowCenterY = (pillMin.y + pillMax.y) * 0.5f - 1.0f * s;
+        float arrowHalfW = 6.0f * s;
+        float arrowH = 5.0f * s;
 
         ImVec2 p1(centerX - arrowHalfW, arrowCenterY - arrowH * 0.5f);
         ImVec2 p2(centerX, arrowCenterY + arrowH * 0.5f);
         ImVec2 p3(centerX + arrowHalfW, arrowCenterY - arrowH * 0.5f);
 
-        drawList->AddLine(p1, p2, arrowColor, 2.0f);
-        drawList->AddLine(p2, p3, arrowColor, 2.0f);
+        drawList->AddLine(p1, p2, arrowColor, 2.0f * s);
+        drawList->AddLine(p2, p3, arrowColor, 2.0f * s);
     }
 }
 
@@ -383,11 +430,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
     float aspect = (height > 0) ? (static_cast<float>(width) / static_cast<float>(height)) : 1.0f;
     bool isPortrait = (aspect < 1.05f);
+    const float s = m_uiScale;
 
     ImGuiCond layoutCond = ImGuiCond_FirstUseEver;
     if (!m_layoutInitialized || m_lastWasPortrait != isPortrait ||
         m_lastWidth != width || m_lastHeight != height ||
-        m_lastDispW != dispW || m_lastDispH != dispH) {
+        m_lastDispW != dispW || m_lastDispH != dispH || std::abs(m_lastUiScale - s) > 0.005f) {
         layoutCond = ImGuiCond_Always;
         m_layoutInitialized = true;
         m_lastWasPortrait = isPortrait;
@@ -395,43 +443,44 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         m_lastHeight = height;
         m_lastDispW = dispW;
         m_lastDispH = dispH;
+        m_lastUiScale = s;
     }
 
-    float hudX = 20.0f;
-    float hudY = 20.0f;
-    float hudW = std::min(460.0f, dispW - 40.0f);
-    float hudH = std::min(dispH - 40.0f, 1100.0f);
+    float hudX = 20.0f * s;
+    float hudY = 20.0f * s;
+    float hudW = std::min(460.0f * s, dispW - 40.0f * s);
+    float hudH = std::min(dispH - 40.0f * s, 1100.0f * s);
 
-    float ctrlW = std::min(480.0f, dispW - 40.0f);
-    float ctrlX = std::max(20.0f, dispW - ctrlW - 20.0f);
-    float ctrlY = 20.0f;
-    float ctrlH = std::min(dispH - 40.0f, 1550.0f);
+    float ctrlW = std::min(480.0f * s, dispW - 40.0f * s);
+    float ctrlX = std::max(20.0f * s, dispW - ctrlW - 20.0f * s);
+    float ctrlY = 20.0f * s;
+    float ctrlH = std::min(dispH - 40.0f * s, 1550.0f * s);
 
     if (isPortrait) {
         // Vertical stacked layout on the left: leaves the right side unobstructed for the 3D scene
-        float sidebarW = std::min(440.0f, dispW * 0.45f);
-        if (sidebarW < 320.0f) sidebarW = std::max(260.0f, dispW - 24.0f);
+        float sidebarW = std::min(440.0f * s, dispW * 0.45f);
+        if (sidebarW < 320.0f * s) sidebarW = std::max(260.0f * s, dispW - 24.0f * s);
 
-        hudX = 12.0f;
-        hudY = 12.0f;
+        hudX = 12.0f * s;
+        hudY = 12.0f * s;
         hudW = sidebarW;
-        hudH = std::min(dispH * 0.45f, 750.0f);
+        hudH = std::min(dispH * 0.45f, 750.0f * s);
 
-        ctrlX = 12.0f;
-        ctrlY = hudY + hudH + 12.0f;
+        ctrlX = 12.0f * s;
+        ctrlY = hudY + hudH + 12.0f * s;
         ctrlW = sidebarW;
-        ctrlH = std::max(200.0f, dispH - ctrlY - 12.0f);
+        ctrlH = std::max(200.0f * s, dispH - ctrlY - 12.0f * s);
     } else {
         // Landscape layout: HUD on left, Control panel docked safely on right edge
-        hudX = 20.0f;
-        hudY = 20.0f;
-        hudW = std::min(460.0f, (dispW - 60.0f) * 0.5f);
-        hudH = std::min(dispH - 40.0f, 1100.0f);
+        hudX = 20.0f * s;
+        hudY = 20.0f * s;
+        hudW = std::min(460.0f * s, (dispW - 60.0f * s) * 0.5f);
+        hudH = std::min(dispH - 40.0f * s, 1100.0f * s);
 
-        ctrlW = std::min(480.0f, (dispW - 60.0f) * 0.5f);
-        ctrlX = std::max(hudX + hudW + 20.0f, dispW - ctrlW - 20.0f);
-        ctrlY = 20.0f;
-        ctrlH = std::min(dispH - 40.0f, 1550.0f);
+        ctrlW = std::min(480.0f * s, (dispW - 60.0f * s) * 0.5f);
+        ctrlX = std::max(hudX + hudW + 20.0f * s, dispW - ctrlW - 20.0f * s);
+        ctrlY = 20.0f * s;
+        ctrlH = std::min(dispH - 40.0f * s, 1550.0f * s);
     }
 
     // =========================================================================
@@ -476,9 +525,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 0. Prominent Obvious FPS Hero Display Card
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.10f, 0.16f, 0.55f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 8.0f));
-        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f, 62.0f), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f * s, 8.0f * s));
+        if (ImGui::BeginChild("FpsHeroCard", ImVec2(hudW - 40.0f * s, 62.0f * s), ImGuiChildFlags_Borders, ImGuiWindowFlags_NoScrollbar)) {
 
             ImGui::BeginGroup();
             ImGui::SetWindowFontScale(2.0f);
@@ -582,7 +631,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         std::snprintf(overlayBuf, sizeof(overlayBuf), "Current: %.2f ms", currentFrameTime);
         float graphMax = std::max(16.0f, historyMax * 1.2f);
         ImGui::PlotLines("Latency", m_frameTimeHistory, static_cast<int>(HISTORY_SIZE), m_historyOffset,
-                         overlayBuf, 0.0f, graphMax, ImVec2(hudW - 60.0f, 75.0f));
+                         overlayBuf, 0.0f, graphMax, ImVec2(hudW - 60.0f * s, 75.0f * s));
         ImGui::TextDisabled("%.1fms Budget Line (%.0f FPS Target)", config.target_frame_time_ms, 1000.0f / config.target_frame_time_ms);
 
         ImGui::Separator();
@@ -815,7 +864,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 6. Offline Telemetry Export
         if (ImGui::CollapsingHeader("Offline Telemetry Comparison", ImGuiTreeNodeFlags_None)) {
             ImGui::TextDisabled("Save hardware, driver, support & performance data:");
-            if (ImGui::Button("Export Telemetry Data (.json)", ImVec2(hudW - 40.0f, 28.0f))) {
+            if (ImGui::Button("Export Telemetry Data (.json)", ImVec2(hudW - 40.0f * s, 28.0f * s))) {
                 std::string path = ImageDumper::generateDefaultTelemetryPath();
                 if (actions) {
                     actions->exportTelemetry = true;
@@ -845,7 +894,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::BulletText("GPU 0: %.2f ms | Tonemap: %.2f ms (Single GPU)", c.primary_gpu_time_ms, c.tonemap_time_ms);
                 }
                 if (c.pipeline_stages.is_wavefront && !c.pipeline_stages.bounces.empty()) {
-                    ImGui::Indent(15.0f);
+                    ImGui::Indent(15.0f * s);
                     if (c.pipeline_stages.primary_rays > 0) {
                         ImGui::TextDisabled("Stages: Classify: %.2f ms | %s rays left (100.0%%)",
                                             c.pipeline_stages.classify_ms,
@@ -868,12 +917,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                             c.pipeline_stages.tail_megakernel_bounce,
                                             c.pipeline_stages.tail_megakernel_ms);
                     }
-                    ImGui::Unindent(15.0f);
+                    ImGui::Unindent(15.0f * s);
                 }
                 ImGui::BulletText("Throughput: %.2f GigaRays/s | %s", c.gigarays_per_second, c.target_achieved ? "ACHIEVED" : "EXCEEDED");
             }
         }
-        renderMoreDataBelowIndicator("TelemetryHUD");
+        renderMoreDataBelowIndicator("TelemetryHUD", s);
     }
     ImGui::End();
 
@@ -895,14 +944,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (cameraMode) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.22f, 0.22f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            if (ImGui::Button("FPS NAVIGATION ACTIVE\n[Click, TAB, or Start to release]", ImVec2(topBtnW, 38.0f))) {
+            if (ImGui::Button("FPS NAVIGATION ACTIVE\n[Click, TAB, or Start to release]", ImVec2(topBtnW, 38.0f * s))) {
                 cameraMode = false;
             }
             ImGui::PopStyleColor(2);
         } else {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.28f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.24f, 0.68f, 0.35f, 1.0f));
-            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click, TAB, or Start to capture]", ImVec2(topBtnW, 38.0f))) {
+            if (ImGui::Button("ENTER SCENE NAVIGATION\n[Click, TAB, or Start to capture]", ImVec2(topBtnW, 38.0f * s))) {
                 cameraMode = true;
             }
             ImGui::PopStyleColor(2);
@@ -910,7 +959,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.30f, 0.50f, 1.0f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.42f, 0.68f, 1.0f));
-        if (ImGui::Button("RESET ACCUMULATION\n[Purge temporal frames]", ImVec2(topBtnW, 38.0f))) {
+        if (ImGui::Button("RESET ACCUMULATION\n[Purge temporal frames]", ImVec2(topBtnW, 38.0f * s))) {
             settingsChanged = true;
             if (actions) actions->resetAccumulation = true;
         }
@@ -941,7 +990,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(label, ImVec2(modeBtnW, 30.0f))) {
+                if (ImGui::Button(label, ImVec2(modeBtnW, 30.0f * s))) {
                     if (mode != config.mgpu_mode) {
                         if (actions) {
                             actions->mgpuModeChanged = true;
@@ -1098,7 +1147,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(label, ImVec2(upBtnW, 28.0f)) && isSupported) {
+                if (ImGui::Button(label, ImVec2(upBtnW, 28.0f * s)) && isSupported) {
                     onClick();
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
@@ -1176,7 +1225,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                     }
-                    if (ImGui::Button(lbl, ImVec2(scaleBtnW, 24.0f))) {
+                    if (ImGui::Button(lbl, ImVec2(scaleBtnW, 24.0f * s))) {
                         config.render_scale = scaleVal;
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
@@ -1231,7 +1280,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button(label, ImVec2(denBtnW, 28.0f)) && isSupported) {
+                if (ImGui::Button(label, ImVec2(denBtnW, 28.0f * s)) && isSupported) {
                     if (config.denoiser_mode != mode ||
                         (config.upscaler_mode == UpscalerMode::Upways && mode != DenoiserMode::Upways)) {
                         config.denoiser_mode = mode;
@@ -1308,7 +1357,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.14f, 0.18f, 0.24f, 1.0f));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.28f, 0.38f, 1.0f));
                 }
-                if (ImGui::Button((flag && isSupported) ? labelOn : labelOff, ImVec2(giBtnW, 28.0f)) && isSupported) {
+                if (ImGui::Button((flag && isSupported) ? labelOn : labelOff, ImVec2(giBtnW, 28.0f * s)) && isSupported) {
                     flag = !flag;
                     settingsChanged = true;
                     if (actions) actions->resetAccumulation = true;
@@ -1580,7 +1629,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         static_cast<float>(activeSppVal - config.min_spp) / static_cast<float>(config.max_spp - config.min_spp) : 1.0f;
                     char sppBuf[64];
                     std::snprintf(sppBuf, sizeof(sppBuf), "Active Dynamic SPP: %u (Range: %u..%u)", activeSppVal, config.min_spp, config.max_spp);
-                    ImGui::ProgressBar(std::clamp(sppFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f), sppBuf);
+                    ImGui::ProgressBar(std::clamp(sppFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f * s), sppBuf);
 
                     int minSpp = static_cast<int>(config.min_spp);
                     if (ImGui::SliderInt("Min SPP Floor", &minSpp, 1, static_cast<int>(config.max_spp))) {
@@ -1598,7 +1647,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         static_cast<float>(activeBouncesVal - config.min_bounces) / static_cast<float>(config.max_dynamic_bounces - config.min_bounces) : 1.0f;
                     char bncBuf[64];
                     std::snprintf(bncBuf, sizeof(bncBuf), "Active Dynamic Bounces: %u (Range: %u..%u)", activeBouncesVal, config.min_bounces, config.max_dynamic_bounces);
-                    ImGui::ProgressBar(std::clamp(bounceFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f), bncBuf);
+                    ImGui::ProgressBar(std::clamp(bounceFraction, 0.0f, 1.0f), ImVec2(-1, 22.0f * s), bncBuf);
 
                     int minB = static_cast<int>(config.min_bounces);
                     if (ImGui::SliderInt("Min Bounces Floor", &minB, 1, static_cast<int>(config.max_dynamic_bounces))) {
@@ -1628,7 +1677,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 // Category Filter Tabs (default to 0 = All so all scenes are visible in the selector)
                 static int sceneCategoryFilter = 0; // 0: All, 1: Showcase, 2: Research, 3: USD, 4: Custom, 5: Procedural
 
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 3.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f * s, 3.0f * s));
                 auto drawFilterTab = [&](const char* name, int filterIdx) {
                     bool active = (sceneCategoryFilter == filterIdx);
                     if (active) {
@@ -1678,7 +1727,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::BeginDisabled(stats.is_scene_loading);
 
                 // Styled prominent dropdown combo
-                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f * s, 8.0f * s));
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.10f, 0.16f, 0.26f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.16f, 0.25f, 0.38f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.70f, 1.0f, 0.9f));
@@ -1687,9 +1736,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 if (ImGui::BeginCombo("##SceneSelector", previewText.c_str(), ImGuiComboFlags_HeightLarge)) {
                     if (ImGui::BeginTable("##SceneSelectTable", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
                         ImGui::TableSetupColumn("Scene Asset", ImGuiTableColumnFlags_WidthStretch, 0.46f);
-                        ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                        ImGui::TableSetupColumn("Materials", ImGuiTableColumnFlags_WidthFixed, 65.0f);
-                        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                        ImGui::TableSetupColumn("Triangles", ImGuiTableColumnFlags_WidthFixed, 80.0f * s);
+                        ImGui::TableSetupColumn("Materials", ImGuiTableColumnFlags_WidthFixed, 65.0f * s);
+                        ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 75.0f * s);
                         ImGui::TableHeadersRow();
 
                         for (int i = 0; i < static_cast<int>(availableScenes.size()); ++i) {
@@ -1737,8 +1786,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::PopStyleVar();
 
                 // Quick Navigation Stepper Buttons
-                float navBtnW = (ImGui::GetContentRegionAvail().x - 16.0f) / 3.0f;
-                if (ImGui::Button("< Prev Scene", ImVec2(navBtnW, 26.0f))) {
+                float navBtnW = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2.0f) / 3.0f;
+                if (ImGui::Button("< Prev Scene", ImVec2(navBtnW, 26.0f * s))) {
                     int newIdx = (currentSceneIndex - 1 + static_cast<int>(availableScenes.size())) % static_cast<int>(availableScenes.size());
                     if (actions) {
                         actions->sceneChanged = true;
@@ -1748,7 +1797,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Next Scene >", ImVec2(navBtnW, 26.0f))) {
+                if (ImGui::Button("Next Scene >", ImVec2(navBtnW, 26.0f * s))) {
                     int newIdx = (currentSceneIndex + 1) % static_cast<int>(availableScenes.size());
                     if (actions) {
                         actions->sceneChanged = true;
@@ -1758,7 +1807,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Cornell Box", ImVec2(navBtnW, 26.0f))) {
+                if (ImGui::Button("Cornell Box", ImVec2(navBtnW, 26.0f * s))) {
                     if (actions) {
                         actions->sceneChanged = true;
                         actions->newScenePath = "";
@@ -1789,7 +1838,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     std::string applyLabel = canApply
                         ? std::format("Apply Reference Settings ({} SPP, {} Bounces)", targetSpp, targetBnc)
                         : "Reference Settings Active (Matched)";
-                    if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f))) {
+                    if (ImGui::Button(applyLabel.c_str(), ImVec2(-1.0f, 26.0f * s))) {
                         if (stats.scene_default_spp > 0) config.spp = targetSpp;
                         if (stats.scene_default_max_bounces > 0) {
                             config.max_bounces = targetBnc;
@@ -1822,10 +1871,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::Spacing();
                     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.10f, 0.04f, 0.70f));
                     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 0.78f, 0.25f, 0.90f));
-                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f);
-                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 6.0f));
+                    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 4.0f * s);
+                    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * s, 6.0f * s));
 
-                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f), true, ImGuiWindowFlags_NoScrollbar)) {
+                    if (ImGui::BeginChild("##SceneLoadingBanner", ImVec2(0, 48.0f * s), true, ImGuiWindowFlags_NoScrollbar)) {
                         int dotCount = static_cast<int>(ImGui::GetTime() * 4.0) % 4;
                         std::string dots(dotCount, '.');
                         ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.25f, 1.0f),
@@ -1848,7 +1897,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 }
                 if (config.animate_objects) {
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(140.0f);
+                    ImGui::SetNextItemWidth(140.0f * s);
                     if (ImGui::SliderFloat("Speed##AnimSpeed", &config.animation_speed, 0.0f, 5.0f, "%.2fx")) {
                         settingsChanged = true;
                         if (actions) actions->resetAccumulation = true;
@@ -2319,12 +2368,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Position: (%.2f, %.2f, %.2f)", pos.x, pos.y, pos.z);
                 ImGui::Text("Look Angles: Yaw: %.1f deg, Pitch: %.1f deg", camera->getYaw(), camera->getPitch());
 
-                if (ImGui::Button("Focus on Center (F)", ImVec2(180.0f, 26.0f))) {
+                if (ImGui::Button("Focus on Center (F)", ImVec2(180.0f * s, 26.0f * s))) {
                     camera->focusOnTarget(camera->getCentralTarget());
                     settingsChanged = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Reset Camera", ImVec2(140.0f, 26.0f))) {
+                if (ImGui::Button("Reset Camera", ImVec2(140.0f * s, 26.0f * s))) {
                     camera->resetToDefault();
                     settingsChanged = true;
                 }
@@ -2373,7 +2422,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 6. Display & Viewport Setup
         if (displayInfo && ImGui::CollapsingHeader("Display & Viewport Setup")) {
-            if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f, 26.0f))) {
+            if (ImGui::Button(isFullscreen ? "Exit Fullscreen (F11)" : "Toggle Fullscreen (F11)", ImVec2(180.0f * s, 26.0f * s))) {
                 if (actions) actions->toggleFullscreen = true;
             }
 
@@ -2384,14 +2433,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             // Row 1: Native Full Display | DualUp (1280x2048)
             std::string nativeBtnLabel = std::format("Native ({}x{})", displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : 3840,
                                                                          displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : 2160);
-            if (ImGui::Button(nativeBtnLabel.c_str(), ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button(nativeBtnLabel.c_str(), ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = displayInfo->nativeWidth > 0 ? displayInfo->nativeWidth : displayInfo->usableWidth;
                     actions->requestedHeight = displayInfo->nativeHeight > 0 ? displayInfo->nativeHeight : displayInfo->usableHeight;
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("DualUp (1280x2048)", ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button("DualUp (1280x2048)", ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = 1280;
                     actions->requestedHeight = 2048;
@@ -2399,7 +2448,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             // Row 2: Square Aspect (1440x1440) | FHD (1920x1080)
-            if (ImGui::Button("Square Aspect (1440x1440)", ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button("Square Aspect (1440x1440)", ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = 1440;
                     actions->requestedHeight = 1440;
@@ -2409,7 +2458,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::SetTooltip("Sets window viewport to a 1440x1440 1:1 square aspect ratio (e.g. for DualUp monitors).");
             }
             ImGui::SameLine();
-            if (ImGui::Button("FHD (1920x1080)", ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button("FHD (1920x1080)", ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = 1920;
                     actions->requestedHeight = 1080;
@@ -2417,14 +2466,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             // Row 3: QHD (2560x1440) | 4K UHD (3840x2160)
-            if (ImGui::Button("QHD (2560x1440)", ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button("QHD (2560x1440)", ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = 2560;
                     actions->requestedHeight = 1440;
                 }
             }
             ImGui::SameLine();
-            if (ImGui::Button("4K (3840x2160)", ImVec2(presetBtnW, 26.0f))) {
+            if (ImGui::Button("4K (3840x2160)", ImVec2(presetBtnW, 26.0f * s))) {
                 if (actions) {
                     actions->requestedWidth = 3840;
                     actions->requestedHeight = 2160;
@@ -2438,7 +2487,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     camera->adaptFovForAspect(aspect);
                     settingsChanged = true;
                 }
-                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(180.0f, 26.0f))) {
+                if (ImGui::Button("Re-frame Scene (Auto FOV)", ImVec2(180.0f * s, 26.0f * s))) {
                     camera->adaptFovForAspect(aspect);
                     settingsChanged = true;
                 }
@@ -2603,7 +2652,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             ImGui::Spacing();
-            if (ImGui::Button("Capture Screenshot (F12)", ImVec2(-1.0f, 28.0f))) {
+            if (ImGui::Button("Capture Screenshot (F12)", ImVec2(-1.0f, 28.0f * s))) {
                 if (actions) actions->takeScreenshot = true;
             }
             if (ImGui::IsItemHovered()) {
@@ -2611,7 +2660,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
         }
 
-        renderMoreDataBelowIndicator("ControlPanel");
+        renderMoreDataBelowIndicator("ControlPanel", s);
     }
     ImGui::End();
 
@@ -2627,8 +2676,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         if (config.mgpu_mode == MultiGpuMode::CheckerboardTile ||
             config.mgpu_mode == MultiGpuMode::Auto) {
-            float badgeW = 420.0f;
-            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
+            float badgeW = 420.0f * s;
+            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f * s), ImGuiCond_Always);
             if (ImGui::Begin("##MgpuCheckerboardBadge", nullptr, overlayFlags)) {
                 ImGui::TextColored(ImVec4(0.2f, 0.9f, 1.0f, 1.0f), "[GPU 0: Cyan (Even)]");
                 ImGui::SameLine();
@@ -2638,8 +2687,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             ImGui::End();
         } else if (config.mgpu_mode == MultiGpuMode::SampleParallel) {
-            float badgeW = 420.0f;
-            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f), ImGuiCond_Always);
+            float badgeW = 420.0f * s;
+            ImGui::SetNextWindowPos(ImVec2(midX - badgeW * 0.5f, 18.0f * s), ImGuiCond_Always);
             if (ImGui::Begin("##MgpuSampleParallelBadge", nullptr, overlayFlags)) {
                 uint32_t primSpp = (config.spp + 1) / 2;
                 uint32_t secSpp = config.spp / 2;
@@ -2656,13 +2705,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove;
         float alpha = std::min(1.0f, stats.screenshot_notification_timer * 1.5f);
         ImGui::SetNextWindowBgAlpha(0.88f * alpha);
-        float toastW = std::min(580.0f, dispW - 40.0f);
-        ImGui::SetNextWindowPos(ImVec2((dispW - toastW) * 0.5f, 22.0f), ImGuiCond_Always);
+        float toastW = std::min(580.0f * s, dispW - 40.0f * s);
+        ImGui::SetNextWindowPos(ImVec2((dispW - toastW) * 0.5f, 22.0f * s), ImGuiCond_Always);
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.12f, 0.10f, 0.92f * alpha));
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.2f, 0.95f, 0.45f, 0.85f * alpha));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 10.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f * s, 10.0f * s));
         if (ImGui::Begin("##ScreenshotNotificationToast", nullptr, toastFlags)) {
             ImGui::TextColored(ImVec4(0.25f, 1.0f, 0.5f, alpha), "SCREENSHOT CAPTURED [F12 / PrintScreen]");
             ImGui::TextColored(ImVec4(0.85f, 0.90f, 0.95f, alpha), "%s", stats.last_screenshot_path.c_str());
@@ -2680,17 +2729,17 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             bgDraw->AddRectFilled(ImVec2(0, 0), ImVec2(dispW, dispH), IM_COL32(6, 10, 16, 160));
         }
 
-        float modalW = std::min(520.0f, dispW - 40.0f);
+        float modalW = std::min(520.0f * s, dispW - 40.0f * s);
         float modalX = (dispW - modalW) * 0.5f;
-        float modalY = std::max(60.0f, dispH * 0.36f);
+        float modalY = std::max(60.0f * s, dispH * 0.36f);
 
         ImGui::SetNextWindowPos(ImVec2(modalX, modalY), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(modalW, 0.0f));
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.09f, 0.15f, 0.96f));
         ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.35f, 0.75f, 1.0f, 0.90f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 20.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f * s);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f * s, 20.0f * s));
 
         ImGuiWindowFlags modalFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -2700,7 +2749,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             std::string dots(dotCount, '.');
 
             ImGui::TextColored(ImVec4(0.35f, 0.85f, 1.0f, 1.0f), "PATHWAYS SCENE LOADER");
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f);
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 60.0f * s);
             ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.28f, 1.0f), "[%.1fs]", stats.loading_elapsed_sec);
 
             ImGui::Separator();
@@ -2726,7 +2775,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             float progressFraction = 0.5f + 0.5f * std::sin(t * 3.5f);
             char timerBuf[64];
             std::snprintf(timerBuf, sizeof(timerBuf), "Loading: %.1fs", stats.loading_elapsed_sec);
-            ImGui::ProgressBar(progressFraction, ImVec2(-1.0f, 16.0f), timerBuf);
+            ImGui::ProgressBar(progressFraction, ImVec2(-1.0f, 16.0f * s), timerBuf);
 
             ImGui::Spacing();
             char statusBuf[128];
