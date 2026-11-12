@@ -286,8 +286,9 @@ void Config::printUsage(const char* progName) {
     std::cout << "Usage: " << progName << " [options]\n\n"
               << "General & Display:\n"
               << "  --headless              Run in headless offscreen mode (no window)\n"
-              << "  --fullscreen            Run in fullscreen mode [default]\n"
+              << "  --fullscreen            Run in fullscreen borderless windowed mode [default]\n"
               << "  --windowed              Run in windowed / non-fullscreen mode\n"
+              << "  --exclusive-fullscreen  Acquire hardware exclusive display scanout (bypasses DWM; may interrupt HDMI/DP audio)\n"
               << "  --no-gui                Disable Dear ImGui HUD and control panel overlay\n"
               << "  -r, --res <preset>      Resolution preset: 1080, 1440, 4k, 5k, 8k, dualup, square, or <W>x<H>\n"
               << "  --width <int>           Viewport width in pixels (default: native display, or 3840 in headless)\n"
@@ -434,6 +435,12 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
         if (arg == "--fullscreen") {
+            cfg.fullscreen = true;
+            fullscreen_explicit = true;
+            continue;
+        }
+        if (arg == "--exclusive-fullscreen") {
+            cfg.exclusive_fullscreen = true;
             cfg.fullscreen = true;
             fullscreen_explicit = true;
             continue;

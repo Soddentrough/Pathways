@@ -31,18 +31,23 @@ PresentationManager::PresentationManager(
             m_context->getDevice(),
             m_context->getPhysicalDevice(),
             m_surface,
-            m_window->getWidth(),
-            m_window->getHeight(),
+            m_window->getSurfaceWidth(),
+            m_window->getSurfaceHeight(),
             m_context->getGraphicsQueueFamily(),
             config.enable_hdr,
-            m_window->isFullscreen(),
+            config.exclusive_fullscreen && m_window->isFullscreen(),
             m_context,
             &m_window->getDisplayInfo(),
             config.hdr_peak_nits,
             config.hdr_paper_white_nits
         );
-        config.width = m_swapchain->getExtent().width;
-        config.height = m_swapchain->getExtent().height;
+        if (m_window->isComposedBorderless()) {
+            config.width = std::min(m_window->getWidth(), m_swapchain->getExtent().width);
+            config.height = std::min(m_window->getHeight(), m_swapchain->getExtent().height);
+        } else {
+            config.width = m_swapchain->getExtent().width;
+            config.height = m_swapchain->getExtent().height;
+        }
     }
 
     initSyncObjects();
@@ -141,27 +146,23 @@ bool PresentationManager::acquireNextImage(
         return true;
     }
 
-    int curW = 0, curH = 0;
-    SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
-    uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
-    uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+    uint32_t targetViewW = 0, targetViewH = 0, targetSurfW = 0, targetSurfH = 0;
+    m_window->queryViewportAndSurfacePixels(targetViewW, targetViewH, targetSurfW, targetSurfH);
 
-    if (targetW != m_swapchain->getExtent().width ||
-        targetH != m_swapchain->getExtent().height ||
-        config.width != m_swapchain->getExtent().width ||
-        config.height != m_swapchain->getExtent().height) {
+    if (targetSurfW != m_swapchain->getExtent().width ||
+        targetSurfH != m_swapchain->getExtent().height ||
+        config.width != targetViewW ||
+        config.height != targetViewH) {
         if (onResizeFn) {
-            onResizeFn(targetW, targetH, true);
+            onResizeFn(targetViewW, targetViewH, true);
         }
     }
 
     VkResult res = m_swapchain->acquireNextImage(m_imageAvailableSemaphores[frameSlot], &outImageIndex);
     if (res == VK_ERROR_OUT_OF_DATE_KHR) {
-        SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
-        targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
-        targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+        m_window->queryViewportAndSurfacePixels(targetViewW, targetViewH, targetSurfW, targetSurfH);
         if (onResizeFn) {
-            onResizeFn(targetW, targetH, true);
+            onResizeFn(targetViewW, targetViewH, true);
         }
         return false;
     }
@@ -218,17 +219,48 @@ bool PresentationManager::recordPresentation(
     vkCmdPipelineBarrier2(cmd, &depToDst);
 
     // Copy or blit output image to swapchain image
-    bool extentsMatch = (config.width == m_swapchain->getExtent().width &&
-                         config.height == m_swapchain->getExtent().height);
-    bool formatsMatch = (outputImage->getFormat() == m_swapchain->getFormat());
+    const uint32_t swapW = m_swapchain->getExtent().width;
+    const uint32_t swapH = m_swapchain->getExtent().height;
+    const bool extentsMatch = (config.width == swapW && config.height == swapH);
+    const bool isPaddedBorderless = (!extentsMatch &&
+                                     swapW >= config.width && swapH >= config.height &&
+                                     (swapW - config.width) <= 2u && (swapH - config.height) <= 2u);
+    const bool formatsMatch = (outputImage->getFormat() == m_swapchain->getFormat());
 
-    if (extentsMatch && formatsMatch) {
+    if ((extentsMatch || isPaddedBorderless) && formatsMatch) {
         VkImageCopy copyRegion{};
         copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         copyRegion.extent = { config.width, config.height, 1 };
         vkCmdCopyImage(cmd, outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+        // Initialize the +1px off-screen composed-flip padding strip cleanly using separate
+        // single-region copies so source regions never overlap within one vkCmdCopyImage call.
+        if (swapH > config.height && config.height > 0) {
+            for (uint32_t padY = config.height; padY < swapH; ++padY) {
+                VkImageCopy padRow{};
+                padRow.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                padRow.srcOffset = { 0, static_cast<int32_t>(config.height - 1), 0 };
+                padRow.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                padRow.dstOffset = { 0, static_cast<int32_t>(padY), 0 };
+                padRow.extent = { config.width, 1, 1 };
+                vkCmdCopyImage(cmd, outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &padRow);
+            }
+        }
+        if (swapW > config.width && config.width > 0) {
+            for (uint32_t padX = config.width; padX < swapW; ++padX) {
+                VkImageCopy padCol{};
+                padCol.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                padCol.srcOffset = { static_cast<int32_t>(config.width - 1), 0, 0 };
+                padCol.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                padCol.dstOffset = { static_cast<int32_t>(padX), 0, 0 };
+                padCol.extent = { 1, config.height, 1 };
+                vkCmdCopyImage(cmd, outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &padCol);
+            }
+        }
     } else {
         VkImageBlit blitRegion{};
         blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -236,8 +268,10 @@ bool PresentationManager::recordPresentation(
         blitRegion.srcOffsets[1] = { static_cast<int32_t>(config.width), static_cast<int32_t>(config.height), 1 };
         blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
         blitRegion.dstOffsets[0] = { 0, 0, 0 };
-        blitRegion.dstOffsets[1] = { static_cast<int32_t>(m_swapchain->getExtent().width), static_cast<int32_t>(m_swapchain->getExtent().height), 1 };
-        VkFilter filter = extentsMatch ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+        const uint32_t dstBlitW = isPaddedBorderless ? config.width : swapW;
+        const uint32_t dstBlitH = isPaddedBorderless ? config.height : swapH;
+        blitRegion.dstOffsets[1] = { static_cast<int32_t>(dstBlitW), static_cast<int32_t>(dstBlitH), 1 };
+        VkFilter filter = (extentsMatch || isPaddedBorderless) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         vkCmdBlitImage(cmd, outputImage->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, filter);
     }
@@ -367,12 +401,10 @@ void PresentationManager::present(
     if (!m_swapchain || !m_window || m_window->isHeadless()) return;
     VkResult res = m_swapchain->queuePresent(queue, imageIndex, m_renderFinishedSemaphores[imageIndex]);
     if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
-        int curW = 0, curH = 0;
-        SDL_GetWindowSizeInPixels(m_window->getSDLWindow(), &curW, &curH);
-        uint32_t targetW = (curW > 0) ? static_cast<uint32_t>(curW) : m_window->getWidth();
-        uint32_t targetH = (curH > 0) ? static_cast<uint32_t>(curH) : m_window->getHeight();
+        uint32_t targetViewW = 0, targetViewH = 0, targetSurfW = 0, targetSurfH = 0;
+        m_window->queryViewportAndSurfacePixels(targetViewW, targetViewH, targetSurfW, targetSurfH);
         if (onResizeFn) {
-            onResizeFn(targetW, targetH, true);
+            onResizeFn(targetViewW, targetViewH, true);
         }
     }
 }
@@ -403,13 +435,20 @@ void PresentationManager::onResize(
     newWidth = std::max(64u, newWidth);
     newHeight = std::max(64u, newHeight);
 
+    const bool useComposedSurface = (m_window && m_window->isComposedBorderless() &&
+                                     newWidth == m_window->getWidth() &&
+                                     newHeight == m_window->getHeight());
+    const uint32_t targetSurfW = useComposedSurface ? m_window->getSurfaceWidth() : newWidth;
+    const uint32_t targetSurfH = useComposedSurface ? m_window->getSurfaceHeight() : newHeight;
+
     if (!forceRecreate &&
         newWidth == config.width && newHeight == config.height &&
-        m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
+        m_swapchain->getExtent().width == targetSurfW && m_swapchain->getExtent().height == targetSurfH) {
         return;
     }
 
-    Logger::info("Handling window resize: updating viewport from {}x{} to {}x{}", config.width, config.height, newWidth, newHeight);
+    Logger::info("Handling window resize: updating viewport from {}x{} to {}x{} (surface: {}x{})",
+                 config.width, config.height, newWidth, newHeight, targetSurfW, targetSurfH);
 
     VkDevice device = m_context->getDevice();
     vkDeviceWaitIdle(device);
@@ -427,11 +466,11 @@ void PresentationManager::onResize(
         device,
         m_context->getPhysicalDevice(),
         m_surface,
-        config.width,
-        config.height,
+        targetSurfW,
+        targetSurfH,
         m_context->getGraphicsQueueFamily(),
         config.enable_hdr,
-        m_window ? m_window->isFullscreen() : false,
+        config.exclusive_fullscreen && (m_window ? m_window->isFullscreen() : false),
         m_context,
         m_window ? &m_window->getDisplayInfo() : nullptr,
         config.hdr_peak_nits,
@@ -439,8 +478,13 @@ void PresentationManager::onResize(
         oldSwapchainHandle
     );
     m_swapchain = std::move(newSwapchain);
-    config.width = m_swapchain->getExtent().width;
-    config.height = m_swapchain->getExtent().height;
+    if (useComposedSurface) {
+        config.width = std::min(newWidth, m_swapchain->getExtent().width);
+        config.height = std::min(newHeight, m_swapchain->getExtent().height);
+    } else {
+        config.width = m_swapchain->getExtent().width;
+        config.height = m_swapchain->getExtent().height;
+    }
 
     VkSemaphoreCreateInfo semInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
     uint32_t numSwapImages = m_swapchain->getImageCount();

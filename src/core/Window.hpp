@@ -44,6 +44,11 @@ public:
 
     uint32_t getWidth() const { return m_width; }
     uint32_t getHeight() const { return m_height; }
+    uint32_t getSurfaceWidth() const { return m_composedBorderlessActive ? m_surfaceWidth : m_width; }
+    uint32_t getSurfaceHeight() const { return m_composedBorderlessActive ? m_surfaceHeight : m_height; }
+    bool isComposedBorderless() const { return m_composedBorderlessActive; }
+    void queryViewportAndSurfacePixels(uint32_t& outViewW, uint32_t& outViewH,
+                                       uint32_t& outSurfW, uint32_t& outSurfH) const;
     SDL_Window* getSDLWindow() const { return m_window; }
     const DisplayInfo& getDisplayInfo() const { return m_displayInfo; }
 
@@ -74,12 +79,19 @@ public:
 private:
 #ifdef _WIN32
     void queryDxgiHdrInfo();
+    void applyWin32ComposedBorderless(bool showGuard);
+    void releaseWin32ComposedBorderless();
+    void* m_composedGuardHwnd = nullptr;
 #endif
     bool m_headless = false;
     bool m_shouldClose = false;
     bool m_isFullscreen = false;
+    bool m_exclusiveFullscreen = false;
+    bool m_composedBorderlessActive = false;
     uint32_t m_width = 3840;
     uint32_t m_height = 2160;
+    uint32_t m_surfaceWidth = 3840;
+    uint32_t m_surfaceHeight = 2160;
     DisplayInfo m_displayInfo;
 
     SDL_Window* m_window = nullptr;

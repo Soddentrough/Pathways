@@ -120,7 +120,8 @@ struct Config {
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
-    bool fullscreen = true;         // Default: true (fullscreen by default, disable with --windowed)
+    bool fullscreen = true;         // Default: true (fullscreen borderless windowed mode, disable with --windowed)
+    bool exclusive_fullscreen = false; // Opt-in hardware exclusive scanout (VK_EXT_full_screen_exclusive); disallows DWM composition and may interrupt HDMI/DP audio
     uint32_t spp = 1;
     uint32_t max_bounces = 4;
     bool custom_bounces = false;    // Set to true when --max-bounces or --bounces is passed explicitly on CLI

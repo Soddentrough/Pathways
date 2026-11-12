@@ -19,7 +19,7 @@ class Swapchain {
 public:
     Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
               uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
-              bool enableHdr = true, bool isFullscreen = false,
+              bool enableHdr = true, bool exclusiveFullscreen = false,
               const VulkanContext* context = nullptr,
               const DisplayInfo* displayInfo = nullptr,
               float peakNits = 1000.0f, float paperWhiteNits = 200.0f,

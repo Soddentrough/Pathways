@@ -19,7 +19,7 @@ namespace pathways {
 
 Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
                      uint32_t width, uint32_t height, uint32_t graphicsQueueFamily,
-                     bool enableHdr, bool isFullscreen,
+                     bool enableHdr, bool exclusiveFullscreen,
                      const VulkanContext* context,
                      const DisplayInfo* displayInfo,
                      float peakNits, float paperWhiteNits,
@@ -48,9 +48,9 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
         formats[i] = formats2[i].surfaceFormat;
     }
 
-    Logger::debug("Surface formats supported by display ({} available):", formatCount);
+    Logger::info("Surface formats supported by display ({} available):", formatCount);
     for (const auto& f : formats) {
-        Logger::debug("  Format: {}, ColorSpace: {}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
+        Logger::info("  Format: {}, ColorSpace: {}", static_cast<int>(f.format), static_cast<int>(f.colorSpace));
     }
 
     bool chosen = false;
@@ -59,54 +59,28 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     bool allowHdr = enableHdr;
     if (enableHdr) {
         // Evaluate whether HDR output can be engaged:
-        // 1. If in windowed mode while desktop is in SDR, DWM cannot output HDR -> fallback to SDR to prevent washed-out clipping.
-        // 2. If in fullscreen mode, application can switch the display output color space to HDR10 via direct scanout.
-        // 3. If desktop is already in HDR mode, both windowed and fullscreen can use HDR.
+        // 1. If desktop is in HDR mode (Windows HDR ON), both windowed and fullscreen windowed use HDR seamlessly via DWM.
+        // 2. If desktop is in SDR, only explicit hardware exclusive fullscreen (--exclusive-fullscreen) can drive direct HDR10 scanout.
+        // 3. Otherwise fall back to SDR sRGB to avoid washed-out PQ clipping on an SDR desktop.
         bool isDesktopHdr = displayInfo ? displayInfo->isDesktopHdr : false;
         bool isDisplayCapable = displayInfo ? displayInfo->isDisplayHdrCapable : true;
 
-        if (!isFullscreen && !isDesktopHdr && displayInfo) {
-            Logger::info("Windowed mode on SDR desktop detected: Compositor / Desktop HDR unavailable. Using SDR sRGB. (Run in Fullscreen to engage display HDR10 mode).");
-            allowHdr = false;
-        } else if (!isDisplayCapable && displayInfo) {
+        if (!isDisplayCapable && displayInfo) {
             Logger::info("Connected display does not report HDR capabilities. Using SDR sRGB.");
+            allowHdr = false;
+        } else if (!isDesktopHdr && !exclusiveFullscreen && displayInfo) {
+            Logger::info("Windows Desktop HDR is currently disabled. Using SDR sRGB. (Enable HDR in Windows Settings via Win+Alt+B or pass --exclusive-fullscreen to force direct HDR).");
             allowHdr = false;
         }
     }
 
     if (allowHdr) {
-        // Priority 1: True HDR10 with native 10-bit A2B10G10R10_UNORM_PACK32 (Rec.2020 SMPTE ST 2084 PQ)
-        // Explicitly prioritize A2B10G10R10 over A2R10G10B10 to match engine backbuffer layout
-        for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
-                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
-                m_imageFormat = f.format;
-                m_colorSpace = f.colorSpace;
-                m_hdrMode = HdrDisplayMode::HDR10;
-                chosen = true;
-                Logger::info("Selected HDR Display: A2B10G10R10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
-                break;
-            }
-        }
-
-        // Fallback for drivers/compositors exposing A2R10G10B10 instead of A2B10G10R10
-        if (!chosen) {
-            for (const auto& f : formats) {
-                if (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
-                    f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
-                    m_imageFormat = f.format;
-                    m_colorSpace = f.colorSpace;
-                    m_hdrMode = HdrDisplayMode::HDR10;
-                    chosen = true;
-                    Logger::info("Selected HDR Display: A2R10G10B10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
-                    break;
-                }
-            }
-        }
-
-        // Priority 2: scRGB Linear (16-bit Float, 1.0 = 80 nits reference paper white)
-        // Fallback for compositors that expose scRGB but not HDR10
-        if (!chosen) {
+        if (!exclusiveFullscreen) {
+            // Windowed / Borderless Fullscreen Mode (Windows DWM):
+            // Priority 1: scRGB Linear (16-bit Float, 1.0 = 80 nits reference paper white)
+            // VK_FORMAT_R16G16B16A16_SFLOAT + VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+            // This is the native Windows 11 DWM HDR composition format. Avoids DWM PQ dequantization/conversions,
+            // eliminates washed-out black levels, and avoids HDMI audio drops from CTA-861 InfoFrames.
             for (const auto& f : formats) {
                 if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
                     f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
@@ -116,6 +90,74 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
                     chosen = true;
                     Logger::info("Selected HDR Display: R16G16B16A16_SFLOAT with EXTENDED_SRGB_LINEAR (scRGB Linear)");
                     break;
+                }
+            }
+
+            // Fallback for Windowed: HDR10 ST2084 PQ if scRGB is unsupported by compositor
+            if (!chosen) {
+                for (const auto& f : formats) {
+                    if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                        f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                        m_imageFormat = f.format;
+                        m_colorSpace = f.colorSpace;
+                        m_hdrMode = HdrDisplayMode::HDR10;
+                        chosen = true;
+                        Logger::info("Selected HDR Display: A2B10G10R10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
+                        break;
+                    }
+                }
+            }
+            if (!chosen) {
+                for (const auto& f : formats) {
+                    if (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
+                        f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                        m_imageFormat = f.format;
+                        m_colorSpace = f.colorSpace;
+                        m_hdrMode = HdrDisplayMode::HDR10;
+                        chosen = true;
+                        Logger::info("Selected HDR Display: A2R10G10B10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Hardware Exclusive Fullscreen Mode (--exclusive-fullscreen):
+            // Priority 1: Direct scanout 10-bit A2B10G10R10_UNORM_PACK32 (Rec.2020 SMPTE ST 2084 PQ)
+            for (const auto& f : formats) {
+                if (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 &&
+                    f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                    m_imageFormat = f.format;
+                    m_colorSpace = f.colorSpace;
+                    m_hdrMode = HdrDisplayMode::HDR10;
+                    chosen = true;
+                    Logger::info("Selected HDR Display (FSE): A2B10G10R10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
+                    break;
+                }
+            }
+            if (!chosen) {
+                for (const auto& f : formats) {
+                    if (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 &&
+                        f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
+                        m_imageFormat = f.format;
+                        m_colorSpace = f.colorSpace;
+                        m_hdrMode = HdrDisplayMode::HDR10;
+                        chosen = true;
+                        Logger::info("Selected HDR Display (FSE): A2R10G10B10_UNORM with HDR10_ST2084 (HDR10 PQ Rec.2020)");
+                        break;
+                    }
+                }
+            }
+            if (!chosen) {
+                for (const auto& f : formats) {
+                    if (f.format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                        f.colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT) {
+                        m_imageFormat = f.format;
+                        m_colorSpace = f.colorSpace;
+                        m_hdrMode = HdrDisplayMode::scRGB;
+                        chosen = true;
+                        Logger::info("Selected HDR Display (FSE): R16G16B16A16_SFLOAT with EXTENDED_SRGB_LINEAR (scRGB Linear)");
+                        break;
+                    }
                 }
             }
         }
@@ -214,7 +256,7 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     VkSurfaceFullScreenExclusiveWin32InfoEXT win32ExclusiveInfo{};
     win32ExclusiveInfo.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
 
-    if (m_context && m_context->hasFullScreenExclusive() && isFullscreen) {
+    if (m_context && m_context->hasFullScreenExclusive() && exclusiveFullscreen) {
         exclusiveInfo.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
 
         HMONITOR targetHmon = nullptr;
@@ -229,6 +271,14 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
         exclusiveInfo.pNext = &win32ExclusiveInfo;
         win32ExclusiveInfo.pNext = const_cast<void*>(createInfo.pNext);
         createInfo.pNext = &exclusiveInfo;
+    } else if (m_context && m_context->hasFullScreenExclusive()) {
+        // Explicitly forbid the driver from silently promoting a monitor-sized borderless window to
+        // exclusive fullscreen (the DEFAULT policy lets the driver decide). Exclusive promotion retrains
+        // the HDMI/DP link and interrupts audio; DWM-composed flip presentation does not.
+        exclusiveInfo.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+        exclusiveInfo.pNext = const_cast<void*>(createInfo.pNext);
+        createInfo.pNext = &exclusiveInfo;
+        Logger::info("Swapchain: VK_EXT_full_screen_exclusive set to DISALLOWED (DWM-composed presentation).");
     }
 #endif
 
@@ -240,7 +290,7 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     }
 
 #ifdef _WIN32
-    if (m_context && m_context->hasFullScreenExclusive() && isFullscreen &&
+    if (m_context && m_context->hasFullScreenExclusive() && exclusiveFullscreen &&
         exclusiveInfo.fullScreenExclusive == VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT) {
         auto pfnAcquire = m_context->getAcquireFullScreenExclusiveModeEXT();
         if (pfnAcquire) {
@@ -255,7 +305,10 @@ Swapchain::Swapchain(VkDevice device, VkPhysicalDevice physicalDevice, VkSurface
     }
 #endif
 
-    if (m_hdrMode != HdrDisplayMode::SDR) {
+    // Only send static CTA-861 HDR InfoFrames via vkSetHdrMetadataEXT when in Hardware Exclusive Fullscreen.
+    // In windowed and borderless fullscreen modes, Windows DWM manages HDR output metadata directly.
+    // Sending CTA-861 InfoFrames over HDMI in windowed mode forces the display (e.g. LG OLED TVs) to renegotiate the link, causing audio dropouts.
+    if (m_hdrMode != HdrDisplayMode::SDR && exclusiveFullscreen) {
         float minNits = displayInfo ? displayInfo->minLuminanceNits : 0.001f;
         setHdrMetadata(peakNits, paperWhiteNits, minNits, displayInfo);
     }
