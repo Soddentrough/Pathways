@@ -68,6 +68,9 @@ public:
     // and 8-bit/float8/int8 support required for ML Super-Resolution (FSR 4).
     static bool supportsHardwareMl(VkPhysicalDevice physDevice);
 
+    // Queries whether the physical device supports RDNA 4 FP8 Cooperative Matrix required by Upways 3.0
+    static bool supportsHardwareFloat8(VkPhysicalDevice physDevice);
+
     // Query available effect versions via ffxQueryDescGetVersions
     std::vector<FfxSdkVersionInfo> queryEffectVersions(
         uint64_t createDescType,

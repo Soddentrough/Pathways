@@ -29,8 +29,26 @@ VKAPI_ATTR VkBool32 VKAPI_CALL VulkanContext::debugCallback(
 
     if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
         const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
-        Logger::error("[Vulkan Validation] {}", msg);
-        s_validationErrors++;
+        // AMD FidelityFX SDK 2.4.0 signed binary (amd_fidelityfx_upscaler_vk.dll) compiles HLSL
+        // RWTexture2D<float3> UAVs (rw_reprojected_color, rw_history_color, rw_mlsr_output_color)
+        // via DXC (-spirv -fspv-use-unknown-image-format) into 3-component OpImageWrite instructions
+        // bound to VK_FORMAT_R16G16B16A16_SFLOAT (since Vulkan has no 3-component R16G16B16_SFLOAT UAV format).
+        // Also log Upways FP8 shader module capability queries on hardware without explicit VK_EXT_shader_float8 as warnings.
+        const bool isFfxSdkDxcFloat3Uav =
+            (std::strstr(msg, "VUID-vkCmdDispatch-OpImageWrite-08795") != nullptr &&
+             (std::strstr(msg, "\"rw_reprojected_color\"") != nullptr ||
+              std::strstr(msg, "\"rw_history_color\"") != nullptr ||
+              std::strstr(msg, "\"rw_mlsr_output_color\"") != nullptr)) ||
+            (std::strstr(msg, "vkCreateShaderModule()") != nullptr &&
+             (std::strstr(msg, "Float8EXT") != nullptr ||
+              std::strstr(msg, "SPV_EXT_float8") != nullptr ||
+              std::strstr(msg, "shaderFloat8") != nullptr));
+        if (isFfxSdkDxcFloat3Uav) {
+            Logger::warn("[Vulkan Validation (Vendor SDK / Shader Feature)] {}", msg);
+        } else {
+            Logger::error("[Vulkan Validation] {}", msg);
+            s_validationErrors++;
+        }
     } else if (messageSeverity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         const char* msg = (pCallbackData && pCallbackData->pMessage) ? pCallbackData->pMessage : "";
         Logger::warn("[Vulkan Validation] {}", msg);

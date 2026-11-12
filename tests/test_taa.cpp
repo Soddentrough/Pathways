@@ -353,16 +353,18 @@ int main() {
             check_true(srMgr.getUpwaysPipeline() == nullptr, "UpwaysPipeline must be lazily null in Pure MC mode");
             check_true(srMgr.getFsrUpscaler() == nullptr, "FsrUpscaler must be lazily null in Pure MC mode");
 
-            // On-demand Upways pipeline creation & lazy reclamation
-            Config cfgUpways = cfg;
-            cfgUpways.upscaler_mode = UpscalerMode::Upways;
-            cfgUpways.upways_superres = true;
-            cfgUpways.render_scale = 2.0f / 3.0f;
-            srMgr.createUpwaysPipelines(cfgUpways);
-            check_true(srMgr.getUpwaysPipeline() != nullptr, "UpwaysPipeline allocated on demand");
+            // On-demand Upways pipeline creation & lazy reclamation (requires RDNA 4 FP8 Cooperative Matrix)
+            if (vkCtx.hasFp8CooperativeMatrix()) {
+                Config cfgUpways = cfg;
+                cfgUpways.upscaler_mode = UpscalerMode::Upways;
+                cfgUpways.upways_superres = true;
+                cfgUpways.render_scale = 2.0f / 3.0f;
+                srMgr.createUpwaysPipelines(cfgUpways);
+                check_true(srMgr.getUpwaysPipeline() != nullptr, "UpwaysPipeline allocated on demand");
 
-            srMgr.releaseInactivePipelines(cfg);
-            check_true(srMgr.getUpwaysPipeline() == nullptr, "Inactive UpwaysPipeline reclaimed cleanly");
+                srMgr.releaseInactivePipelines(cfg);
+                check_true(srMgr.getUpwaysPipeline() == nullptr, "Inactive UpwaysPipeline reclaimed cleanly");
+            }
 
 #if defined(__linux__)
             // Verify honest FSR 4 stub reporting when no native Linux FSR 4 Vulkan .so exists

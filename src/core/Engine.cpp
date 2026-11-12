@@ -126,8 +126,8 @@ Engine::Engine(const Config& config) : m_config(config) {
                 }
             }
         } else if (m_config.upscaler_mode == UpscalerMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+                   (!m_context || !m_context->hasCooperativeMatrix() || !m_context->hasFp8CooperativeMatrix())) {
+            Logger::error("Upways Super-Resolution requires RDNA 4 FP8 Cooperative Matrix; disabling upscaling.");
             m_config.upscaler_mode = UpscalerMode::None;
             m_config.render_scale = 1.0f;
             m_config.render_width = 0;
@@ -141,8 +141,8 @@ Engine::Engine(const Config& config) : m_config(config) {
                 m_config.denoiser_mode = DenoiserMode::None;
             }
         } else if (m_config.denoiser_mode == DenoiserMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Neural Denoiser requires VK_KHR_cooperative_matrix; disabling denoiser.");
+                   (!m_context || !m_context->hasCooperativeMatrix() || !m_context->hasFp8CooperativeMatrix())) {
+            Logger::error("Upways Neural Denoiser requires RDNA 4 FP8 Cooperative Matrix; disabling denoiser.");
             m_config.denoiser_mode = DenoiserMode::None;
         }
 
@@ -1797,8 +1797,8 @@ void Engine::renderFrame() {
                 }
             }
         } else if (m_config.upscaler_mode == UpscalerMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+                   (!m_context || !m_context->hasCooperativeMatrix() || !m_context->hasFp8CooperativeMatrix())) {
+            Logger::error("Upways Super-Resolution requires RDNA 4 FP8 Cooperative Matrix; disabling upscaling.");
             m_config.upscaler_mode = UpscalerMode::None;
             m_config.render_scale = 1.0f;
             m_config.render_width = 0;
@@ -3230,9 +3230,15 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     newWidth = std::max(64u, newWidth);
     newHeight = std::max(64u, newHeight);
 
+    const bool useComposedSurface = (m_window && m_window->isComposedBorderless() &&
+                                     newWidth == m_window->getWidth() &&
+                                     newHeight == m_window->getHeight());
+    const uint32_t expectedSwapW = useComposedSurface ? m_window->getSurfaceWidth() : newWidth;
+    const uint32_t expectedSwapH = useComposedSurface ? m_window->getSurfaceHeight() : newHeight;
+
     if (!forceRecreate &&
         newWidth == m_config.width && newHeight == m_config.height &&
-        m_swapchain->getExtent().width == newWidth && m_swapchain->getExtent().height == newHeight) {
+        m_swapchain->getExtent().width == expectedSwapW && m_swapchain->getExtent().height == expectedSwapH) {
         m_resetAccumulation = true;
         return;
     }

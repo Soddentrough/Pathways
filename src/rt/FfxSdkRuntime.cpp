@@ -334,6 +334,42 @@ bool FfxSdkRuntime::supportsHardwareMl(VkPhysicalDevice physDevice) {
     return supported;
 }
 
+bool FfxSdkRuntime::supportsHardwareFloat8(VkPhysicalDevice physDevice) {
+    if (physDevice == VK_NULL_HANDLE) return false;
+    uint32_t extCount = 0;
+    if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, nullptr) != VK_SUCCESS || extCount == 0) {
+        return false;
+    }
+    std::vector<VkExtensionProperties> exts(extCount);
+    if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, exts.data()) != VK_SUCCESS) {
+        return false;
+    }
+    bool hasFloat8Ext = false;
+    bool hasCoopMatrixExt = false;
+    for (const auto& ext : exts) {
+        if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) hasCoopMatrixExt = true;
+#ifdef VK_EXT_shader_float8
+        if (std::strcmp(ext.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) hasFloat8Ext = true;
+#endif
+    }
+    if (!hasFloat8Ext || !hasCoopMatrixExt) return false;
+
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT };
+    coopFeatures.pNext = &float8Features;
+#endif
+    VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    feat2.pNext = &coopFeatures;
+    vkGetPhysicalDeviceFeatures2(physDevice, &feat2);
+
+#ifdef VK_EXT_shader_float8
+    return (float8Features.shaderFloat8 == VK_TRUE && float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
+#else
+    return false;
+#endif
+}
+
 std::vector<FfxSdkVersionInfo> FfxSdkRuntime::queryEffectVersions(
     uint64_t createDescType,
     VkPhysicalDevice physDevice,
