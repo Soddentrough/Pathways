@@ -62,17 +62,23 @@ vec3 LinearToST2084(vec3 L) {
 
 // Filmic HDR S-Curve Tone Mapping
 // Maps scene linear radiance [0, inf) into target absolute display luminance [0, peakNits]
-// - Anchors true blacks (x -> 0 => L -> 0) with a natural filmic contrast toe (p = 1.25).
-// - Preserves contrast in dark regions rather than linearly boosting them.
-// - Anchors reference diffuse paper white (x = 1.0) cleanly to paperWhite nits.
-// - Asymptotically rolls off high-dynamic-range highlights to peakNits.
-// - Scales color vector by mapped luminance ratio to preserve chromaticity without color shifts.
+// - Anchors true blacks (x -> 0 => L -> 0).
+// - Preserves contrast and filmic response in midtones anchored to paper white.
+// - Diffuse white (x = 1.0) maps precisely to paperWhite nits.
+// - Asymptotically rolls off HDR specular highlights (x > 1.0) up to peak display nits.
 float FilmicHdrLuminance(float x, float paperWhite, float peakNits) {
     if (x <= 1e-6) return 0.0;
-    // Strength reduction: x^1.25 == x * pow(x, 0.25) == x * sqrt(sqrt(x)) (mathematically exact)
-    float k = max((peakNits / max(paperWhite, 50.0)) - 1.0, 0.1);
-    float xp = x * sqrt(sqrt(x));
-    return peakNits * (xp / (xp + k));
+    const float ACES_AT_1 = 0.803797f;
+    if (x <= 1.0) {
+        float m = ACESFilm(vec3(x)).r;
+        return (m / ACES_AT_1) * paperWhite;
+    } else {
+        float headroom = max(peakNits - paperWhite, 0.0);
+        float extra = x - 1.0;
+        float k = max(1.5 * (headroom / max(paperWhite, 100.0)), 1.0);
+        float shoulder = headroom > 0.0 ? (headroom * (extra / (extra + k))) : 0.0;
+        return paperWhite + shoulder;
+    }
 }
 
 vec3 TonemapHDR(vec3 color, float paperWhite, float peakNits) {

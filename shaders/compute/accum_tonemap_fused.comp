@@ -99,9 +99,17 @@ vec3 LinearToST2084(vec3 L) {
 // Filmic HDR S-Curve Luminance Mapping
 float FilmicHdrLuminance(float x, float paperWhite, float peakNits) {
     if (x <= 1e-6) return 0.0;
-    float k = max((peakNits / max(paperWhite, 50.0)) - 1.0, 0.1);
-    float xp = x * sqrt(sqrt(x));
-    return peakNits * (xp / (xp + k));
+    const float ACES_AT_1 = 0.803797f;
+    if (x <= 1.0) {
+        float m = ACESFilm(vec3(x)).r;
+        return (m / ACES_AT_1) * paperWhite;
+    } else {
+        float headroom = max(peakNits - paperWhite, 0.0);
+        float extra = x - 1.0;
+        float k = max(1.5 * (headroom / max(paperWhite, 100.0)), 1.0);
+        float shoulder = headroom > 0.0 ? (headroom * (extra / (extra + k))) : 0.0;
+        return paperWhite + shoulder;
+    }
 }
 
 vec3 TonemapHDR(vec3 color, float paperWhite, float peakNits) {
