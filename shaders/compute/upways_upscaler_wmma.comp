@@ -1,0 +1,254 @@
+#version 460
+#include "upways_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer WeightFp8Buf     { uint w8[]; }    g_w8;
+layout(set = 0, binding = 1) readonly  buffer WeightFp32Buf    { float w32[]; }  g_w32;
+layout(set = 0, binding = 2) readonly  buffer DenoiseActFp8Buf { uvec2 act2[]; } g_act;
+layout(set = 0, binding = 3) writeonly buffer SrSubpixelBuf    { uvec2 sub[]; }  g_srSub;
+
+shared f16vec4 s_b[1024]; // 128*8 = 1024 f16vec4 (8,192 B)
+#ifndef UPWAYS_FP16_WMMA
+shared uint s_a[1024];    // 128*8 = 1024 uint32 (4,096 B)
+#else
+shared uint s_a[2048];    // 128*16 = 2048 uint32 (8,192 B)
+shared uint s_w16[256];   // max inTiles=2 * 128 = 256 uint32 (1,024 B)
+#endif
+shared float s_acc[2304]; // 9,216 B (stride 18 avoids 16-way LDS bank conflicts)
+
+void writeSA(uint px, uint vecIdx, uint vec4PerPx, vec4 v) {
+    vec4 q = quantFp8Sim4(v);
+#ifndef UPWAYS_FP16_WMMA
+    s_a[px * vec4PerPx + vecIdx] = packFp8Vec4(q);
+#else
+    uint base = (px * vec4PerPx + vecIdx) * 2u;
+    s_a[base + 0u] = packHalf2x16(q.xy);
+    s_a[base + 1u] = packHalf2x16(q.zw);
+#endif
+}
+
+#ifdef UPWAYS_FP16_WMMA
+void preloadWeightNTile(uint wBaseU32, uint ob, uint inTiles) {
+    uint t = gl_SubgroupID * 32u + gl_SubgroupInvocationID;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        uint tileBase = wBaseU32 + (ob * inTiles + ib) * 64u;
+        uint packed4 = g_w8.w8[tileBase + (t >> 1u)];
+        vec4 w = unpackFp8Vec4(packed4);
+        s_w16[ib * 128u + t] = packHalf2x16(((t & 1u) == 0u) ? w.xy : w.zw);
+    }
+    barrier();
+}
+#endif
+
+void evalPwNTile(
+    uint inTiles,
+    uint wBaseU32,
+    uint ob,
+    uint sOff,
+    uint bOff,
+    bool applyLrelu,
+    out vec4 o0, out vec4 o1, out vec4 o2, out vec4 o3
+) {
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+
+#ifndef UPWAYS_FP16_WMMA
+    uint aStride = inTiles * 4u;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_a, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_a, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#else
+    uint aStride = inTiles * 8u;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_a, r0 + ib * 8u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_a, r1 + ib * 8u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  s_w16, ib * 128u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#endif
+
+    coopMatStore(acc0, s_acc, sg * 576u,        18u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, s_acc, sg * 576u + 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint baseAcc = sg * 576u + lane * 18u;
+    uint cBase   = ob * 16u;
+
+    vec4 a0 = vec4(s_acc[baseAcc + 0u],  s_acc[baseAcc + 1u],  s_acc[baseAcc + 2u],  s_acc[baseAcc + 3u]);
+    vec4 a1 = vec4(s_acc[baseAcc + 4u],  s_acc[baseAcc + 5u],  s_acc[baseAcc + 6u],  s_acc[baseAcc + 7u]);
+    vec4 a2 = vec4(s_acc[baseAcc + 8u],  s_acc[baseAcc + 9u],  s_acc[baseAcc + 10u], s_acc[baseAcc + 11u]);
+    vec4 a3 = vec4(s_acc[baseAcc + 12u], s_acc[baseAcc + 13u], s_acc[baseAcc + 14u], s_acc[baseAcc + 15u]);
+
+    vec4 sc0 = vec4(g_w32.w32[sOff + cBase + 0u],  g_w32.w32[sOff + cBase + 1u],  g_w32.w32[sOff + cBase + 2u],  g_w32.w32[sOff + cBase + 3u]);
+    vec4 sc1 = vec4(g_w32.w32[sOff + cBase + 4u],  g_w32.w32[sOff + cBase + 5u],  g_w32.w32[sOff + cBase + 6u],  g_w32.w32[sOff + cBase + 7u]);
+    vec4 sc2 = vec4(g_w32.w32[sOff + cBase + 8u],  g_w32.w32[sOff + cBase + 9u],  g_w32.w32[sOff + cBase + 10u], g_w32.w32[sOff + cBase + 11u]);
+    vec4 sc3 = vec4(g_w32.w32[sOff + cBase + 12u], g_w32.w32[sOff + cBase + 13u], g_w32.w32[sOff + cBase + 14u], g_w32.w32[sOff + cBase + 15u]);
+
+    vec4 bi0 = vec4(g_w32.w32[bOff + cBase + 0u],  g_w32.w32[bOff + cBase + 1u],  g_w32.w32[bOff + cBase + 2u],  g_w32.w32[bOff + cBase + 3u]);
+    vec4 bi1 = vec4(g_w32.w32[bOff + cBase + 4u],  g_w32.w32[bOff + cBase + 5u],  g_w32.w32[bOff + cBase + 6u],  g_w32.w32[bOff + cBase + 7u]);
+    vec4 bi2 = vec4(g_w32.w32[bOff + cBase + 8u],  g_w32.w32[bOff + cBase + 9u],  g_w32.w32[bOff + cBase + 10u], g_w32.w32[bOff + cBase + 11u]);
+    vec4 bi3 = vec4(g_w32.w32[bOff + cBase + 12u], g_w32.w32[bOff + cBase + 13u], g_w32.w32[bOff + cBase + 14u], g_w32.w32[bOff + cBase + 15u]);
+
+    o0 = a0 * sc0 + bi0;
+    o1 = a1 * sc1 + bi1;
+    o2 = a2 * sc2 + bi2;
+    o3 = a3 * sc3 + bi3;
+
+    if (applyLrelu) {
+        o0 = upwaysLrelu4(o0);
+        o1 = upwaysLrelu4(o1);
+        o2 = upwaysLrelu4(o2);
+        o3 = upwaysLrelu4(o3);
+    }
+    subgroupBarrier();
+}
+
+void main() {
+    if ((pc.flags & UPWAYS_FLAG_ENABLE_SUPERRES) == 0u) {
+        return;
+    }
+
+    uint t   = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
+    uint lx  = t & 15u;
+    uint ly  = t >> 4u;
+    int  W0  = int(pc.lrWidth);
+    int  H0  = int(pc.lrHeight);
+    int  wgX = int(gl_WorkGroupID.x * 16u);
+    int  wgY = int(gl_WorkGroupID.y * 8u);
+
+    // 1. Load 18x10 clamped tile of 16-ch SrIn (pc.offHw0) into s_b (180*4 = 720 f16vec4)
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        uint ap = pass * 128u + t;
+        if (ap < 180u) {
+            int ax = int(ap % 18u);
+            int ay = int(ap / 18u);
+            ivec2 gp = clamp(ivec2(wgX + ax - 1, wgY + ay - 1), ivec2(0), ivec2(W0 - 1, H0 - 1));
+            uint base2 = (pc.offHw0 >> 1u) + uint(gp.y * W0 + gp.x) * 2u;
+            for (uint c2 = 0u; c2 < 2u; ++c2) {
+                uvec2 v = g_act.act2[base2 + c2];
+                s_b[ap * 4u + c2 * 2u + 0u] = f16vec4(unpackFp8Vec4(v.x));
+                s_b[ap * 4u + c2 * 2u + 1u] = f16vec4(unpackFp8Vec4(v.y));
+            }
+        }
+    }
+    barrier();
+
+    // 2. SR_DW1(16): 3x3 depthwise + LReLU -> s_a
+    for (uint c4 = 0u; c4 < 4u; ++c4) {
+        uint c = c4 * 4u;
+        vec4 acc = vec4(
+            g_w32.w32[F32_DW_SR1_B + c + 0u],
+            g_w32.w32[F32_DW_SR1_B + c + 1u],
+            g_w32.w32[F32_DW_SR1_B + c + 2u],
+            g_w32.w32[F32_DW_SR1_B + c + 3u]
+        );
+        uint tap = 0u;
+        for (int dy = -1; dy <= 1; ++dy) {
+            uint ay = uint(int(ly + 1u) + dy);
+            for (int dx = -1; dx <= 1; ++dx) {
+                uint ax = uint(int(lx + 1u) + dx);
+                vec4 x = vec4(s_b[(ay * 18u + ax) * 4u + c4]);
+                uint wIdx = F32_DW_SR1_W + tap * 16u + c;
+                vec4 w = vec4(
+                    g_w32.w32[wIdx + 0u],
+                    g_w32.w32[wIdx + 1u],
+                    g_w32.w32[wIdx + 2u],
+                    g_w32.w32[wIdx + 3u]
+                );
+                acc += x * w;
+                ++tap;
+            }
+        }
+        writeSA(t, c4, 4u, upwaysLrelu4(acc));
+    }
+    barrier();
+
+    // 3. SR_PW1: 16 -> 32 (inTiles=1, outTiles=2) + LReLU -> keep s1 in registers & s_a
+    vec4 s1Reg[8];
+    for (uint ob = 0u; ob < 2u; ++ob) {
+#ifdef UPWAYS_FP16_WMMA
+        preloadWeightNTile(U32_W_SR_PW1, ob, 1u);
+#endif
+        vec4 o0, o1, o2, o3;
+        evalPwNTile(1u, U32_W_SR_PW1, ob, F32_S_SR_PW1, F32_B_SR_PW1, true, o0, o1, o2, o3);
+        s1Reg[ob * 4u + 0u] = o0;
+        s1Reg[ob * 4u + 1u] = o1;
+        s1Reg[ob * 4u + 2u] = o2;
+        s1Reg[ob * 4u + 3u] = o3;
+#ifdef UPWAYS_FP16_WMMA
+        barrier();
+#endif
+    }
+    barrier();
+    for (uint c4 = 0u; c4 < 8u; ++c4) {
+        writeSA(t, c4, 8u, s1Reg[c4]);
+    }
+    barrier();
+
+    // 4. SR_PW2: 32 -> 32 + s1 residual + LReLU -> s_a
+    vec4 s2Reg[8];
+    for (uint ob = 0u; ob < 2u; ++ob) {
+#ifdef UPWAYS_FP16_WMMA
+        preloadWeightNTile(U32_W_SR_PW2, ob, 2u);
+#endif
+        vec4 o0, o1, o2, o3;
+        evalPwNTile(2u, U32_W_SR_PW2, ob, F32_S_SR_PW2, F32_B_SR_PW2, false, o0, o1, o2, o3);
+        s2Reg[ob * 4u + 0u] = upwaysLrelu4(o0 + s1Reg[ob * 4u + 0u]);
+        s2Reg[ob * 4u + 1u] = upwaysLrelu4(o1 + s1Reg[ob * 4u + 1u]);
+        s2Reg[ob * 4u + 2u] = upwaysLrelu4(o2 + s1Reg[ob * 4u + 2u]);
+        s2Reg[ob * 4u + 3u] = upwaysLrelu4(o3 + s1Reg[ob * 4u + 3u]);
+#ifdef UPWAYS_FP16_WMMA
+        barrier();
+#endif
+    }
+    barrier();
+    for (uint c4 = 0u; c4 < 8u; ++c4) {
+        writeSA(t, c4, 8u, s2Reg[c4]);
+    }
+    barrier();
+
+    // 5. SR_HEAD: 32 -> 16 (inTiles=2, outTiles=1) -> 4 subpixels * vec4(delta_r, delta_g, delta_b, w_logit)
+#ifdef UPWAYS_FP16_WMMA
+    preloadWeightNTile(U32_W_SR_HEAD, 0u, 2u);
+#endif
+    vec4 sp0, sp1, sp2, sp3;
+    evalPwNTile(2u, U32_W_SR_HEAD, 0u, F32_S_SR_HEAD, F32_B_SR_HEAD, false, sp0, sp1, sp2, sp3);
+
+    int gx = wgX + int(lx);
+    int gy = wgY + int(ly);
+    if (gx < W0 && gy < H0) {
+        uint baseSub = uint(gy * W0 + gx) * 4u;
+        vec4 sps[4] = vec4[4](sp0, sp1, sp2, sp3);
+        for (uint c = 0u; c < 4u; ++c) {
+            vec4 v = clamp(sps[c], vec4(-4.0, -4.0, -4.0, -6.0), vec4(4.0, 4.0, 4.0, 6.0));
+            g_srSub.sub[baseSub + c] = uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+        }
+    }
+}

@@ -45,8 +45,8 @@ void main() {
     inDiffuse.a = abs(inDiffuse.a);
 
     vec4 nd = imageLoad(uNormalDepth, coord);
-    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-4 && !hasSpec))) {
-        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
+    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-6 && !hasSpec))) {
+        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 2e-6) : inDiffuse.a));
         imageStore(uOutSpecular, coord, hasSpec ? imageLoad(uInSpecular, coord) : vec4(0.0));
         return;
     }
@@ -59,19 +59,23 @@ void main() {
     float effPhiLuminance = pc.phiLuminance * mix(1.0, 0.35, tighten);
     float effPhiNormal    = pc.phiNormal    * mix(1.0, 2.00, tighten);
 
+    vec4 albRough = imageLoad(uAlbedoRoughness, coord);
+    bool centerZeroAlb = (dot(albRough.rgb, albRough.rgb) <= 1e-5) && (nd.w < 9999.0);
+
     vec4 filteredDiffuse = atrousFilterDiffuse(
         coord, pc.stepSize, inDiffuse,
-        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 4e-6),
+        centerZeroAlb,
         effPhiNormal, pc.phiPlaneDepth, effPhiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
     float outVarD = clamp(filteredDiffuse.a, 0.0, 65000.0);
-    imageStore(uOutDiffuse, coord, vec4(clamp(filteredDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 1e-5) : outVarD));
+    imageStore(uOutDiffuse, coord, vec4(clamp(filteredDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 2e-6) : outVarD));
 
     if (hasSpec) {
         vec4 inSpecular = imageLoad(uInSpecular, coord);
         float centerLumS = denoiseLuminance(inSpecular.rgb);
-        float roughness = imageLoad(uAlbedoRoughness, coord).a;
+        float roughness = albRough.a;
         vec4 filteredSpecular = atrousFilterSpecular(
             coord, pc.stepSize, inSpecular,
             nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),

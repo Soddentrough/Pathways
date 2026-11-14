@@ -41,7 +41,7 @@
 // Reservoir layout: 8 × 4 B = 32 bytes, matches DiReservoirGPU in ReSTIRTypes.hpp
 // -----------------------------------------------------------------------------
 struct DiReservoir {
-    uint  idxM;        // [15:0] light index, [31:16] M
+    uint  idxM;        // [23:0] light index (up to 16.7M lights), [31:24] M (0..255)
     float wSum;        // RIS weight sum
     float targetPdf;   // p̂ of the selected sample at the storing pixel
     uint  flags;       // [7:0] age, [8] valid, [9] transmission lobe, [25:10] oct16(x1 normal)
@@ -53,10 +53,10 @@ struct DiReservoir {
 
 // Tunables / bias gates
 const uint  RESTIR_MAX_AGE              = 255u;   // 8-bit age ceiling (disocclusion and motion handle invalidation)
-const float RESTIR_TAP_NORMAL_MIN_DOT   = 0.70f;  // disocclusion guard on stored x1 normal
-const float RESTIR_TAP_DEPTH_REL_GATE   = 0.15f;  // disocclusion guard on primary hit distance
-const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.05f;
-const float RESTIR_JACOBIAN_CLAMP_MAX   = 10.0f;
+const float RESTIR_TAP_NORMAL_MIN_DOT   = 0.90f;  // disocclusion guard on stored x1 normal
+const float RESTIR_TAP_DEPTH_REL_GATE   = 0.10f;  // spatial tap disocclusion guard on view depth
+const float RESTIR_JACOBIAN_CLAMP_MIN   = 0.25f;
+const float RESTIR_JACOBIAN_CLAMP_MAX   = 4.0f;
 
 const ivec2 RESTIR_TAP_OFFSETS[32] = ivec2[32](
     ivec2( 2,  0), ivec2( 0,  2), ivec2(-2,  0), ivec2( 0, -2),
@@ -73,15 +73,15 @@ const ivec2 RESTIR_TAP_OFFSETS[32] = ivec2[32](
 // Bit packing
 // -----------------------------------------------------------------------------
 uint restirPackIdxM(uint id, uint M) {
-    return (id & 0xFFFFu) | ((M & 0xFFFFu) << 16u);
+    return (id & 0xFFFFFFu) | (min(M, 255u) << 24u);
 }
 
 uint restirGetLightIdx(uint idxM) {
-    return idxM & 0xFFFFu;
+    return idxM & 0xFFFFFFu;
 }
 
 uint restirGetM(uint idxM) {
-    return (idxM >> 16u) & 0xFFFFu;
+    return (idxM >> 24u) & 0xFFu;
 }
 
 uint restirPackOct16(vec3 v) {
@@ -246,13 +246,51 @@ struct DiSample {
 // Fresh candidate stream: M light samples, classical 1-sample stream RIS.
 // Builds the initial reservoir including the current-surface context (x1).
 // -----------------------------------------------------------------------------
+float restirEvalTargetPdf(
+    vec3 lightEmission,
+    vec3 lightDir,
+    vec3 hitNormal,
+    vec3 V,
+    f16vec3 diffColor,
+    f16vec3 F0,
+    float alphaRoughness,
+    float diffTrans,
+    bool isTrans
+) {
+    float rawNdotL = dot(hitNormal, lightDir);
+    float NdotL = isTrans ? max(-rawNdotL, 0.0) : max(rawNdotL, 0.0);
+    if (NdotL <= 0.0) return 0.0;
+
+    float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
+    vec3 f = vec3(diffColor) * (INV_PI * transScale);
+
+    if (!isTrans) {
+        float NdotV = max(dot(hitNormal, V), 1e-4);
+        vec3 H = normalize(V + lightDir);
+        float NdotH = max(dot(hitNormal, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+        float a = clamp(alphaRoughness, 0.12, 1.0);
+        float D = distributionGGX(NdotH, a);
+        float Vis = visibilitySmithGGXCorrelated(NdotV, NdotL, a);
+        vec3 f0v = vec3(F0);
+        vec3 F = f0v + (vec3(1.0) - f0v) * pow(clamp(1.0 - VdotH, 0.0, 1.0), 5.0);
+        f += (D * Vis) * F;
+    }
+
+    const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+    return max(dot(lightEmission * f, LUMA) * NdotL, 0.0);
+}
+
 void restirDiFreshStream(
     uint numLights,
     bool useLightTree,
     vec3 hitPoint,
     vec3 hitNormal,
     float hitT,
-    f16vec3 proxyLumWeight,
+    vec3 V,
+    f16vec3 diffColor,
+    f16vec3 F0,
+    float alphaRoughness,
     float diffTrans,
     uint M,
     inout uint seed,
@@ -334,8 +372,8 @@ void restirDiFreshStream(
         bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
         float NdotL = isTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
         if (validLightSample && NdotL > 0.0 && (rawNdotL > 0.0 || isTrans)) {
-            float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
-            float target = max(dot(lightEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
+            float target = restirEvalTargetPdf(lightEmission, lightDir, hitNormal, V,
+                                               diffColor, F0, alphaRoughness, diffTrans, isTrans);
             float sourcePdf = max(lightPdf * lightSelectPdf, 1e-20);
             float weight = target / sourcePdf;
 
@@ -383,7 +421,54 @@ void restirDiFreshStream(
 // point, gate on surface similarity + reconnection validity, and stream-combine
 // into r. mCap truncates the tap's history (weights scaled consistently).
 // -----------------------------------------------------------------------------
-void restirDiApplyTap(
+bool restirDiPrepareTapShadowRay(
+    in DiReservoir src,
+    uint numLights,
+    vec3 hitPoint,
+    vec3 hitNormal,
+    float expectedPrevHitT,
+    float diffTrans,
+    out vec3 outShadowDir,
+    out float outShadowDist,
+    out bool outIsTrans
+) {
+    outShadowDir = vec3(0.0, 1.0, 0.0);
+    outShadowDist = 0.0;
+    outIsTrans = false;
+    if (!restirIsValid(src.flags)) return false;
+    if (restirGetAge(src.flags) >= RESTIR_MAX_AGE) return false;
+    uint mSrc = restirGetM(src.idxM);
+    if (mSrc == 0u) return false;
+    uint srcLightIdx = restirGetLightIdx(src.idxM);
+    if (srcLightIdx >= numLights) return false;
+    if (dot(hitNormal, restirGetX1Normal(src.flags)) < RESTIR_TAP_NORMAL_MIN_DOT) return false;
+    vec2 srcMisc = restirUnpackF16Pair(src.x1Misc);
+    float srcX1Dist = srcMisc.y;
+    float relDepthDiff = abs(expectedPrevHitT - srcX1Dist) / max(max(expectedPrevHitT, srcX1Dist), 1e-4);
+    float tapDepthGate = (numLights > 4096u) ? 0.04 : RESTIR_TAP_DEPTH_REL_GATE;
+    if (relDepthDiff > tapDepthGate) return false;
+    if (src.targetPdf <= 0.0 || src.wSum <= 0.0) return false;
+
+    Light srcLight = lights[srcLightIdx];
+    vec2 srcLuv = unpackUnorm2x16(src.lightUv16);
+    vec3 reconEmission;
+    float cosLightNew;
+    if (!reconnectDirectPath(hitPoint, srcLight, srcLuv, outShadowDir, outShadowDist, reconEmission, cosLightNew)) {
+        return false;
+    }
+    float rawNdotL = dot(hitNormal, outShadowDir);
+    outIsTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
+    float NdotL = outIsTrans ? -rawNdotL : clamp(rawNdotL, 0.0, 1.0);
+    return (NdotL > 0.0 && (rawNdotL > 0.0 || outIsTrans));
+}
+
+struct DiTapEval {
+    uint mTap;            // 0u if rejected by similarity gates, else min(mSrc, mCap)
+    float weightOverPHat; // > 0.0 iff validGeom && weight > 0.0, equals wFactor * float(mTap)
+    DiSample tapSample;
+};
+
+bool restirDiApplyTapEx(
     inout DiReservoir r,
     inout DiSample sel,
     in DiReservoir src,
@@ -391,36 +476,59 @@ void restirDiApplyTap(
     vec3 hitPoint,
     vec3 hitNormal,
     float hitT,
-    f16vec3 proxyLumWeight,
+    float expectedPrevHitT,
+    vec3 V,
+    f16vec3 diffColor,
+    f16vec3 F0,
+    float alphaRoughness,
     float diffTrans,
     uint mCap,
     uint ageNew,
     bool isOccluded,
-    inout uint seed
+    bool clampWeight,
+    inout uint seed,
+    out DiTapEval outEval
 ) {
-    if (!restirIsValid(src.flags)) return;
-    if (restirGetAge(src.flags) >= RESTIR_MAX_AGE) return;
+    outEval.mTap = 0u;
+    outEval.weightOverPHat = 0.0;
+    outEval.tapSample.lightIdx = 0u;
+    outEval.tapSample.dir = vec3(0.0, 1.0, 0.0);
+    outEval.tapSample.dist = 0.0;
+    outEval.tapSample.emission = vec3(0.0);
+    outEval.tapSample.selectPdf = -1.0;
+    outEval.tapSample.cosLight = 1.0;
+    outEval.tapSample.ndotL = 0.0;
+    outEval.tapSample.target = 0.0;
+    outEval.tapSample.luv = vec2(0.0);
+    outEval.tapSample.isTrans = false;
+    outEval.tapSample.has = false;
+
+    if (!restirIsValid(src.flags)) return false;
+    if (restirGetAge(src.flags) >= RESTIR_MAX_AGE) return false;
 
     uint mSrc = restirGetM(src.idxM);
-    if (mSrc == 0u) return;
+    if (mSrc == 0u) return false;
 
     uint srcLightIdx = restirGetLightIdx(src.idxM);
-    if (srcLightIdx >= numLights) return;
+    if (srcLightIdx >= numLights) return false;
 
     // Disocclusion / surface-similarity gates against the stored x1 context.
-    if (dot(hitNormal, restirGetX1Normal(src.flags)) < RESTIR_TAP_NORMAL_MIN_DOT) return;
+    if (dot(hitNormal, restirGetX1Normal(src.flags)) < RESTIR_TAP_NORMAL_MIN_DOT) return false;
     vec2 srcMisc = restirUnpackF16Pair(src.x1Misc);
     float srcX1Dist = srcMisc.y;
-    float relDepthDiff = abs(hitT - srcX1Dist) / max(max(hitT, srcX1Dist), 1e-4);
-    if (relDepthDiff > RESTIR_TAP_DEPTH_REL_GATE) return;
+    float relDepthDiff = abs(expectedPrevHitT - srcX1Dist) / max(max(expectedPrevHitT, srcX1Dist), 1e-4);
+    float tapDepthGate = (numLights > 4096u) ? 0.04 : RESTIR_TAP_DEPTH_REL_GATE;
+    if (relDepthDiff > tapDepthGate) return false;
 
     uint mTap = min(mSrc, mCap);
+    if (mTap == 0u) return false;
+    outEval.mTap = mTap;
 
     // If source evaluated samples with 0 weight, it contributes 0 weight but carries mTap trials.
     if (src.targetPdf <= 0.0 || src.wSum <= 0.0) {
-        uint combinedM = restirGetM(r.idxM) + mTap;
+        uint combinedM = min(restirGetM(r.idxM) + mTap, 255u);
         r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
-        return;
+        return false;
     }
 
     Light srcLight = lights[srcLightIdx];
@@ -438,28 +546,67 @@ void restirDiApplyTap(
 
     if (!validGeom) {
         // Sample lands behind horizon or is occluded from current surface: carries 0 weight, but increments M
-        uint combinedM = restirGetM(r.idxM) + mTap;
+        uint combinedM = min(restirGetM(r.idxM) + mTap, 255u);
         r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
-        return;
+        return false;
     }
 
-    float transScale = isTrans ? diffTrans : (1.0 - diffTrans);
-    float pHat = max(dot(reconEmission, vec3(proxyLumWeight)) * (NdotL * transScale), 1e-6);
+    float pHat = restirEvalTargetPdf(reconEmission, reconDir, hitNormal, V,
+                                     diffColor, F0, alphaRoughness, diffTrans, isTrans);
 
-    float J = evalDirectReuseJacobian(uint(srcLight.position.w), cosLightNew, reconDist, srcMisc.x, src.hitDist);
+    uint srcLightType = uint(srcLight.position.w);
+    float J = evalDirectReuseJacobian(srcLightType, cosLightNew, reconDist, srcMisc.x, src.hitDist);
 
     // History M-truncation scales the stored sum by mTap/mSrc before re-weighting.
-    float weight = (src.wSum / float(mSrc)) * float(mTap) * (pHat / max(src.targetPdf, 1e-6)) * J;
+    float W_src = src.wSum / max(float(mSrc) * src.targetPdf, 1e-6);
+    float wFactor = W_src * J;
+    if (clampWeight) {
+        bool isAreaSrc = (srcLightType == 0u || srcLightType == 3u);
+        bool manyLights = (numLights > 4096u);
+        if (manyLights) {
+            float J_capped = min(J, 6.0);
+            wFactor = W_src * J_capped;
+            float tapRad = pHat * wFactor;
+            if (tapRad > 35.0 && pHat > 1e-8) {
+                wFactor = 35.0 / pHat;
+            }
+        } else {
+            float maxWSrc = isAreaSrc ? 100.0 : 250.0;
+            float maxWFac = isAreaSrc ? 120.0 : 250.0;
+            W_src = min(W_src, maxWSrc);
+            wFactor = min(W_src * J, maxWFac);
+        }
+    }
+    float weight = wFactor * float(mTap) * pHat;
+    if (isnan(weight) || isinf(weight) || !(weight > 0.0)) {
+        weight = 0.0;
+    }
+
+    if (weight > 0.0) {
+        outEval.weightOverPHat = wFactor * float(mTap);
+        outEval.tapSample.lightIdx = srcLightIdx;
+        outEval.tapSample.dir = reconDir;
+        outEval.tapSample.dist = reconDist;
+        outEval.tapSample.emission = reconEmission;
+        outEval.tapSample.selectPdf = -1.0;
+        outEval.tapSample.cosLight = cosLightNew;
+        outEval.tapSample.ndotL = NdotL;
+        outEval.tapSample.target = pHat;
+        outEval.tapSample.luv = srcLuv;
+        outEval.tapSample.isTrans = isTrans;
+        outEval.tapSample.has = true;
+    }
 
     r.wSum += weight;
-    uint combinedM = restirGetM(r.idxM) + mTap;
+    uint combinedM = min(restirGetM(r.idxM) + mTap, 255u);
 
     if (weight > 0.0 && (randFloat(seed) * r.wSum < weight || !sel.has)) {
         sel.lightIdx = srcLightIdx;
         sel.dir = reconDir;
         sel.dist = reconDist;
         sel.emission = reconEmission;
-        sel.selectPdf = misLightSelectPdf(srcLightIdx, hitPoint, numLights);
+        // Deferred: evaluate LightTree MIS selectPdf only for the final visible winner.
+        sel.selectPdf = -1.0;
         sel.cosLight = cosLightNew;
         sel.ndotL = NdotL;
         sel.target = pHat;
@@ -476,9 +623,39 @@ void restirDiApplyTap(
         r.flags = restirPackFlags(ageNew, true, isTrans, hitNormal);
         r.x1Misc = restirPackF16Pair(cosLightNew, min(hitT, 60000.0));
         r.lightUv16 = packUnorm2x16(srcLuv);
+        return true;
     } else {
         r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
+        return false;
     }
+}
+
+bool restirDiApplyTap(
+    inout DiReservoir r,
+    inout DiSample sel,
+    in DiReservoir src,
+    uint numLights,
+    vec3 hitPoint,
+    vec3 hitNormal,
+    float hitT,
+    float expectedPrevHitT,
+    vec3 V,
+    f16vec3 diffColor,
+    f16vec3 F0,
+    float alphaRoughness,
+    float diffTrans,
+    uint mCap,
+    uint ageNew,
+    bool isOccluded,
+    bool clampWeight,
+    inout uint seed
+) {
+    DiTapEval unusedEval;
+    return restirDiApplyTapEx(
+        r, sel, src, numLights, hitPoint, hitNormal, hitT, expectedPrevHitT,
+        V, diffColor, F0, alphaRoughness, diffTrans,
+        mCap, ageNew, isOccluded, clampWeight, seed, unusedEval
+    );
 }
 
 #endif // RESTIR_INCLUDE_SAMPLER_HELPERS
@@ -517,7 +694,7 @@ struct X1Context {
     uint n1Oct;     // oct32(x1 world shading normal)
     uint albedoRG;  // fp16 (baseColor.r, baseColor.g)
     uint albedoB;   // [15:0] fp16 baseColor.b, [31:16] fp16 metallic
-    uint flags;     // [0] valid, [1] reserved, [31:2] qSelf fp32[31:2]
+    uint flags;     // [0] valid (GI), [1] diRestirMis, [31:2] qSelf fp32[31:2]
     uint woOct;     // oct32(x1 -> camera direction, V at primary hit)
     uint f0Pad;     // [15:0] fp16 dielectric scalar F0, [31:16] fp16 roughness
 };
@@ -526,7 +703,7 @@ const uint  GI_MAX_AGE          = 63u;
 const uint  GI_INVALID_INST_20  = 0xFFFFFu;
 const float GI_TAP_MIN_COS      = 0.05;
 const float GI_TAP_MIN_DIST     = 1e-3;
-const float GI_WEIGHT_CLAMP_MAX = 500.0;
+const float GI_WEIGHT_CLAMP_MAX = 32.0;
 
 uint restirPackRgb9e5(vec3 rgb) {
     vec3 c = clamp(rgb, vec3(0.0), vec3(65408.0));
@@ -572,7 +749,16 @@ X1Context makeX1Context(vec3 n1, vec3 baseColor, float metallic, vec3 wo, float 
     return c;
 }
 
-bool  x1ContextValid(X1Context c)     { return (c.flags & 1u) != 0u; }
+const uint  X1_FLAG_VALID         = 1u;
+const uint  X1_FLAG_DI_RESTIR_MIS = 2u;
+
+bool  x1ContextValid(X1Context c)            { return (c.flags & X1_FLAG_VALID) != 0u; }
+bool  x1ContextHasDiRestirMis(X1Context c)   { return (c.flags & X1_FLAG_DI_RESTIR_MIS) != 0u; }
+X1Context makeDiMisOnlyX1Context() {
+    X1Context c = invalidX1Context();
+    c.flags = X1_FLAG_DI_RESTIR_MIS;
+    return c;
+}
 vec3  x1ContextNormal(X1Context c)    { return unpackOct32(c.n1Oct); }
 vec3  x1ContextBaseColor(X1Context c) {
     vec2 rg = unpackHalf2x16(c.albedoRG);

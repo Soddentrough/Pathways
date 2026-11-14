@@ -2,253 +2,332 @@
 #include "rt/upways_weights.hpp"
 #include "rt/upways_default_weights.hpp"
 #include "core/Config.hpp"
+#include "vulkan/Buffer.hpp"
+#include "vulkan/Image.hpp"
 #include "vulkan/VulkanContext.hpp"
 
-#include <algorithm>
-#include <cassert>
+#include <glm/gtc/packing.hpp>
+
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
 using namespace pathways;
 
-static void check_true(bool cond, const char* msg) {
+namespace {
+
+int g_failures = 0;
+
+void check_true(bool cond, const char* msg) {
     if (!cond) {
-        std::cerr << "[FAIL] Assertion failed: " << msg << std::endl;
-        std::exit(1);
+        std::cerr << "[FAIL] " << msg << std::endl;
+        ++g_failures;
     }
 }
 
-// Invertible log1p / expm1 transform matching upways_common.glsl (MAX_LOG1P_IRRADIANCE = 9.0f)
-static float upwaysLog1pTransform(float x) {
-    float clampedX = std::clamp(x, 0.0f, 8100.0f);
-    return std::clamp(std::log1p(clampedX), 0.0f, 9.0f);
+std::filesystem::path findSpv(const std::string& name) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> candidates = {
+#ifdef SHADER_DIR
+        fs::path(SHADER_DIR) / name,
+#endif
+        fs::current_path() / "shaders" / name,
+        fs::current_path() / "build" / "shaders" / name,
+        fs::current_path() / "build" / "linux-release" / "shaders" / name,
+        fs::current_path() / "build" / "windows-clang-release" / "shaders" / name,
+    };
+    for (const auto& p : candidates) {
+        if (fs::exists(p)) {
+            return p;
+        }
+    }
+    return {};
 }
 
-static float upwaysExpm1Transform(float y) {
-    float clampedY = std::clamp(y, 0.0f, 9.0f);
-    return std::max(std::expm1(clampedY), 0.0f);
+std::vector<char> loadSpv(const std::string& name) {
+    auto p = findSpv(name);
+    if (p.empty()) {
+        return {};
+    }
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        return {};
+    }
+    const size_t sz = static_cast<size_t>(f.tellg());
+    std::vector<char> buf(sz);
+    f.seekg(0);
+    f.read(buf.data(), static_cast<std::streamsize>(sz));
+    return buf;
 }
+
+bool validateSpirv(const std::vector<char>& bytes) {
+    if (bytes.size() < 20) {
+        return false;
+    }
+    uint32_t header[5]{};
+    std::memcpy(header, bytes.data(), sizeof(header));
+    return header[0] == 0x07230203u && header[3] > 5u;
+}
+
+struct GpuGbufferSet {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::unique_ptr<Image> diff;
+    std::unique_ptr<Image> spec;
+    std::unique_ptr<Image> albRough;
+    std::unique_ptr<Image> specAlb;
+    std::unique_ptr<Image> skip;
+    std::unique_ptr<Image> normDepth;
+    std::unique_ptr<Image> surfMv;
+    std::unique_ptr<Image> specMv;
+};
+
+GpuGbufferSet createPopulatedGbufferSet(
+    VkDevice device,
+    VmaAllocator allocator,
+    VkCommandBuffer cmd,
+    uint32_t width,
+    uint32_t height,
+    std::vector<std::unique_ptr<Buffer>>& stagingKeepAlive
+) {
+    GpuGbufferSet gbuf;
+    gbuf.width = width;
+    gbuf.height = height;
+
+    const VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+    auto mkImg = [&]() {
+        return std::make_unique<Image>(
+            device, allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage
+        );
+    };
+    gbuf.diff = mkImg();
+    gbuf.spec = mkImg();
+    gbuf.albRough = mkImg();
+    gbuf.specAlb = mkImg();
+    gbuf.skip = mkImg();
+    gbuf.normDepth = mkImg();
+    gbuf.surfMv = mkImg();
+    gbuf.specMv = mkImg();
+
+    const size_t numPixels = static_cast<size_t>(width) * height;
+    auto uploadRgba16 = [&](Image& img, float r, float g, float b, float a) {
+        std::vector<uint16_t> pixels(numPixels * 4);
+        const uint16_t hr = glm::packHalf1x16(r);
+        const uint16_t hg = glm::packHalf1x16(g);
+        const uint16_t hb = glm::packHalf1x16(b);
+        const uint16_t ha = glm::packHalf1x16(a);
+        for (size_t i = 0; i < numPixels; ++i) {
+            pixels[i * 4 + 0] = hr;
+            pixels[i * 4 + 1] = hg;
+            pixels[i * 4 + 2] = hb;
+            pixels[i * 4 + 3] = ha;
+        }
+        const VkDeviceSize bytes = static_cast<VkDeviceSize>(pixels.size() * sizeof(uint16_t));
+        auto stg = std::make_unique<Buffer>(
+            allocator, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        );
+        stg->copyFrom(pixels.data(), bytes);
+
+        img.transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+            VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+        VkBufferImageCopy region{};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { width, height, 1 };
+        vkCmdCopyBufferToImage(cmd, stg->getBuffer(), img.getImage(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        stagingKeepAlive.push_back(std::move(stg));
+    };
+
+    // Normalized Upways 4.0 G-buffer:
+    //   0.8 * 1.0 + 0.06 * 0.25 + 0.05 = 0.865 linear radiance on uniform front-facing surface
+    uploadRgba16(*gbuf.diff, 1.0f, 1.0f, 1.0f, 0.5f);
+    uploadRgba16(*gbuf.spec, 0.25f, 0.25f, 0.25f, 0.0f);
+    uploadRgba16(*gbuf.albRough, 0.8f, 0.8f, 0.8f, 0.4f);
+    uploadRgba16(*gbuf.specAlb, 0.06f, 0.06f, 0.06f, 0.5f);
+    uploadRgba16(*gbuf.skip, 0.05f, 0.05f, 0.05f, 0.0f);
+    uploadRgba16(*gbuf.normDepth, 0.0f, 0.0f, 1.0f, 3.0f);
+    uploadRgba16(*gbuf.surfMv, 0.0f, 0.0f, 0.0f, 0.0f);
+    uploadRgba16(*gbuf.specMv, 0.0f, 0.0f, 0.0f, 0.5f);
+    return gbuf;
+}
+
+} // namespace
 
 int main() {
     std::cout << "==========================================================" << std::endl;
-    std::cout << "  Pathways: Testing Upways 3.0 RDNA 4 FP8 Reconstructor   " << std::endl;
-    std::cout << "  Push Constants, FP8+FP32 Weights & Pipeline Invariants  " << std::endl;
+    std::cout << "  Pathways: Upways 4.0 Neural Pipeline Unit & GPU Test    " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 1. Verify Unified 56-Byte Shader Push Constant Struct Layout
-    std::cout << "[TEST 1] Upways 3.0 Unified Push Constant Layout (56 bytes)..." << std::endl;
+    // 1. Push Constant Layout & Flags (56 B immutable ABI)
+    std::cout << "[TEST 1] UpwaysPushConstants ABI (56 B) & Flags..." << std::endl;
     check_true(sizeof(UpwaysPushConstants) == 56, "UpwaysPushConstants must be 56 bytes");
-    check_true(offsetof(UpwaysPushConstants, renderWidth) == 0, "renderWidth at offset 0");
-    check_true(offsetof(UpwaysPushConstants, renderHeight) == 4, "renderHeight at offset 4");
-    check_true(offsetof(UpwaysPushConstants, displayWidth) == 8, "displayWidth at offset 8");
-    check_true(offsetof(UpwaysPushConstants, displayHeight) == 12, "displayHeight at offset 12");
-    check_true(offsetof(UpwaysPushConstants, jitterX) == 16, "jitterX at offset 16");
-    check_true(offsetof(UpwaysPushConstants, jitterY) == 20, "jitterY at offset 20");
-    check_true(offsetof(UpwaysPushConstants, preExposure) == 24, "preExposure at offset 24");
-    check_true(offsetof(UpwaysPushConstants, resetHistory) == 28, "resetHistory at offset 28");
-    check_true(offsetof(UpwaysPushConstants, preserveJitterGuide) == 32, "preserveJitterGuide at offset 32");
-    check_true(offsetof(UpwaysPushConstants, stageId) == 36, "stageId at offset 36");
-    check_true(offsetof(UpwaysPushConstants, srcWidth) == 40, "srcWidth at offset 40");
-    check_true(offsetof(UpwaysPushConstants, srcHeight) == 44, "srcHeight at offset 44");
-    check_true(offsetof(UpwaysPushConstants, dstWidth) == 48, "dstWidth at offset 48");
-    check_true(offsetof(UpwaysPushConstants, dstHeight) == 52, "dstHeight at offset 52");
-    std::cout << "  -> Unified 56-byte UpwaysPushConstants struct verified." << std::endl;
+    check_true(offsetof(UpwaysPushConstants, lrWidth) == 0, "lrWidth offset == 0");
+    check_true(offsetof(UpwaysPushConstants, lrHeight) == 4, "lrHeight offset == 4");
+    check_true(offsetof(UpwaysPushConstants, hrWidth) == 8, "hrWidth offset == 8");
+    check_true(offsetof(UpwaysPushConstants, hrHeight) == 12, "hrHeight offset == 12");
+    check_true(offsetof(UpwaysPushConstants, jitterX) == 16, "jitterX offset == 16");
+    check_true(offsetof(UpwaysPushConstants, jitterY) == 20, "jitterY offset == 20");
+    check_true(offsetof(UpwaysPushConstants, frameIndex) == 24, "frameIndex offset == 24");
+    check_true(offsetof(UpwaysPushConstants, flags) == 28, "flags offset == 28");
+    check_true(offsetof(UpwaysPushConstants, offX0) == 32, "offX0 offset == 32");
+    check_true(offsetof(UpwaysPushConstants, offHw0) == 36, "offHw0 offset == 36");
+    check_true(offsetof(UpwaysPushConstants, offS0) == 40, "offS0 offset == 40");
+    check_true(offsetof(UpwaysPushConstants, offB1) == 44, "offB1 offset == 44");
+    check_true(offsetof(UpwaysPushConstants, offB2) == 48, "offB2 offset == 48");
+    check_true(offsetof(UpwaysPushConstants, exposureScale) == 52, "exposureScale offset == 52");
+    check_true(UPWAYS_FLAG_RESET_HISTORY == 1u, "UPWAYS_FLAG_RESET_HISTORY == 1");
+    check_true(UPWAYS_FLAG_ENABLE_SUPERRES == 2u, "UPWAYS_FLAG_ENABLE_SUPERRES == 2");
+    check_true(UPWAYS_FLAG_ZERO_RESIDUAL_MODE == 4u, "UPWAYS_FLAG_ZERO_RESIDUAL_MODE == 4");
 
-    // 2. Verify Invertible log1p / expm1 Compression & Decompression Math
-    std::cout << "[TEST 2] Invertible log1p / expm1 Compression Math..." << std::endl;
-    check_true(std::abs(upwaysLog1pTransform(0.0f)) < 1e-6f, "log1p transform of 0.0 must be 0.0");
-    check_true(upwaysLog1pTransform(8000.0f) <= 9.0f, "8000 nit firefly must be bounded by MAX_LOG1P_IRRADIANCE (9.0)");
+    // 2. Log1p/Expm1 & Demodulation/Remodulation Energy Conservation
+    std::cout << "[TEST 2] safeLog1p / safeExpm1 & Demodulation Conservation..." << std::endl;
+    {
+        for (float v : { 0.0f, 0.01f, 0.25f, 1.0f, 12.5f, 500.0f, 5000.0f }) {
+            const float rt = upwaysSafeExpm1(upwaysSafeLog1p(v));
+            check_true(std::abs(rt - v) <= 1e-3f * (1.0f + v), "safeLog1p/safeExpm1 roundtrip mismatch");
+        }
+        check_true(upwaysSafeLog1p(-5.0f) == 0.0f, "safeLog1p clamps negative inputs to 0");
+        check_true(upwaysSafeExpm1(-5.0f) == 0.0f, "safeExpm1 clamps negative inputs to 0");
+        check_true(std::abs(upwaysSafeLog1p(1e6f) - std::log1p(65504.0f)) < 1e-4f,
+                   "safeLog1p upper clamp matches FP16 max (65504)");
 
-    const float testRadiances[] = { 0.0f, 0.01f, 0.1f, 0.5f, 1.0f, 5.0f, 10.0f, 50.0f, 100.0f, 500.0f, 1000.0f, 5000.0f };
-    for (float r : testRadiances) {
-        float compressed = upwaysLog1pTransform(r);
-        float decompressed = upwaysExpm1Transform(compressed);
-        float relError = std::abs(decompressed - r) / (r + 1e-5f);
-        check_true(relError < 1e-4f, "log1p/expm1 inversion relative error must be < 0.01%");
+        const glm::vec3 diffAlb(0.6f, 0.4f, 0.2f);
+        const glm::vec3 specAlb(0.08f, 0.08f, 0.12f);
+        const glm::vec3 diffIrr = upwaysDemodulate(glm::vec3(1.2f, 0.8f, 0.4f), diffAlb);
+        const glm::vec3 specIrr(0.5f, 0.25f, 0.1f);
+        const glm::vec3 skip(0.1f, 0.05f, 0.02f);
+        const glm::vec3 remod = upwaysRemodulate(diffAlb, specAlb, diffIrr, specIrr, skip);
+        const glm::vec3 expected(1.2f + 0.08f * 0.5f + 0.1f, 0.8f + 0.08f * 0.25f + 0.05f, 0.4f + 0.12f * 0.1f + 0.02f);
+        check_true(glm::length(remod - expected) < 1e-5f, "upwaysDemodulate/upwaysRemodulate must conserve radiance");
     }
-    std::cout << "  -> Invertible log1p/expm1 transform validated across 0 to 5,000 nits." << std::endl;
 
-    // 3. Verify Diffuse Albedo & Metallic-Fresnel Specular Demodulation / Remodulation Invariants
-    std::cout << "[TEST 3] Co-Designed Diffuse & Metallic-Fresnel Specular Demodulation..." << std::endl;
-    for (float alb = 0.05f; alb <= 1.0f; alb += 0.15f) {
-        float rad = 2.5f;
-        float safeAlb = std::max(alb, 0.04f);
-        float demod = rad / safeAlb;
-        float remod = demod * safeAlb;
-        float err = std::abs(remod - rad) / rad;
-        check_true(err < 1e-5f, "Diffuse demodulation/remodulation roundtrip must be exact");
+    // 3. Immutable 24,064-B Weight Contract (C++ Headers + On-Disk Binary)
+    std::cout << "[TEST 3] Upways 4.0 Weight Contract (24,064 B / 17,392 params)..." << std::endl;
+    check_true(upways::FP8_WEIGHT_BYTES == 15616u, "FP8_WEIGHT_BYTES == 15616");
+    check_true(upways::FP32_WEIGHT_BYTES == 8448u, "FP32_WEIGHT_BYTES == 8448");
+    check_true(upways::TOTAL_WEIGHT_BYTES == 24064u, "TOTAL_WEIGHT_BYTES == 24064");
+    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 24064u, "TOTAL_WEIGHT_BUFFER_SIZE == 24064");
+    check_true(upways::ACTIVE_PARAMETER_COUNT == 17392u, "ACTIVE_PARAMETER_COUNT == 17392");
+    check_true(sizeof(upways::DEFAULT_WEIGHTS) == 24064u, "sizeof(DEFAULT_WEIGHTS) == 24064");
+    check_true(upways::EMBEDDED_WEIGHTS_SIZE == 24064u, "EMBEDDED_WEIGHTS_SIZE == 24064");
+    check_true(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == 24064u, "sizeof(DEFAULT_UPWAYS_WEIGHTS) == 24064");
+    {
+        namespace fs = std::filesystem;
+        const std::vector<fs::path> weightCandidates = {
+            "data/models/upways_weights.bin",
+            "../data/models/upways_weights.bin",
+            "../../data/models/upways_weights.bin",
+            "../../../data/models/upways_weights.bin",
+        };
+        bool foundWeightFile = false;
+        for (const auto& wp : weightCandidates) {
+            if (fs::exists(wp)) {
+                foundWeightFile = true;
+                check_true(fs::file_size(wp) == upways::TOTAL_WEIGHT_BYTES,
+                           "On-disk upways_weights.bin must be exactly 24,064 bytes");
+                break;
+            }
+        }
+        check_true(foundWeightFile, "upways_weights.bin found in expected data/models path");
     }
-    for (float metallic : { 0.0f, 0.5f, 1.0f }) {
-        float albedo = 0.8f;
-        float nDotV = 0.5f;
-        float f0 = 0.04f * (1.0f - metallic) + albedo * metallic;
-        float fresnel = f0 + (1.0f - f0) * std::pow(1.0f - nDotV, 5.0f);
-        float safeF = std::max(fresnel, 0.04f);
-        float specRad = 1.75f;
-        float demodSpec = specRad / safeF;
-        float remodSpec = demodSpec * safeF;
-        check_true(std::abs(remodSpec - specRad) < 1e-5f, "Specular metallic-Fresnel demodulation/remodulation roundtrip must be exact");
+
+    // 4. U-Net Pyramid Dimensions & 256-B Alignment
+    std::cout << "[TEST 4] U-Net Pyramid Dimensions & 256-B Buffer Offsets..." << std::endl;
+    {
+        auto p540 = computeUpwaysPyramidDims(960u, 540u);
+        check_true(p540.w0 == 960u && p540.h0 == 540u, "960x540 level 0");
+        check_true(p540.w1 == 480u && p540.h1 == 270u, "960x540 level 1 == 480x270");
+        check_true(p540.w2 == 240u && p540.h2 == 135u, "960x540 level 2 == 240x135");
+        check_true((p540.offX0 % 64u) == 0u && (p540.offHw0 % 64u) == 0u &&
+                   (p540.offS0 % 64u) == 0u && (p540.offB1 % 64u) == 0u &&
+                   (p540.offB2 % 64u) == 0u && (p540.totalUints % 64u) == 0u,
+                   "All pyramid activation offsets must be 256-B (64-uint) aligned");
+
+        auto p1080 = computeUpwaysPyramidDims(1920u, 1080u);
+        check_true(p1080.w1 == 960u && p1080.h1 == 540u && p1080.w2 == 480u && p1080.h2 == 270u,
+                   "1920x1080 pyramid dims");
+
+        auto pOdd = computeUpwaysPyramidDims(240u, 135u);
+        check_true(pOdd.w1 == 120u && pOdd.h1 == 68u, "240x135 ceil half level 1 == 120x68");
+        check_true(pOdd.w2 == 60u && pOdd.h2 == 34u, "240x135 ceil half level 2 == 60x34");
     }
-    std::cout << "  -> Co-designed diffuse and metallic-Fresnel specular demodulation/remodulation verified." << std::endl;
 
-    // 4. Verify Upways 3.0 (71,606 params = 87,232B FP8 E4M3 + FP32) Weights Topology
-    std::cout << "[TEST 4] Upways 3.0 (71,606 Params / 87,232B FP8+FP32) Weights Topology..." << std::endl;
-    check_true(upways::TOTAL_PARAMETER_COUNT == 71606u, "TOTAL_PARAMETER_COUNT must be 71,606");
-    check_true(upways::FP8_WEIGHT_SECTION_OFFSET == 0u, "FP8_WEIGHT_SECTION_OFFSET must be 0");
-    check_true(upways::FP8_WEIGHT_SECTION_BYTES == 67584u, "FP8_WEIGHT_SECTION_BYTES must be 67,584");
-    check_true(upways::FP32_WEIGHT_SECTION_OFFSET == 67584u, "FP32_WEIGHT_SECTION_OFFSET must be 67,584 (256B aligned)");
-    check_true((upways::FP32_WEIGHT_SECTION_OFFSET % 256u) == 0u, "FP32_WEIGHT_SECTION_OFFSET must be 256-byte aligned");
-    check_true(upways::FP32_WEIGHT_SECTION_BYTES == 19648u, "FP32_WEIGHT_SECTION_BYTES must be 19,648");
-    check_true(upways::TOTAL_WEIGHT_BUFFER_SIZE == 87232u, "TOTAL_WEIGHT_BUFFER_SIZE must be 87,232 bytes");
-    check_true(upways::ENC0_PW1_W_FP8_OFFSET == 0u, "ENC0_PW1_W_FP8_OFFSET must be 0");
-    check_true(upways::REC_PROJ_W_FP8_OFFSET == 1024u, "REC_PROJ_W_FP8_OFFSET must be 1024");
-    check_true(upways::ENC0_PW2_W_FP8_OFFSET == 1536u, "ENC0_PW2_W_FP8_OFFSET must be 1536");
-    check_true(upways::ENC1_PW1_W_FP8_OFFSET == 2560u, "ENC1_PW1_W_FP8_OFFSET must be 2560");
-    check_true(upways::BOT1_PW1_W_FP8_OFFSET == 8704u, "BOT1_PW1_W_FP8_OFFSET must be 8704");
-    check_true(upways::BOT2_PW1_W_FP8_OFFSET == 33280u, "BOT2_PW1_W_FP8_OFFSET must be 33280");
-    check_true(upways::DEC1_PW1_W_FP8_OFFSET == 57856u, "DEC1_PW1_W_FP8_OFFSET must be 57856");
-    check_true(upways::DEC0_PW1_W_FP8_OFFSET == 64000u, "DEC0_PW1_W_FP8_OFFSET must be 64000");
-    check_true(upways::DEC0_PW2_W_FP8_OFFSET == 65024u, "DEC0_PW2_W_FP8_OFFSET must be 65024");
-    check_true(upways::HEAD_OUT_W_FP8_OFFSET == 66048u, "HEAD_OUT_W_FP8_OFFSET must be 66048");
-    check_true(upways::HEAD_REC_W_FP8_OFFSET == 66560u, "HEAD_REC_W_FP8_OFFSET must be 66560");
-    check_true(upways::HEAD_REC_W_FP8_OFFSET + 1024u == upways::FP8_WEIGHT_SECTION_BYTES, "FP8 section end must match 67,584");
-    check_true(upways::SKIP_SCALE_F32_OFFSET == 4896u, "SKIP_SCALE_F32_OFFSET must be 4896");
-    check_true((upways::SKIP_SCALE_F32_OFFSET + 16u) * sizeof(float) == upways::FP32_WEIGHT_SECTION_BYTES, "FP32 section end must match 19,648");
-    std::cout << "  -> Upways 3.0 (71,606 params = 67,584B FP8 + 19,648B FP32 = 87,232B) verified." << std::endl;
+    // 5. Pipeline Constants & LDS Budgets
+    std::cout << "[TEST 5] Pipeline Constants & LDS Budgets..." << std::endl;
+    static_assert(UpwaysPipeline::MAX_QUERY_SLOTS == 2, "MAX_QUERY_SLOTS == 2");
+    static_assert(UpwaysPipeline::QUERIES_PER_SLOT == 5, "QUERIES_PER_SLOT == 5");
+    static_assert(UpwaysPipeline::NUM_DENOISER_STAGES == 4, "NUM_DENOISER_STAGES == 4");
+    static_assert(UpwaysPipeline::BASE_ANCHOR_LAYERS == 4, "BASE_ANCHOR_LAYERS == 4");
+    {
+        const uint32_t ldsPrep = 180u * (16u * 3u + 4u);          // s_diff, s_spec, s_nd, s_mat
+        const uint32_t ldsDenoiserFp8 = (5760u + 2304u) * 4u;     // s_buf + s_acc
+        const uint32_t ldsDenoiserFp16 = (6144u + 768u + 2304u) * 4u;
+        const uint32_t ldsUpscalerFp8 = 1024u * 8u + 1024u * 4u + 2304u * 4u;
+        const uint32_t ldsUpscalerFp16 = 1024u * 8u + 2048u * 4u + 256u * 4u + 2304u * 4u;
 
-    // 5. Verify Exported Weights and Embedded Fallback Integrity
-    std::cout << "[TEST 5] Neural Weights Integrity (Embedded & File)..." << std::endl;
-    check_true(sizeof(kUpwaysWeightsFp8Blob) == upways::TOTAL_WEIGHT_BUFFER_SIZE,
-               "kUpwaysWeightsFp8Blob size must match TOTAL_WEIGHT_BUFFER_SIZE");
-    check_true(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == upways::TOTAL_WEIGHT_BUFFER_SIZE,
-               "Embedded DEFAULT_UPWAYS_WEIGHTS size must match TOTAL_WEIGHT_BUFFER_SIZE exactly");
-    check_true(upways::EMBEDDED_WEIGHTS_SIZE == upways::TOTAL_WEIGHT_BUFFER_SIZE,
-               "EMBEDDED_WEIGHTS_SIZE must match TOTAL_WEIGHT_BUFFER_SIZE");
-    std::cout << "  -> Embedded default neural weights verified (" << sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) << " bytes)." << std::endl;
+        check_true(ldsPrep == 9360u && ldsPrep <= 32768u, "denoise_prep LDS == 9,360 B <= 32 KiB");
+        check_true(ldsDenoiserFp8 == 32256u && ldsDenoiserFp8 <= 32768u, "denoiser_wmma FP8 LDS == 32,256 B <= 32 KiB");
+        check_true(ldsDenoiserFp16 == 36864u && ldsDenoiserFp16 <= 65536u, "denoiser_wmma FP16 LDS == 36,864 B <= 64 KiB");
+        check_true(ldsUpscalerFp8 == 21504u && ldsUpscalerFp8 <= 32768u, "upscaler_wmma FP8 LDS == 21,504 B <= 32 KiB");
+        check_true(ldsUpscalerFp16 == 26624u && ldsUpscalerFp16 <= 32768u, "upscaler_wmma FP16 LDS == 26,624 B <= 32 KiB");
+    }
 
-    std::vector<std::string> searchPaths = {
-        "data/models/upways_weights.bin",
-        "../data/models/upways_weights.bin",
-        "../../data/models/upways_weights.bin",
-        "../../../data/models/upways_weights.bin",
-        "build/bin/data/models/upways_weights.bin",
-        "bin/data/models/upways_weights.bin"
+    // 6. Config CLI Parsing
+    std::cout << "[TEST 6] Config CLI Parsing (Upways + PTTD v3/v4 Defaults)..." << std::endl;
+    {
+        Config defCfg;
+        check_true(defCfg.capture_channels == 24u, "Default Config::capture_channels == 24 preserved");
+        check_true(defCfg.denoiser_mode == DenoiserMode::None, "Default DenoiserMode == None");
+        check_true(!defCfg.upways_superres && !defCfg.upways_heuristic_fallback, "Default Upways SR/heuristic disabled");
+
+        const char* argv1[] = { "pathways", "--denoiser", "upways", "--capture-channels", "32" };
+        Config c1 = Config::parse(5, const_cast<char**>(argv1));
+        check_true(c1.denoiser_mode == DenoiserMode::Upways, "--denoiser upways selects Upways");
+        check_true(!c1.upways_superres, "--denoiser upways leaves upways_superres false");
+        check_true(c1.capture_channels == 32u, "--capture-channels 32 accepted");
+
+        const char* argv2[] = { "pathways", "--scaler", "upways", "--upways-heuristic" };
+        Config c2 = Config::parse(4, const_cast<char**>(argv2));
+        check_true(c2.denoiser_mode == DenoiserMode::Upways, "--scaler upways enables Upways denoiser");
+        check_true(c2.upscaler_mode == UpscalerMode::Upways, "--scaler upways selects UpscalerMode::Upways");
+        check_true(c2.upways_superres, "--scaler upways sets upways_superres true");
+        check_true(c2.upways_heuristic_fallback, "--upways-heuristic enables fallback flag");
+    }
+
+    // 7. SPIR-V Shader Validation (FP8 + FP16 Variants)
+    std::cout << "[TEST 7] SPIR-V Header Verification (8 Shaders)..." << std::endl;
+    const char* shaderNames[] = {
+        "upways_denoise_prep.comp.spv",
+        "upways_denoiser_wmma.comp.spv",
+        "upways_upscaler_wmma.comp.spv",
+        "upways_upscale_resolve.comp.spv",
+        "upways_denoise_prep.fp16.comp.spv",
+        "upways_denoiser_wmma.fp16.comp.spv",
+        "upways_upscaler_wmma.fp16.comp.spv",
+        "upways_upscale_resolve.fp16.comp.spv",
     };
-    std::string foundPath;
-    for (const auto& p : searchPaths) {
-        if (std::filesystem::exists(p)) {
-            foundPath = p;
-            break;
+    for (const char* sname : shaderNames) {
+        const auto spv = loadSpv(sname);
+        if (!validateSpirv(spv)) {
+            std::cerr << "[FAIL] Invalid/missing SPIR-V: " << sname << std::endl;
+            ++g_failures;
         }
     }
-    if (!foundPath.empty()) {
-        auto fileSize = std::filesystem::file_size(foundPath);
-        check_true(fileSize == upways::TOTAL_WEIGHT_BUFFER_SIZE, "upways_weights.bin file size must match TOTAL_WEIGHT_BUFFER_SIZE (87,232B)");
-        std::cout << "  -> External weight file binary verified at: " << foundPath << " (" << fileSize << " bytes)." << std::endl;
-    }
 
-    // 6. Verify FP8 Activation Pyramid Dimensions & 256-Byte Alignment Across Standard and Odd Resolutions
-    std::cout << "[TEST 6] Multi-Scale FP8 Activation Pyramid Alignment (L0 / L1 / L2)..." << std::endl;
-    {
-        const std::pair<uint32_t, uint32_t> testDims[] = {
-            { 1u, 1u }, { 960u, 540u }, { 1280u, 720u }, { 1441u, 811u }, { 1920u, 1080u }, { 2560u, 1440u }, { 3840u, 2160u }
-        };
-        for (auto [rw, rh] : testDims) {
-            UpwaysPyramidDims pyr = computeUpwaysPyramidDims(rw, rh);
-            check_true(pyr.w0 == rw && pyr.h0 == rh, "L0 dims must equal render dims");
-            check_true(pyr.w1 == ((rw + 1u) >> 1u) && pyr.h1 == ((rh + 1u) >> 1u), "L1 dims must be ceil(L0 / 2)");
-            check_true(pyr.w2 == ((pyr.w1 + 1u) >> 1u) && pyr.h2 == ((pyr.h1 + 1u) >> 1u), "L2 dims must be ceil(L1 / 2)");
-            check_true(pyr.totalBytes >= 256u && (pyr.totalBytes % 256u) == 0u, "Pyramid buffer totalBytes must be 256B aligned");
-        }
-        std::cout << "  -> FP8 activation pyramid alignment verified across standard and odd resolutions." << std::endl;
-    }
-
-    // 7. Verify Disocclusion & 90-Degree Camera Flick Rejection Invariants
-    std::cout << "[TEST 7] Disocclusion & 90-Degree Camera Flick Rejection..." << std::endl;
-    {
-        float nCurr[3] = { 1.0f, 0.0f, 0.0f };
-        float nPrev[3] = { 0.0f, 0.0f, 1.0f };
-        float nDotPos = std::clamp(nCurr[0] * nPrev[0] + nCurr[1] * nPrev[1] + nCurr[2] * nPrev[2], 0.0f, 1.0f);
-        float zCurr = 4.0f;
-        float zPrev = 0.0f;
-        float relDz = std::clamp(std::abs(zCurr - zPrev) / std::max(zCurr, 0.1f), 0.0f, 1.0f);
-        float disoccD = std::clamp(relDz + (1.0f - nDotPos), 0.0f, 1.0f);
-        check_true(disoccD == 1.0f, "90-degree camera flick must yield maximum disocclusion penalty (1.0)");
-        std::cout << "  -> 90-degree camera flick disocclusion rejection verified (disoccD = 1.0)." << std::endl;
-    }
-
-    // 8. Verify 3-Pass RDNA 4 LDS Memory Footprint Invariants (16x8 Dual-M WMMA Tiles, 0B s_f32 LDS)
-    std::cout << "[TEST 8] 3-Pass RDNA 4 LDS Memory Footprint Invariants..." << std::endl;
-    {
-        // Pass 1 (upways_temporal.comp): float s_z[324] + vec2 s_surfMv[324] + vec2 s_effSpecMv[324] = 6,480 bytes
-        size_t pass1LdsBytes = 18u * 18u * (sizeof(float) + 2u * 2u * sizeof(float));
-        // Pass 2 (upways_neural_guide.comp, 16x8 pixel tiles, pure fe4m3vec4 LDS, 0B FP32 scratch):
-        //   Stage 0 (L0 enc0): (1024 + 1536) * 4B = 10,240 bytes (10.0 KB -> 12 subgroups/SIMD)
-        //   Stage 1 (L1 enc1): (2048 + 2048) * 4B = 16,384 bytes (16.0 KB -> 8 subgroups/SIMD)
-        //   Stage 2 (L2 bot1): (2048 + 4096) * 4B = 24,576 bytes (24.0 KB -> 4 subgroups/SIMD)
-        //   Stage 3 (L2 bot2): (4096 + 4096) * 4B = 32,768 bytes (32.0 KB -> 4 subgroups/SIMD)
-        //   Stage 4 (L1 dec1): (4096 + 2880) * 4B = 27,520 bytes (26.9 KB -> 4 subgroups/SIMD)
-        //   Stage 5 (L0 dec0): (2048 + 1536) * 4B = 14,336 bytes (14.0 KB -> 8 subgroups/SIMD)
-        size_t pass2Stage0Bytes = (1024u + 1536u) * 4u;
-        size_t pass2Stage3Bytes = (4096u + 4096u) * 4u;
-        size_t pass2Stage5Bytes = (2048u + 1536u) * 4u;
-        // Pass 3 (upways_upscale_resolve.comp): 0 bytes (100% register-resident <64 Pre-Sched VGPR streaming resolve)
-        size_t pass3LdsBytes = 0u;
-
-        check_true(pass1LdsBytes == 6480u && pass1LdsBytes <= 32768u, "Pass 1 LDS must be 6,480 bytes");
-        check_true(pass2Stage0Bytes == 10240u && pass2Stage5Bytes == 14336u, "Pass 2 L0 stages LDS must be 10.0 KB / 14.0 KB");
-        check_true(pass2Stage3Bytes == 32768u && pass2Stage3Bytes <= 32768u, "Pass 2 L2 max LDS must fit within 32 KB SIMD budget");
-        check_true(pass3LdsBytes == 0u, "Pass 3 LDS must be 0 bytes (register-resident)");
-        std::cout << "  -> LDS footprints verified: Pass 1 = " << (pass1LdsBytes / 1024.0f)
-                  << " KB, Pass 2 L0 = " << (pass2Stage0Bytes / 1024.0f) << "/" << (pass2Stage5Bytes / 1024.0f)
-                  << " KB, Pass 2 L2 max = " << (pass2Stage3Bytes / 1024.0f)
-                  << " KB, Pass 3 = 0.0 KB." << std::endl;
-    }
-
-    // 9. Verify Upways CLI Configuration & PTTD v3 Capture Defaults
-    std::cout << "[TEST 9] Upways CLI Configuration & PTTD v3 Capture Flags..." << std::endl;
-    {
-        const char* argv1[] = { "pathways", "--res", "4k", "--scaler", "upways", "quality" };
-        Config c1 = Config::parse(6, const_cast<char**>(argv1));
-        check_true(c1.width == 3840 && c1.height == 2160, "c1 output resolution must be 3840x2160");
-        check_true(c1.upscaler_mode == UpscalerMode::Upways, "c1 upscaler_mode must be Upways");
-        check_true(c1.upways_superres == true, "c1 upways_superres must be true");
-        check_true(c1.denoiser_mode == DenoiserMode::Upways, "c1 denoiser_mode must be Upways");
-        check_true(c1.getRenderWidth() == 2560 && c1.getRenderHeight() == 1440, "c1 internal resolution must be 2560x1440 (1.5x)");
-
-        const char* argv2[] = {
-            "pathways", "--res", "1080", "--scaler", "upways", "performance",
-            "--capture-training-data", "out_pttd", "--capture-input-spp", "2"
-        };
-        Config c2 = Config::parse(10, const_cast<char**>(argv2));
-        check_true(c2.capture_training_data_dir == "out_pttd", "c2 capture_training_data_dir must equal out_pttd");
-        check_true(c2.capture_channels == 24u, "Default PTTD v3 capture_channels must be 24");
-        check_true(c2.capture_input_spp == 2u, "c2 capture_input_spp must honour --capture-input-spp 2");
-        check_true(c2.getRenderWidth() == 960 && c2.getRenderHeight() == 540, "c2 internal resolution must be 960x540 (2.0x)");
-
-        std::cout << "  -> Verified Upways CLI parsing, resolution scaling, and PTTD v3 24-ch capture configuration." << std::endl;
-    }
-
-    // 10. Verify Per-Pass Hardware Timestamp Profiler Structures & Slot Counts
-    std::cout << "[TEST 10] Per-Pass Hardware Timestamp Query Pool & Stage Constants..." << std::endl;
-    {
-        static_assert(UpwaysPipeline::MAX_QUERY_SLOTS == 2, "UpwaysPipeline must double-buffer query slots");
-        static_assert(UpwaysPipeline::QUERIES_PER_SLOT == 5, "UpwaysPipeline must record 5 timestamps per slot");
-        static_assert(UpwaysPipeline::NUM_NEURAL_STAGES == 6, "UpwaysPipeline must specialize 6 neural U-Net stages");
-        static_assert(UpwaysPipeline::NEURAL_HIDDEN_LAYERS == 4, "UpwaysPipeline must allocate 4 RGBA16F layers (16 channels) for recurrent hidden state");
-
-        UpwaysPassTimings uTimings{};
-        check_true(!uTimings.valid && uTimings.totalMs == 0.0 && uTimings.historyCopyMs == 0.0,
-                   "Default UpwaysPassTimings must be invalid and zeroed");
-        std::cout << "  -> Verified Upways 3.0 (5 timestamps/slot, 6 Wave32 FP8 stages, 4-layer hidden array) layout." << std::endl;
-    }
-
-    // 11. Live GPU UpwaysPipeline Execution & Lossless Dynamic Resolution Scaling (DRS)
+    // 8. Live Headless GPU Execution, Lossless DRS, Resize & Native 1.0x
     {
         uint32_t hwGpuCount = 0;
         VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -272,115 +351,213 @@ int main() {
         }
 
         if (hwGpuCount > 0) {
-            std::cout << "[TEST 11] Live GPU UpwaysPipeline Execution & Lossless DRS..." << std::endl;
+            std::cout << "[TEST 8] Live GPU Upways 4.0 Pipeline, Lossless DRS & Native 1.0x..." << std::endl;
             Config cfg;
             cfg.headless = true;
             cfg.validation_layers = true;
-            cfg.gpu_index = (hwGpuCount >= 2) ? 1 : 0;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1u : 0u;
 
-            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "Upways GPU DRS Test");
-            if (vkCtx.hasCooperativeMatrix() && vkCtx.hasFp8CooperativeMatrix()) {
-                auto loadSpv = [](const std::string& name) -> std::vector<char> {
-                    std::vector<std::filesystem::path> cands = {
-#ifdef SHADER_DIR
-                        std::filesystem::path(SHADER_DIR) / name,
-#endif
-                        std::filesystem::current_path() / "shaders" / name,
-                        std::filesystem::current_path() / "build" / "shaders" / name
-                    };
-                    for (const auto& p : cands) {
-                        std::ifstream f(p, std::ios::binary | std::ios::ate);
-                        if (f.is_open()) {
-                            size_t sz = static_cast<size_t>(f.tellg());
-                            std::vector<char> buf(sz);
-                            f.seekg(0);
-                            f.read(buf.data(), static_cast<std::streamsize>(sz));
-                            return buf;
-                        }
-                    }
-                    return {};
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "Upways 4.0 GPU Test");
+            VkDevice device = vkCtx.getDevice();
+            VmaAllocator allocator = vkCtx.getAllocator();
+            VkQueue queue = vkCtx.getGraphicsQueue();
+
+            const bool useFp8 = UpwaysPipeline::supportsFp8CoopMatrix(vkCtx.getPhysicalDevice());
+            const std::string suffix = useFp8 ? ".comp.spv" : ".fp16.comp.spv";
+            const auto prepSpv = loadSpv("upways_denoise_prep" + suffix);
+            const auto denSpv = loadSpv("upways_denoiser_wmma" + suffix);
+            const auto upSpv = loadSpv("upways_upscaler_wmma" + suffix);
+            const auto resSpv = loadSpv("upways_upscale_resolve" + suffix);
+            check_true(!prepSpv.empty() && !denSpv.empty() && !upSpv.empty() && !resSpv.empty(),
+                       "Upways 4.0 SPIR-V binaries loaded for live GPU test");
+
+            VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+            cpInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
+            VkCommandPool cmdPool = VK_NULL_HANDLE;
+            check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "Create cmdPool");
+
+            VkCommandBufferAllocateInfo cbAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            cbAlloc.commandPool = cmdPool;
+            cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbAlloc.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            check_true(vkAllocateCommandBuffers(device, &cbAlloc, &cmd) == VK_SUCCESS, "Allocate cmd");
+
+            const VkDeviceSize maxReadBytes = 160ULL * 160ULL * 4ULL * sizeof(uint16_t);
+            Buffer readbackBuf(
+                allocator, maxReadBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+            );
+
+            {
+                std::vector<std::unique_ptr<Buffer>> stagingKeepAlive;
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkResetCommandBuffer(cmd, 0);
+                vkBeginCommandBuffer(cmd, &beginInfo);
+
+                GpuGbufferSet g64 = createPopulatedGbufferSet(device, allocator, cmd, 64u, 64u, stagingKeepAlive);
+                GpuGbufferSet g96 = createPopulatedGbufferSet(device, allocator, cmd, 96u, 96u, stagingKeepAlive);
+
+                VkMemoryBarrier2 initBar{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                initBar.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                initBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                initBar.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                initBar.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+                VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers = &initBar;
+                vkCmdPipelineBarrier2(cmd, &dep);
+                vkEndCommandBuffer(cmd);
+
+                VkSubmitInfo upSub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                upSub.commandBufferCount = 1;
+                upSub.pCommandBuffers = &cmd;
+                check_true(vkQueueSubmit(queue, 1, &upSub, VK_NULL_HANDLE) == VK_SUCCESS, "Upload G-buffers");
+                vkQueueWaitIdle(queue);
+                stagingKeepAlive.clear();
+
+                auto bindGbuf = [](UpwaysPipeline& pipe, const GpuGbufferSet& g) {
+                    pipe.updateDescriptors(
+                        g.diff->getImageView(),
+                        g.spec->getImageView(),
+                        g.albRough->getImageView(),
+                        g.specAlb->getImageView(),
+                        g.skip->getImageView(),
+                        g.normDepth->getImageView(),
+                        g.surfMv->getImageView(),
+                        g.specMv->getImageView()
+                    );
                 };
 
-                auto p1Spv = loadSpv("upways_temporal.comp.spv");
-                auto p2Spv = loadSpv("upways_neural_guide.comp.spv");
-                auto p3Spv = loadSpv("upways_upscale_resolve.comp.spv");
-                check_true(!p1Spv.empty() && !p2Spv.empty() && !p3Spv.empty(), "Upways SPIR-V shaders must exist");
-
-                VkDevice device = vkCtx.getDevice();
-                VmaAllocator allocator = vkCtx.getAllocator();
-                VkQueue queue = vkCtx.getGraphicsQueue();
-
-                UpwaysPipeline upw(
-                    device, vkCtx.getPhysicalDevice(), allocator,
-                    64u, 64u, 128u, 128u,
-                    p1Spv, p2Spv, p3Spv, "", true
-                );
-                check_true(upw.isInitialized(), "UpwaysPipeline must initialize on FP8 CooperativeMatrix GPU");
-                check_true(!upw.isHistoryValid(), "Initial m_historyValid must be false");
-
-                VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
-                cpInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-                cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
-                VkCommandPool cmdPool = VK_NULL_HANDLE;
-                check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "Command pool created");
-
-                VkCommandBufferAllocateInfo cbAlloc{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
-                cbAlloc.commandPool = cmdPool;
-                cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                cbAlloc.commandBufferCount = 1;
-                VkCommandBuffer cmd = VK_NULL_HANDLE;
-                check_true(vkAllocateCommandBuffers(device, &cbAlloc, &cmd) == VK_SUCCESS, "Command buffer allocated");
-
-                auto runStep = [&](uint32_t frameIdx, const glm::vec2& jit) {
+                auto submitFrame = [&](UpwaysPipeline& pipe, uint32_t frameIdx, bool resetHist,
+                                       glm::vec2 jit, bool zeroResidual, bool readbackOut) {
                     vkResetCommandBuffer(cmd, 0);
-                    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                     vkBeginCommandBuffer(cmd, &beginInfo);
-                    upw.recordFrame(
-                        cmd, frameIdx, false, false,
-                        glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f),
-                        jit, 1u, false, false
-                    );
+                    pipe.recordFrame(cmd, frameIdx, resetHist, jit, false, zeroResidual, 1.0f);
+                    if (readbackOut) {
+                        VkMemoryBarrier2 outBar{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                        outBar.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                        outBar.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+                        outBar.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+                        outBar.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                        VkDependencyInfo rbDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                        rbDep.memoryBarrierCount = 1;
+                        rbDep.pMemoryBarriers = &outBar;
+                        vkCmdPipelineBarrier2(cmd, &rbDep);
+
+                        VkBufferImageCopy region{};
+                        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                        region.imageExtent = { pipe.getOutputWidth(), pipe.getOutputHeight(), 1 };
+                        vkCmdCopyImageToBuffer(
+                            cmd, pipe.getOutputImage()->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                            readbackBuf.getBuffer(), 1, &region
+                        );
+                    }
                     vkEndCommandBuffer(cmd);
                     VkSubmitInfo sub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
                     sub.commandBufferCount = 1;
                     sub.pCommandBuffers = &cmd;
-                    check_true(vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE) == VK_SUCCESS, "Queue submit succeeded");
+                    check_true(vkQueueSubmit(queue, 1, &sub, VK_NULL_HANDLE) == VK_SUCCESS, "Submit Upways frame");
                     vkQueueWaitIdle(queue);
                 };
 
-                // Run 2 frames at 64x64 -> 128x128
-                runStep(0u, glm::vec2(0.125f, -0.25f));
-                runStep(1u, glm::vec2(-0.125f, 0.25f));
-                check_true(upw.isHistoryValid(), "m_historyValid must be true after frame execution");
+                UpwaysPipeline upw(
+                    device, vkCtx.getPhysicalDevice(), allocator,
+                    64u, 64u, 128u, 128u,
+                    prepSpv, denSpv, upSpv, resSpv,
+                    "", true, VK_FORMAT_R16G16B16A16_SFLOAT, useFp8
+                );
+                check_true(upw.isInitialized(), "UpwaysPipeline 4.0 must initialize on GPU");
+                check_true(upw.usesFp8CoopMatrix() == useFp8, "usesFp8CoopMatrix reflects requested mode");
+                bindGbuf(upw, g64);
+
+                // Phase A: 2x Super-Resolution (64x64 -> 128x128), zero-residual + neural passes
+                submitFrame(upw, 0u, true, { 0.0f, 0.0f }, true, false);
+                submitFrame(upw, 1u, false, { 0.25f, -0.25f }, false, false);
+                submitFrame(upw, 2u, false, { -0.25f, 0.25f }, false, true);
+                check_true(upw.isHistoryValid(), "History must be valid after initial SR frames");
+                check_true(upw.getLastPassTimings().valid, "VkQueryPool timings valid after >= 3 frames");
+
+                {
+                    readbackBuf.invalidate();
+                    const uint16_t* halfPtr = static_cast<const uint16_t*>(readbackBuf.map());
+                    check_true(halfPtr != nullptr, "Map 128x128 SR readback");
+                    bool allFinitePos = true;
+                    const size_t nPix = 128ULL * 128ULL;
+                    for (size_t i = 0; i < nPix; ++i) {
+                        const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
+                        const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
+                        const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
+                        if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || r <= 0.0f) {
+                            allFinitePos = false;
+                            break;
+                        }
+                    }
+                    readbackBuf.unmap();
+                    check_true(allFinitePos, "All 128x128 SR output pixels must be finite and positive");
+                }
+
+                // Phase B: Lossless DRS resize (64x64 -> 96x96 @ 128x128)
                 Image* preDrsOutput = upw.getOutputImage();
-
-                // Trigger Lossless DRS: render resolution 64x64 -> 96x96 while display resolution stays 128x128
                 upw.resize(96u, 96u, 128u, 128u, true);
-                check_true(upw.isHistoryValid(), "Lossless DRS resize must preserve m_historyValid == true");
-                check_true(upw.getOutputImage() == preDrsOutput, "Lossless DRS resize must preserve display-res output image");
-                check_true(upw.getInputWidth() == 96u && upw.getInputHeight() == 96u, "Render dimensions updated to 96x96");
+                check_true(upw.getOutputImage() == preDrsOutput, "Lossless DRS preserves display output image");
+                check_true(upw.isHistoryValid(), "Lossless DRS preserves temporal HR history validity");
+                bindGbuf(upw, g96);
+                submitFrame(upw, 3u, false, { 0.125f, 0.125f }, false, false);
+                submitFrame(upw, 4u, false, { -0.125f, -0.125f }, false, false);
+                check_true(upw.isHistoryValid(), "History remains valid across DRS dispatches");
 
-                // Run 2 frames at 96x96 -> 128x128 (exercises both ping-pong LR slots across DRS transition)
-                runStep(2u, glm::vec2(0.25f, 0.125f));
-                runStep(3u, glm::vec2(-0.25f, -0.125f));
-                check_true(upw.isHistoryValid(), "m_historyValid remains true across post-DRS frames");
-
-                // Changing display resolution (128x128 -> 160x160) must reset history cleanly
+                // Phase C: Display resize (96x96 -> 160x160) resets & recovers history
                 upw.resize(96u, 96u, 160u, 160u, true);
-                check_true(!upw.isHistoryValid(), "Display-resolution resize must reset m_historyValid to false");
-                runStep(4u, glm::vec2(0.0f, 0.0f));
-                check_true(upw.isHistoryValid(), "m_historyValid recovers on first frame at new display resolution");
+                check_true(!upw.isHistoryValid(), "Display resize resets HR temporal history");
+                check_true(upw.getOutputWidth() == 160u && upw.getOutputHeight() == 160u,
+                           "Display resize updates output dimensions to 160x160");
+                submitFrame(upw, 5u, true, { 0.0f, 0.0f }, false, false);
+                check_true(upw.isHistoryValid(), "History recovers cleanly after display resize");
 
-                vkDestroyCommandPool(device, cmdPool, nullptr);
-                check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors across lossless DRS sequence");
-                std::cout << "  -> Live GPU UpwaysPipeline + Lossless DRS verified (64x64 -> 96x96 @ 128x128, 0 validation errors)." << std::endl;
+                // Phase D: Native 1.0x Denoiser-only mode (64x64 -> 64x64, zero-residual identity check)
+                upw.resize(64u, 64u, 64u, 64u, false);
+                check_true(!upw.isSuperResEnabled(), "Native 1.0x resize disables SuperRes");
+                bindGbuf(upw, g64);
+                submitFrame(upw, 6u, true, { 0.0f, 0.0f }, true, false);
+                submitFrame(upw, 7u, false, { 0.0f, 0.0f }, true, true);
+
+                {
+                    readbackBuf.invalidate();
+                    const uint16_t* halfPtr = static_cast<const uint16_t*>(readbackBuf.map());
+                    check_true(halfPtr != nullptr, "Map 64x64 native zero-residual readback");
+                    bool energyExact = true;
+                    const size_t nPix = 64ULL * 64ULL;
+                    for (size_t i = 0; i < nPix; ++i) {
+                        const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
+                        const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
+                        const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
+                        if (!std::isfinite(r) || std::abs(r - 0.865f) > 0.02f ||
+                            std::abs(g - 0.865f) > 0.02f || std::abs(b - 0.865f) > 0.02f) {
+                            energyExact = false;
+                            break;
+                        }
+                    }
+                    readbackBuf.unmap();
+                    check_true(energyExact, "Native 1.0x zero-residual output matches remodulated 0.865 radiance");
+                }
             }
+
+            vkDestroyCommandPool(device, cmdPool, nullptr);
+            check_true(vkCtx.getValidationErrors() == 0u, "Zero Vulkan validation errors during Upways 4.0 GPU test");
+            std::cout << "  -> Live GPU Upways 4.0 + Lossless DRS + 1.0x verified (FP8=" << (useFp8 ? "true" : "false")
+                      << ", 0 validation errors)." << std::endl;
+        } else {
+            std::cout << "[TEST 8] Skipped (no Vulkan 1.4 hardware GPU available)." << std::endl;
         }
     }
 
-    std::cout << "\n==========================================================" << std::endl;
-    std::cout << " [SUCCESS] All Upways 3.0 FP8 Pipeline Tests Passed! (11/11)" << std::endl;
-    std::cout << "==========================================================" << std::endl;
+    if (g_failures > 0) {
+        std::cerr << "\n[RESULT] " << g_failures << " check(s) FAILED" << std::endl;
+        return 1;
+    }
+    std::cout << "\n[RESULT] All Upways 4.0 pipeline checks PASSED" << std::endl;
     return 0;
 }

@@ -207,6 +207,13 @@ vec3 ffxApproximateBRDF(vec3 specularAlbedo, float roughness, vec3 N, vec3 V) {
     return specularAlbedo * AB.x + AB.y;
 }
 
+vec3 demodulateMlSafe(vec3 rad, vec3 demodFactor) {
+    // Sky/emissive/pure-metal/pure-dielectric channels store 0.0 and fall back to identity.
+    bool valid = any(greaterThan(demodFactor, vec3(1e-4)));
+    vec3 safeDenom = valid ? max(demodFactor, vec3(0.02)) : vec3(1.0);
+    return min(rad / safeDenom, vec3(65000.0));
+}
+
 // 64-byte cache-line aligned shading triangle (2 triangles per 128B RDNA 4 vector cache line)
 struct Triangle {
     uint octNormal0;
@@ -652,26 +659,34 @@ struct RayState {
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
 #define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
 
-RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode) {
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode, bool nrcSkip) {
     RayState s;
     s.stateData.x = packHalf2x16(vec2(throughput.rg));
-    uint flags = (isSpecularPath ? 1u : 0u) | (causticApplied ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
+    uint flags = (nrcSkip ? 1u : 0u) | (causticApplied ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
     s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u) | ((pdfCode & 0xFFFu) << 20u);
     s.stateData.z = seed;
     s.stateData.w = (pixelIndex & PIXEL_INDEX_MASK) | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u) | (causticApplied ? CAUSTIC_APPLIED_BIT : 0u);
     return s;
 }
 
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode) {
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, pdfCode, isSpecularPath);
+}
+
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, 0u);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, 0u, isSpecularPath);
 }
 
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u, 0u);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u, 0u, isSpecularPath);
 }
 
 uint unpackRayPdfCode(RayState s) {
     return (s.stateData.y >> 20u) & 0xFFFu;
+}
+
+bool unpackRayNrcSkip(RayState s) {
+    return ((s.stateData.y >> 16u) & 1u) != 0u;
 }
 
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied, out uint dispersionChannel) {
@@ -723,6 +738,19 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             } \
             float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
             imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); } \
+        } \
+    } while(false)
+
+// Records normalized first-bounce diffuse indirect hit distance into uMlDiffuseImage.a for Upways 4.0.
+#define RECORD_DIFFUSE_HIT_DIST(pixelIdx, hitDist, isMiss) \
+    do { \
+        if (pc.currentBounce == 1u && !isSpecularPath && \
+            ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) && \
+            pc.sppSampleIndex == 0u) { \
+            ivec2 dCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
+            vec4 dPrev_ = imageLoad(uMlDiffuseImage, dCoord_); \
+            float normDist_ = (isMiss) ? 1.0 : clamp(float(hitDist) / (1.0 + max(float(hitDist), 0.0)), 0.0, 1.0); \
+            imageStore(uMlDiffuseImage, dCoord_, vec4(dPrev_.rgb, normDist_)); \
         } \
     } while(false)
 

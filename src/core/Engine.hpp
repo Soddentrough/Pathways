@@ -293,6 +293,8 @@ private:
     Image* m_mlSpecularMotionImage = nullptr;
     Image* m_mlDiffuseImage = nullptr;
     Image* m_mlSpecularImage = nullptr;
+    Image* m_mlSkipImage = nullptr;
+    Image* m_mlSpecAlbedoImage = nullptr;
     void createGBufferResources();
     void destroyGBufferResources();
     void syncRenderTargetPointers();

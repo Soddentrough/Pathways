@@ -57,9 +57,11 @@ void main() {
     inDiffuse.a = abs(inDiffuse.a);
     vec4 inSpecular = hasSpec ? imageLoad(uInSpecular, coord) : vec4(0.0);
 
-    // Wavefront uniform voting: moderate curvature or already-converged waves bypass the coarse
-    // s = 8 taps and evaluate remodulation directly from converged radiance
-    bool bypassCoarseTaps = subgroupAll(effectiveRho >= pc.edgeThresholdLow || (inDiffuse.a < 1e-4 && (!hasSpec || inSpecular.a < 1e-4)));
+    bool isCoupled = (pc.stepSize < 8);
+    // Wavefront uniform voting: moderate curvature or zero-variance waves bypass the coarse
+    // taps and evaluate remodulation directly from Pass 4 radiance
+    float effEdgeThresh = isCoupled ? 0.45 : pc.edgeThresholdLow;
+    bool bypassCoarseTaps = subgroupAll((effectiveRho >= effEdgeThresh) || (inDiffuse.a < 1e-6 && (!hasSpec || inSpecular.a < 1e-6)));
     if (bypassCoarseTaps) {
         vec3 L_remod = inDiffuse.rgb * modulate + inSpecular.rgb * specModulate;
         L_remod = clamp(L_remod, 0.0, 65000.0);
@@ -67,14 +69,20 @@ void main() {
         return;
     }
 
-    // Coarse dilated convolution (s = 8) for smooth / flat regions
+    // Coarse dilated convolution (s = 8 uncoupled, s = 6 coupled) for smooth / flat regions
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
 
+    float coupledTighten = isCoupled ? clamp((effectiveRho - 0.30) / 0.25, 0.0, 1.0) : 0.0;
+    float effPhiLuminance = pc.phiLuminance * mix(1.0, 0.35, coupledTighten);
+    float effPhiNormal    = pc.phiNormal    * mix(1.0, 2.00, coupledTighten);
+
     float centerLumD = denoiseLuminance(inDiffuse.rgb);
+    bool centerZeroAlb = (dot(albRough.rgb, albRough.rgb) <= 1e-5) && (nd.w < 9999.0);
     vec4 filteredDiffuse = atrousFilterDiffuse(
         coord, pc.stepSize, inDiffuse,
-        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
-        pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 4e-6),
+        centerZeroAlb,
+        effPhiNormal, pc.phiPlaneDepth, effPhiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
     vec4 filteredSpecular = inSpecular;
@@ -83,12 +91,14 @@ void main() {
         filteredSpecular = atrousFilterSpecular(
             coord, pc.stepSize, inSpecular,
             nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),
-            albRough.a, pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
+            albRough.a, effPhiNormal, pc.phiPlaneDepth, effPhiLuminance,
             pc.tanHalfFovY, pc.aspectRatio, imgMax);
     }
 
-    // Continuous smoothstep blend across [0.25, 0.35] prevents spatial boundary seams
-    float edgeBlend = smoothstep(0.25, pc.edgeThresholdLow, effectiveRho);
+    // Continuous smoothstep blend across [0.25, 0.35] (or [0.30, 0.45] when coupled s=6) prevents spatial boundary seams
+    float edgeBlend = (!isCoupled)
+        ? smoothstep(0.25, pc.edgeThresholdLow, effectiveRho)
+        : smoothstep(0.30, 0.45, effectiveRho);
     vec3 finalDiffuse  = mix(filteredDiffuse.rgb,  inDiffuse.rgb,  edgeBlend);
     vec3 finalSpecular = mix(filteredSpecular.rgb, inSpecular.rgb, edgeBlend);
 

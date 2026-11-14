@@ -1,21 +1,23 @@
 #version 460
 #extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_GOOGLE_include_directive : enable
 
 #include "nrc_common.glsl"
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 
-// Dual shared memory buffers for ping-ponging 16 queries x 64 features (2 KB each)
-shared float16_t s_layer0[16 * 64];
-shared float16_t s_layer1[16 * 64];
-shared float16_t s_output[16 * 16];
+// Quad-subgroup shared memory buffers for 4 independent Wave32 batches (64 queries total)
+shared float16_t s_layer0[4 * 16 * 64];
+shared float16_t s_layer1[4 * 16 * 64];
+shared float16_t s_output[4 * 16 * 16];
 
-shared vec3 s_throughput[16];
-shared uint s_pixelIndex[16];
-shared bool s_valid[16];
+shared vec3 s_throughput[64];
+shared uint s_pixelIndex[64];
+shared bool s_valid[64];
+shared bool s_isSpec[64];
 
 layout(std430, set = 0, binding = 0) buffer AtomicAccumBuffer {
     uint nrcAtomicBuffer[];
@@ -37,126 +39,192 @@ layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
     uint queryCount;
-    uint pad;
+    float maxRadiance;
     vec4 worldMin;
     vec4 invWorldExtent;
 } pc;
 
 
 void main() {
-    uint queryBase = gl_WorkGroupID.x * 16u;
-    if (queryBase >= counters.queryCount) return;
+    uint sg = gl_SubgroupID;
+    uint tid = gl_SubgroupInvocationID;
+    uint actualCount = min(pc.queryCount, counters.queryCount);
+    if (gl_WorkGroupID.x * 64u >= actualCount) return;
+    uint queryBase = (gl_WorkGroupID.x * 4u + sg) * 16u;
+    if (queryBase >= actualCount) return;
 
-    uint tid = gl_LocalInvocationIndex;
+    uint sgLayerOff = sg * 1024u;
+    uint sgOutOff = sg * 256u;
+    uint sgMetaOff = sg * 16u;
 
-    // 1. Initialize shared memory feature vector for 16 queries (channels 32..47 padded with 0; 48..63 skipped in Layer 0)
-    for (uint i = tid; i < 16u * 48u; i += 32u) {
-        s_layer0[i] = float16_t(0.0);
-    }
-    if (tid < 16u) {
-        s_valid[tid] = false;
-    }
-    barrier();
+    // 1. Wave32 parallel multi-frequency encoding (2 lanes per query: 16 queries x 64 features per subgroup)
+    //    Out-of-range trailing slots are zero-padded so workgroup-uniform barrier() covers all 4 subgroups.
+    uint qSlot = tid >> 1u;
+    uint halfLane = tid & 1u;
+    uint metaSlot = sgMetaOff + qSlot;
+    uint qIdx = queryBase + qSlot;
+    uint rowBase = sgLayerOff + qSlot * 64u;
 
-    // 2. Hash Grid Feature Encoding (threads 0..15 handle 1 query each)
-    if (tid < 16u) {
-        uint qIdx = queryBase + tid;
-        uint actualCount = min(pc.queryCount, counters.queryCount);
-        if (qIdx < actualCount) {
-            NRCQuery q = queries[qIdx];
-            s_throughput[tid] = q.throughput.xyz;
-            s_pixelIndex[tid] = floatBitsToUint(q.dir_pixelIndex.w);
-            s_valid[tid] = true;
+    if (qIdx < actualCount) {
+        NRCQuery q = queries[qIdx];
+        vec3 normPos = clamp((q.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+        const float PI = 3.14159265359;
 
-            vec3 normPos = clamp((q.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+        if (halfLane == 0u) {
+            s_throughput[metaSlot] = q.throughput.xyz;
+            s_pixelIndex[metaSlot] = floatBitsToUint(q.dir_pixelIndex.w);
+            s_isSpec[metaSlot] = (q.normal_flags.w > 0.5);
+            s_valid[metaSlot] = true;
 
-            // Independent multi-frequency sinusoidal spatial encoding (24 features: 3 axes x 4 octaves x 2 (sin/cos))
-            const float PI = 3.14159265359;
-            for (uint axis = 0u; axis < 3u; ++axis) {
-                float coord = normPos[axis];
-                for (uint l = 0u; l < 4u; ++l) {
-                    float freq = float(1 << l) * PI;
-                    uint baseIdx = axis * 8u + l * 2u;
-                    s_layer0[tid * 64u + baseIdx + 0u] = float16_t(sin(coord * freq));
-                    s_layer0[tid * 64u + baseIdx + 1u] = float16_t(cos(coord * freq));
+            // 28 features (channels 0..27): axes X & Y x 7 octaves via double-angle recurrence
+            for (uint axis = 0u; axis < 2u; ++axis) {
+                float th = normPos[axis] * PI;
+                float s = sin(th);
+                float c = cos(th);
+                float amp = 1.0;
+                uint axisBase = rowBase + axis * 14u;
+                for (uint l = 0u; l < 7u; ++l) {
+                    s_layer0[axisBase + l * 2u + 0u] = float16_t(s * amp);
+                    s_layer0[axisBase + l * 2u + 1u] = float16_t(c * amp);
+                    if (l < 6u) {
+                        float s2 = 2.0 * s * c;
+                        float c2 = c * c - s * s;
+                        s = s2;
+                        c = c2;
+                        amp *= 0.75;
+                    }
                 }
             }
 
-            // Normal (channels 24..26)
-            s_layer0[tid * 64u + 24u] = float16_t(q.normal_flags.x);
-            s_layer0[tid * 64u + 25u] = float16_t(q.normal_flags.y);
-            s_layer0[tid * 64u + 26u] = float16_t(q.normal_flags.z);
+            // Normal (channels 54..56), View Direction (57..59), Roughness (60), Reflectance (61..63)
+            s_layer0[rowBase + 54u] = float16_t(q.normal_flags.x);
+            s_layer0[rowBase + 55u] = float16_t(q.normal_flags.y);
+            s_layer0[rowBase + 56u] = float16_t(q.normal_flags.z);
+            s_layer0[rowBase + 57u] = float16_t(q.dir_pixelIndex.x);
+            s_layer0[rowBase + 58u] = float16_t(q.dir_pixelIndex.y);
+            s_layer0[rowBase + 59u] = float16_t(q.dir_pixelIndex.z);
+            s_layer0[rowBase + 60u] = float16_t(q.pos_roughness.w);
+            s_layer0[rowBase + 61u] = float16_t(q.albedo_pad.x);
+            s_layer0[rowBase + 62u] = float16_t(q.albedo_pad.y);
+            s_layer0[rowBase + 63u] = float16_t(q.albedo_pad.z);
+        } else {
+            // 14 features (channels 28..41): axis Z x 7 octaves via double-angle recurrence
+            float th = normPos.z * PI;
+            float s = sin(th);
+            float c = cos(th);
+            float amp = 1.0;
+            uint axisBase = rowBase + 28u;
+            for (uint l = 0u; l < 7u; ++l) {
+                s_layer0[axisBase + l * 2u + 0u] = float16_t(s * amp);
+                s_layer0[axisBase + l * 2u + 1u] = float16_t(c * amp);
+                if (l < 6u) {
+                    float s2 = 2.0 * s * c;
+                    float c2 = c * c - s * s;
+                    s = s2;
+                    c = c2;
+                    amp *= 0.75;
+                }
+            }
 
-            // View Direction (channels 27..29)
-            s_layer0[tid * 64u + 27u] = float16_t(q.dir_pixelIndex.x);
-            s_layer0[tid * 64u + 28u] = float16_t(q.dir_pixelIndex.y);
-            s_layer0[tid * 64u + 29u] = float16_t(q.dir_pixelIndex.z);
-
-            // Roughness (channel 30)
-            s_layer0[tid * 64u + 30u] = float16_t(q.pos_roughness.w);
-
-            // Base Color Albedo (channels 31..33)
-            s_layer0[tid * 64u + 31u] = float16_t(q.albedo_pad.x);
-            s_layer0[tid * 64u + 32u] = float16_t(q.albedo_pad.y);
-            s_layer0[tid * 64u + 33u] = float16_t(q.albedo_pad.z);
-            // Channels 34..63 remain 0.0 padding
+            // 12 features (channels 42..53): 6 3D cross-axis diagonals x 2 (sin/cos)
+            float diagCoords[6] = float[6](
+                0.5 * (normPos.x + normPos.y),
+                0.5 * (normPos.y + normPos.z),
+                0.5 * (normPos.z + normPos.x),
+                0.5 * (normPos.x - normPos.y) + 0.5,
+                0.5 * (normPos.y - normPos.z) + 0.5,
+                0.5 * (normPos.z - normPos.x) + 0.5
+            );
+            for (uint d = 0u; d < 6u; ++d) {
+                float ang = diagCoords[d] * (6.0 * PI);
+                s_layer0[rowBase + 42u + d * 2u + 0u] = float16_t(sin(ang) * 0.5);
+                s_layer0[rowBase + 42u + d * 2u + 1u] = float16_t(cos(ang) * 0.5);
+            }
+        }
+    } else {
+        if (halfLane == 0u) {
+            s_valid[metaSlot] = false;
+            s_isSpec[metaSlot] = false;
+        }
+        uint colStart = halfLane * 32u;
+        for (uint c = 0u; c < 32u; ++c) {
+            s_layer0[rowBase + colStart + c] = float16_t(0.0);
         }
     }
-    barrier();
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
 
     // ==========================================
-    // 3. LAYER 0: 34 (padded to 48) -> 64 WMMA
+    // 3. LAYER 0: 64 -> 64 WMMA
     // ==========================================
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles0[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        coopMatLoad(aTiles0[k], s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
     for (uint col = 0u; col < 4u; ++col) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
         c0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
-        for (uint k = 0u; k < 3u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_layer0, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
+        for (uint k = 0u; k < 4u; ++k) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (col * 16u);
             coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
-            c0 = coopMatMulAdd(aTile, bTile, c0);
+            c0 = coopMatMulAdd(aTiles0[k], bTile, c0);
         }
 
-        coopMatStore(c0, s_layer1, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c0, s_layer1, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
-    barrier();
-    for (uint i = tid; i < 16u * 64u; i += 32u) {
-        float16_t b0 = weights[NRC_B0_OFFSET + (i & 63u)];
-        float16_t v = s_layer1[i] + b0;
-        s_layer1[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    {
+        float16_t b0_lo = weights[NRC_B0_OFFSET + tid];
+        float16_t b0_hi = weights[NRC_B0_OFFSET + tid + 32u];
+        for (uint r = 0u; r < 16u; ++r) {
+            uint rowOff = sgLayerOff + r * 64u;
+            float16_t v0 = s_layer1[rowOff + tid] + b0_lo;
+            s_layer1[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
+            float16_t v1 = s_layer1[rowOff + tid + 32u] + b0_hi;
+            s_layer1[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
+        }
     }
-    barrier();
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
 
     // ==========================================
     // 4. LAYER 1: 64 -> 64 WMMA
     // ==========================================
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles1[4];
+    for (uint k = 0u; k < 4u; ++k) {
+        coopMatLoad(aTiles1[k], s_layer1, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+    }
     for (uint col = 0u; col < 4u; ++col) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
         c1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
 
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_layer1, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (col * 16u);
             coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
-            c1 = coopMatMulAdd(aTile, bTile, c1);
+            c1 = coopMatMulAdd(aTiles1[k], bTile, c1);
         }
 
-        coopMatStore(c1, s_layer0, col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c1, s_layer0, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
-    barrier();
-    for (uint i = tid; i < 16u * 64u; i += 32u) {
-        float16_t b1 = weights[NRC_B1_OFFSET + (i & 63u)];
-        float16_t v = s_layer0[i] + b1;
-        s_layer0[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    {
+        float16_t b1_lo = weights[NRC_B1_OFFSET + tid];
+        float16_t b1_hi = weights[NRC_B1_OFFSET + tid + 32u];
+        for (uint r = 0u; r < 16u; ++r) {
+            uint rowOff = sgLayerOff + r * 64u;
+            float16_t v0 = s_layer0[rowOff + tid] + b1_lo;
+            s_layer0[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
+            float16_t v1 = s_layer0[rowOff + tid + 32u] + b1_hi;
+            s_layer0[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
+        }
     }
-    barrier();
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
 
     // ==========================================
     // 5. LAYER 2: 64 -> 16 WMMA (Output layer)
@@ -166,7 +234,7 @@ void main() {
 
     for (uint k = 0u; k < 4u; ++k) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-        coopMatLoad(aTile, s_layer0, k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(aTile, s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
 
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
         uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
@@ -176,34 +244,40 @@ void main() {
     }
 
     // Store linear output to s_output
-    coopMatStore(c2, s_output, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    barrier();
+    coopMatStore(c2, s_output, sgOutOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
 
     // 6. Write final predicted radiance to 32-bit fixed-point atomic buffer (CRIT-05)
-    if (tid < 16u && s_valid[tid]) {
-        vec3 rawPred = vec3(
-            float(s_output[tid * 16u + 0u] + weights[NRC_B2_OFFSET + 0u]),
-            float(s_output[tid * 16u + 1u] + weights[NRC_B2_OFFSET + 1u]),
-            float(s_output[tid * 16u + 2u] + weights[NRC_B2_OFFSET + 2u])
-        );
-        if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
-        if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
-        if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
-        vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(250.0));
-        vec3 radiance = clamp(s_throughput[tid] * predRadiance, vec3(0.0), vec3(250.0));
+    if (tid < 16u) {
+        uint slot = sgMetaOff + tid;
+        if (s_valid[slot]) {
+            uint outRow = sgOutOff + tid * 16u;
+            vec3 rawPred = vec3(
+                float(s_output[outRow + 0u] + weights[NRC_B2_OFFSET + 0u]),
+                float(s_output[outRow + 1u] + weights[NRC_B2_OFFSET + 1u]),
+                float(s_output[outRow + 2u] + weights[NRC_B2_OFFSET + 2u])
+            );
+            if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
+            if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
+            if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
+            float maxRad = (pc.maxRadiance > 0.0) ? pc.maxRadiance : 10.0;
+            vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(maxRad));
+            vec3 radiance = clamp(s_throughput[slot] * predRadiance, vec3(0.0), vec3(maxRad));
 
-        if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
-        if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;
-        if (isnan(radiance.z) || isinf(radiance.z)) radiance.z = 0.0;
+            if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
+            if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;
+            if (isnan(radiance.z) || isinf(radiance.z)) radiance.z = 0.0;
 
-        uint pixelIdx = s_pixelIndex[tid];
-        if (pixelIdx < pc.width * pc.height) {
-            uint base = pixelIdx * 3u;
-            // Q16.16 fixed-point scaling (65536.0)
-            uvec3 fixedRad = uvec3(clamp(radiance, vec3(0.0), vec3(65535.0)) * 65536.0 + 0.5);
-            if (fixedRad.x > 0u) atomicAdd(nrcAtomicBuffer[base + 0u], fixedRad.x);
-            if (fixedRad.y > 0u) atomicAdd(nrcAtomicBuffer[base + 1u], fixedRad.y);
-            if (fixedRad.z > 0u) atomicAdd(nrcAtomicBuffer[base + 2u], fixedRad.z);
+            uint pixelIdx = s_pixelIndex[slot];
+            if (pixelIdx < pc.width * pc.height) {
+                uint base = pixelIdx * 6u + (s_isSpec[slot] ? 3u : 0u);
+                // Q16.16 fixed-point scaling (65536.0)
+                uvec3 fixedRad = uvec3(clamp(radiance, vec3(0.0), vec3(65535.0)) * 65536.0 + 0.5);
+                if (fixedRad.x > 0u) atomicAdd(nrcAtomicBuffer[base + 0u], fixedRad.x);
+                if (fixedRad.y > 0u) atomicAdd(nrcAtomicBuffer[base + 1u], fixedRad.y);
+                if (fixedRad.z > 0u) atomicAdd(nrcAtomicBuffer[base + 2u], fixedRad.z);
+            }
         }
     }
 }

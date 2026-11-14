@@ -43,6 +43,10 @@ struct QueueCountersBuffer {
     wf_uint pad[20];
 };
 
+#define ML_CAPTURE_ENABLED_BIT   1u
+#define ML_CAPTURE_KEEP_ACCUM_BIT 2u
+#define ML_CAPTURE_UPWAYS_V4_BIT 4u
+
 struct WavefrontClassifyPC {
     wf_uint numTriangles;
     wf_uint numSpheres;

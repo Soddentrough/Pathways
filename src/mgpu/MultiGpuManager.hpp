@@ -11,6 +11,7 @@
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/FsrUpscaler.hpp"
 #include "rt/ReSTIRManager.hpp"
+#include "rt/NRCManager.hpp"
 #include "rt/GpuTlasUpdatePipeline.hpp"
 #include "rt/CausticsPipeline.hpp"
 #include "vulkan/Texture.hpp"
@@ -99,6 +100,8 @@ struct GpuDeviceNode {
     std::unique_ptr<Image> mlSpecularImage;
     std::unique_ptr<Image> mlAlbedoRoughnessImage;
     std::unique_ptr<Image> mlSpecularMotionImage;
+    std::unique_ptr<Image> mlSkipImage;
+    std::unique_ptr<Image> mlSpecAlbedoImage;
 
     // Secondary GPU Dynamic Scene & Caustics Subsystems
     std::unique_ptr<GpuTlasUpdatePipeline> tlasUpdatePipeline;
@@ -117,9 +120,14 @@ struct GpuDeviceNode {
 
     // Secondary GPU FSR 3.1 Upscaler (Sample Parallel / Approach 2)
     std::unique_ptr<Fsr3Upscaler> upscaler;
+    glm::vec2 prevUpscalerJitter{ 0.0f, 0.0f };
+    bool hasPrevUpscalerJitter = false;
 
     // Secondary GPU ReSTIR Spatiotemporal Resampling Manager
     std::unique_ptr<ReSTIRManager> restirManager;
+
+    // Secondary GPU Neural Radiance Cache Manager
+    std::unique_ptr<NRCManager> nrcManager;
 
     ~GpuDeviceNode();
 };
@@ -294,6 +302,7 @@ private:
     void updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode);
     void ensureSecondaryMlGuides(GpuDeviceNode* secNode);
     void ensureSecondaryCaustics(GpuDeviceNode* secNode);
+    void ensureSecondaryNrc(GpuDeviceNode* secNode);
     bool needSecondaryMlGuides() const;
 
     bool initSharedP2PBuffer(VkDeviceSize bufferSize);
@@ -345,6 +354,8 @@ private:
     std::atomic<uint64_t> m_currentTimelineValue{ 0 };
     glm::vec3 m_boundsMin = glm::vec3(-1000.0f);
     glm::vec3 m_boundsMax = glm::vec3(1000.0f);
+    glm::vec3 m_focalBoundsMin = glm::vec3(-1000.0f);
+    glm::vec3 m_focalBoundsMax = glm::vec3(1000.0f);
     bool m_hasDielectrics = false;
     glm::vec3 m_dielectricBoundsMin = glm::vec3(-1000.0f);
     glm::vec3 m_dielectricBoundsMax = glm::vec3(1000.0f);

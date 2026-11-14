@@ -116,7 +116,7 @@ struct Config {
     float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
     bool enable_tail_megakernel = false;      // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: false, opt-in via --tail-megakernel]
     uint32_t tail_megakernel_bounce = 2;      // Bounce at which to switch from Wavefront to Tail Megakernel (default: 2)
-    uint32_t delta_unroll = 4;                // Max delta-chain unroll depth for smooth dielectrics [Default: 4, 0 = Pure Wavefront]
+    uint32_t delta_unroll = 6;                // Max delta-chain unroll depth for smooth dielectrics [Default: 6, 0 = Pure Wavefront]
     uint32_t width = 3840;
     uint32_t height = 2160;
     bool custom_resolution = false; // Set to true when --width or --height is passed explicitly on CLI
@@ -185,7 +185,7 @@ struct Config {
     bool emissive_geometry_lights = true; // Register emissive instanced geometry as MIS area lights (disable via --no-emissive-geometry-lights)
     bool enable_light_tree = true;       // Hierarchical Light Tree importance sampling for many-light scenes [Default: true]
     bool enable_delta_unroll = true;     // Collapse dielectric transmission via inline rayQuery delta unrolling [Default: true]
-    uint32_t max_delta_events = 4;       // Maximum internal delta events to unroll per dielectric vertex (default: 4)
+    uint32_t max_delta_events = 6;       // Maximum internal delta events to unroll per dielectric vertex (default: 6)
     bool dgc_preprocess = true;          // DGC explicit preprocessing enabled by default (disable via --no-dgc-preprocess)
     bool dgc_batch_preprocess = true;    // Batched DGC preprocessing enabled by default (disable via --no-dgc-batch-preprocess)
     // Denoiser Defaults & Rationale:
@@ -208,8 +208,8 @@ struct Config {
     // Neural Radiance Caching (NRC) with Wave32 WMMA & AMD FSR Radiance Cache 0.9.0 (gfx1201 / Vulkan 1.4)
     bool enable_nrc = false;              // Neural Radiance Cache indirect query termination [Default: disabled]
     NrcBackend nrc_backend = NrcBackend::Auto; // Target NRC backend (Auto, NativeWave32, FfxRadianceCache)
-    uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
-    float nrc_train_ratio = 0.03f;        // Ratio of paths (2%-5%, default 0.03 = 3%) continuing tracing to ground truth depth for training
+    uint32_t nrc_bounce = 1;              // Path bounce depth where NRC terminates tracing and queries cache (default: 1)
+    float nrc_train_ratio = 0.04f;        // Ratio of paths (2%-5%, default 0.04 = 4%) continuing tracing for self-training
 
     // Caustics & Forward Photon Injection (Vulkan 1.4 hardware rayQueryEXT)
     bool enable_caustics = false;         // Enable real-time forward ray-traced caustics [Default: disabled, opt-in via --caustics]

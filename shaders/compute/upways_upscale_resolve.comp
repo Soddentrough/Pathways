@@ -1,364 +1,243 @@
 #version 460
-#extension GL_EXT_shader_explicit_arithmetic_types : require
-#extension GL_EXT_control_flow_attributes : require
-
 #include "upways_common.glsl"
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-// Render-resolution transient & G-buffer inputs
-layout(set = 0, binding = 0, rgba16f) uniform readonly image2D uNormalDepth;
-layout(set = 0, binding = 1, rgba16f) uniform readonly image2D tLogDiff;
-layout(set = 0, binding = 2, rgba16f) uniform readonly image2D tLogSpec;
-layout(set = 0, binding = 3, rgba16f) uniform readonly image2D tGuideDiff;
-layout(set = 0, binding = 4, rgba16f) uniform readonly image2D tGuideSpec;
-layout(set = 0, binding = 5, rgba16f) uniform readonly image2D tDilatedMv;
-layout(set = 0, binding = 6, rgba16f) uniform readonly image2D tTemporalConf;
+layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D tCleanRadLr;
+layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D uNormalDepth;
+layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D uMotionVectors;
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uMlSpecular;
+layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D uMlSkip;
+layout(set = 0, binding = 5)          readonly  buffer  SrSubpixelBuf { uvec2 sub[]; } g_srSub;
+layout(set = 0, binding = 6, rgba16f) readonly  uniform image2D uPrevColorHr;
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D uCurrColorHr;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutputColor;
 
-// Render-resolution 16-ch neural parameters & FP32 skip_scale weights
-layout(set = 0, binding = 7, std430) readonly buffer SubpixelParamsBuf {
-    f16vec4 uSubpixelParams[];
-};
-
-layout(set = 0, binding = 8, std430) readonly buffer WeightFp32Buf {
-    float w_f32[];
-};
-
-// Display-resolution hardware-sampled history & BRDF guides (VK_FILTER_LINEAR, CLAMP_TO_EDGE)
-layout(set = 0, binding = 9)  uniform sampler2D uPrevIrrDiffHr;
-layout(set = 0, binding = 10) uniform sampler2D uPrevIrrSpecHr;
-layout(set = 0, binding = 11) uniform sampler2D uPrevGuideDiffHr;
-layout(set = 0, binding = 12) uniform sampler2D uPrevGuideSpecHr;
-
-// Display-resolution resolved HDR output & ping-pong history outputs
-layout(set = 0, binding = 13, rgba16f) uniform writeonly image2D uOutputColor;
-layout(set = 0, binding = 14, rgba16f) uniform writeonly image2D uCurrIrrDiffHr;
-layout(set = 0, binding = 15, rgba16f) uniform writeonly image2D uCurrIrrSpecHr;
-layout(set = 0, binding = 16, rgba16f) uniform writeonly image2D uCurrGuideDiffHr;
-layout(set = 0, binding = 17, rgba16f) uniform writeonly image2D uCurrGuideSpecHr;
+vec4 fetchSubpixel(ivec2 sp, int lrW) {
+    ivec2 lp = sp >> 1;
+    uint corner = uint(((sp.y & 1) << 1) | (sp.x & 1));
+    uvec2 pck = g_srSub.sub[uint(lp.y * lrW + lp.x) * 4u + corner];
+    return vec4(unpackHalf2x16(pck.x), unpackHalf2x16(pck.y));
+}
 
 void main() {
-    ivec2 displayPos = ivec2(gl_GlobalInvocationID.xy);
-    if (displayPos.x >= int(pc.displayWidth) || displayPos.y >= int(pc.displayHeight)) {
+    ivec2 hrPos = ivec2(gl_GlobalInvocationID.xy);
+    int hrW = int(pc.hrWidth);
+    int hrH = int(pc.hrHeight);
+    if (hrPos.x >= hrW || hrPos.y >= hrH) {
         return;
     }
 
-    ivec2 anc;
-    float dx0;
-    float dy0;
-    {
-        float uy = (float(displayPos.y) + 0.5) * (float(pc.renderHeight) / float(pc.displayHeight));
-        float ux = (float(displayPos.x) + 0.5) * (float(pc.renderWidth)  / float(pc.displayWidth));
-        int ancY = clamp(int(floor(uy)), 0, int(pc.renderHeight) - 1);
-        int ancX = clamp(int(floor(ux)), 0, int(pc.renderWidth)  - 1);
-        anc = ivec2(ancX, ancY);
-        vec2 jitter = vec2(f16vec2(vec2(pc.jitterX, pc.jitterY)));
-        dx0 = ((ux - float(ancX)) - 0.5) - jitter.x;
-        dy0 = ((uy - float(ancY)) - 0.5) - jitter.y;
-    }
+    int lrW = int(pc.lrWidth);
+    int lrH = int(pc.lrHeight);
+    vec2 hrSizeF = vec2(float(hrW), float(hrH));
+    vec2 lrSizeF = vec2(float(lrW), float(lrH));
 
-    // 1. Scoped streaming 9-tap subpixel ray-locus gather in unbiased linear irradiance space (<64 VGPRs, 0 LDS)
-    vec3 currDiffLinHr;
-    vec3 currSpecLinHr;
-    f16vec3 dMinF16;
-    f16vec3 dMaxF16;
-    f16vec3 sMinF16;
-    f16vec3 sMaxF16;
-    float roughCenter;
-    float zCenter;
+    vec2 currUV  = (vec2(hrPos) + vec2(0.5)) / hrSizeF;
+    vec2 lrCoord = (vec2(hrPos) + vec2(0.5)) * lrSizeF / hrSizeF; // Unjittered continuous LR coordinate
 
-    {
-        float r2_0 = dx0 * dx0 + dy0 * dy0;
+    // Primary ray at LR texel (lx, ly) samples (lx + 0.5 + jitter.x, ly + 0.5 + jitter.y)
+    ivec2 lrCenter = clamp(ivec2(floor(lrCoord - vec2(pc.jitterX, pc.jitterY) + vec2(1e-5))), ivec2(0), ivec2(lrW - 1, lrH - 1));
 
-        vec4 ndC = sanitizeVec4Input(imageLoad(uNormalDepth, anc));
-        f16vec3 ncF16 = f16vec3(ndC.xyz);
-        zCenter = ndC.w;
-        float invZc = 1.0 / max(zCenter, 0.1);
+    vec4  cRadInfo       = imageLoad(tCleanRadLr, lrCenter);
+    vec4  ndCenter       = imageLoad(uNormalDepth, lrCenter);
+    vec3  cNrmR          = vec3(sanitizeFloat(ndCenter.r, 0.0), sanitizeFloat(ndCenter.g, 0.0), sanitizeFloat(ndCenter.b, 1.0));
+    float cNLen          = length(cNrmR);
+    vec3  centerNrm      = (cNLen > 1e-5) ? (cNrmR / cNLen) : vec3(0.0, 0.0, 1.0);
+    float centerDepth    = clamp(sanitizeFloat(ndCenter.a, 10000.0), 0.0, 10000.0);
+    float centerDiffConf = clamp(sanitizeFloat(cRadInfo.a, 0.0), 0.0, 1.0);
+    float centerLogL     = safeLog1pF(upwaysLuma(sanitizeRgb(cRadInfo.rgb)));
+    bool  isSky          = (centerDepth >= 9999.0);
 
-        f16vec2 yCsF16;
-        vec3 accD;
-        vec3 accS;
-        {
-            vec4 ldC = imageLoad(tLogDiff, anc);
-            vec3 dc = ldC.rgb;
-            roughCenter = ldC.a;
-            float ydC = max(dc.x, max(dc.y, dc.z));
-            dMinF16 = f16vec3(dc);
-            dMaxF16 = f16vec3(dc);
-            accD = upwaysExpm1Vec3(dc);
+    // 1. De-jittered 3x3 bilateral gather + 3x3 log1p moments + 3x3 closest-depth dilated MV
+    vec3  radSum        = vec3(0.0);
+    float wSum          = 0.0;
+    vec3  logSum        = vec3(0.0);
+    vec3  logSum2       = vec3(0.0);
+    float momCount      = 0.0;
+    float maxTapSpatial = 0.0;
 
-            vec3 sc = imageLoad(tLogSpec, anc).rgb;
-            float ysC = max(sc.x, max(sc.y, sc.z));
-            yCsF16 = f16vec2(ydC, ysC);
-            sMinF16 = f16vec3(sc);
-            sMaxF16 = f16vec3(sc);
-            accS = upwaysExpm1Vec3(sc);
-        }
+    float minDepth  = 1e30;
+    vec2  dilatedMv = vec2(0.0);
 
-        float kSub;
-        float kSubS;
-        float kZ;
-        float kN;
-        float kLum;
-        {
-            uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
-            float smoothC = clamp(1.0 - roughCenter, 0.0, 1.0);
-            vec4 u0 = vec4(uSubpixelParams[cIdx * 4u + 0u]);
-            float u4 = float(uSubpixelParams[cIdx * 4u + 1u].x);
-            kSub  = upwaysSoftplus(u0.x);
-            kSubS = kSub + upwaysSoftplus(u0.y) * (smoothC * smoothC);
-            kZ    = upwaysSoftplus(u0.z);
-            kN    = upwaysSoftplus(u0.w);
-            kLum  = upwaysSoftplus(u4);
-        }
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(lrCenter + ivec2(dx, dy), ivec2(0), ivec2(lrW - 1, lrH - 1));
+            vec3  qRad  = sanitizeRgb(imageLoad(tCleanRadLr, q).rgb);
+            vec4  qNd   = imageLoad(uNormalDepth, q);
+            vec3  qNrmR = vec3(sanitizeFloat(qNd.r, 0.0), sanitizeFloat(qNd.g, 0.0), sanitizeFloat(qNd.b, 1.0));
+            float qNL   = length(qNrmR);
+            vec3  qNrm  = (qNL > 1e-5) ? (qNrmR / qNL) : vec3(0.0, 0.0, 1.0);
+            float qD    = clamp(sanitizeFloat(qNd.a, 10000.0), 0.0, 10000.0);
+            bool  qSky  = (qD >= 9999.0);
 
-        float sumWd = 1.0;
-        float sumWs = 1.0;
-
-        ivec2 maxLr = ivec2(int(pc.renderWidth) - 1, int(pc.renderHeight) - 1);
-        [[dont_unroll]] for (int tap = 0; tap < 8; ++tap) {
-            int idx9 = (tap < 4) ? tap : (tap + 1);
-            int dy = (idx9 / 3) - 1;
-            int dx = (idx9 % 3) - 1;
-            ivec2 np = clamp(anc + ivec2(dx, dy), ivec2(0), maxLr);
-
-            float ddx = dx0 - float(dx);
-            float ddy = dy0 - float(dy);
-            float dr2 = (ddx * ddx + ddy * ddy) - r2_0;
-
-            float basePen;
-            {
-                vec4 ndI = sanitizeVec4Input(imageLoad(uNormalDepth, np));
-                float dz = clamp(abs(zCenter - ndI.w) * invZc, 0.0, 2.0);
-                float ndot = clamp(dot(vec3(ncF16), ndI.xyz), 0.0, 1.0);
-                basePen = kZ * dz + kN * (1.0 - ndot);
+            // Closest-depth dilated MV
+            if (qD < minDepth) {
+                minDepth = qD;
+                vec4 qMv = imageLoad(uMotionVectors, q);
+                dilatedMv = vec2(sanitizeFloat(qMv.r, 0.0), sanitizeFloat(qMv.g, 0.0));
             }
 
-            float geomPen;
-            {
-                vec4 ldI = imageLoad(tLogDiff, np);
-                vec3 di = ldI.rgb;
-                geomPen = basePen + kN * abs(roughCenter - ldI.a);
-                dMinF16 = min(dMinF16, f16vec3(di));
-                dMaxF16 = max(dMaxF16, f16vec3(di));
-                float ydI = max(di.x, max(di.y, di.z));
-                float ld = clamp(-(kSub * dr2 + geomPen + kLum * abs(ydI - float(yCsF16.x))), -40.0, 10.0);
-                float wd = exp(ld);
-                sumWd += wd;
-                accD += wd * upwaysExpm1Vec3(di);
+            // Distance from LR sample position to HR target
+            vec2  d        = lrCoord - (vec2(q) + vec2(0.5) + vec2(pc.jitterX, pc.jitterY));
+            float wSpatial = exp(-5.5 * dot(d, d));
+            float qLogL    = safeLog1pF(upwaysLuma(qRad));
+            float lumaW    = (dx == 0 && dy == 0) ? 1.0 : exp(-3.5 * (qLogL - centerLogL) * (qLogL - centerLogL));
+            float wBilat   = 0.0;
+            if (qSky == isSky) {
+                if (!isSky) {
+                    float relD = (qD - centerDepth) / max(centerDepth, 1e-3);
+                    float ndot = max(dot(centerNrm, qNrm), 0.0);
+                    wBilat = exp(-16.0 * relD * relD) * (ndot * ndot * ndot * ndot) * lumaW;
+                } else {
+                    wBilat = lumaW;
+                }
+                if (wBilat > 0.05) {
+                    maxTapSpatial = max(maxTapSpatial, wSpatial);
+                }
             }
-
-            {
-                vec3 si = imageLoad(tLogSpec, np).rgb;
-                sMinF16 = min(sMinF16, f16vec3(si));
-                sMaxF16 = max(sMaxF16, f16vec3(si));
-                float ysI = max(si.x, max(si.y, si.z));
-                float ls = clamp(-(kSubS * dr2 + geomPen + kLum * abs(ysI - float(yCsF16.y))), -40.0, 10.0);
-                float ws = exp(ls);
-                sumWs += ws;
-                accS += ws * upwaysExpm1Vec3(si);
+            float w = wSpatial * wBilat;
+            if (dx == 0 && dy == 0) {
+                w = max(w, 1e-4);
             }
-        }
+            radSum += w * qRad;
+            wSum   += w;
 
-        currDiffLinHr = accD / sumWd;
-        currSpecLinHr = accS / sumWs;
-    }
-
-    float isSurfF = (zCenter > 1e-4 && zCenter < SKY_DEPTH_THRESHOLD) ? 1.0 : 0.0;
-
-    vec4 dilMv = (pc.resetHistory == 0u) ? imageLoad(tDilatedMv, anc) : vec4(0.0);
-    vec2 surfMv = dilMv.xy;
-    vec2 specMv = dilMv.zw;
-
-    uvec2 prevSize = (pc.resetHistory == 0u)
-        ? uvec2(textureSize(uPrevIrrDiffHr, 0))
-        : uvec2(pc.displayWidth, pc.displayHeight);
-
-    f16vec2 disoccF16;
-    f16vec2 staticF16;
-    {
-        float reactiveCenter = imageLoad(tLogSpec, anc).a;
-        float mvSpeedLr = sqrt(dot(surfMv, surfMv) + 1e-12);
-        float specMvSpeedLr = sqrt(dot(specMv, specMv) + 1e-12);
-        float reactiveDisocc = reactiveCenter * clamp(mvSpeedLr * 32.0, 0.0, 1.0);
-        vec3 tConf = imageLoad(tTemporalConf, anc).xyz;
-        float nDotPos = clamp(tConf.y, 0.0, 1.0);
-        float disoccD = clamp(tConf.x + (1.0 - nDotPos) + reactiveDisocc, 0.0, 1.0);
-        float smoothLr = clamp(1.0 - roughCenter, 0.0, 1.0);
-        float disoccS = clamp(max(disoccD, (smoothLr * smoothLr) * tConf.z), 0.0, 1.0);
-        disoccF16 = f16vec2(disoccD, disoccS);
-        float staticD = clamp(1.0 - float(float16_t(disoccD)) * 16.0 - mvSpeedLr * 2048.0, 0.0, 1.0);
-        float staticS = clamp(1.0 - float(float16_t(disoccS)) * 16.0 - specMvSpeedLr * 2048.0, 0.0, 1.0);
-        staticF16 = f16vec2(staticD, staticS);
-    }
-
-    // 2. Scoped BRDF guide warp & subpixel jitter-locus HR guide accumulation
-    f16vec3 guideDiffF16;
-    f16vec3 guideSpecF16;
-    f16vec2 validHistF16;
-    float kDisocc;
-
-    {
-        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
-        float u1y = float(uSubpixelParams[cIdx * 4u + 1u].y);
-        float rawHg = float(uSubpixelParams[cIdx * 4u + 2u].x);
-        kDisocc = upwaysSoftplus(u1y);
-
-        vec4 gdVec4 = imageLoad(tGuideDiff, anc);
-        vec4 gsVec4 = imageLoad(tGuideSpec, anc);
-        vec3 currGuideDiffHr = gdVec4.rgb;
-        vec3 currGuideSpecHr = gsVec4.rgb;
-        validHistF16 = f16vec2(gdVec4.a, gsVec4.a);
-
-        vec2 dispUv = (vec2(displayPos) + 0.5) / vec2(float(pc.displayWidth), float(pc.displayHeight));
-        vec2 prevSurfUv = dispUv - surfMv;
-        bool surfInBounds = (pc.resetHistory == 0u) &&
-            (prevSurfUv.x >= 0.0) && (prevSurfUv.x <= 1.0) &&
-            (prevSurfUv.y >= 0.0) && (prevSurfUv.y <= 1.0);
-
-        vec3 wGuideDiff = currGuideDiffHr;
-        vec3 wGuideSpec = currGuideSpecHr;
-        if (pc.resetHistory == 0u) {
-            if (surfInBounds) {
-                wGuideDiff = textureLod(uPrevGuideDiffHr, prevSurfUv, 0.0).rgb;
-                wGuideSpec = textureLod(uPrevGuideSpecHr, prevSurfUv, 0.0).rgb;
-            } else {
-                wGuideDiff = vec3(0.0);
-                wGuideSpec = vec3(0.0);
+            if ((dx == 0 && dy == 0) || (qSky == isSky)) {
+                vec3 lq = safeLog1p(qRad);
+                logSum   += lq;
+                logSum2  += lq * lq;
+                momCount += 1.0;
             }
         }
+    }
 
-        vec3 absGd = abs(currGuideDiffHr - wGuideDiff);
-        vec3 absGs = abs(currGuideSpecHr - wGuideSpec);
-        float guideDeltaD = clamp(max(absGd.x, max(absGd.y, absGd.z)), 0.0, 1.0);
-        float guideDeltaS = clamp(max(absGs.x, max(absGs.y, absGs.z)), 0.0, 1.0);
-        float guideDeltaMax = max(guideDeltaD, guideDeltaS);
-        float mvGateG = clamp(sqrt(dot(surfMv, surfMv) + 1e-12) * 64.0, 0.0, 1.0);
+    vec3  iBase   = radSum / max(wSum, 1e-6);
+    float invMom  = 1.0 / max(momCount, 1.0);
+    vec3  logMu   = logSum * invMom;
+    vec3  logStd  = sqrt(max(logSum2 * invMom - logMu * logMu, vec3(0.0)));
 
-        float vdHrG = float(validHistF16.x) * (surfInBounds ? 1.0 : 0.0) * isSurfF;
-        float scaleX = float(pc.displayWidth)  / float(max(pc.renderWidth,  1u));
-        float scaleY = float(pc.displayHeight) / float(max(pc.renderHeight, 1u));
-        float dRayX = scaleX * dx0;
-        float dRayY = scaleY * dy0;
-        float wLocus = exp(clamp(-2.5 * (dRayX * dRayX + dRayY * dRayY), -20.0, 0.0));
+    // 2. Explicit 4-tap bilinear sampling of predicted 2x2 subpixel deltas & temporal weight logits
+    bool zeroResidual = (pc.flags & UPWAYS_FLAG_ZERO_RESIDUAL_MODE) != 0u;
+    vec3  srDelta = vec3(0.0);
+    float wLogit  = 0.0;
 
-        float hGBase = vdHrG * clamp(rawHg - kDisocc * (float(disoccF16.x) + mvGateG * 2.0 * guideDeltaMax * guideDeltaMax), 0.0, 0.96);
-        float effAlphaG = 1.0;
-        if (pc.preserveJitterGuide == 0u) {
-            float alphaLocus = wLocus * (1.0 - 0.5 * hGBase) + (1.0 - wLocus) * (1.0 - hGBase) * 0.1;
-            float gateG = vdHrG * clamp(hGBase * 4.0, 0.0, 1.0);
-            effAlphaG = 1.0 + gateG * (alphaLocus - 1.0);
+    if (!zeroResidual && !isSky) {
+        vec2 spCoord = currUV * vec2(float(lrW * 2), float(lrH * 2)) - vec2(0.5);
+        BilinearTaps spt = computeBilinearTaps(spCoord, ivec2(lrW * 2, lrH * 2));
+        vec4 sp = spt.w.x * fetchSubpixel(spt.i00, lrW)
+                + spt.w.y * fetchSubpixel(spt.i10, lrW)
+                + spt.w.z * fetchSubpixel(spt.i01, lrW)
+                + spt.w.w * fetchSubpixel(spt.i11, lrW);
+        srDelta = clamp(sp.xyz, vec3(-4.0), vec3(4.0));
+        wLogit  = clamp(sp.w, -6.0, 6.0);
+    }
+
+    vec3 iSr = (zeroResidual || isSky) ? iBase : safeExpm1(safeLog1p(iBase) + srDelta);
+
+    // 3. Explicit imageLoad warp of HR color history along dilatedMv (ring-free 12-tap Catmull-Rom when moving)
+    bool reset    = (pc.flags & UPWAYS_FLAG_RESET_HISTORY) != 0u;
+    vec2 prevUVHr = currUV - dilatedMv;
+    bool inBndHr  = !reset
+                 && all(greaterThanEqual(prevUVHr, vec2(0.0)))
+                 && all(lessThan(prevUVHr, vec2(1.0)));
+
+    vec3 hrOut = iSr;
+    if (inBndHr) {
+        vec2  hrCoord = prevUVHr * hrSizeF - vec2(0.5);
+        vec2  fHr     = floor(hrCoord);
+        vec2  tHr     = clamp(hrCoord - fHr, vec2(0.0), vec2(1.0));
+        int   x0      = int(fHr.x);
+        int   y0      = int(fHr.y);
+        ivec2 hiHr    = ivec2(hrW - 1, hrH - 1);
+
+        ivec2 i00  = ivec2(clamp(x0,     0, hiHr.x), clamp(y0,     0, hiHr.y));
+        ivec2 i10  = ivec2(clamp(x0 + 1, 0, hiHr.x), clamp(y0,     0, hiHr.y));
+        ivec2 i01  = ivec2(clamp(x0,     0, hiHr.x), clamp(y0 + 1, 0, hiHr.y));
+        ivec2 i11  = ivec2(clamp(x0 + 1, 0, hiHr.x), clamp(y0 + 1, 0, hiHr.y));
+        float bw00 = (1.0 - tHr.x) * (1.0 - tHr.y);
+        float bw10 = tHr.x * (1.0 - tHr.y);
+        float bw01 = (1.0 - tHr.x) * tHr.y;
+        float bw11 = tHr.x * tHr.y;
+
+        vec4 p00 = imageLoad(uPrevColorHr, i00);
+        vec4 p10 = imageLoad(uPrevColorHr, i10);
+        vec4 p01 = imageLoad(uPrevColorHr, i01);
+        vec4 p11 = imageLoad(uPrevColorHr, i11);
+
+        vec3 c00 = sanitizeRgb(p00.rgb);
+        vec3 c10 = sanitizeRgb(p10.rgb);
+        vec3 c01 = sanitizeRgb(p01.rgb);
+        vec3 c11 = sanitizeRgb(p11.rgb);
+
+        vec3  prevAcc  = vec3(0.0);
+        float validSum = 0.0;
+        if (p00.a > 0.5) { prevAcc += bw00 * c00; validSum += bw00; }
+        if (p10.a > 0.5) { prevAcc += bw10 * c10; validSum += bw10; }
+        if (p01.a > 0.5) { prevAcc += bw01 * c01; validSum += bw01; }
+        if (p11.a > 0.5) { prevAcc += bw11 * c11; validSum += bw11; }
+
+        if (validSum > 1e-4) {
+            vec3  prevHr    = prevAcc / validSum;
+            float hrMvPx    = length(dilatedMv * hrSizeF);
+            float hrMotionT = clamp(hrMvPx * 0.5, 0.0, 1.0);
+
+            bool inner4Valid  = (p00.a > 0.5) && (p10.a > 0.5) && (p01.a > 0.5) && (p11.a > 0.5);
+            bool bicubicInBnd = (x0 >= 1) && (x0 + 2 < hrW) && (y0 >= 1) && (y0 + 2 < hrH);
+            if (hrMvPx > 0.05 && inner4Valid && bicubicInBnd) {
+                vec4 pm0 = imageLoad(uPrevColorHr, ivec2(x0,     y0 - 1));
+                vec4 pm1 = imageLoad(uPrevColorHr, ivec2(x0 + 1, y0 - 1));
+                vec4 pl0 = imageLoad(uPrevColorHr, ivec2(x0 - 1, y0));
+                vec4 pr0 = imageLoad(uPrevColorHr, ivec2(x0 + 2, y0));
+                vec4 pl1 = imageLoad(uPrevColorHr, ivec2(x0 - 1, y0 + 1));
+                vec4 pr1 = imageLoad(uPrevColorHr, ivec2(x0 + 2, y0 + 1));
+                vec4 pp0 = imageLoad(uPrevColorHr, ivec2(x0,     y0 + 2));
+                vec4 pp1 = imageLoad(uPrevColorHr, ivec2(x0 + 1, y0 + 2));
+
+                if (pm0.a > 0.5 && pm1.a > 0.5 && pl0.a > 0.5 && pr0.a > 0.5
+                    && pl1.a > 0.5 && pr1.a > 0.5 && pp0.a > 0.5 && pp1.a > 0.5) {
+                    float ux = tHr.x, ux2 = ux * ux, ux3 = ux2 * ux;
+                    float uy = tHr.y, uy2 = uy * uy, uy3 = uy2 * uy;
+                    float wx0 = -0.5 * ux + ux2 - 0.5 * ux3;
+                    float wx1 =  1.0 - 2.5 * ux2 + 1.5 * ux3;
+                    float wx2 =  0.5 * ux + 2.0 * ux2 - 1.5 * ux3;
+                    float wx3 = -0.5 * ux2 + 0.5 * ux3;
+                    float wy0 = -0.5 * uy + uy2 - 0.5 * uy3;
+                    float wy1 =  1.0 - 2.5 * uy2 + 1.5 * uy3;
+                    float wy2 =  0.5 * uy + 2.0 * uy2 - 1.5 * uy3;
+                    float wy3 = -0.5 * uy2 + 0.5 * uy3;
+
+                    float wSum12 = (wx1 + wx2) * (wy0 + wy3) + (wy1 + wy2);
+                    vec3  rowM   = wx1 * sanitizeRgb(pm0.rgb) + wx2 * sanitizeRgb(pm1.rgb);
+                    vec3  row0   = wx0 * sanitizeRgb(pl0.rgb) + wx1 * c00 + wx2 * c10 + wx3 * sanitizeRgb(pr0.rgb);
+                    vec3  row1   = wx0 * sanitizeRgb(pl1.rgb) + wx1 * c01 + wx2 * c11 + wx3 * sanitizeRgb(pr1.rgb);
+                    vec3  rowP   = wx1 * sanitizeRgb(pp0.rgb) + wx2 * sanitizeRgb(pp1.rgb);
+                    vec3  bicubic = (wy0 * rowM + wy1 * row0 + wy2 * row1 + wy3 * rowP) / max(wSum12, 1e-6);
+
+                    vec3 cMin4 = min(min(c00, c10), min(c01, c11));
+                    vec3 cMax4 = max(max(c00, c10), max(c01, c11));
+                    prevHr = clamp(bicubic, cMin4, cMax4);
+                }
+            }
+
+            float sigmaBox    = mix(3.0, 1.6, hrMotionT) + 0.75 * (1.0 - maxTapSpatial) * (1.0 - hrMotionT);
+            float padBox      = mix(0.08, 0.025, hrMotionT);
+            vec3  boxMin      = logMu - sigmaBox * logStd - vec3(padBox);
+            vec3  boxMax      = logMu + sigmaBox * logStd + vec3(padBox);
+            vec3  prevClamped = safeExpm1(clamp(safeLog1p(prevHr), boxMin, boxMax));
+
+            float sigW        = 1.0 / (1.0 + exp(-(1.5 + wLogit)));
+            float confFactor  = isSky ? 1.0 : mix(0.65, 1.0, centerDiffConf);
+            float maxAlphaHr  = mix(0.94, 0.72, hrMotionT);
+            float baseAlpha   = sigW * confFactor;
+            float sampleAlign = mix(0.28, 1.0, maxTapSpatial);
+            float alphaRaw    = 1.0 - (1.0 - baseAlpha) * sampleAlign;
+            float alphaHr     = clamp(alphaRaw * maxAlphaHr, 0.0, maxAlphaHr);
+            hrOut = mix(iSr, prevClamped, alphaHr);
         }
-
-        vec3 guideDiffHr = clamp((1.0 - effAlphaG) * wGuideDiff + effAlphaG * currGuideDiffHr, vec3(0.0), vec3(1.0));
-        vec3 guideSpecHr = clamp((1.0 - effAlphaG) * wGuideSpec + effAlphaG * currGuideSpecHr, vec3(0.0), vec3(1.0));
-        guideDiffF16 = f16vec3(guideDiffHr);
-        guideSpecF16 = f16vec3(guideSpecHr);
-        imageStore(uCurrGuideDiffHr, displayPos, vec4(guideDiffF16, float16_t(1.0)));
-        imageStore(uCurrGuideSpecHr, displayPos, vec4(guideSpecF16, float16_t(1.0)));
     }
 
-    // 3. Scoped Diffuse 5-tap Catmull-Rom RLS linear resolve & remodulation
-    vec3 modDiffHr;
-    float kGhost;
-    {
-        float inBSurf = 0.0;
-        vec4 wDiff4 = (pc.resetHistory == 0u)
-            ? sampleCatmullRom5Tap(uPrevIrrDiffHr, displayPos, uvec2(pc.displayWidth, pc.displayHeight), prevSize, surfMv, inBSurf)
-            : vec4(0.0);
-        vec3 wDiff = wDiff4.rgb;
-        float prevHistLenD = wDiff4.a * 64.0;
-
-        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
-        float rawHd = float(uSubpixelParams[cIdx * 4u + 1u].z);
-        vec3 u2yzw = vec3(uSubpixelParams[cIdx * 4u + 2u].yzw);
-        float u3w = float(uSubpixelParams[cIdx * 4u + 3u].w);
-        kGhost = upwaysSoftplus(u3w);
-
-        float disoccD = float(disoccF16.x);
-        float vdHr = (pc.resetHistory == 0u) ? (float(validHistF16.x) * inBSurf * isSurfF) : 0.0;
-        float staticTrustD = float(staticF16.x) * clamp((rawHd - 0.5) * 2.0, 0.0, 1.0);
-        float effRawHd = rawHd + staticTrustD * (0.985 - rawHd);
-        float gammaD = vdHr * clamp(effRawHd - kDisocc * disoccD, 0.0, 0.985);
-        float keptD = gammaD * prevHistLenD;
-        float hWeightD = keptD / (1.0 + keptD);
-        float nextHistNormD = clamp((1.0 + keptD) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
-        float maturityD = clamp(keptD * (1.0 / 16.0), 0.0, 1.0);
-
-        vec3 resD = vec3(safeTanh(u2yzw.x), safeTanh(u2yzw.y), safeTanh(u2yzw.z)) * 0.8;
-        vec3 skipD = vec3(f16vec3(vec3(
-            w_f32[SKIP_SCALE_F32_OFFSET + 0u],
-            w_f32[SKIP_SCALE_F32_OFFSET + 1u],
-            w_f32[SKIP_SCALE_F32_OFFSET + 2u]
-        )));
-        vec3 effSkipD = vec3(1.0) + (skipD - vec3(1.0)) * (1.0 - maturityD);
-        vec3 baseLogD = upwaysLog1pVec3(max(effSkipD * currDiffLinHr, vec3(0.0)));
-        vec3 dzD = vec3(0.025) * (vec3(1.0) - clamp(baseLogD * 8.0, vec3(0.0), vec3(1.0)));
-        vec3 effResD = resD - clamp(resD, -dzD, dzD);
-        vec3 refDiffHr = clamp(
-            max(baseLogD + effResD * isSurfF * (1.0 - maturityD), vec3(0.0)),
-            vec3(0.0),
-            vec3(MAX_LOG1P_IRRADIANCE)
-        );
-        vec3 boxMinD = min(vec3(dMinF16), refDiffHr);
-        vec3 boxMaxD = max(vec3(dMaxF16), refDiffHr);
-        float rectTD = safeTanh(kGhost * disoccD);
-        vec3 rectWDiff = clamp(wDiff + rectTD * (clamp(wDiff, boxMinD, boxMaxD) - wDiff), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
-        vec3 linDiffBlend = (1.0 - hWeightD) * upwaysExpm1Vec3(refDiffHr) + hWeightD * upwaysExpm1Vec3(rectWDiff);
-        vec3 irrDiffHr = clamp(upwaysLog1pVec3(max(linDiffBlend, vec3(0.0))), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
-        imageStore(uCurrIrrDiffHr, displayPos, vec4(f16vec4(vec4(irrDiffHr, nextHistNormD))));
-        modDiffHr = vec3(guideDiffF16) * upwaysExpm1Vec3(irrDiffHr);
-    }
-
-    // 4. Scoped Specular 5-tap Catmull-Rom RLS linear resolve & final HDR output
-    {
-        float inBSpec = 0.0;
-        vec4 wSpec4 = (pc.resetHistory == 0u)
-            ? sampleCatmullRom5Tap(uPrevIrrSpecHr, displayPos, uvec2(pc.displayWidth, pc.displayHeight), prevSize, specMv, inBSpec)
-            : vec4(0.0);
-        vec3 wSpec = wSpec4.rgb;
-        float prevHistLenS = wSpec4.a * 64.0;
-
-        uint cIdx = uint(anc.y) * pc.renderWidth + uint(anc.x);
-        float rawHs = float(uSubpixelParams[cIdx * 4u + 1u].w);
-        vec3 u3xyz = vec3(uSubpixelParams[cIdx * 4u + 3u].xyz);
-
-        float disoccS = float(disoccF16.y);
-        float vsHr = (pc.resetHistory == 0u) ? (float(validHistF16.y) * inBSpec * isSurfF) : 0.0;
-        float staticTrustS = float(staticF16.y) * clamp((rawHs - 0.5) * 2.0, 0.0, 1.0);
-        float effRawHs = rawHs + staticTrustS * (0.985 - rawHs);
-        float gammaS = vsHr * clamp(effRawHs - kDisocc * disoccS, 0.0, 0.985);
-        float keptS = gammaS * prevHistLenS;
-        float hWeightS = keptS / (1.0 + keptS);
-        float nextHistNormS = clamp((1.0 + keptS) * isSurfF * (1.0 / 64.0), 0.0, 1.0);
-        float maturityS = clamp(keptS * (1.0 / 16.0), 0.0, 1.0);
-
-        vec3 resS = vec3(safeTanh(u3xyz.x), safeTanh(u3xyz.y), safeTanh(u3xyz.z)) * 0.8;
-        vec3 skipS = vec3(f16vec3(vec3(
-            w_f32[SKIP_SCALE_F32_OFFSET + 3u],
-            w_f32[SKIP_SCALE_F32_OFFSET + 4u],
-            w_f32[SKIP_SCALE_F32_OFFSET + 5u]
-        )));
-        vec3 effSkipS = vec3(1.0) + (skipS - vec3(1.0)) * (1.0 - maturityS);
-        vec3 baseLogS = upwaysLog1pVec3(max(effSkipS * currSpecLinHr, vec3(0.0)));
-        vec3 dzS = vec3(0.025) * (vec3(1.0) - clamp(baseLogS * 8.0, vec3(0.0), vec3(1.0)));
-        vec3 effResS = resS - clamp(resS, -dzS, dzS);
-        vec3 refSpecHr = clamp(
-            max(baseLogS + effResS * isSurfF * (1.0 - maturityS), vec3(0.0)),
-            vec3(0.0),
-            vec3(MAX_LOG1P_IRRADIANCE)
-        );
-        vec3 boxMinS = min(vec3(sMinF16), refSpecHr);
-        vec3 boxMaxS = max(vec3(sMaxF16), refSpecHr);
-        float rectTS = safeTanh(kGhost * disoccS);
-        vec3 rectWSpec = clamp(wSpec + rectTS * (clamp(wSpec, boxMinS, boxMaxS) - wSpec), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
-        vec3 linSpecBlend = (1.0 - hWeightS) * upwaysExpm1Vec3(refSpecHr) + hWeightS * upwaysExpm1Vec3(rectWSpec);
-        vec3 irrSpecHr = clamp(upwaysLog1pVec3(max(linSpecBlend, vec3(0.0))), vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE));
-        imageStore(uCurrIrrSpecHr, displayPos, vec4(f16vec4(vec4(irrSpecHr, nextHistNormS))));
-
-        vec3 modSpecHr = vec3(guideSpecF16) * upwaysExpm1Vec3(irrSpecHr);
-        float invExp = 1.0 / max(pc.preExposure, 1e-6);
-        vec3 rgbHr = sanitizeRadiance((modDiffHr + modSpecHr) * invExp);
-        imageStore(uOutputColor, displayPos, vec4(f16vec4(vec4(rgbHr, 1.0))));
-    }
+    vec3 hrStore = clampFp16Rgb(hrOut);
+    imageStore(uCurrColorHr, hrPos, vec4(hrStore, 1.0));
+    imageStore(uOutputColor, hrPos, vec4(hrStore, 1.0));
 }

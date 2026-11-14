@@ -155,7 +155,10 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
 
         bool hasDenoiser = (params.config.denoiser_mode != DenoiserMode::None ||
                             params.config.upscaler_mode == UpscalerMode::Upways);
-        bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
+        bool fsrUpscaling = (params.config.upscaler_mode == UpscalerMode::FSR) &&
+                            (params.config.getRenderWidth() < params.config.width ||
+                             params.config.getRenderHeight() < params.config.height);
+        bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
         bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
                               (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
         bool enableJitter = !isStationaryAccum &&
@@ -204,14 +207,14 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         bool copyMvImage = needNormals || (needMvDepth && params.config.accum_format == AccumFormat::R11G11B10_UFLOAT);
         if (plan.tileOffsetX_sec == 2u) {
             if (needMlGbuffers) {
-                plan.frameBytes = align64k(radRaw) + 6u * planeAligned;
+                plan.frameBytes = align64k(radRaw) + 8u * planeAligned;
             } else if (copyMvImage) {
                 plan.frameBytes = align64k(radRaw) + (needNormals ? 2u : 1u) * planeAligned;
             } else {
                 plan.frameBytes = radRaw;
             }
         } else if (plan.mergeMode == 2u && needMlGbuffers) {
-            plan.frameBytes = align64k(radRaw) + 2u * planeAligned;
+            plan.frameBytes = align64k(radRaw) + 3u * planeAligned;
         } else {
             plan.frameBytes = radRaw;
         }
@@ -229,7 +232,9 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         glm::vec2 jitterSec(0.0f);
         const bool hasDenoiser = (params.config.denoiser_mode != DenoiserMode::None ||
                                   params.config.upscaler_mode == UpscalerMode::Upways);
-        const bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
+        const bool fsrUpscaling = (params.config.upscaler_mode == UpscalerMode::FSR) &&
+                                  (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height);
+        const bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
         const bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
                                     (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
         if (!isStationaryAccum &&

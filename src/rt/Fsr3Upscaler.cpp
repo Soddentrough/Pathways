@@ -121,9 +121,9 @@ const char* FsrUpscaler::getActiveVersionName() const {
 void FsrUpscaler::initFfxSdkContext() {
     destroyFfxSdkContext();
 
-    // Baseline VRAM of Pathways-side output + SDK input prep targets
+    // Baseline VRAM of Pathways-side output + SDK input prep targets + ping-pong linear pre-integration history
     const uint64_t outBytes = static_cast<uint64_t>(m_displayWidth) * static_cast<uint64_t>(m_displayHeight) * 8ull;
-    const uint64_t prepBytes = static_cast<uint64_t>(m_renderWidth) * static_cast<uint64_t>(m_renderHeight) * (8ull + 4ull + 4ull);
+    const uint64_t prepBytes = static_cast<uint64_t>(m_renderWidth) * static_cast<uint64_t>(m_renderHeight) * (8ull + 4ull + 4ull + 32ull);
     m_vramUsageBytes = outBytes + prepBytes;
 
 #if defined(PATHWAYS_HAS_FFX_SDK)
@@ -170,7 +170,6 @@ void FsrUpscaler::initFfxSdkContext() {
 
     ffx::CreateContextDescUpscale createUpscale{};
     createUpscale.flags = FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE |
-                          FFX_UPSCALE_ENABLE_AUTO_EXPOSURE |
                           FFX_UPSCALE_ENABLE_DEPTH_INVERTED |
                           FFX_UPSCALE_ENABLE_DEPTH_INFINITE;
     createUpscale.maxRenderSize = { m_renderWidth, m_renderHeight };
@@ -265,18 +264,33 @@ void FsrUpscaler::initImages() {
         usage
     );
 
-    m_historyValid = false;
     for (int i = 0; i < 2; ++i) {
+        m_linearColorHistory[i] = std::make_unique<Image>(
+            m_device, m_allocator,
+            m_renderWidth, m_renderHeight,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            usage
+        );
+        m_linearGuideHistory[i] = std::make_unique<Image>(
+            m_device, m_allocator,
+            m_renderWidth, m_renderHeight,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            usage
+        );
         m_lastBoundInputViews[i] = VK_NULL_HANDLE;
+        m_lastBoundRawViews[i] = VK_NULL_HANDLE;
         m_lastBoundMvViews[i] = VK_NULL_HANDLE;
         m_lastBoundDepthViews[i] = VK_NULL_HANDLE;
     }
-    m_nextPrepSlot = 0;
+
+    m_historyValid = false;
+    m_historyImagesInitialized = false;
+    m_historyParity = 0;
 }
 
 void FsrUpscaler::createDescriptorSetLayouts() {
-    VkDescriptorSetLayoutBinding bindings[6]{};
-    for (uint32_t b = 0; b < 6; ++b) {
+    VkDescriptorSetLayoutBinding bindings[11]{};
+    for (uint32_t b = 0; b < 11; ++b) {
         bindings[b].binding = b;
         bindings[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         bindings[b].descriptorCount = 1;
@@ -284,7 +298,7 @@ void FsrUpscaler::createDescriptorSetLayouts() {
     }
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-    layoutInfo.bindingCount = 6;
+    layoutInfo.bindingCount = 11;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(m_device, &layoutInfo, nullptr, &m_sdkPrepDescLayout) != VK_SUCCESS) {
@@ -295,7 +309,7 @@ void FsrUpscaler::createDescriptorSetLayouts() {
 void FsrUpscaler::allocateDescriptorSets() {
     VkDescriptorPoolSize poolSizes[1]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 16;
+    poolSizes[0].descriptorCount = 32;
 
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.maxSets = 2;
@@ -316,13 +330,18 @@ void FsrUpscaler::allocateDescriptorSets() {
     }
 }
 
-void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView) {
+void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView rawColorView, VkImageView motionVectorsView, VkImageView depthView) {
     slot &= 1u;
+    const uint32_t currIdx = slot;
+    const uint32_t prevIdx = slot ^ 1u;
     if (inputColorView == VK_NULL_HANDLE || !m_sharpenedImage ||
-        !m_sdkColorInput || !m_sdkDepthInput || !m_sdkMotionVectorsInput) {
+        !m_sdkColorInput || !m_sdkDepthInput || !m_sdkMotionVectorsInput ||
+        !m_linearColorHistory[0] || !m_linearColorHistory[1] ||
+        !m_linearGuideHistory[0] || !m_linearGuideHistory[1]) {
         return;
     }
 
+    VkImageView rawView = (rawColorView != VK_NULL_HANDLE) ? rawColorView : inputColorView;
     VkImageView mvView = (motionVectorsView != VK_NULL_HANDLE) ? motionVectorsView : inputColorView;
     VkImageView dView = (depthView != VK_NULL_HANDLE) ? depthView : inputColorView;
 
@@ -332,17 +351,28 @@ void FsrUpscaler::updateDescriptorSets(uint32_t slot, VkImageView inputColorView
     VkDescriptorImageInfo sdkColorInfo{ VK_NULL_HANDLE, m_sdkColorInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkDepthInfo{ VK_NULL_HANDLE, m_sdkDepthInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo sdkMvInfo{ VK_NULL_HANDLE, m_sdkMotionVectorsInput->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo rawInfo{ VK_NULL_HANDLE, rawView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevColInfo{ VK_NULL_HANDLE, m_linearColorHistory[prevIdx]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo prevGuideInfo{ VK_NULL_HANDLE, m_linearGuideHistory[prevIdx]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo currColInfo{ VK_NULL_HANDLE, m_linearColorHistory[currIdx]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo currGuideInfo{ VK_NULL_HANDLE, m_linearGuideHistory[currIdx]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
-    VkWriteDescriptorSet writes[6]{};
+    VkWriteDescriptorSet writes[11]{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
     writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr };
     writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dInfo, nullptr, nullptr };
     writes[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkColorInfo, nullptr, nullptr };
     writes[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkDepthInfo, nullptr, nullptr };
     writes[5] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &sdkMvInfo, nullptr, nullptr };
+    writes[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &rawInfo, nullptr, nullptr };
+    writes[7] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevColInfo, nullptr, nullptr };
+    writes[8] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &prevGuideInfo, nullptr, nullptr };
+    writes[9] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currColInfo, nullptr, nullptr };
+    writes[10] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_sdkPrepDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &currGuideInfo, nullptr, nullptr };
 
-    vkUpdateDescriptorSets(m_device, 6, writes, 0, nullptr);
+    vkUpdateDescriptorSets(m_device, 11, writes, 0, nullptr);
     m_lastBoundInputViews[slot] = inputColorView;
+    m_lastBoundRawViews[slot] = rawView;
     m_lastBoundMvViews[slot] = mvView;
     m_lastBoundDepthViews[slot] = dView;
 }
@@ -413,22 +443,17 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
         return;
     }
 
+    VkImageView effRawView = (desc.rawColorIn != VK_NULL_HANDLE) ? desc.rawColorIn : desc.colorIn;
     VkImageView effMvView = (desc.motionVectorsIn != VK_NULL_HANDLE) ? desc.motionVectorsIn : desc.colorIn;
     VkImageView effDepthView = (desc.depthIn != VK_NULL_HANDLE) ? desc.depthIn : desc.colorIn;
 
-    uint32_t prepSlot = 0;
-    if (desc.colorIn == m_lastBoundInputViews[0] &&
-        effMvView == m_lastBoundMvViews[0] &&
-        effDepthView == m_lastBoundDepthViews[0]) {
-        prepSlot = 0;
-    } else if (desc.colorIn == m_lastBoundInputViews[1] &&
-               effMvView == m_lastBoundMvViews[1] &&
-               effDepthView == m_lastBoundDepthViews[1]) {
-        prepSlot = 1;
-    } else {
-        prepSlot = m_nextPrepSlot;
-        m_nextPrepSlot = (m_nextPrepSlot + 1u) & 1u;
-        updateDescriptorSets(prepSlot, desc.colorIn, desc.motionVectorsIn, desc.depthIn);
+    const uint32_t prepSlot = m_historyParity & 1u;
+    m_historyParity ^= 1u;
+    if (desc.colorIn != m_lastBoundInputViews[prepSlot] ||
+        effRawView != m_lastBoundRawViews[prepSlot] ||
+        effMvView != m_lastBoundMvViews[prepSlot] ||
+        effDepthView != m_lastBoundDepthViews[prepSlot]) {
+        updateDescriptorSets(prepSlot, desc.colorIn, effRawView, desc.motionVectorsIn, desc.depthIn);
     }
 
     if (m_sharpenedImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
@@ -463,19 +488,68 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
             );
         }
 
+        if (!m_historyImagesInitialized) {
+            for (int i = 0; i < 2; ++i) {
+                if (m_linearColorHistory[i] && m_linearColorHistory[i]->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+                    m_linearColorHistory[i]->transitionLayout(
+                        desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                    );
+                }
+                if (m_linearGuideHistory[i] && m_linearGuideHistory[i]->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+                    m_linearGuideHistory[i]->transitionLayout(
+                        desc.cmd, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                    );
+                }
+            }
+        } else {
+            const uint32_t prevSlot = prepSlot ^ 1u;
+            VkImageMemoryBarrier2 histBarriers[2]{};
+            for (int b = 0; b < 2; ++b) {
+                histBarriers[b].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                histBarriers[b].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                histBarriers[b].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                histBarriers[b].dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                histBarriers[b].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                histBarriers[b].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                histBarriers[b].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                histBarriers[b].image = (b == 0) ? m_linearColorHistory[prevSlot]->getImage() : m_linearGuideHistory[prevSlot]->getImage();
+                histBarriers[b].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            }
+            VkDependencyInfo histDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            histDep.imageMemoryBarrierCount = 2;
+            histDep.pImageMemoryBarriers = histBarriers;
+            vkCmdPipelineBarrier2(desc.cmd, &histDep);
+        }
+
         vkCmdBindPipeline(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sdkPrepPipeline);
         vkCmdBindDescriptorSets(desc.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_sdkPrepPipelineLayout, 0, 1, &m_sdkPrepDescSets[prepSlot], 0, nullptr);
 
+        const bool effectiveReset = desc.resetHistory || !m_historyValid || !m_historyImagesInitialized;
         FfxSdkPrepPushConstants prepPC{};
         prepPC.renderWidth = m_renderWidth;
         prepPC.renderHeight = m_renderHeight;
         prepPC.sampleScale = desc.inputIsNormalized ? 1.0f : (1.0f / static_cast<float>(std::max(1u, desc.totalSamples)));
+        prepPC.rawSampleScale = (desc.rawColorIn != VK_NULL_HANDLE) ? desc.rawSampleScale : prepPC.sampleScale;
         prepPC.nearZ = std::max(desc.cameraNear, 0.001f);
+        prepPC.jitterDeltaX = effectiveReset ? 0.0f : (desc.jitterX - desc.prevJitterX);
+        prepPC.jitterDeltaY = effectiveReset ? 0.0f : (desc.jitterY - desc.prevJitterY);
+        prepPC.totalSamples = std::max(1u, desc.totalSamples);
+        const bool isUpscaling = (m_renderWidth < m_displayWidth || m_renderHeight < m_displayHeight);
+        prepPC.flags = (effectiveReset ? 1u : 0u)
+                     | (desc.cameraMoved ? 2u : 0u)
+                     | (desc.inputIsDenoised ? 4u : 0u)
+                     | ((desc.rawColorIn != VK_NULL_HANDLE) ? 8u : 0u)
+                     | (isUpscaling ? 16u : 0u);
 
         vkCmdPushConstants(desc.cmd, m_sdkPrepPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(prepPC), &prepPC);
         uint32_t renderGroupsX = (m_renderWidth + 15) / 16;
         uint32_t renderGroupsY = (m_renderHeight + 15) / 16;
         vkCmdDispatch(desc.cmd, renderGroupsX, renderGroupsY, 1);
+        m_historyImagesInitialized = true;
 
         m_sdkColorInput->transitionLayout(
             desc.cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -509,7 +583,7 @@ void FsrUpscaler::recordUpscale(const UpscalerDispatchDesc& desc) {
         dispatchUpscale.enableSharpening = desc.enableSharpening;
         dispatchUpscale.sharpness = desc.enableSharpening ? desc.sharpness : 0.0f;
         dispatchUpscale.frameTimeDelta = std::max(desc.frameTimeDeltaMs, 1.0f);
-        dispatchUpscale.preExposure = 1.0f;
+        dispatchUpscale.preExposure = std::clamp(desc.preExposure, 0.1f, 4.0f);
         dispatchUpscale.reset = desc.resetHistory || !m_historyValid;
         dispatchUpscale.cameraNear = std::max(desc.cameraNear, 0.001f);
         dispatchUpscale.cameraFar = FLT_MAX;

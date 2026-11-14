@@ -66,6 +66,8 @@ public:
     [[nodiscard]] Image* getMlSpecularMotionImage() const { return m_mlSpecularMotionImage.get(); }
     [[nodiscard]] Image* getMlDiffuseImage() const { return m_mlDiffuseImage.get(); }
     [[nodiscard]] Image* getMlSpecularImage() const { return m_mlSpecularImage.get(); }
+    [[nodiscard]] Image* getMlSkipImage() const { return m_mlSkipImage.get(); }
+    [[nodiscard]] Image* getMlSpecAlbedoImage() const { return m_mlSpecAlbedoImage.get(); }
 
 private:
     void transitionAllToGeneral(VkCommandBuffer cmd);
@@ -88,6 +90,8 @@ private:
     std::unique_ptr<Image> m_mlSpecularMotionImage;
     std::unique_ptr<Image> m_mlDiffuseImage;
     std::unique_ptr<Image> m_mlSpecularImage;
+    std::unique_ptr<Image> m_mlSkipImage;
+    std::unique_ptr<Image> m_mlSpecAlbedoImage;
 };
 
 } // namespace pathways

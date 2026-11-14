@@ -12,10 +12,13 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 26, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 layout(binding = 24, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 40, rgba16f) uniform image2D uMlSkipImage;
+layout(binding = 41, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -151,6 +154,7 @@ void main() {
         bool isSpecularPath, causticApplied;
         uint dispersionChannel = 0u;
         unpackRayState(state, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
+        bool inNrcSkip = unpackRayNrcSkip(state);
         uint bounce = pc.currentBounce;
         bool outIsSpecularPath = (bounce == 0u) ? true : isSpecularPath;
 
@@ -189,18 +193,30 @@ void main() {
 
 
             if (pc.captureMlData != 0u) {
-                if (outIsSpecularPath) {
+                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                if (isV4 && bounce == 0u) {
+                    vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
+                    imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
+                } else if (outIsSpecularPath) {
+                    vec3 outSpec = isV4
+                        ? demodulateMlSafe(skyContrib, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                        : skyContrib;
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                 } else {
+                    vec3 outDiff = isV4
+                        ? demodulateMlSafe(skyContrib, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                        : skyContrib;
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                 }
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, 10000.0, true);
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, hitT, false);
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             hitNormal = frontFace ? hitNormal : -hitNormal;
 
@@ -226,9 +242,12 @@ void main() {
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             }
+            float emitLightScale = (bounce >= 2u)
+                ? restirSecondaryMisLightScale(bounce - 1u, pc.numLights, pc.captureMlData, pc.enableNrc)
+                : 1.0;
             float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
                 ? 0.0
-                : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights));
+                : ((bounce == 0u) ? 1.0 : emitterHitMisWeightScaled(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale));
             if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                 vec3 emissiveContrib = vec3(throughput) * emissive * emitMisW;
                 if (bounce > 0u) {
@@ -241,12 +260,22 @@ void main() {
                     imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
                 }
                 if (pc.captureMlData != 0u) {
-                    if (outIsSpecularPath) {
+                    bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                    if (isV4 && bounce == 0u) {
+                        vec4 prevSkip = imageLoad(uMlSkipImage, pCoord);
+                        imageStore(uMlSkipImage, pCoord, vec4(addFp16Stochastic(prevSkip.rgb, emissiveContrib, seed), prevSkip.a));
+                    } else if (outIsSpecularPath) {
+                        vec3 outSpec = isV4
+                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlSpecAlbedoImage, pCoord).rgb)
+                            : emissiveContrib;
                         vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                        imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
+                        imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                     } else {
+                        vec3 outDiff = isV4
+                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
+                            : emissiveContrib;
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), prevDiff.a));
+                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                     }
                 }
             }
@@ -314,13 +343,20 @@ void main() {
             // Direct Lighting via shared NEE + MIS
             if (!pathTerminated && !isDelta && enableDirect && enableSpecular && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
-                uint M = (pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
+                float secLightScale = (bounce >= 1u)
+                    ? restirSecondaryMisLightScale(bounce, pc.numLights, pc.captureMlData, pc.enableNrc)
+                    : 1.0;
+                uint M = (pc.numLights > 1u)
+                    ? ((secLightScale > 1.0)
+                        ? restirSecondaryFreshM(bounce, pc.numLights, true, pc.captureMlData)
+                        : min(pc.numLights, (pc.numLights > 4096u) ? ((bounce <= 1u) ? 2u : 1u) : 4u))
+                    : 1u;
                 vec3 shadowOrigin, selectedLightDir, diffContrib, specContrib;
                 float selectedLightDist;
-                if (evalStandardDirectNEE(bsdf, hitPoint, hitNormal, V, pc.numLights, M,
-                                          bounce + 1u < pc.maxBounces, seed,
-                                          shadowOrigin, selectedLightDir, selectedLightDist,
-                                          diffContrib, specContrib)) {
+                if (evalStandardDirectNEEScaled(bsdf, hitPoint, hitNormal, V, pc.numLights, M,
+                                                bounce + 1u < pc.maxBounces, secLightScale, seed,
+                                                shadowOrigin, selectedLightDir, selectedLightDist,
+                                                diffContrib, specContrib)) {
                     f16vec3 unshadowed = throughput * f16vec3(clamp(diffContrib + specContrib, vec3(0.0), vec3(65500.0)));
                     if (bounce > 0u) {
                         unshadowed = clampIndirectRadiance(unshadowed, pc.indirectClamp);
@@ -338,12 +374,19 @@ void main() {
                                         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                                     }
                                     if (pc.captureMlData != 0u) {
+                                        bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
                                         if (outIsSpecularPath) {
+                                            vec3 outSpec = isV4
+                                                ? demodulateMlSafe(vec3(unshadowed), imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                                : vec3(unshadowed);
                                             vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
+                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                                         } else {
+                                            vec3 outDiff = isV4
+                                                ? demodulateMlSafe(vec3(unshadowed), imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                                : vec3(unshadowed);
                                             vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), prevDiff.a));
+                                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                                         }
                                     }
                                 }
@@ -407,7 +450,8 @@ void main() {
                         if (!pathTerminated) {
                             survivesToNext = true;
                             nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                            nextState = packRayState(throughput, seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode);
+                            bool outNrcSkip = (bounce == 0u) ? (roughness < 0.15) : (inNrcSkip && bounce < 2u);
+                            nextState = packRayState(throughput, seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode, outNrcSkip);
                         }
                     }
                 }

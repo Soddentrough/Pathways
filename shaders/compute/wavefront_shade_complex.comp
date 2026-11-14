@@ -17,12 +17,15 @@ layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 23, rgba16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 26, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
 layout(binding = 31, rgba16f) uniform readonly image2D uCausticImage;
 layout(binding = 24, rgba16f) uniform readonly image2D uNormalDepthImage;
 layout(binding = 33, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
+layout(binding = 40, rgba16f) uniform image2D uMlSkipImage;
+layout(binding = 41, rgba16f) uniform image2D uMlSpecAlbedoImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -137,28 +140,29 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
 };
 #endif
 
-#if IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
-#define ENABLE_RESTIR_GI 1
-#include "restir_gi_reuse.glsl"
-#else
-#define ENABLE_RESTIR_GI 0
-#endif
-
 #ifndef ENABLE_INLINE_SHADOWS
-#if IS_SECONDARY_BOUNCE
-#define ENABLE_INLINE_SHADOWS 0
-#else
 #define ENABLE_INLINE_SHADOWS 1
-#endif
 #endif
 
 #if ENABLE_INLINE_SHADOWS
 #include "wavefront_shadow_inline.glsl"
 #endif
 
+#if IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
+#define ENABLE_RESTIR_GI 1
+#else
+#define ENABLE_RESTIR_GI 0
+#endif
+
+#if ENABLE_RESTIR_PT
+#include "restir_gi_reuse.glsl"
+#endif
+
 layout(push_constant) uniform PushConstants {
     WavefrontShadePC pc;
 };
+
+#include "nrc_record_helper.glsl"
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -170,7 +174,7 @@ void main() {
     RayGeometry nextGeom;
     RayState nextState;
     PackedShadowRay shadowCandidate;
-#if ENABLE_RESTIR_GI
+#if ENABLE_RESTIR_PT
     bool hasGiShadowRay = false;
     PackedShadowRay giShadowCandidate;
 #endif
@@ -195,6 +199,7 @@ void main() {
         bool isSpecularPath, causticApplied;
         uint dispersionChannel = 0u;
         unpackRayState(state, throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
+        bool inNrcSkip = unpackRayNrcSkip(state);
         uint bounce = pc.currentBounce;
         bool sampledSpecularLobe = false;
 
@@ -211,6 +216,15 @@ void main() {
                 giReservoirs[pixelIndex] = invalidGiReservoir();
             }
         }
+#else
+        X1Context giCtx = (enableRestirFlag && bounce == 1u) ? x1Contexts[pixelIndex] : invalidX1Context();
+        bool giHasCtx = x1ContextValid(giCtx);
+        bool giHasSelfCandidate = false;
+        vec3 giSelfX2 = vec3(0.0);
+        vec3 giSelfN2 = vec3(0.0, 1.0, 0.0);
+        float giSelfHitT = 0.0;
+        float giCosRcSelf = 0.0;
+        vec3 giL2 = vec3(0.0);
 #endif
 #endif
 
@@ -236,20 +250,33 @@ void main() {
 
 
             if (pc.captureMlData != 0u) {
-                if (isSpecularPath) {
+                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                if (isV4 && bounce == 0u) {
+                    vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
+                    imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
+                } else if (isSpecularPath) {
+                    vec3 outSpec = isV4
+                        ? demodulateMlSafe(skyContrib, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                        : skyContrib;
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, skyContrib, seed), prevSpec.a));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                 } else {
+                    vec3 outDiff = isV4
+                        ? demodulateMlSafe(skyContrib, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                        : skyContrib;
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyContrib, seed), prevDiff.a));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                 }
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, 10000.0, true);
         } else {
             vec3 hitPoint = origin + hitT * rayDir;
             RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, hitT, false);
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             hitNormal = frontFace ? hitNormal : -hitNormal;
+            vec3 geomFrontNormal = hitNormal;
 
             Material mat = materials[matId];
             uint inPdfCode = unpackRayPdfCode(state);
@@ -291,11 +318,23 @@ void main() {
                     nextDirection = rayDir;
                     vec3 nextOrigin = hitPoint + rayDir * 0.001;
                     nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                    nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, inPdfCode);
+                    nextState = packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, inPdfCode, inNrcSkip);
                 }
             } else {
             f16vec3 baseColor = f16vec3(baseColorFull.rgb);
             bool routeAllToSpec = (bounce > 0u) && isSpecularPath;
+            bool pathTerminated = ((mat.type & MATERIAL_TYPE_MASK) == 3u);
+#if ENABLE_RESTIR_GI && IS_SECONDARY_BOUNCE
+            bool giCaptureSelf = giHasCtx && !pathTerminated && ((ubo.flags & (1 << 0)) != 0) && (pc.numLights > 0u) &&
+                                 !(((ubo.flags & (1 << 3)) != 0) && (mat.transmission > 0.001 || (mat.type & MATERIAL_TYPE_MASK) == 2u));
+            if (giCaptureSelf) {
+                giHasSelfCandidate = true;
+                giSelfX2 = hitPoint;
+                giSelfN2 = geomFrontNormal;
+                giSelfHitT = hitT;
+                giCosRcSelf = clamp(dot(geomFrontNormal, -rayDir), 0.0, 1.0);
+            }
+#endif
 
             vec3 emissive = mat.emissive.rgb;
             if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
@@ -303,9 +342,31 @@ void main() {
             }
             // Emission found by the path: MIS-weighted against NEE at the
             // previous vertex (mis_common.glsl); camera rays count fully.
+            float emitLightScale = (bounce >= 2u)
+                ? restirSecondaryMisLightScale(bounce - 1u, pc.numLights, pc.captureMlData, pc.enableNrc)
+                : 1.0;
+#if ENABLE_RESTIR_PT
+#if IS_SECONDARY_BOUNCE
+            if (enableRestirFlag && bounce == 1u && x1ContextHasDiRestirMis(giCtx)) {
+                emitLightScale = restirDiMisLightScale(pc.numLights, pc.captureMlData);
+            }
+#else
+            if (enableRestirFlag && bounce == 1u && x1ContextHasDiRestirMis(x1Contexts[pixelIndex])) {
+                emitLightScale = restirDiMisLightScale(pc.numLights, pc.captureMlData);
+            }
+#endif
+#endif
             float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
                 ? 0.0
-                : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights));
+                : ((bounce == 0u) ? 1.0 : emitterHitMisWeightScaled(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale));
+            bool isUnindexedTriEmitter = (hitType == 0u) && (triangles[hit.hitData1.y].padding0 == TRI_LIGHT_NONE);
+#if ENABLE_RESTIR_GI && IS_SECONDARY_BOUNCE
+            if (giCaptureSelf && isUnindexedTriEmitter) {
+                if (length(emissive) > 1e-3 && emitMisW > 0.0) {
+                    giL2 += clampIndirectRadiance(emissive, pc.indirectClamp * 2.0);
+                }
+            } else
+#endif
             if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                 vec3 emissiveContrib = vec3(throughput) * emissive * emitMisW;
                 if (bounce > 0u) {
@@ -318,17 +379,26 @@ void main() {
                     imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), prev.a));
                 }
                 if (pc.captureMlData != 0u) {
-                    if (routeAllToSpec) {
+                    bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                    if (isV4 && bounce == 0u) {
+                        vec4 prevSkip = imageLoad(uMlSkipImage, pCoord);
+                        imageStore(uMlSkipImage, pCoord, vec4(addFp16Stochastic(prevSkip.rgb, emissiveContrib, seed), prevSkip.a));
+                    } else if (routeAllToSpec) {
+                        vec3 outSpec = isV4
+                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlSpecAlbedoImage, pCoord).rgb)
+                            : emissiveContrib;
                         vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                        imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, emissiveContrib, seed), prevSpec.a));
+                        imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                     } else {
+                        vec3 outDiff = isV4
+                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
+                            : emissiveContrib;
                         vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, emissiveContrib, seed), prevDiff.a));
+                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                     }
                 }
             }
 
-            bool pathTerminated = false;
             float roughness = mat.roughness;
             float metallic = mat.metallic;
             if (mat.mrTex > 0u && mat.mrTex <= 512u) {
@@ -440,9 +510,6 @@ void main() {
                              vec3(sheenColor), sheenRoughness);
             stdBsdfSetAnisoIridescence(bsdf, anisoT, anisoB, alphaX, alphaY,
                                        mat.iridescence, mat.iridescenceIor, mat.iridescenceThickness);
-            if (pc.captureMlData != 0u && bounce == 0u && roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01) {
-                bsdf.specProb = 0.0;
-            }
 
             bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
             if (enableCaustics && transmission < 0.1 && (mat.type & MATERIAL_TYPE_MASK) != 2u && metallic < 0.2) {
@@ -461,23 +528,73 @@ void main() {
                         }
                         causticApplied = true;
                         if (pc.captureMlData != 0u) {
+                            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
                             if (routeAllToSpec) {
+                                vec3 outSpec = isV4
+                                    ? demodulateMlSafe(causticRad, imageLoad(uMlSpecAlbedoImage, pCoord).rgb)
+                                    : causticRad;
                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                                imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, causticRad, seed), prevSpec.a));
+                                imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                             } else {
+                                vec3 outDiff = isV4
+                                    ? demodulateMlSafe(causticRad, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
+                                    : causticRad;
                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                                imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, causticRad, seed), prevDiff.a));
+                                imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                             }
                         }
                     }
                 }
             }
 
+            bool canContinueWavefront = (bounce + 1u < pc.maxBounces);
+            bool nrcTrainThisPath = false;
+            bool nrcQueryEmitted = false;
+            float nrcRoughness = max(roughness, 0.20);
+            f16vec3 secDirectL = f16vec3(0.0);
+#if ENABLE_RESTIR_GI && IS_SECONDARY_BOUNCE
+            uint effNrcBounce = giHasCtx ? max(pc.nrcBounce, 2u) : max(pc.nrcBounce, 1u);
+#else
+            uint effNrcBounce = max(pc.nrcBounce, 1u);
+#endif
+            bool nrcPrimaryTransmissive = ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) &&
+                (imageLoad(uMlSpecularMotionImage, ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width))).z < 0.0);
+            bool nrcVertexActive = false;
+            if (!pathTerminated && !deltaBranch && enableIndirect &&
+                pc.enableNrc == 1u && (!inNrcSkip || bounce >= 2u || (roughness >= 0.35 && metallic < 0.5)) && !nrcPrimaryTransmissive &&
+                bounce >= effNrcBounce && roughness >= 0.20 && !(metallic >= 0.9 && roughness < 0.25) &&
+                (bounce >= 2u || clearcoat <= 0.25 || clearcoatRoughness >= 0.20) &&
+                transmission <= 0.001 && (mat.type & MATERIAL_TYPE_MASK) != 2u && hitT > 0.05) {
+                float prevPdf = (inPdfCode > 0u) ? exp2(float(inPdfCode) * (1.0 / 64.0) - 20.0) : 0.318309886;
+                float cosThetaIn = max(abs(dot(hitNormal, V)), 0.05);
+                float pathSpreadSq = (hitT * hitT) / max(prevPdf * cosThetaIn, 1e-3);
+                float camDistSq = max(dot(hitPoint - ubo.position.xyz, hitPoint - ubo.position.xyz), 0.01);
+                bool isLastWavefrontBounce = (bounce + 1u >= pc.maxBounces);
+                float spreadThreshold = min(camDistSq * 0.01, 0.25) * 0.07957747;
+                nrcVertexActive = (bounce > effNrcBounce) ||
+                                  (roughness >= 0.25 && (bounce >= 2u || isLastWavefrontBounce || pathSpreadSq >= spreadThreshold));
+            }
+
+#if !IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
+            bool diRestirMisActive = false;
+#endif
 #if IS_SECONDARY_BOUNCE
             // --- STREAMLINED SECONDARY DIRECT LIGHTING (1-Sample NEE + Base Lobe BRDF) ---
-            f16vec3 secDirectL = f16vec3(0.0);
-            if (enableDirect && !deltaBranch && pc.numLights > 0u) {
-                uint M = (bounce == 1u && isSpecularPath && (inPdfCode == 0u || inPdfCode >= 1280u)) ? 4u : 1u;
+            if (!pathTerminated && enableDirect && !deltaBranch && pc.numLights > 0u) {
+#if ENABLE_RESTIR_GI
+                bool boostGiNee = giCaptureSelf;
+#else
+                bool boostGiNee = false;
+#endif
+                bool restirRuntimeActive = ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u);
+                uint M = 1u;
+                if (pc.numLights > 1u) {
+                    if (restirRuntimeActive) {
+                        M = restirSecondaryFreshM(bounce, pc.numLights, isSpecularPath, pc.captureMlData);
+                    } else if (bounce == 1u && (boostGiNee || (isSpecularPath && (inPdfCode == 0u || inPdfCode >= 1280u)))) {
+                        M = min(pc.numLights, (pc.numLights > 4096u) ? 2u : 4u);
+                    }
+                }
                 uint chosenLightIdx = 0u;
                 vec3 chosenLightDir = vec3(0.0, 1.0, 0.0);
                 float chosenLightDist = 0.0;
@@ -508,7 +625,10 @@ void main() {
 
                     uint candLightType = uint(candLight.position.w);
                     if (candLightType == 0u || candLightType == 3u /* AREA QUAD / TRIANGLE */) {
-                        vec2 luv = randVec2(seed);
+                        vec2 luv = (bounce == 1u && m == 0u &&
+                                    (pc.captureMlData != 0u || pc.enableNrc != 0u))
+                            ? sampleSobolOwen2D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, 6u)
+                            : randVec2(seed);
                         vec2 uv = luv;
                         if (candLightType == 3u) {
                             float r1 = sqrt(luv.x);
@@ -575,65 +695,73 @@ void main() {
                     {
                         float lightPdfEff = chosenLightPdfEff;
                         float risWeight = (weightSum / float(M)) / max(chosenTargetPdf, 1e-6);
-                        float misWeight = (uint(light.position.w) == 0u || uint(light.position.w) == 3u) ? neeMisWeight(lightIdx, lightPdfEff, neeBsdfPdf, bounce + 1u < pc.maxBounces) : 1.0;
+                        float secMisScale = restirSecondaryMisLightScale(bounce, pc.numLights, pc.captureMlData, pc.enableNrc);
+                        float misWeight = (uint(light.position.w) == 0u || uint(light.position.w) == 3u)
+                            ? neeMisWeightScaled(lightIdx, lightPdfEff, neeBsdfPdf, (bounce + 1u < pc.maxBounces) || nrcVertexActive, secMisScale)
+                            : 1.0;
                         vec3 secScale = lightEmission * (misWeight * risWeight);
                         f16vec3 secDiff = f16vec3(clamp((neeFCos - chosenSpecFCos) * secScale, vec3(0.0), vec3(65500.0)));
                         f16vec3 secSpec = f16vec3(clamp(chosenSpecFCos * secScale, vec3(0.0), vec3(65500.0)));
                         secDirectL = secDiff + secSpec;
-                        f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, pc.indirectClamp);
 
-                        if (length(unshadowed) > float16_t(1e-5)) {
-                            bool keepShadow = true;
-                            uint shadowRrMinBounce = (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u) ? 2u : 1u;
-                            if (bounce >= shadowRrMinBounce && !isSpecularPath) {
-                                float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
-                                float prob = clamp(lum * 1.5, 0.20, 1.0);
-                                if (randFloat(seed) < prob) {
-                                    unshadowed /= float16_t(prob);
-                                } else {
-                                    keepShadow = false;
+#if ENABLE_RESTIR_GI && IS_SECONDARY_BOUNCE
+                        if (giCaptureSelf) {
+                            float giDirectClampVal = (pc.captureMlData != 0u && (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u)
+                                ? (pc.indirectClamp * 4.0)
+                                : pc.indirectClamp;
+                            vec3 giDirectClamped = (pc.indirectClamp > 0.0)
+                                ? clampIndirectRadiance(vec3(secDirectL), giDirectClampVal)
+                                : vec3(secDirectL);
+                            float giRadMax = max(giDirectClamped.r, max(giDirectClamped.g, giDirectClamped.b));
+                            if (giRadMax > 1e-5) {
+                                bool giVis = true;
+                                if (enableShadows && pc.useHardwareRT == 1u) {
+                                    vec3 giShadowOrigin = isTransmitted ? offsetRayOrigin(hitPoint, -hitNormal) : offsetRayOrigin(hitPoint, hitNormal);
+                                    giVis = !traceShadowRayInline(giShadowOrigin, lightDir, lightDist,
+                                                                  (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
                                 }
+                                if (giVis) {
+                                    giL2 += giDirectClamped;
+                                } else {
+                                    secDirectL = f16vec3(0.0);
+                                }
+                            } else {
+                                secDirectL = f16vec3(0.0);
                             }
-                            if (keepShadow) {
-                                if (enableShadows) {
-                                    vec3 shadowOrigin = isTransmitted ? (hitPoint - hitNormal * EPSILON) : (hitPoint + hitNormal * EPSILON);
-#if ENABLE_INLINE_SHADOWS
-                                    bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
-                                    if (enableInlineShadows && pc.useHardwareRT == 1u) {
-                                        bool occluded = traceShadowRayInline(shadowOrigin, lightDir, lightDist,
-                                                                             (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                        if (!occluded) {
-                                            ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                            if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
-                                                vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                                                imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
-                                            }
-                                            if (pc.captureMlData != 0u) {
-                                                if (routeAllToSpec) {
-                                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
-                                                } else {
-                                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(unshadowed), seed), prevDiff.a));
-                                                }
-                                            }
-                                        } else {
-                                            secDirectL = f16vec3(0.0);
-                                        }
-                                    } else
+                        } else
 #endif
-                                    {
+                        {
+                            vec3 secShadowOrigin = isTransmitted ? offsetRayOrigin(hitPoint, -hitNormal) : offsetRayOrigin(hitPoint, hitNormal);
+                            float secClamp = (bounce >= 2u && (isSpecularPath || inNrcSkip)) ? min(pc.indirectClamp, 1.5) : pc.indirectClamp;
+                            f16vec3 unshadowed = clampIndirectRadiance(throughput * secDirectL, secClamp);
+
+                            if (length(unshadowed) > float16_t(1e-5)) {
+                                bool keepShadow = true;
+                                bool heavyLightTree = (pc.numLights > 4096u);
+                                uint shadowRrMinBounce = (!heavyLightTree && restirRuntimeActive && pc.captureMlData == 0u) ? 3u : ((pc.captureMlData != 0u || (!heavyLightTree && restirRuntimeActive)) ? 2u : 1u);
+                                if (bounce >= shadowRrMinBounce && !isSpecularPath) {
+                                    float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
+                                    float minShadowProb = restirRuntimeActive ? 0.45 : 0.20;
+                                    float prob = clamp(lum * 1.5, minShadowProb, 1.0);
+                                    if (randFloat(seed) < prob) {
+                                        unshadowed /= float16_t(prob);
+                                    } else {
+                                        keepShadow = false;
+                                    }
+                                }
+                                if (keepShadow) {
+                                    if (enableShadows) {
                                         float dLum = dot(vec3(secDiff), vec3(0.2126, 0.7152, 0.0722));
                                         float sLum = dot(vec3(secSpec), vec3(0.2126, 0.7152, 0.0722));
                                         float secSpecCode = routeAllToSpec ? 2.0 : clamp(sLum / max(dLum + sLum, 1e-8), 0.0, 1.0);
                                         hasShadowRay = true;
-                                        shadowCandidate.originDist = vec4(shadowOrigin, lightDist);
+                                        shadowCandidate.originDist = vec4(secShadowOrigin, lightDist);
                                         shadowCandidate.dirPixelRad = uvec4(packOct32(lightDir), pixelIndex, packHalf2x16(vec2(unshadowed.rg)), packHalf2x16(vec2(unshadowed.b, secSpecCode)));
+                                    } else {
+                                        ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                                        vec4 prev = imageLoad(uAccumImage, pCoord);
+                                        imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                                     }
-                                } else {
-                                    ivec2 pCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                                    vec4 prev = imageLoad(uAccumImage, pCoord);
-                                    imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                                 }
                             }
                         }
@@ -642,75 +770,254 @@ void main() {
             }
 #else
             // Direct Lighting (Unified ReSTIR PT Inline Path Resampling & Stochastic NEE)
-            f16vec3 secDirectL = f16vec3(0.0);
 #if ENABLE_RESTIR_PT
-            bool enableRestirPT = enableRestirFlag && (roughness >= 0.10);
+            bool enableRestirPT = enableRestirFlag && (roughness >= 0.20) && (clearcoat <= 0.10);
+            bool isV4DiCapture = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+            bool isEsvgfDi = (pc.captureMlData != 0u) && !isV4DiCapture;
 #endif
-            if (enableDirect && !deltaBranch && pc.numLights > 0u) {
+            if (!pathTerminated && enableDirect && !deltaBranch && pc.numLights > 0u) {
                 bool enableInlineShadows = ((ubo.flags & (1 << 6)) != 0) && (bounce == 0u);
                 uint M = (bounce == 0u && pc.numLights > 1u) ? min(pc.numLights, 4u) : 1u;
-
-                f16vec3 proxyLumWeight = max(diffuseColor + F0, f16vec3(0.04)) * f16vec3(0.2126, 0.7152, 0.0722);
+#if ENABLE_RESTIR_PT
+                bool allowDiRestirMis = (pc.captureMlData != 0u) ? enableRestirFlag : enableRestirPT;
+                diRestirMisActive = allowDiRestirMis && !isV4DiCapture && (bounce == 0u) && ((ubo.flags & (1u << 10)) == 0u);
+                if (enableRestirFlag && !isV4DiCapture && (bounce == 0u) && pc.numLights > 1u) {
+                    M = restirDiFreshM(pc.numLights, pc.captureMlData);
+                }
+#endif
 
                 DiReservoir r;
                 DiSample sel;
                 restirDiFreshStream(pc.numLights, (ubo.flags & (1 << 7)) != 0,
-                                    hitPoint, hitNormal, hitT, proxyLumWeight,
+                                    hitPoint, hitNormal, hitT,
+                                    V, diffuseColor, F0, alphaRoughness,
                                     diffTrans, M, seed, r, sel);
 
+                bool winnerVisVerified = false;
+                bool hasCamMotionRestir = false;
 #if ENABLE_RESTIR_PT
-                if (enableRestirPT && bounce == 0u && ubo.frameIndex > 0u &&
-                    (ubo.flags & (1 << 23)) == 0u) {
-                    // 1. Temporal reuse (tap 0): center tap reprojected with motion vectors
-                    ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
-                    vec2 mv = imageLoad(uMotionVectorImage, pixelCoord).xy;
-                    ivec2 prevCoord = ivec2(round(vec2(pixelCoord) - mv * vec2(pc.width, pc.height)));
+                bool useRbDi = false;
+                vec3 rbDiDiffSum = vec3(0.0);
+                vec3 rbDiSpecSum = vec3(0.0);
+                uint rbDiMTotal = 0u;
+                bool canContOrNrc = (bounce + 1u < pc.maxBounces) || nrcVertexActive;
+#endif
 
-                    if (prevCoord.x >= 0 && prevCoord.y >= 0 &&
-                        prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
-                        DiReservoir src = historyReservoirs[uint(prevCoord.y) * pc.width + uint(prevCoord.x)];
-                        uint ageNew = min(restirGetAge(src.flags) + 1u, RESTIR_MAX_AGE);
-                        uint tempMCap = min(pc.restirMCap, clamp(pc.numLights * 6u, 6u, 24u));
-                        restirDiApplyTap(r, sel, src, pc.numLights, hitPoint, hitNormal, hitT,
-                                         proxyLumWeight, diffTrans, tempMCap, ageNew, false, seed);
+#if ENABLE_RESTIR_PT
+                if (enableRestirPT && bounce == 0u) {
+                    // 1. Validate fresh candidate visibility before reservoir combination
+                    //    so occluded samples cannot enter wSum or survive in history.
+#if ENABLE_INLINE_SHADOWS
+                    if (enableShadows && enableInlineShadows && pc.useHardwareRT == 1u) {
+                        winnerVisVerified = true;
+                        if (sel.has && sel.target > 1e-6) {
+                            vec3 freshVisOrig = sel.isTrans
+                                ? offsetRayOrigin(hitPoint, -hitNormal)
+                                : offsetRayOrigin(hitPoint, hitNormal);
+                            bool freshVis = !traceShadowRayInline(
+                                freshVisOrig, sel.dir, sel.dist,
+                                (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                            if (!freshVis) {
+                                r.wSum = 0.0;
+                                r.targetPdf = 0.0;
+                                r.idxM = restirPackIdxM(0u, M);
+                                sel.has = false;
+                                sel.target = 0.0;
+                            }
+                        }
+                        if (!isV4DiCapture) {
+                            useRbDi = true;
+                            rbDiMTotal = M;
+                            if (sel.has && sel.target > 1e-6) {
+                                float freshWOverP = min(r.wSum / sel.target, float(M) * 500.0);
+                                accumulateDiRbSample(
+                                    bsdf, hitPoint, hitNormal, V, pc.numLights, pc.captureMlData,
+                                    canContOrNrc, diRestirMisActive, sel, freshWOverP,
+                                    M, 0.0, rbDiDiffSum, rbDiSpecSum
+                                );
+                            }
+                        }
                     }
+#endif
 
-                    // Save the pure TEMPORAL reservoir to history.
-                    // Spatial reuse must NEVER be fed back into temporal history (prevents positive correlation runaway).
-                    if (pc.sppSampleIndex == 0u) {
+                    if (ubo.frameIndex > 0u && (ubo.flags & (1 << 23)) == 0u) {
+                        uint restirSeed = seed ^ 0x9E3779B9u;
+                        pcg_hash(restirSeed);
+                        // 2. Temporal reuse (tap 0): center tap reprojected with motion vectors
+                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec4 mvFull = imageLoad(uMotionVectorImage, pixelCoord);
+                        vec2 mv = mvFull.xy;
+                        vec2 mvPx = mv * vec2(float(pc.width), float(pc.height));
+                        bool hasCamMotion = dot(mvPx, mvPx) > 0.25;
+                        hasCamMotionRestir = hasCamMotion;
+                        float currViewZ = max(dot(hitPoint - ubo.position.xyz, -ubo.viewInverse[2].xyz), 1e-4);
+                        float expectedPrevDepth = max(currViewZ + mvFull.z, 1e-4);
+                        float expectedPrevHitT = hitT * (expectedPrevDepth / currViewZ);
+                        ivec2 prevCoord = ivec2(round(vec2(pixelCoord) - mvPx));
+
+                        DiReservoir tempR = r;
+                        DiSample tempSel = sel;
+                        DiTapEval tempDiEval;
+                        tempDiEval.mTap = 0u;
+                        tempDiEval.weightOverPHat = 0.0;
+                        tempDiEval.tapSample.has = false;
+                        bool allowMultiLightStaticDi = (pc.numLights > 4u);
+                        bool manyLightScene = (pc.numLights > 4096u);
+                        bool allowTemporalDiHistory = isV4DiCapture || hasCamMotion || allowMultiLightStaticDi;
+                        if (allowTemporalDiHistory && prevCoord.x >= 0 && prevCoord.y >= 0 &&
+                            prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
+                            float prevTapDepth = imageLoad(uPrevNormalDepthImage, prevCoord).w;
+                            float relDepthDiff = abs(expectedPrevDepth - prevTapDepth) / max(max(expectedPrevDepth, prevTapDepth), 1e-4);
+                            if (relDepthDiff <= 0.06) {
+                                DiReservoir src = historyReservoirs[uint(prevCoord.y) * pc.width + uint(prevCoord.x)];
+                                uint ageNew = min(restirGetAge(src.flags) + 1u, RESTIR_MAX_AGE);
+                                uint tempMCap = min(pc.restirMCap, hasCamMotion ? 6u : (isV4DiCapture ? 20u : (manyLightScene ? ((pc.captureMlData == 0u) ? 8u : 4u) : 4u)));
+                                bool isTempOccluded = false;
+#if ENABLE_INLINE_SHADOWS
+                                if (winnerVisVerified) {
+                                    vec3 tapDir;
+                                    float tapDist;
+                                    bool tapIsTrans;
+                                    if (restirDiPrepareTapShadowRay(src, pc.numLights, hitPoint, hitNormal,
+                                                                    expectedPrevHitT, diffTrans,
+                                                                    tapDir, tapDist, tapIsTrans)) {
+                                        vec3 tapVisOrig = tapIsTrans
+                                            ? offsetRayOrigin(hitPoint, -hitNormal)
+                                            : offsetRayOrigin(hitPoint, hitNormal);
+                                        isTempOccluded = traceShadowRayInline(
+                                            tapVisOrig, tapDir, tapDist,
+                                            (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                    }
+                                }
+#endif
+                                restirDiApplyTapEx(tempR, tempSel, src, pc.numLights, hitPoint, hitNormal, hitT, expectedPrevHitT,
+                                                   V, diffuseColor, F0, alphaRoughness, diffTrans,
+                                                   tempMCap, ageNew, isTempOccluded, hasCamMotion || manyLightScene, restirSeed, tempDiEval);
+                            }
+                        }
+
+                        // Save the pure TEMPORAL reservoir to history.
+                        // Spatial reuse must NEVER be fed back into temporal history (prevents positive correlation runaway).
+                        if (pc.sppSampleIndex == 0u) {
+                            currentReservoirs[pixelIndex] = tempR;
+                        }
+                        bool useTemporalDiShade = isV4DiCapture || hasCamMotion || allowMultiLightStaticDi;
+                        if (useTemporalDiShade) {
+                            r = tempR;
+                            sel = tempSel;
+                        }
+                        if (useRbDi && (hasCamMotion || allowMultiLightStaticDi) && tempDiEval.mTap > 0u) {
+                            rbDiMTotal += tempDiEval.mTap;
+                            if (tempDiEval.weightOverPHat > 0.0) {
+                                uint tempLType = uint(lights[tempDiEval.tapSample.lightIdx].position.w);
+                                float clampTempW = manyLightScene ? 1e30 : (float(tempDiEval.mTap) * ((tempLType == 0u || tempLType == 3u) ? 40.0 : 100.0));
+                                float maxTempLum = manyLightScene ? ((pc.captureMlData != 0u) ? 25.0 : 60.0) : 0.0;
+                                accumulateDiRbSample(
+                                    bsdf, hitPoint, hitNormal, V, pc.numLights, pc.captureMlData,
+                                    canContOrNrc, diRestirMisActive, tempDiEval.tapSample,
+                                    min(tempDiEval.weightOverPHat, clampTempW), tempDiEval.mTap, maxTempLum,
+                                    rbDiDiffSum, rbDiSpecSum
+                                );
+                            }
+                        }
+
+                        // 3. Spatial reuse into a separate shading reservoir (visibility-verified before combine)
+                        bool allowSpatialDi = !(metallic > 0.5 && roughness < 0.25) && !(isEsvgfDi && !hasCamMotion);
+                        if (allowSpatialDi) {
+                            DiReservoir shadeR = r;
+                            DiSample shadeSel = sel;
+
+                            bool isV4Di = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                            uint tapHash = (pixelIndex * 0x9E3779B9u) ^ (pc.frameIndex * 0x85EBCA6Bu);
+                            if (isV4Di) {
+                                tapHash ^= 0xA3C59AC3u;
+                            }
+                            pcg_hash(tapHash);
+                            uint rot = (tapHash >> 30u) & 3u;
+                            uint numSpatialTaps = isV4Di ? 2u : ((hasCamMotion || manyLightScene) ? 2u : 4u);
+                            uint tapOff = (tapHash >> 24u) % 24u;
+                            uint mCap = isV4Di
+                                ? min(pc.restirMCap, hasCamMotion ? 6u : 12u)
+                                : (hasCamMotion ? min(pc.restirMCap, 6u) : min(pc.restirMCap, manyLightScene ? ((pc.captureMlData == 0u) ? 12u : 8u) : 16u));
+                            float spatDiDepthGate = isV4Di ? 0.06 : (manyLightScene ? 0.04 : RESTIR_TAP_DEPTH_REL_GATE);
+
+                            for (uint tap = 0u; tap < numSpatialTaps; ++tap) {
+                                uint tapIdx = isV4Di
+                                    ? (((tapHash >> 28u) & 2u) + tap)
+                                    : (hasCamMotion
+                                        ? (8u + ((tapOff + tap * 7u) % 24u))
+                                        : (manyLightScene
+                                            ? (((tapHash >> 27u) + tap) & 7u)
+                                            : (((tapHash >> 24u) + tap * 7u) & 31u)));
+                                ivec2 base = RESTIR_TAP_OFFSETS[tapIdx];
+                                if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
+                                if ((rot & 2u) != 0u) base = -base;
+                                ivec2 offset = base;
+                                ivec2 tapCoord = prevCoord + offset;
+                                if (tapCoord.x < 0 || tapCoord.y < 0 ||
+                                    tapCoord.x >= int(pc.width) || tapCoord.y >= int(pc.height)) {
+                                    continue;
+                                }
+                                float prevTapDepth = imageLoad(uPrevNormalDepthImage, tapCoord).w;
+                                float relDepthDiff = abs(expectedPrevDepth - prevTapDepth) / max(max(expectedPrevDepth, prevTapDepth), 1e-4);
+                                if (relDepthDiff > spatDiDepthGate) {
+                                    continue;
+                                }
+                                DiReservoir src = historyReservoirs[uint(tapCoord.y) * pc.width + uint(tapCoord.x)];
+                                uint ageNew = restirGetAge(src.flags);
+                                bool isSpatOccluded = false;
+#if ENABLE_INLINE_SHADOWS
+                                if (winnerVisVerified) {
+                                    vec3 tapDir;
+                                    float tapDist;
+                                    bool tapIsTrans;
+                                    if (restirDiPrepareTapShadowRay(src, pc.numLights, hitPoint, hitNormal,
+                                                                    expectedPrevHitT, diffTrans,
+                                                                    tapDir, tapDist, tapIsTrans)) {
+                                        vec3 tapVisOrig = tapIsTrans
+                                            ? offsetRayOrigin(hitPoint, -hitNormal)
+                                            : offsetRayOrigin(hitPoint, hitNormal);
+                                        isSpatOccluded = traceShadowRayInline(
+                                            tapVisOrig, tapDir, tapDist,
+                                            (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                                    }
+                                }
+#endif
+                                DiTapEval spatDiEval;
+                                restirDiApplyTapEx(shadeR, shadeSel, src, pc.numLights, hitPoint, hitNormal, hitT, expectedPrevHitT,
+                                                   V, diffuseColor, F0, alphaRoughness, diffTrans,
+                                                   mCap, ageNew, isSpatOccluded, true, restirSeed, spatDiEval);
+                                if (useRbDi && spatDiEval.mTap > 0u) {
+                                    rbDiMTotal += spatDiEval.mTap;
+                                    if (spatDiEval.weightOverPHat > 0.0) {
+                                        uint spatLType = uint(lights[spatDiEval.tapSample.lightIdx].position.w);
+                                        float spatMotionClamp = (spatLType == 0u || spatLType == 3u) ? 40.0 : 100.0;
+                                        float clampSpatW = manyLightScene ? 1e30 : (float(spatDiEval.mTap) * (hasCamMotion ? spatMotionClamp : 500.0));
+                                        float maxSpatLum = manyLightScene ? ((pc.captureMlData != 0u) ? 25.0 : 60.0) : 0.0;
+                                        accumulateDiRbSample(
+                                            bsdf, hitPoint, hitNormal, V, pc.numLights, pc.captureMlData,
+                                            canContOrNrc, diRestirMisActive, spatDiEval.tapSample,
+                                            min(spatDiEval.weightOverPHat, clampSpatW), spatDiEval.mTap, maxSpatLum,
+                                            rbDiDiffSum, rbDiSpecSum
+                                        );
+                                    }
+                                }
+                            }
+
+                            r = shadeR;
+                            sel = shadeSel;
+                        }
+                    } else if (pc.sppSampleIndex == 0u) {
                         currentReservoirs[pixelIndex] = r;
                     }
-
-                    // 2. Spatial reuse (taps 1..4): gathers neighbors into a separate shading reservoir
-                    DiReservoir shadeR = r;
-                    DiSample shadeSel = sel;
-
-                    uint tapHash = (pixelIndex * 0x9E3779B9u) ^ (pc.frameIndex * 0x85EBCA6Bu);
-                    uint rot = (tapHash >> 30u) & 3u;
-
-                    for (uint tap = 1u; tap <= 4u; ++tap) {
-                        ivec2 base = RESTIR_TAP_OFFSETS[tap - 1u];
-                        if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
-                        if ((rot & 2u) != 0u) base = -base;
-                        ivec2 tapCoord = prevCoord + base;
-                        if (tapCoord.x < 0 || tapCoord.y < 0 ||
-                            tapCoord.x >= int(pc.width) || tapCoord.y >= int(pc.height)) {
-                            continue;
-                        }
-                        DiReservoir src = historyReservoirs[uint(tapCoord.y) * pc.width + uint(tapCoord.x)];
-                        uint mCap = min(pc.restirMCap, 8u);
-                        uint ageNew = restirGetAge(src.flags);
-
-                        // Post-selection LATE_WRS_MIS inline shadow ray at finalization handles visibility
-                        // without 4 per-tap divergent rayQueryEXT traversals inside the spatial loop.
-                        restirDiApplyTap(shadeR, shadeSel, src, pc.numLights, hitPoint, hitNormal, hitT,
-                                         proxyLumWeight, diffTrans, mCap, ageNew, false, seed);
+                    if (((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) && pc.sppSampleIndex == 0u) {
+                        float restirMNorm = float(min(restirGetM(r.idxM), 64u)) / 64.0;
+                        ivec2 saCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        vec4 prevSa = imageLoad(uMlSpecAlbedoImage, saCoord);
+                        imageStore(uMlSpecAlbedoImage, saCoord, vec4(prevSa.rgb, restirMNorm));
                     }
-
-                    r = shadeR;
-                    sel = shadeSel;
                 } else if (bounce == 0u && enableRestirFlag && pc.sppSampleIndex == 0u) {
-                    currentReservoirs[pixelIndex] = enableRestirPT ? r : invalidDiReservoir();
+                    currentReservoirs[pixelIndex] = invalidDiReservoir();
                 }
 #endif
 
@@ -726,17 +1033,55 @@ void main() {
                 float selectedLightSelectPdf = sel.selectPdf;
                 bool hasCandidate = sel.has;
 
+#if ENABLE_RESTIR_PT
+                if (useRbDi) {
+                    float invDiM = 1.0 / float(max(rbDiMTotal, 1u));
+                    f16vec3 diffBrdf = f16vec3(clamp(rbDiDiffSum * invDiM, vec3(0.0), vec3(65500.0)));
+                    f16vec3 specBrdf = f16vec3(clamp(rbDiSpecSum * invDiM, vec3(0.0), vec3(65500.0)));
+                    secDirectL = diffBrdf + specBrdf;
+                    f16vec3 unshadowed = throughput * secDirectL;
+                    if (length(unshadowed) > float16_t(1e-5)) {
+                        ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+                        if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
+                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
+                        }
+                        if (pc.captureMlData != 0u) {
+                            bool mergeMatteSpec = (!routeAllToSpec && roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01);
+                            f16vec3 diffUnshadowed = throughput * (mergeMatteSpec ? secDirectL : diffBrdf);
+                            f16vec3 specUnshadowed = mergeMatteSpec ? f16vec3(0.0) : (throughput * specBrdf);
+                            if (routeAllToSpec) {
+                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
+                            } else {
+                                if (dot(vec3(diffUnshadowed), vec3(diffUnshadowed)) > 1e-10) {
+                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), prevDiff.a));
+                                }
+                                if (dot(vec3(specUnshadowed), vec3(specUnshadowed)) > 1e-10) {
+                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), prevSpec.a));
+                                }
+                            }
+                        }
+                    }
+                } else
+#endif
                 if (hasCandidate && selectedTarget > 1e-6) {
                     vec3 shadowOrigin = selectedIsTrans ? offsetRayOrigin(hitPoint, -hitNormal) : offsetRayOrigin(hitPoint, hitNormal);
                     bool inlineShadowExecuted = false;
                     bool inlineShadowVisible = true;
 #if ENABLE_INLINE_SHADOWS
                     if (enableShadows && enableInlineShadows && pc.useHardwareRT == 1u) {
-                        // RTXPT LATE_WRS_MIS: Trace inline shadow visibility first so occluded candidates
-                        // skip stdBsdfEvalSplit, Light buffer fetch, and LightTree MIS PDF traversal.
+                        // RTXPT LATE_WRS_MIS: Reuse pre-combine inline shadow visibility when ReSTIR PT
+                        // verified fresh/temporal/spatial candidates, otherwise trace inline here.
                         inlineShadowExecuted = true;
-                        inlineShadowVisible = !traceShadowRayInline(shadowOrigin, selectedLightDir, selectedLightDist,
-                                                                    (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                        if (winnerVisVerified) {
+                            inlineShadowVisible = true;
+                        } else {
+                            inlineShadowVisible = !traceShadowRayInline(shadowOrigin, selectedLightDir, selectedLightDist,
+                                                                        (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
+                        }
                     }
 #endif
                     if (inlineShadowVisible) {
@@ -753,11 +1098,22 @@ void main() {
                         {
                             Light selLight = lights[selectedLightIdx];
                             uint selType = uint(selLight.position.w);
-                            if (selType == 0u || selType == 3u) {
+                            if ((selType == 0u || selType == 3u) && lightUsesMis(selectedLightIdx)) {
+                                if (selectedLightSelectPdf < 0.0) {
+                                    selectedLightSelectPdf = misLightSelectPdf(selectedLightIdx, hitPoint, pc.numLights);
+                                }
                                 float effCos = max(selectedCosLight, 1e-4);
                                 float effDist = max(selectedLightDist, 1e-4);
                                 float lightPdfEff = ((effDist * effDist) / (selLight.emission.w * effCos)) * selectedLightSelectPdf;
-                                misWeight = neeMisWeight(selectedLightIdx, lightPdfEff, neeBsdfPdf, bounce + 1u < pc.maxBounces);
+                                float diMisScale = (bounce >= 1u)
+                                    ? restirSecondaryMisLightScale(bounce, pc.numLights, pc.captureMlData, pc.enableNrc)
+                                    : 1.0;
+#if ENABLE_RESTIR_PT
+                                if (diRestirMisActive) {
+                                    diMisScale = restirDiMisLightScale(pc.numLights, pc.captureMlData);
+                                }
+#endif
+                                misWeight = neeMisWeightScaled(selectedLightIdx, lightPdfEff, neeBsdfPdf, (bounce + 1u < pc.maxBounces) || nrcVertexActive, diMisScale);
                             }
                         }
 
@@ -766,7 +1122,11 @@ void main() {
                         if (enableRestirPT && bounce == 0u) {
                             uint finalM = restirGetM(r.idxM);
                             risWeight = (finalM > 0u && selectedTarget > 1e-6) ? (r.wSum / (float(finalM) * selectedTarget)) : 0.0;
-                            risWeight = clamp(risWeight, 0.0, 500.0);
+                            if (pc.numLights <= 4096u) {
+                                uint selLightType = uint(lights[selectedLightIdx].position.w);
+                                float motionRisClamp = (selLightType == 0u || selLightType == 3u) ? 40.0 : 100.0;
+                                risWeight = clamp(risWeight, 0.0, hasCamMotionRestir ? motionRisClamp : 500.0);
+                            }
                         } else
 #endif
                         {
@@ -779,6 +1139,18 @@ void main() {
                         f16vec3 specBrdf = f16vec3(clamp(neeSpecFCos * neeScale, vec3(0.0), vec3(65500.0)));
                         vec3 directLightRadiance = vec3(1.0);
                         secDirectL = diffBrdf + specBrdf;
+#if ENABLE_RESTIR_PT
+                        if (pc.numLights > 4096u && bounce == 0u && enableRestirPT) {
+                            float maxDirectLum = (pc.captureMlData != 0u) ? 30.0 : 60.0;
+                            float secLum = dot(vec3(secDirectL), vec3(0.2126, 0.7152, 0.0722));
+                            if (secLum > maxDirectLum) {
+                                float sc = maxDirectLum / secLum;
+                                diffBrdf *= float16_t(sc);
+                                specBrdf *= float16_t(sc);
+                                secDirectL = diffBrdf + specBrdf;
+                            }
+                        }
+#endif
                         f16vec3 unshadowed = throughput * secDirectL;
                         if (bounce > 0u) {
                             unshadowed = clampIndirectRadiance(unshadowed, pc.indirectClamp);
@@ -786,7 +1158,7 @@ void main() {
 
                         if (length(unshadowed) > float16_t(1e-5)) {
                             bool keepShadow = true;
-                            uint shadowRrMinBounce = (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u) ? 2u : 1u;
+                            uint shadowRrMinBounce = (pc.captureMlData != 0u) ? 2u : 1u;
                             if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                                 float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
                                 float prob = clamp(lum * 1.5, 0.20, 1.0);
@@ -806,7 +1178,8 @@ void main() {
                                             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, vec3(unshadowed), seed), prev.a));
                                         }
                                         if (pc.captureMlData != 0u) {
-                                            bool mergeMatteSpec = (!routeAllToSpec && (bounce > 0u || (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01)));
+                                            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                                            bool mergeMatteSpec = (!routeAllToSpec && (bounce > 0u || (!isV4 && roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01)));
                                             f16vec3 diffUnshadowed = throughput * (mergeMatteSpec ? secDirectL : diffBrdf) * f16vec3(directLightRadiance);
                                             f16vec3 specUnshadowed = mergeMatteSpec ? f16vec3(0.0) : (throughput * specBrdf * f16vec3(directLightRadiance));
                                             if (bounce > 0u) {
@@ -814,23 +1187,33 @@ void main() {
                                                 specUnshadowed = clampIndirectRadiance(specUnshadowed, pc.indirectClamp);
                                             }
                                             if (routeAllToSpec) {
+                                                vec3 outSpec = isV4
+                                                    ? demodulateMlSafe(vec3(unshadowed), imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                                    : vec3(unshadowed);
                                                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(unshadowed), seed), prevSpec.a));
+                                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                                             } else {
                                                 if (dot(vec3(diffUnshadowed), vec3(diffUnshadowed)) > 1e-10) {
+                                                    vec3 outDiff = isV4
+                                                        ? demodulateMlSafe(vec3(diffUnshadowed), imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                                        : vec3(diffUnshadowed);
                                                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, vec3(diffUnshadowed), seed), prevDiff.a));
+                                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                                                 }
                                                 if (dot(vec3(specUnshadowed), vec3(specUnshadowed)) > 1e-10) {
+                                                    vec3 outSpec = isV4
+                                                        ? demodulateMlSafe(vec3(specUnshadowed), imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                                        : vec3(specUnshadowed);
                                                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, vec3(specUnshadowed), seed), prevSpec.a));
+                                                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                                                 }
                                             }
                                         }
                                     } else
 #endif
                                     {
-                                        bool mergeMatteSpecShadow = (!routeAllToSpec && (bounce > 0u || (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01)));
+                                        bool isV4Shadow = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                                        bool mergeMatteSpecShadow = (!routeAllToSpec && (bounce > 0u || (!isV4Shadow && roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01)));
                                         float diffShadowLum = dot(vec3(diffBrdf), vec3(0.2126, 0.7152, 0.0722));
                                         float specShadowLum = dot(vec3(specBrdf), vec3(0.2126, 0.7152, 0.0722));
                                         float shadowSpecCode = routeAllToSpec ? 2.0 : (mergeMatteSpecShadow ? 0.0 : clamp(specShadowLum / max(diffShadowLum + specShadowLum, 1e-8), 0.0, 1.0));
@@ -865,12 +1248,59 @@ void main() {
 #endif
 
             // Indirect Bounce
-            bool sampledSpecularLobe = false;
-            nextDirection = vec3(0.0);
-            vec3 nextOrigin;
-            uint nextPdfCode = 0u; // 0 = delta lobe / no NEE here: emitter hits get full weight
+            // NRC Indirect Continuation (Müller et al. 2021): emit NRCQuery for 100% of active
+            // NRC vertices while running inline self-training on the doTrain subset.
+            if (nrcVertexActive && !pathTerminated) {
+                uint waveSeed = subgroupBroadcastFirst(seed);
+                bool doTrain = (randFloat(waveSeed) < pc.nrcTrainRatio);
+                uvec4 qBallot = subgroupBallot(true);
+                uint qWaveCount = subgroupBallotBitCount(qBallot);
+                uint qWaveBase = 0u;
+                uint maxQ = pc.width * pc.height;
+                if (subgroupElect()) {
+                    qWaveBase = atomicAdd(nrcCounters.queryCount, qWaveCount);
+                    if (qWaveBase < maxQ) {
+                        uint endIdx = min(qWaveBase + qWaveCount - 1u, maxQ - 1u);
+                        if ((qWaveBase & 63u) == 0u || (qWaveBase >> 6u) != (endIdx >> 6u)) {
+                            atomicMax(nrcCounters.dispatchX, (endIdx >> 6u) + 1u);
+                        }
+                    }
+                }
+                qWaveBase = subgroupBroadcastFirst(qWaveBase);
+                uint qIdx = qWaveBase + subgroupBallotExclusiveBitCount(qBallot);
+                if (qIdx < maxQ) {
+                    vec3 nrcRefl = max(mix(vec3(diffuseColor), vec3(F0), metallic), vec3(0.04));
+                    nrcQueries[qIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
+                    nrcQueries[qIdx].normal_flags = vec4(hitNormal, routeAllToSpec ? 1.0 : 0.0);
+                    nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
+                    nrcQueries[qIdx].albedo_pad = vec4(nrcRefl, 0.0);
+                    nrcQueries[qIdx].throughput = vec4(vec3(throughput), 0.0);
+                    nrcQueryEmitted = true;
+                    if (!doTrain) {
+                        pathTerminated = true;
+                    }
+                }
+                if (doTrain) {
+                    nrcTrainThisPath = true;
+                }
+            }
 
-            if (bounce + 1u >= pc.maxBounces || !enableIndirect) {
+#if !IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
+            float giF0Scalar = clamp(f0Dielectric * specFactor, 0.0, 1.0);
+            bool giSurfaceEligible = enableRestirFlag && (bounce == 0u) && (pc.useHardwareRT == 1u) &&
+                                     !pathTerminated && !deltaBranch && enableDirect && enableIndirect &&
+                                     (pc.numLights > 0u) && (bounce + 1u < pc.maxBounces) &&
+                                     (diffTrans <= 0.001) && (clearcoat <= 0.10) && (roughness >= 0.20) && (metallic < 0.50);
+            float giSampledBsdfPdf = 0.0;
+#endif
+            sampledSpecularLobe = false;
+            nextDirection = vec3(0.0);
+            vec3 nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
+            uint nextPdfCode = 0u; // 0 = delta lobe / no NEE here: emitter hits get full weight
+            bool validBounce = false;
+            vec3 nrcBsdfWeight = vec3(0.0);
+
+            if (pathTerminated || (!canContinueWavefront && !nrcTrainThisPath) || !enableIndirect) {
                 pathTerminated = true;
             } else if (enableRefraction && (transmission > 0.001 || (mat.type & MATERIAL_TYPE_MASK) == 2u)) {
                 sampledSpecularLobe = true;
@@ -887,6 +1317,7 @@ void main() {
                     if (length(refracted) > 1e-4) {
                         nextDirection = normalize(refracted);
                         nextOrigin = offsetRayOrigin(hitPoint, -hitNormal);
+                        nrcBsdfWeight = vec3(baseColor);
                         throughput *= baseColor;
                     } else {
                         // Total Internal Reflection fallback
@@ -894,60 +1325,14 @@ void main() {
                         nextOrigin = offsetRayOrigin(hitPoint, hitNormal);
                     }
                 }
+                validBounce = true;
             } else {
-                // Check if NRC should evaluate this rough diffuse surface
-                if (pc.enableNrc == 1u && (!isSpecularPath || pc.captureMlData == 0u) && bounce >= pc.nrcBounce && roughness >= 0.20 && metallic < 0.9 && hitT > 0.05) {
-                    vec3 surfReflectance = max(vec3(diffuseColor) + vec3(F0), vec3(0.05));
-                    float nrcRoughness = max(roughness, 0.20);
-                    bool isTrain = (randFloat(seed) < pc.nrcTrainRatio);
-                    if (isTrain) {
-                        uint trainIdx = atomicAdd(nrcCounters.trainCount, 1u);
-                        if (trainIdx < pc.maxQueueCapacity) {
-                            vec3 targetRad = vec3(secDirectL);
-#if !IS_SECONDARY_BOUNCE && ENABLE_INLINE_SHADOWS
-                            if (hasShadowRay && pc.useHardwareRT == 1u && length(targetRad) > 1e-4) {
-                                vec3 sOrigin = shadowCandidate.originDist.xyz;
-                                float sDist = shadowCandidate.originDist.w;
-                                vec3 sDir = unpackOct32(shadowCandidate.dirPixelRad.x);
-                                bool occluded = traceShadowRayInline(sOrigin, sDir, sDist,
-                                                                     (ubo.flags & (1u << 5)) != 0u, pc.numSpheres, pc.numOpaqueTriangles);
-                                if (occluded) {
-                                    targetRad = vec3(0.0);
-                                }
-                            }
-#endif
-                            nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
-                            nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
-                            nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcTrainRecords[trainIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
-                            nrcTrainRecords[trainIdx].throughput = vec4(vec3(throughput) * surfReflectance, 0.0);
-                            nrcTrainRecords[trainIdx].targetRadiance = vec4(targetRad / surfReflectance, 0.0);
-                        }
-                    } else {
-                        uint qIdx = atomicAdd(nrcCounters.queryCount, 1u);
-                        if (qIdx < pc.maxQueueCapacity) {
-                            if ((qIdx & 15u) == 0u) {
-                                atomicMax(nrcCounters.dispatchX, (qIdx >> 4u) + 1u);
-                            }
-                            nrcQueries[qIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
-                            nrcQueries[qIdx].normal_flags = vec4(hitNormal, 0.0);
-                            nrcQueries[qIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-                            nrcQueries[qIdx].albedo_pad = vec4(vec3(baseColor), 0.0);
-                            nrcQueries[qIdx].throughput = vec4(vec3(throughput) * surfReflectance, 0.0);
-                            pathTerminated = true;
-                        } else {
-                            // Queue capacity exceeded: do NOT drop ray silently (CRIT-04). Continue standard bounce.
-                            pathTerminated = false;
-                        }
-                    }
-                }
-
-                if (!pathTerminated) {
-                    // One-sample mixture over the shared BSDF (bsdf_standard.glsl):
-                    // clearcoat (prob ccProb), else base spec (specProb), else cosine
-                    // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
+                // One-sample mixture over the shared BSDF (bsdf_standard.glsl):
+                // clearcoat (prob ccProb), else base spec (specProb), else cosine
+                // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
 #if !IS_SECONDARY_BOUNCE
-                    bool useBounce0Sobol = (bounce == 0u) && (pc.captureMlData != 0u || pc.enableNrc != 0u || (ubo.flags & (1u << 9)) != 0u || pc.secondarySortMode < 2u);
+                    bool useRestirNonV4Sobol = (pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u);
+                    bool useBounce0Sobol = (bounce == 0u) && (pc.captureMlData != 0u || pc.enableNrc != 0u || useRestirNonV4Sobol || pc.secondarySortMode < 2u);
                     uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                     float lobeSelect = useBounce0Sobol
                         ? sampleSobolOwen1D(pixelIndex, pc.width, sobolSampleIdx, 0u)
@@ -998,11 +1383,17 @@ void main() {
 #if !IS_SECONDARY_BOUNCE
                             nextDirection = useBounce0Sobol
                                 ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(pixelIndex, pc.width, sobolSampleIdx, 2u))
-                                : sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot);
+                                : (((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u)
+                                    ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
+                                    : sampleCosineHemisphere(lobeN, seed));
 #else
-                            nextDirection = (pc.secondarySortMode >= 2u)
-                                ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
-                                : sampleCosineHemisphere(lobeN, seed);
+                            bool useBounce1Sobol = (bounce == 1u) &&
+                                (pc.enableNrc != 0u || ((pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u)));
+                            nextDirection = useBounce1Sobol
+                                ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(pixelIndex, pc.width, frameRot, 8u))
+                                : ((pc.secondarySortMode >= 2u && ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u))
+                                    ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
+                                    : sampleCosineHemisphere(lobeN, seed));
 #endif
                         }
                     }
@@ -1015,8 +1406,12 @@ void main() {
                         float bsdfPdf = 0.0;
                         vec3 specFCos = vec3(0.0);
                         vec3 fCos = stdBsdfEvalSplit(bsdf, hitNormal, V, nextDirection, bsdfPdf, specFCos);
+#if !IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
+                        giSampledBsdfPdf = bsdfPdf;
+#endif
+                        bool mergeMatteIndirectSpec = ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u) && (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01);
                         if (bsdfPdf > 0.0 && dot(fCos, vec3(1.0)) > 0.0) {
-                            if (pc.captureMlData != 0u && bounce == 0u && bsdf.specProb > 0.0 && bsdf.specProb < 1.0) {
+                            if (pc.captureMlData != 0u && bounce == 0u && !mergeMatteIndirectSpec && bsdf.specProb > 0.0 && bsdf.specProb < 1.0) {
                                 float NdotL = abs(dot(hitNormal, nextDirection));
                                 float diffFactor = isTrans ? bsdf.diffTrans : (1.0 - bsdf.diffTrans);
                                 float diffSelPdf = (1.0 - bsdf.ccProb) * (1.0 - bsdf.specProb) * diffFactor * NdotL * INV_PI;
@@ -1024,18 +1419,24 @@ void main() {
                                 vec3 lobeFCos = pickSpec ? specFCos : max(fCos - specFCos, vec3(0.0));
                                 float lobePdf = pickSpec ? specSelPdf : diffSelPdf;
                                 if (lobePdf > 1e-7 && dot(lobeFCos, vec3(1.0)) > 0.0) {
-                                    throughput *= f16vec3(min(lobeFCos / lobePdf, vec3(65000.0)));
+                                    vec3 wLobe = min(lobeFCos / lobePdf, vec3(65000.0));
+                                    nrcBsdfWeight = wLobe;
+                                    throughput *= f16vec3(wLobe);
                                     nextPdfCode = encodeBsdfPdf(bsdfPdf);
                                     nextOrigin = offsetRayOrigin(hitPoint, isTrans ? -hitNormal : hitNormal);
                                     sampledSpecularLobe = pickSpec;
+                                    validBounce = true;
                                 } else {
                                     validSample = false;
                                 }
                             } else {
-                                throughput *= f16vec3(min(fCos / bsdfPdf, vec3(65000.0)));
+                                vec3 wStd = min(fCos / bsdfPdf, vec3(65000.0));
+                                nrcBsdfWeight = wStd;
+                                throughput *= f16vec3(wStd);
                                 nextPdfCode = encodeBsdfPdf(bsdfPdf);
                                 nextOrigin = offsetRayOrigin(hitPoint, isTrans ? -hitNormal : hitNormal);
                                 sampledSpecularLobe = pickSpec;
+                                validBounce = true;
                             }
                         } else {
                             validSample = false;
@@ -1044,37 +1445,72 @@ void main() {
                     if (!validSample) {
                         pathTerminated = true;
                     }
-                }
+            }
+
+            if (nrcTrainThisPath) {
+                vec3 nrcRefl = max(mix(vec3(diffuseColor), vec3(F0), metallic), vec3(0.04));
+                nrcEmitSelfTrainingRecord(
+                    hitPoint, hitNormal, V, pixelIndex,
+                    nrcRefl, nrcRoughness,
+                    validBounce, nextOrigin, nextDirection, nrcBsdfWeight, nextPdfCode, seed
+                );
+            }
+            if (!canContinueWavefront || (nrcTrainThisPath && nrcQueryEmitted)) {
+                pathTerminated = true;
             }
 
             // Adaptive Russian roulette (only for paths that actually continue)
             if (!pathTerminated) {
                 float maxThresh = float(max(throughput.r, max(throughput.g, throughput.b))) * float(max(ubo.spp, 1u));
-                pathTerminated = applyRussianRoulette16(throughput, maxThresh, bounce, seed);
+                bool skipRawRestirB1Rr = (bounce == 1u) && (pc.captureMlData == 0u) && (pc.enableNrc == 0u) && ((ubo.flags & (1u << 9)) != 0u);
+                pathTerminated = skipRawRestirB1Rr ? !(maxThresh > 0.0) : applyRussianRoulette16(throughput, maxThresh, bounce, seed);
             }
 
             if (!pathTerminated) {
                 survivesToNext = true;
                 nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                bool mergeMatteIndirectSpec = (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01);
+                bool matteNrcSpec = ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u) && (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01);
+                bool mergeMatteIndirectSpec = (pc.captureMlData != 0u) && matteNrcSpec;
                 bool outIsSpecularPath = (bounce == 0u) ? (sampledSpecularLobe && !mergeMatteIndirectSpec) : isSpecularPath;
-                nextState = packRayState(throughput, seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode);
+                bool outNrcSkip = (bounce == 0u) ? (sampledSpecularLobe && roughness < 0.15) : (inNrcSkip && bounce < 2u);
+                nextState = packRayState(throughput, seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode, outNrcSkip);
             }
+#if !IS_SECONDARY_BOUNCE && ENABLE_RESTIR_PT
+            bool tagDiMis = diRestirMisActive && survivesToNext && (nextPdfCode != 0u);
+            if (giSurfaceEligible) {
+                if (survivesToNext) {
+                    X1Context ctxOut = makeX1Context(hitNormal, baseColor.rgb, metallic, V, giF0Scalar, roughness, giSampledBsdfPdf);
+                    if (tagDiMis) ctxOut.flags |= X1_FLAG_DI_RESTIR_MIS;
+                    x1Contexts[pixelIndex] = ctxOut;
+                } else {
+                    X1Context giCtx0 = makeX1Context(hitNormal, baseColor.rgb, metallic, V, giF0Scalar, roughness, max(giSampledBsdfPdf, 1e-4));
+                    uint giReuseSeed0 = seed ^ 0xC2B2AE35u;
+                    pcg_hash(giReuseSeed0);
+                    restirGiRunReuse(
+                        pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
+                        pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                        pc.useHardwareRT == 1u, pc.numSpheres, pc.numOpaqueTriangles,
+                        giCtx0, hitPoint, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
+                        giReuseSeed0, hasGiShadowRay, giShadowCandidate
+                    );
+                }
+            } else if (tagDiMis) {
+                x1Contexts[pixelIndex] = makeDiMisOnlyX1Context();
+            }
+#endif
             }
         }
 #if ENABLE_RESTIR_GI
-        if (enableRestirFlag && bounce == 1u) {
-            X1Context giCtx = x1Contexts[pixelIndex];
-            if (x1ContextValid(giCtx)) {
-                restirGiRunReuse(
-                    pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
-                    pc.restirMCap, pc.captureMlData, pc.indirectClamp,
-                    giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
-                    seed, hasGiShadowRay, giShadowCandidate
-                );
-            } else if (pc.sppSampleIndex == 0u) {
-                giReservoirs[pixelIndex] = invalidGiReservoir();
-            }
+        if (giHasCtx) {
+            uint giReuseSeed = seed ^ 0xC2B2AE35u;
+            pcg_hash(giReuseSeed);
+            restirGiRunReuse(
+                pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
+                pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                pc.useHardwareRT == 1u, pc.numSpheres, pc.numOpaqueTriangles,
+                giCtx, origin, giHasSelfCandidate, giSelfX2, giSelfN2, giSelfHitT, giCosRcSelf, giL2,
+                giReuseSeed, hasGiShadowRay, giShadowCandidate
+            );
         }
 #endif
     }
@@ -1149,7 +1585,7 @@ void main() {
         }
     }
 
-#if ENABLE_RESTIR_GI
+#if ENABLE_RESTIR_PT
     // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
     uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
     uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);

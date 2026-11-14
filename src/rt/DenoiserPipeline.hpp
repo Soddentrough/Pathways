@@ -74,7 +74,9 @@ public:
         float    depthThreshold;            // Default: 0.08f (static geometry)
         float    dynamicDepthThreshold;     // Default: 0.15f (dynamic objects)
         float    mvDiscrepancyThreshold;    // Default: 2.00f
-        float    _pad[3];
+        uint32_t accumulatedSamples;        // Stationary accumulated sample count
+        uint32_t upscalerCoupled;           // 1 when coupled to external temporal upscaler (FSR)
+        uint32_t _pad;
     };
     static_assert(sizeof(FusedTemporalPushConstants) == 80, "FusedTemporalPushConstants must be 80 bytes");
 

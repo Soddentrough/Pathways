@@ -45,6 +45,8 @@ void RenderTargetManager::destroy() {
     m_mlSpecularMotionImage.reset();
     m_mlDiffuseImage.reset();
     m_mlSpecularImage.reset();
+    m_mlSkipImage.reset();
+    m_mlSpecAlbedoImage.reset();
 }
 
 void RenderTargetManager::destroyGBufferResources() {
@@ -128,6 +130,22 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
+    if (m_mlSkipImage) {
+        m_mlSkipImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
+    if (m_mlSpecAlbedoImage) {
+        m_mlSpecAlbedoImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    }
 
     vkEndCommandBuffer(cmd);
 
@@ -201,21 +219,35 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
     m_mlSpecularMotionImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
     m_mlDiffuseImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
     m_mlSpecularImage = std::make_unique<Image>(
         m_device, m_allocator, rw, rh,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
+    );
+    m_mlSkipImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
+    );
+    m_mlSpecAlbedoImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
@@ -348,21 +380,35 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
     m_mlSpecularMotionImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
     m_mlDiffuseImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
     m_mlSpecularImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
+    );
+    m_mlSkipImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT,
+        concurrentQueues
+    );
+    m_mlSpecAlbedoImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
     );
@@ -412,6 +458,18 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
     m_mlSpecularImage->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+    m_mlSkipImage->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+    );
+    m_mlSpecAlbedoImage->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,

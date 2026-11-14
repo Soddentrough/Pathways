@@ -335,14 +335,14 @@ int main() {
         check_true(mgpu.getPrimaryImportedTimelineSemaphore() != VK_NULL_HANDLE,
                    "Primary imported timeline semaphore must be valid");
 
-        // Verify shared buffer reserves space for GPU 1's compacted checkerboard grid (radiance + 6x RGBA16F guide planes)
+        // Verify shared buffer reserves space for GPU 1's compacted checkerboard grid (radiance + 8x RGBA16F guide planes)
         const uint32_t tileSize = (cfgOn.tile_size == 0u) ? 64u : cfgOn.tile_size;
         const uint32_t numTilesX = (cfgOn.width + tileSize - 1u) / tileSize;
         const uint32_t secTileCols = (numTilesX + 1u) / 2u;
         const VkDeviceSize secPixelCount = static_cast<VkDeviceSize>(secTileCols * tileSize) * cfgOn.height;
-        const VkDeviceSize minExpectedBytes = secPixelCount * 8u + 6u * secPixelCount * 8u; // FP16 radiance + 6x RGBA16F planes
+        const VkDeviceSize minExpectedBytes = secPixelCount * 8u + 8u * secPixelCount * 8u; // FP16 radiance + 8x RGBA16F planes
         check_true(mgpu.getSharedBufferSize() >= minExpectedBytes,
-                   "Shared inter-GPU buffer must fit radiance + all 6 demodulated denoiser/ML guide planes");
+                   "Shared inter-GPU buffer must fit radiance + all 8 demodulated denoiser/ML guide planes");
 
         VulkanContext* secCtx = mgpu.getSecondaryContext();
         check_true(secCtx != nullptr && secCtx->getValidationErrors() == 0,
@@ -350,7 +350,7 @@ int main() {
         check_true(primaryCtx.getValidationErrors() == 0,
                    "Primary GPU context must have zero Vulkan validation errors");
         std::cout << "  -> Real MultiGpuManager lazy init, timeline sync, and "
-                  << (mgpu.getSharedBufferSize() / 1024) << " KiB 6-plane buffer verified (0 validation errors)." << std::endl;
+                  << (mgpu.getSharedBufferSize() / 1024) << " KiB 8-plane buffer verified (0 validation errors)." << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

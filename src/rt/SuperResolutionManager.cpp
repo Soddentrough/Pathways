@@ -99,9 +99,12 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         return;
     }
     try {
-        auto temporalCode = m_shaderLoader("upways_temporal.comp.spv");
-        auto neuralGuideCode = m_shaderLoader("upways_neural_guide.comp.spv");
-        auto upscaleResolveCode = m_shaderLoader("upways_upscale_resolve.comp.spv");
+        const bool useFp8 = UpwaysPipeline::supportsFp8CoopMatrix(m_physicalDevice);
+        const char* ext = useFp8 ? ".comp.spv" : ".fp16.comp.spv";
+        auto denoisePrepCode    = m_shaderLoader(std::string("upways_denoise_prep") + ext);
+        auto denoiserWmmaCode   = m_shaderLoader(std::string("upways_denoiser_wmma") + ext);
+        auto upscalerWmmaCode   = m_shaderLoader(std::string("upways_upscaler_wmma") + ext);
+        auto upscaleResolveCode = m_shaderLoader(std::string("upways_upscale_resolve") + ext);
 
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         uint32_t inW = config.getRenderWidth();
@@ -118,14 +121,16 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
             inH,
             outW,
             outH,
-            temporalCode,
-            neuralGuideCode,
+            denoisePrepCode,
+            denoiserWmmaCode,
+            upscalerWmmaCode,
             upscaleResolveCode,
             config.upways_weights_path,
             isSuperRes,
-            format
+            format,
+            useFp8
         );
-        Logger::info("Upways 3-Pass Neural Reconstruction & Multi-Scale KPN Pipeline initialized on demand.");
+        Logger::info("Upways 4.0 Neural Denoiser & Super-Resolution Pipeline initialized on demand.");
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("Upways was requested but initialization failed: ") + e.what());
     }
@@ -254,6 +259,8 @@ void SuperResolutionManager::createFsrResources(const Config& config, PostProces
 
 void SuperResolutionManager::destroyFsrResources() {
     m_secAccumImage.reset();
+    m_prevFsrJitter = glm::vec2(0.0f);
+    m_hasPrevFsrJitter = false;
 }
 
 void SuperResolutionManager::resize(uint32_t width, uint32_t height, float renderScale,
@@ -290,6 +297,8 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     }
 
     destroyFsrResources();
+    m_prevFsrJitter = glm::vec2(0.0f);
+    m_hasPrevFsrJitter = false;
     if (upscalerMode == UpscalerMode::FSR) {
         if (!m_fsrUpscaler) {
             createFsrPipelines(cfgStub);
@@ -306,7 +315,9 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
                                               Image* normalDepthImage, Image* motionVectorImage,
                                               Image* mlAlbedoRoughnessImage, Image* mlSpecularMotionImage,
                                               Image* mlDiffuseImage, Image* mlSpecularImage,
-                                              Image* frameImage0) {
+                                              Image* frameImage0,
+                                              Image* mlSkipImage,
+                                              Image* mlSpecAlbedoImage) {
     m_cachedPostProcess = postProcess;
     m_cachedAccumImage = accumImage;
     m_cachedOutputImage = outputImage;
@@ -317,6 +328,8 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
     m_cachedMlDiffuseImage = mlDiffuseImage;
     m_cachedMlSpecularImage = mlSpecularImage;
     m_cachedFrameImage0 = frameImage0;
+    m_cachedMlSkipImage = mlSkipImage;
+    m_cachedMlSpecAlbedoImage = mlSpecAlbedoImage;
 
     refreshCachedDescriptors();
 }
@@ -330,22 +343,18 @@ void SuperResolutionManager::refreshCachedDescriptors() {
         VkImageView diffView = m_cachedMlDiffuseImage ? m_cachedMlDiffuseImage->getImageView()
                              : (m_cachedFrameImage0 ? m_cachedFrameImage0->getImageView() : VK_NULL_HANDLE);
         VkImageView specView = m_cachedMlSpecularImage ? m_cachedMlSpecularImage->getImageView() : VK_NULL_HANDLE;
-
-        m_upwaysPipeline->setHistorySourceImages(
-            m_cachedNormalDepthImage ? m_cachedNormalDepthImage->getImage() : VK_NULL_HANDLE,
-            m_cachedMlSpecularMotionImage ? m_cachedMlSpecularMotionImage->getImage() : VK_NULL_HANDLE
-        );
+        VkImageView specAlbView = m_cachedMlSpecAlbedoImage ? m_cachedMlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView skipView = m_cachedMlSkipImage ? m_cachedMlSkipImage->getImageView() : VK_NULL_HANDLE;
 
         m_upwaysPipeline->updateDescriptors(
             diffView,
             specView,
+            albedoView,
+            specAlbView,
+            skipView,
             normDepthView,
-            albedoView,
             motionView,
-            specMotionView,
-            VK_NULL_HANDLE,
-            albedoView,
-            normDepthView
+            specMotionView
         );
 
         if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage() && m_cachedPostProcess) {
@@ -402,10 +411,9 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         refreshCachedDescriptors();
     }
 
-    glm::mat4 currInvView(1.0f);
-    glm::mat4 prevViewProj(1.0f);
-    glm::mat4 invProj(1.0f);
-    glm::mat4 prevView(1.0f);
+    (void)cameraMovedLastFrame;
+    (void)accumulatedSamples;
+
     glm::vec2 jitter(0.0f);
 
     if (camera) {
@@ -419,21 +427,12 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
             frameIndex, 1, config.max_bounces, 0,
             enableJitter, inW, inH, 0, false, jitterSeqLen
         );
-        currInvView = ubo.viewInverse;
-        prevViewProj = camera->getPrevViewProjMatrix();
-        invProj = ubo.projInverse;
-        prevView = camera->getPrevViewMatrix();
         jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
     }
 
-    uint32_t totalSamples = (config.progressive_accumulation && accumulatedSamples > 0)
-        ? accumulatedSamples
-        : 1u;
-
     m_upwaysPipeline->recordFrame(
-        cmd, frameIndex, resetHistory, cameraMovedLastFrame,
-        currInvView, prevViewProj, invProj, prevView, jitter, totalSamples,
-        coupledWithExternalUpscaler, config.upways_heuristic_fallback
+        cmd, frameIndex, resetHistory, jitter,
+        coupledWithExternalUpscaler, config.upways_heuristic_fallback, 1.0f
     );
     return true;
 }
@@ -444,7 +443,11 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
                                          Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
                                          MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
                                          PostProcessPipeline* postProcess, Image* outputImage,
-                                         const std::function<void()>& onDescriptorsInvalidated) {
+                                         const std::function<void()>& onDescriptorsInvalidated,
+                                         Camera* camera,
+                                         float frameTimeDeltaMs,
+                                         Image* rawFrameImage,
+                                         bool inputIsDenoised) {
     if (config.upscaler_mode != UpscalerMode::FSR) {
         return false;
     }
@@ -500,6 +503,12 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         refreshCachedDescriptors();
     }
 
+    const float camNear = camera ? std::max(camera->getNear(), 0.001f) : 0.05f;
+    const float camFar  = camera ? std::max(camera->getFar(), camNear + 1.0f) : 10000.0f;
+    const float camFovY = camera ? glm::radians(std::clamp(camera->getFov(), 5.0f, 170.0f)) : 0.785398f;
+    const float effDtMs = (frameTimeDeltaMs > 0.1f && frameTimeDeltaMs < 1000.0f) ? frameTimeDeltaMs : 16.667f;
+    const glm::vec2 prevJit = (!resetHistory && m_hasPrevFsrJitter) ? m_prevFsrJitter : glm::vec2(0.0f);
+
     if (isSampleBlend && m_secAccumImage) {
         UpscalerDispatchDesc descPrim{};
         descPrim.cmd = cmd;
@@ -514,12 +523,20 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         glm::vec2 jitter(0.0f);
 
         const bool hasDenoiser = (config.denoiser_mode != DenoiserMode::None);
-        const bool isStationaryAccum = config.progressive_accumulation && !hasDenoiser && !cameraMovedLastFrame && (accumulatedSamples >= 1);
+        const bool fsrUpscaling = (renderW < config.width || renderH < config.height);
+        const bool isStationaryAccum = config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !cameraMovedLastFrame && (accumulatedSamples >= 1);
         if (!isStationaryAccum) {
             jitter = getHaltonJitter(frameIndex, fsrPhaseCount);
+            if (!hasDenoiser && !cameraMovedLastFrame && config.progressive_accumulation && accumulatedSamples >= 2) {
+                jitter *= (1.0f / static_cast<float>(accumulatedSamples));
+            }
         }
         descPrim.jitterX = jitter.x;
         descPrim.jitterY = jitter.y;
+        descPrim.cameraNear = camNear;
+        descPrim.cameraFar = camFar;
+        descPrim.cameraFovY = camFovY;
+        descPrim.frameTimeDeltaMs = effDtMs;
         descPrim.enableSharpening = config.upscaler_sharpening;
         descPrim.sharpness = config.upscaler_sharpening ? config.upscaler_sharpness : 0.0f;
         descPrim.resetHistory = resetHistory;
@@ -527,7 +544,15 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         descPrim.frameIndex = frameIndex;
         descPrim.inputIsNormalized = true;
         descPrim.totalSamples = (config.progressive_accumulation && accumulatedSamples > 0) ? accumulatedSamples : 1u;
+        descPrim.prevJitterX = (resetHistory || !m_hasPrevFsrJitter) ? jitter.x : prevJit.x;
+        descPrim.prevJitterY = (resetHistory || !m_hasPrevFsrJitter) ? jitter.y : prevJit.y;
+        descPrim.preExposure = std::clamp(config.exposure, 0.1f, 4.0f);
+        descPrim.rawColorIn = (!inputIsDenoised && rawFrameImage) ? rawFrameImage->getImageView() : VK_NULL_HANDLE;
+        descPrim.rawSampleScale = 1.0f;
+        descPrim.inputIsDenoised = inputIsDenoised;
         m_fsrUpscaler->recordUpscale(descPrim);
+        m_prevFsrJitter = jitter;
+        m_hasPrevFsrJitter = true;
 
         m_secAccumImage->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -585,7 +610,8 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         glm::vec2 jitter(0.0f);
 
         const bool hasDenoiser = (config.denoiser_mode != DenoiserMode::None);
-        const bool isStationaryAccum = config.progressive_accumulation && !hasDenoiser && !cameraMovedLastFrame && (accumulatedSamples >= 1);
+        const bool fsrUpscaling = (renderW < config.width || renderH < config.height);
+        const bool isStationaryAccum = config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !cameraMovedLastFrame && (accumulatedSamples >= 1);
         if (!isStationaryAccum) {
             glm::vec2 jitterPrim = getHaltonJitter(frameIndex, fsrPhaseCount);
             bool isMgpuSampleParallel = (mgpu && mgpu->isMultiGpuActive() && config.mgpu_mode != MultiGpuMode::Off &&
@@ -597,9 +623,16 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
             } else {
                 jitter = jitterPrim;
             }
+            if (!hasDenoiser && !cameraMovedLastFrame && config.progressive_accumulation && accumulatedSamples >= 2) {
+                jitter *= (1.0f / static_cast<float>(accumulatedSamples));
+            }
         }
         desc.jitterX = jitter.x;
         desc.jitterY = jitter.y;
+        desc.cameraNear = camNear;
+        desc.cameraFar = camFar;
+        desc.cameraFovY = camFovY;
+        desc.frameTimeDeltaMs = effDtMs;
         desc.enableSharpening = config.upscaler_sharpening;
         desc.sharpness = config.upscaler_sharpening ? config.upscaler_sharpness : 0.0f;
         desc.resetHistory = resetHistory;
@@ -607,8 +640,16 @@ bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
         desc.frameIndex = frameIndex;
         desc.inputIsNormalized = true;
         desc.totalSamples = (config.progressive_accumulation && accumulatedSamples > 0) ? accumulatedSamples : 1u;
+        desc.prevJitterX = (resetHistory || !m_hasPrevFsrJitter) ? jitter.x : prevJit.x;
+        desc.prevJitterY = (resetHistory || !m_hasPrevFsrJitter) ? jitter.y : prevJit.y;
+        desc.preExposure = std::clamp(config.exposure, 0.1f, 4.0f);
+        desc.rawColorIn = (!inputIsDenoised && rawFrameImage) ? rawFrameImage->getImageView() : VK_NULL_HANDLE;
+        desc.rawSampleScale = 1.0f;
+        desc.inputIsDenoised = inputIsDenoised;
 
         m_fsrUpscaler->recordUpscale(desc);
+        m_prevFsrJitter = jitter;
+        m_hasPrevFsrJitter = true;
     }
     return true;
 }

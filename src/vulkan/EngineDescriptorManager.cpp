@@ -355,17 +355,19 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            params.prevNormalDepthImage ? params.prevNormalDepthImage->getImageView() : VK_NULL_HANDLE
+            params.prevNormalDepthImage ? params.prevNormalDepthImage->getImageView() : VK_NULL_HANDLE,
+            params.mlSkipImage ? params.mlSkipImage->getImageView() : VK_NULL_HANDLE,
+            params.mlSpecAlbedoImage ? params.mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE
         );
     }
 
     if (params.nrcManager) {
-        VkImageView mlDiffView = params.mlDiffuseImage
-            ? params.mlDiffuseImage->getImageView()
-            : (params.normalDepthImage ? params.normalDepthImage->getImageView() : VK_NULL_HANDLE);
+        VkImageView fallbackView = params.normalDepthImage ? params.normalDepthImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlDiffView = params.mlDiffuseImage ? params.mlDiffuseImage->getImageView() : fallbackView;
+        VkImageView mlSpecView = params.mlSpecularImage ? params.mlSpecularImage->getImageView() : mlDiffView;
         for (uint32_t slot = 0; slot < 2; ++slot) {
             if (params.frameImages[slot]) {
-                params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView(), mlDiffView);
+                params.nrcManager->updateDescriptors(slot, params.frameImages[slot]->getImageView(), mlDiffView, mlSpecView);
             }
         }
     }
@@ -379,8 +381,8 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
     constexpr VkDeviceSize kDummyTransferSize = 65536;
     const bool mgpuSharedActive = params.mgpu && params.mgpu->isSecondaryInitialized() &&
                                   (params.mgpu->isZeroCopyActive() || params.mgpu->isP2PDirectBarActive());
-    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 64 :
-                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 60 : 72;
+    uint32_t bytesPerPixel = (params.accumFormat == AccumFormat::RGBA16_SFLOAT) ? 80 :
+                             (params.accumFormat == AccumFormat::R11G11B10_UFLOAT) ? 76 : 88;
     VkDeviceSize bufferSize = mgpuSharedActive
         ? params.mgpu->getSharedBufferSize()
         : ((params.mgpu && params.mgpu->isSecondaryInitialized())
@@ -420,7 +422,9 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
             params.mlDiffuseImage,
             params.mlSpecularImage,
             params.mlAlbedoRoughnessImage,
-            params.mlSpecularMotionImage
+            params.mlSpecularMotionImage,
+            params.mlSkipImage,
+            params.mlSpecAlbedoImage
         );
     }
 }

@@ -52,7 +52,9 @@ public:
                            Image* normalDepthImage, Image* motionVectorImage,
                            Image* mlAlbedoRoughnessImage, Image* mlSpecularMotionImage,
                            Image* mlDiffuseImage, Image* mlSpecularImage,
-                           Image* frameImage0);
+                           Image* frameImage0,
+                           Image* mlSkipImage = nullptr,
+                           Image* mlSpecAlbedoImage = nullptr);
 
     bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory,
                         const Config& config, Camera* camera,
@@ -67,7 +69,11 @@ public:
                      Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
                      MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
                      PostProcessPipeline* postProcess, Image* outputImage,
-                     const std::function<void()>& onDescriptorsInvalidated);
+                     const std::function<void()>& onDescriptorsInvalidated,
+                     Camera* camera = nullptr,
+                     float frameTimeDeltaMs = 16.667f,
+                     Image* rawFrameImage = nullptr,
+                     bool inputIsDenoised = false);
 
     bool dispatchFsr3(VkCommandBuffer cmd, bool resetHistory,
                       const Config& config, uint32_t frameIndex,
@@ -75,10 +81,15 @@ public:
                       Image* accumImage, Image* normalDepthImage, Image* motionVectorImage,
                       MultiGpuManager* mgpu, Buffer* secTransferBuffer, uint32_t currentFrame,
                       PostProcessPipeline* postProcess, Image* outputImage,
-                      const std::function<void()>& onDescriptorsInvalidated) {
+                      const std::function<void()>& onDescriptorsInvalidated,
+                      Camera* camera = nullptr,
+                      float frameTimeDeltaMs = 16.667f,
+                      Image* rawFrameImage = nullptr,
+                      bool inputIsDenoised = false) {
         return dispatchFsr(cmd, resetHistory, config, frameIndex, cameraMovedLastFrame, accumulatedSamples,
                            accumImage, normalDepthImage, motionVectorImage, mgpu, secTransferBuffer, currentFrame,
-                           postProcess, outputImage, onDescriptorsInvalidated);
+                           postProcess, outputImage, onDescriptorsInvalidated,
+                           camera, frameTimeDeltaMs, rawFrameImage, inputIsDenoised);
     }
 
     void releaseInactivePipelines(const Config& config);
@@ -128,6 +139,8 @@ private:
     std::unique_ptr<FsrUpscaler> m_fsrUpscaler;
     std::unique_ptr<Image> m_secAccumImage;
     VkDescriptorSet m_tonemapFsrDescSet = VK_NULL_HANDLE;
+    glm::vec2 m_prevFsrJitter{ 0.0f, 0.0f };
+    bool m_hasPrevFsrJitter = false;
 
     // Cached external frame targets for lazy on-demand pipeline instantiation
     PostProcessPipeline* m_cachedPostProcess = nullptr;
@@ -140,6 +153,8 @@ private:
     Image* m_cachedMlDiffuseImage = nullptr;
     Image* m_cachedMlSpecularImage = nullptr;
     Image* m_cachedFrameImage0 = nullptr;
+    Image* m_cachedMlSkipImage = nullptr;
+    Image* m_cachedMlSpecAlbedoImage = nullptr;
 };
 
 } // namespace pathways

@@ -48,15 +48,15 @@ layout(set = 0, binding = 4,  rgba16f) readonly uniform image2D uSpecularMotion;
 layout(set = 0, binding = 5,  rgba16f) readonly uniform image2D uNormalDepth;
 layout(set = 0, binding = 6,  rgba16f) readonly uniform image2D uPrevNormalDepth;
 layout(set = 0, binding = 7,  rgba16f) readonly uniform image2D uAlbedoRoughness;
-layout(set = 0, binding = 8,  rgba16f) readonly uniform image2D uHistoryDiffuse;   // A = V^d
-layout(set = 0, binding = 9,  rgba16f) readonly uniform image2D uHistorySpecular;  // A = V^s
-layout(set = 0, binding = 10, rgba16f) readonly uniform image2D uHistoryMoments;   // M1d, M2d, M1s, M2s
+layout(set = 0, binding = 8,  rgba32f) readonly uniform image2D uHistoryDiffuse;   // A = V^d
+layout(set = 0, binding = 9,  rgba32f) readonly uniform image2D uHistorySpecular;  // A = V^s
+layout(set = 0, binding = 10, rgba32f) readonly uniform image2D uHistoryMoments;   // M1d, M2d, M1s, M2s
 layout(set = 0, binding = 11, rgba16f) readonly uniform image2D uHistoryLength;    // Ndiff, Nspec, d_prev_refl, dyn
 layout(set = 0, binding = 12, rg8)     readonly uniform image2D uPrevEdgeDensity;  // R: raw rho^(t-1)
 
-layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D uOutDiffuse;      // -> m_historyDiffuse[currSlot]
-layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D uOutSpecular;     // -> m_historySpecular[currSlot]
-layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D uOutMoments;      // -> m_historyMoments[currSlot]
+layout(set = 0, binding = 13, rgba32f) writeonly uniform image2D uOutDiffuse;      // -> m_historyDiffuse[currSlot]
+layout(set = 0, binding = 14, rgba32f) writeonly uniform image2D uOutSpecular;     // -> m_historySpecular[currSlot]
+layout(set = 0, binding = 15, rgba32f) writeonly uniform image2D uOutMoments;      // -> m_historyMoments[currSlot]
 layout(set = 0, binding = 16, rgba16f) writeonly uniform image2D uOutHistoryLength;// -> m_historyLength[currSlot]
 layout(set = 0, binding = 17, rg8)     writeonly uniform image2D uOutEdgeDensity;  // -> m_edgeDensity[currSlot]
 layout(set = 0, binding = 18, rgba16f) writeonly uniform image2D uOutNormalDepth;  // -> m_historyNormalDepth[currSlot]
@@ -79,7 +79,9 @@ layout(push_constant) uniform PushConstants {
     float depthThreshold;            // 0.08 static
     float dynamicDepthThreshold;     // 0.15 dynamic
     float mvDiscrepancyThreshold;    // 2.0 px
-    float _pad[3];
+    uint accumulatedSamples;         // Stationary accumulated sample count
+    uint upscalerCoupled;            // 1 when coupled to external temporal upscaler
+    uint _pad;
 } pc;
 
 // -----------------------------------------------------------------------------
@@ -231,6 +233,8 @@ float computeBilateralNeighborMomentsBothLDS(
     float m1S = 0.0, m2S = 0.0;
     float validNeighbors = 0.0;
     float invCenterDepth = 1.0 / max(centerDepth, 1e-4);
+    vec3 centerAlb = sampleAlbedoLDS(ldsCoord);
+    bool centerZeroAlb = (dot(centerAlb, centerAlb) <= 1e-5) && (centerDepth < 9999.0);
 
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
@@ -238,10 +242,13 @@ float computeBilateralNeighborMomentsBothLDS(
             int ny = ldsCoord.y + dy;
             int nx = ldsCoord.x + dx;
 
-            // Bilateral consistency: reject samples crossing silhouettes into background
+            // Bilateral consistency: reject samples crossing silhouettes or coplanar emitter boundaries
             vec3 nbrNorm = sampleNormalLDS(ivec2(nx, ny));
             float nbrDepth = s_linearDepth[ny][nx];
-            bool geomConsistent = (dot(centerNorm, nbrNorm) > 0.70) &&
+            vec3 nbrAlb = sampleAlbedoLDS(ivec2(nx, ny));
+            bool nbrZeroAlb = (dot(nbrAlb, nbrAlb) <= 1e-5) && (nbrDepth < 9999.0);
+            bool geomConsistent = (nbrZeroAlb == centerZeroAlb) &&
+                                  (dot(centerNorm, nbrNorm) > 0.70) &&
                                   (abs(centerDepth - nbrDepth) * invCenterDepth < 0.10);
             if (!geomConsistent) continue;
 
@@ -265,20 +272,36 @@ float computeBilateralNeighborMomentsBothLDS(
     return validNeighbors;
 }
 
-vec3 suppressFirefliesWithMoments(vec3 rawCurrRadiance, float validNeighbors, float mu, float sigma, bool isDiffuseLobe, bool isEmissive) {
+vec3 suppressFirefliesWithMoments(vec3 rawCurrRadiance, float validNeighbors, float mu, float sigma, float histMean, float histSigma, bool hasValidHist, bool isDiffuseLobe, bool isEmissive, float demodLumScale, float histLen, bool stationaryUncoupled, uint upscalerCoupled) {
+    vec3 safeRad = (any(isnan(rawCurrRadiance)) || any(isinf(rawCurrRadiance))) ? vec3(0.0) : max(rawCurrRadiance, vec3(0.0));
     if (isEmissive || validNeighbors < 3.0) {
-        return rawCurrRadiance;
+        return safeRad;
+    }
+    float clampWeight = stationaryUncoupled ? (1.0 - smoothstep(64.0, 160.0, histLen)) : 1.0;
+    if (clampWeight <= 1e-4) {
+        return safeRad;
     }
 
-    float minFireflyLum = isDiffuseLobe ? 4.0 : 8.0;
-    float lumThreshold = max(mu + 3.0 * sigma, minFireflyLum);
-    float currLum = denoiseLuminance(rawCurrRadiance);
+    float conv = smoothstep(8.0, 64.0, histLen);
+    float sigmaK = mix(3.5, 8.0, conv);
+    float meanK  = mix(3.5, 8.0, conv);
+    float baseDiffFirefly = (upscalerCoupled != 0u) ? 5.5 : 10.0;
+    float baseSpecFirefly = (upscalerCoupled != 0u) ? 9.0 : 14.0;
+    float minFireflyLum = mix(isDiffuseLobe ? baseDiffFirefly : baseSpecFirefly, isDiffuseLobe ? 28.0 : 44.0, conv) * demodLumScale;
+    if (mu <= 1e-3 && (!hasValidHist || histMean <= 1e-3)) {
+        float darkDiffFirefly = (upscalerCoupled != 0u) ? 8.0 : 14.0;
+        float darkSpecFirefly = (upscalerCoupled != 0u) ? 11.0 : 18.0;
+        minFireflyLum = mix(isDiffuseLobe ? darkDiffFirefly : darkSpecFirefly, isDiffuseLobe ? 32.0 : 48.0, conv) * demodLumScale;
+    }
+    float histBound = hasValidHist ? (histMean * meanK + sigmaK * histSigma) : 0.0;
+    float lumThreshold = max(max(mu + sigmaK * sigma, histBound), minFireflyLum);
+    float currLum = denoiseLuminance(safeRad);
     if (currLum > lumThreshold && currLum > 1e-4) {
         // Soft-clamp preserving chromaticity (smooth asymptotic rolloff)
         float clampedLum = lumThreshold + (currLum - lumThreshold) / (1.0 + (currLum - lumThreshold) / max(lumThreshold, 0.5));
-        return rawCurrRadiance * (clampedLum / currLum);
+        return mix(safeRad, safeRad * (clampedLum / currLum), clampWeight);
     }
-    return rawCurrRadiance;
+    return safeRad;
 }
 
 // -----------------------------------------------------------------------------
@@ -358,7 +381,7 @@ bool validateReprojection(
         if (zExpected <= 1e-4) {
             return false;
         }
-        float grazingFactor = 1.0 + 1.5 * (1.0 - abs(currNormal.z));
+        float grazingFactor = 1.0 + 3.0 * (1.0 - abs(currNormal.z));
         float depthRelDiffStatic = abs(zExpected - prevDepth) / max(zExpected, 1e-3);
         return (depthRelDiffStatic < pc.depthThreshold * grazingFactor);
     }
@@ -564,6 +587,8 @@ void main() {
     // ---------------- Primary reprojection ----------------
     vec2 uv = (vec2(coord) + 0.5) / resolution;
     vec2 mv = imageLoad(uMotionVectors, coord).xy;
+    vec2 mvPx = mv * resolution;
+    bool stationaryMv = (dot(mvPx, mvPx) <= 0.0025);
     vec2 prevUV = uv - mv;
     ivec2 prevCoord = ivec2(floor(prevUV * resolution));
 
@@ -572,43 +597,121 @@ void main() {
     float prevNDiff = 1.0;
     vec4 prevND = vec4(0.0);
     vec4 prevHistLenPrimary = vec4(0.0);
+    vec4 prevMomPrimary = vec4(0.0);
+    vec3 prevDiffRGB = vec3(0.0);
+    float prevRho = rhoSpatial;
 
     vec3 currViewPos = unprojectToView(coord, curZ, uCamera.tanHalfFovY, uCamera.aspectRatio, resolution);
     vec4 prevViewPos = uCamera.currViewToPrevView * vec4(currViewPos, 1.0);
     float zExpectedSurf = prevViewPos.z;
 
     if (pc.resetHistory == 0u &&
-        prevCoord.x >= 0 && prevCoord.y >= 0 &&
-        prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
+        prevUV.x >= 0.0 && prevUV.x <= 1.0 &&
+        prevUV.y >= 0.0 && prevUV.y <= 1.0) {
 
-        prevND = imageLoad(uPrevNormalDepth, prevCoord);
-        valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, currViewPos, prevViewPos,
-                                     prevCoord, prevUV, resolution, isDynamic);
+        if (stationaryMv) {
+            if (prevCoord.x >= 0 && prevCoord.y >= 0 &&
+                prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
+                prevND = imageLoad(uPrevNormalDepth, prevCoord);
+                valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, currViewPos, prevViewPos,
+                                             prevCoord, prevUV, resolution, isDynamic);
+                if (valid) {
+                    prevRho = imageLoad(uPrevEdgeDensity, prevCoord).r;
+                    prevHistLenPrimary = imageLoad(uHistoryLength, prevCoord);
+                    prevMomPrimary = imageLoad(uHistoryMoments, prevCoord);
+                    prevDiffRGB = imageLoad(uHistoryDiffuse, prevCoord).rgb;
+                }
+            }
+        } else {
+            vec2 prevSub = prevUV * resolution - 0.5;
+            ivec2 p00 = ivec2(floor(prevSub));
+            vec2 f = prevSub - vec2(p00);
+
+            float bwSum = 0.0;
+            vec4 ndAcc = vec4(0.0);
+            vec4 hlAcc = vec4(0.0);
+            vec4 momAcc = vec4(0.0);
+            float rhoAcc = 0.0;
+            vec3 diffAcc = vec3(0.0);
+            bool anyDyn = false;
+
+            for (int dy = 0; dy <= 1; ++dy) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    ivec2 tc = clamp(p00 + ivec2(dx, dy), ivec2(0), imgMax);
+                    float wx = (dx == 0) ? (1.0 - f.x) : f.x;
+                    float wy = (dy == 0) ? (1.0 - f.y) : f.y;
+                    float bw = wx * wy;
+                    if (bw <= 1e-4) continue;
+                    vec4 qND = imageLoad(uPrevNormalDepth, tc);
+                    bool qDyn = false;
+                    if (validateReprojection(curN, qND.xyz, curZ, qND.w, currViewPos, prevViewPos,
+                                             tc, prevUV, resolution, qDyn)) {
+                        bwSum += bw;
+                        ndAcc += qND * bw;
+                        hlAcc += imageLoad(uHistoryLength, tc) * bw;
+                        momAcc += imageLoad(uHistoryMoments, tc) * bw;
+                        rhoAcc += imageLoad(uPrevEdgeDensity, tc).r * bw;
+                        diffAcc += imageLoad(uHistoryDiffuse, tc).rgb * bw;
+                        anyDyn = anyDyn || qDyn;
+                    }
+                }
+            }
+
+            if (bwSum > 1e-4) {
+                float invBw = 1.0 / bwSum;
+                prevND = ndAcc * invBw;
+                float nLen = length(prevND.xyz);
+                prevND.xyz = (nLen > 1e-4) ? (prevND.xyz / nLen) : vec3(0.0, 0.0, 1.0);
+                prevHistLenPrimary = hlAcc * invBw;
+                prevMomPrimary = momAcc * invBw;
+                prevRho = rhoAcc * invBw;
+                prevDiffRGB = diffAcc * invBw;
+                valid = true;
+                isDynamic = anyDyn;
+            } else if (prevCoord.x >= 0 && prevCoord.y >= 0 &&
+                       prevCoord.x < int(pc.width) && prevCoord.y < int(pc.height)) {
+                prevND = imageLoad(uPrevNormalDepth, prevCoord);
+                valid = validateReprojection(curN, prevND.xyz, curZ, prevND.w, currViewPos, prevViewPos,
+                                             prevCoord, prevUV, resolution, isDynamic);
+                if (valid) {
+                    prevRho = imageLoad(uPrevEdgeDensity, prevCoord).r;
+                    prevHistLenPrimary = imageLoad(uHistoryLength, prevCoord);
+                    prevMomPrimary = imageLoad(uHistoryMoments, prevCoord);
+                    prevDiffRGB = imageLoad(uHistoryDiffuse, prevCoord).rgb;
+                }
+            }
+        }
     }
 
     // ---------------- Temporal edge density fusion ----------------
     // Channel R preserves the RAW temporal state rho^t (estimator integrity);
     // Channel G stores history-modulated rho_eff for downstream spatial passes.
-    float rho = rhoSpatial;
-    if (pc.resetHistory == 0u && valid) {
-        float prevRho = imageLoad(uPrevEdgeDensity, prevCoord).r;
-        rho = (1.0 - pc.temporalAlpha) * prevRho + pc.temporalAlpha * rhoSpatial;
-    }
+    float rho = valid ? ((1.0 - pc.temporalAlpha) * prevRho + pc.temporalAlpha * rhoSpatial) : rhoSpatial;
 
     // ---------------- Diffuse history length ----------------
-    bool stationaryPixel = !isDynamic && (dot(mv * resolution, mv * resolution) <= 0.0025);
+    bool stationaryPixel = !isDynamic && stationaryMv;
+    float coupledEdge = smoothstep(0.04, 0.20, rho);
+    float coupledMoveEdge = (pc.upscalerCoupled != 0u) ? smoothstep(0.12, 0.35, rho) : 0.0;
+    float maxStaticHist = (pc.upscalerCoupled != 0u)
+        ? mix(clamp(max(pc.maxHistoryLength, float(pc.accumulatedSamples)), 64.0, 128.0), 6.0, coupledEdge)
+        : clamp(max(pc.maxHistoryLength, float(pc.accumulatedSamples)), 64.0, 1024.0);
     float nDiff = 1.0;
     if (valid) {
-        prevHistLenPrimary = imageLoad(uHistoryLength, prevCoord);
         prevNDiff = prevHistLenPrimary.r;
-        float maxDiffHist = isDynamic ? 8.0 : (stationaryPixel ? 256.0 : pc.maxHistoryLength);
+        float maxMovingDiff = mix(min(pc.maxHistoryLength, 24.0), 10.0, coupledMoveEdge);
+        float maxDiffHist = isDynamic ? 8.0 : (stationaryPixel ? maxStaticHist : maxMovingDiff);
         nDiff = min(prevNDiff + 1.0, maxDiffHist);
     }
 
     // ---------------- Specular VMV reprojection track ----------------
     // When stochastic lobe selection did not spawn a specular bounce-1 ray at
     // this pixel in the current frame (dRefl <= 1e-4), fall back to primary mv.
-    vec2 specMv = (dRefl > 1e-4) ? specMotionTex.rg : mv;
+    // On rough glossy surfaces, blend VMV toward primary motion to prevent noisy
+    // single-ray hit distances from scrambling reprojection.
+    bool sharpRefl = (curRoughness < 0.20);
+    float vmvTrust = (!stationaryPixel && dRefl > 1e-4) ? (1.0 - smoothstep(0.15, 0.30, curRoughness)) : 0.0;
+    vec2 specMv = mix(mv, specMotionTex.rg, vmvTrust);
+    vec2 specMvPx = specMv * resolution;
     vec2 prevUVSpec = uv - specMv;
     ivec2 prevCoordSpec = ivec2(floor(prevUVSpec * resolution));
     bool sameSpecCoord = (prevCoordSpec == prevCoord);
@@ -616,63 +719,187 @@ void main() {
     bool validSpec = false;
     float nSpec = 1.0;
     float dOutRefl = dRefl;
+    vec4 prevMomSpec = vec4(0.0);
+    vec3 prevSpecRGB = vec3(0.0);
     if (pc.resetHistory == 0u &&
         prevUVSpec.x >= 0.0 && prevUVSpec.x <= 1.0 &&
-        prevUVSpec.y >= 0.0 && prevUVSpec.y <= 1.0 &&
-        prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
-        prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
+        prevUVSpec.y >= 0.0 && prevUVSpec.y <= 1.0) {
 
-        if (sameSpecCoord && valid && !isDynamic && dRefl <= 1e-4) {
-            // Fast path: non-dynamic primary pixel with no VMV offset reuses already-validated primary history
+        bool currIsSky = (curZ >= 9999.0);
+        if (stationaryPixel && sameSpecCoord && valid && dRefl <= 1e-4 &&
+            prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
+            prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
             validSpec = true;
-            float maxSpecFast = stationaryPixel ? 128.0 : min(pc.maxHistoryLength, 16.0);
-            nSpec = min(prevHistLenPrimary.g + 1.0, maxSpecFast);
+            nSpec = min(prevHistLenPrimary.g + 1.0, maxStaticHist);
             dOutRefl = prevHistLenPrimary.b;
-        } else {
+            prevMomSpec = prevMomPrimary;
+            prevSpecRGB = imageLoad(uHistorySpecular, prevCoordSpec).rgb;
+        } else if (dot(specMvPx, specMvPx) <= 0.0025 &&
+                   prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
+                   prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
             vec4 prevNDSpec = (sameSpecCoord && valid) ? prevND : imageLoad(uPrevNormalDepth, prevCoordSpec);
-            bool currIsSky = (curZ >= 9999.0);
             bool prevSpecIsSky = (prevNDSpec.w >= 9999.0);
-
             if (currIsSky == prevSpecIsSky) {
                 vec3 prevNormalSpecInCurr = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNDSpec.xyz);
                 float normalClosenessSpec = dot(curN, prevNormalSpecInCurr);
-
                 vec4 prevHistLenSpec = (sameSpecCoord && valid) ? prevHistLenPrimary : imageLoad(uHistoryLength, prevCoordSpec);
                 float dPrevRefl = prevHistLenSpec.b;
-
                 float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
                 bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && sameSpecCoord);
-
                 bool hasBothReflDist = (dRefl > 1e-4) && (dPrevRefl > 1e-4);
                 bool stationaryMatch = valid && sameSpecCoord && stationaryPixel;
-                bool hitDistConsistent = stationaryMatch ||
+                bool hitDistConsistent = stationaryMatch || !sharpRefl ||
                     (hasBothReflDist
-                        ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.20)
+                        ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.25)
                         : valid);
-
                 if ((currIsSky || normalClosenessSpec > 0.82) && reflectorDepthConsistent && hitDistConsistent) {
                     validSpec = true;
-                    float maxSpecMoving = min(pc.maxHistoryLength, 16.0);
-                    float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? 128.0 : maxSpecMoving);
+                    float maxSpecMoving = mix(min(pc.maxHistoryLength, 16.0), 8.0, coupledMoveEdge);
+                    float maxSpecHist = isDynamic ? 8.0 : (stationaryMatch ? maxStaticHist : maxSpecMoving);
                     nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
                     if (dOutRefl <= 1e-4) {
                         dOutRefl = dPrevRefl;
+                    }
+                    prevMomSpec = (sameSpecCoord && valid) ? prevMomPrimary : imageLoad(uHistoryMoments, prevCoordSpec);
+                    prevSpecRGB = imageLoad(uHistorySpecular, prevCoordSpec).rgb;
+                }
+            }
+        } else {
+            vec2 prevSpecSub = prevUVSpec * resolution - 0.5;
+            ivec2 sp00 = ivec2(floor(prevSpecSub));
+            vec2 sf = prevSpecSub - vec2(sp00);
+
+            float sbwSum = 0.0;
+            vec4 spHlAcc = vec4(0.0);
+            vec4 spMomAcc = vec4(0.0);
+            vec3 spColAcc = vec3(0.0);
+            for (int dy = 0; dy <= 1; ++dy) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    ivec2 stc = clamp(sp00 + ivec2(dx, dy), ivec2(0), imgMax);
+                    float wx = (dx == 0) ? (1.0 - sf.x) : sf.x;
+                    float wy = (dy == 0) ? (1.0 - sf.y) : sf.y;
+                    float sbw = wx * wy;
+                    if (sbw <= 1e-4) continue;
+                    vec4 qNDSpec = imageLoad(uPrevNormalDepth, stc);
+                    bool qPrevSpecIsSky = (qNDSpec.w >= 9999.0);
+                    if (currIsSky != qPrevSpecIsSky) continue;
+                    vec3 qNormalSpecInCurr = normalize(mat3(uCamera.prevViewToCurrViewRot) * qNDSpec.xyz);
+                    float qNormClose = dot(curN, qNormalSpecInCurr);
+                    float qSurfRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - qNDSpec.w) / max(zExpectedSurf, 1e-3));
+                    bool qDepthOk = currIsSky || (qSurfRelDiff < 0.12);
+                    if (!(currIsSky || qNormClose > 0.82) || !qDepthOk) continue;
+                    vec4 qHistLenSpec = imageLoad(uHistoryLength, stc);
+                    float qDPrevRefl = qHistLenSpec.b;
+                    bool qHasBoth = (dRefl > 1e-4) && (qDPrevRefl > 1e-4);
+                    bool qHitDistOk = !sharpRefl ||
+                        (qHasBoth
+                            ? (abs(dRefl - qDPrevRefl) / max(max(dRefl, qDPrevRefl), 1e-3) < 0.25)
+                            : valid);
+                    if (!qHitDistOk) continue;
+                    sbwSum += sbw;
+                    spHlAcc += qHistLenSpec * sbw;
+                    spMomAcc += imageLoad(uHistoryMoments, stc) * sbw;
+                    spColAcc += imageLoad(uHistorySpecular, stc).rgb * sbw;
+                }
+            }
+            if (sbwSum > 1e-4) {
+                float invSbw = 1.0 / sbwSum;
+                vec4 avgHlSpec = spHlAcc * invSbw;
+                validSpec = true;
+                float maxSpecMoving = mix(min(pc.maxHistoryLength, 16.0), 8.0, coupledMoveEdge);
+                float maxSpecHist = isDynamic ? 8.0 : maxSpecMoving;
+                nSpec = min(avgHlSpec.g + 1.0, maxSpecHist);
+                if (dOutRefl <= 1e-4) {
+                    dOutRefl = avgHlSpec.b;
+                }
+                prevMomSpec = spMomAcc * invSbw;
+                prevSpecRGB = spColAcc * invSbw;
+            } else if (prevCoordSpec.x >= 0 && prevCoordSpec.y >= 0 &&
+                       prevCoordSpec.x < int(pc.width) && prevCoordSpec.y < int(pc.height)) {
+                vec4 prevNDSpec = (sameSpecCoord && valid) ? prevND : imageLoad(uPrevNormalDepth, prevCoordSpec);
+                bool prevSpecIsSky = (prevNDSpec.w >= 9999.0);
+                if (currIsSky == prevSpecIsSky) {
+                    vec3 prevNormalSpecInCurr = normalize(mat3(uCamera.prevViewToCurrViewRot) * prevNDSpec.xyz);
+                    float normalClosenessSpec = dot(curN, prevNormalSpecInCurr);
+                    vec4 prevHistLenSpec = (sameSpecCoord && valid) ? prevHistLenPrimary : imageLoad(uHistoryLength, prevCoordSpec);
+                    float dPrevRefl = prevHistLenSpec.b;
+                    float surfDepthRelDiff = currIsSky ? 0.0 : (abs(zExpectedSurf - prevNDSpec.w) / max(zExpectedSurf, 1e-3));
+                    bool reflectorDepthConsistent = currIsSky || (surfDepthRelDiff < 0.12) || (valid && sameSpecCoord);
+                    bool hasBothReflDist = (dRefl > 1e-4) && (dPrevRefl > 1e-4);
+                    bool hitDistConsistent = !sharpRefl ||
+                        (hasBothReflDist
+                            ? (abs(dRefl - dPrevRefl) / max(max(dRefl, dPrevRefl), 1e-3) < 0.25)
+                            : valid);
+                    if ((currIsSky || normalClosenessSpec > 0.82) && reflectorDepthConsistent && hitDistConsistent) {
+                        validSpec = true;
+                        float maxSpecMoving = mix(min(pc.maxHistoryLength, 16.0), 8.0, coupledMoveEdge);
+                        float maxSpecHist = isDynamic ? 8.0 : maxSpecMoving;
+                        nSpec = min(prevHistLenSpec.g + 1.0, maxSpecHist);
+                        if (dOutRefl <= 1e-4) {
+                            dOutRefl = dPrevRefl;
+                        }
+                        prevMomSpec = (sameSpecCoord && valid) ? prevMomPrimary : imageLoad(uHistoryMoments, prevCoordSpec);
+                        prevSpecRGB = imageLoad(uHistorySpecular, prevCoordSpec).rgb;
                     }
                 }
             }
         }
     }
 
+    // Fallback to validated primary surface reprojection on narrow moving reflectors
+    // when virtual-motion reprojection lands off the reflector silhouette.
+    if (pc.resetHistory == 0u && !validSpec && valid && !stationaryPixel && curZ < 9999.0 && curRoughness < 0.70) {
+        vec2 prevSub = prevUV * resolution - 0.5;
+        ivec2 p00 = ivec2(floor(prevSub));
+        vec2 f = prevSub - vec2(p00);
+        float fbW = 0.0;
+        vec3 fbSpec = vec3(0.0);
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                ivec2 tc = clamp(p00 + ivec2(dx, dy), ivec2(0), imgMax);
+                float bw = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
+                if (bw <= 1e-4) continue;
+                vec4 qND = imageLoad(uPrevNormalDepth, tc);
+                bool qDyn = false;
+                if (validateReprojection(curN, qND.xyz, curZ, qND.w, currViewPos, prevViewPos,
+                                         tc, prevUV, resolution, qDyn)) {
+                    fbW += bw;
+                    fbSpec += imageLoad(uHistorySpecular, tc).rgb * bw;
+                }
+            }
+        }
+        prevSpecRGB = (fbW > 1e-4)
+            ? (fbSpec / fbW)
+            : imageLoad(uHistorySpecular, clamp(prevCoord, ivec2(0), imgMax)).rgb;
+        validSpec = true;
+        nSpec = min(prevHistLenPrimary.g + 1.0, isDynamic ? 4.0 : 6.0);
+        if (dOutRefl <= 1e-4) {
+            dOutRefl = prevHistLenPrimary.b;
+        }
+        prevMomSpec = prevMomPrimary;
+    }
+
     // ---------------- Fused bilateral moments & firefly suppression ----------------
+    float histMeanD = prevMomPrimary.x;
+    float histSigmaD = sqrt(max(0.0, prevMomPrimary.y - prevMomPrimary.x * prevMomPrimary.x));
+    float histMeanS = prevMomSpec.z;
+    float histSigmaS = sqrt(max(0.0, prevMomSpec.w - prevMomSpec.z * prevMomSpec.z));
+
     float muNDiff = 0.0, sigmaNDiff = 0.0;
     float muNSpec = 0.0, sigmaNSpec = 0.0;
     float validNeighbors = computeBilateralNeighborMomentsBothLDS(
         ldsCoord, curN, curZ, muNDiff, sigmaNDiff, muNSpec, sigmaNSpec);
 
-    vec3 currDiff = suppressFirefliesWithMoments(rawCurrDiff, validNeighbors, muNDiff, sigmaNDiff, true, isEmissive);
-    float mirrorBypass = 1.0 - smoothstep(0.02, 0.08, curRoughness);
-    vec3 currSpec = mix(suppressFirefliesWithMoments(curSpecTex.rgb, validNeighbors, muNSpec, sigmaNSpec, false, isEmissive),
-                        curSpecTex.rgb, mirrorBypass);
+    float demodLumScale = isEmissive ? 1.0 : (1.0 / clamp(denoiseLuminance(demodAlb), 0.01, 1.0));
+    bool statUncoupled = (stationaryPixel && pc.upscalerCoupled == 0u);
+    vec3 currDiff = suppressFirefliesWithMoments(rawCurrDiff, validNeighbors, muNDiff, sigmaNDiff, histMeanD, histSigmaD, valid, true, isEmissive, demodLumScale, valid ? nDiff : 1.0, statUncoupled, pc.upscalerCoupled);
+
+    float mirrorBypass = (specMotionTex.z < 0.0)
+        ? (1.0 - smoothstep(0.012, 0.05, curRoughness))
+        : (1.0 - smoothstep(0.008, 0.016, curRoughness));
+    vec3 suppressedSpec = suppressFirefliesWithMoments(curSpecTex.rgb, validNeighbors, muNSpec, sigmaNSpec, histMeanS, histSigmaS, validSpec, false, isEmissive, 1.0, validSpec ? nSpec : 1.0, statUncoupled, pc.upscalerCoupled);
+    vec3 safeRawSpec = (any(isnan(curSpecTex.rgb)) || any(isinf(curSpecTex.rgb))) ? vec3(0.0) : max(curSpecTex.rgb, vec3(0.0));
+    vec3 currSpec = mix(suppressedSpec, safeRawSpec, mirrorBypass);
 
     float lumDiff = denoiseLuminance(currDiff);
     float lumSpec = denoiseLuminance(currSpec);
@@ -688,54 +915,60 @@ void main() {
         : ((validNeighbors >= 3.0) ? (sigmaNSpec * sigmaNSpec + centerDevSpec * centerDevSpec) : 0.01);
 
     // Motion indicators (in pixel units)
-    vec2 mvPx = mv * resolution;
-    vec2 specMvPx = specMv * resolution;
-    bool hasMotion = isDynamic || (dot(mvPx, mvPx) > 0.0025);
+    bool hasMotion = isDynamic || !stationaryMv;
     bool hasSpecMotion = isDynamic || (dot(specMvPx, specMvPx) > 0.0025) || hasMotion;
 
     // ---------------- Temporal accumulation ----------------
     vec3 accDiff = currDiff;
     vec3 accSpec = currSpec;
     vec4 accMom;
-    vec4 prevMomPrimary = vec4(0.0);
     float varDiff;
     float varSpec;
 
     if (valid) {
-        vec4 prevDiffTex = imageLoad(uHistoryDiffuse, prevCoord);
-        vec4 prevMom = imageLoad(uHistoryMoments, prevCoord);
-        prevMomPrimary = prevMom;
+        vec4 prevMom = prevMomPrimary;
 
-        if (hasMotion && validNeighbors >= 3.0) {
-            float prevLumD = denoiseLuminance(prevDiffTex.rgb);
+        if ((isDynamic || hasMotion) && validNeighbors >= 3.0) {
+            float prevLumD = denoiseLuminance(prevDiffRGB);
             float tempSigmaD = sqrt(max(0.0, prevMom.y - prevMom.x * prevMom.x));
-            float denomD = max(max(sigmaNDiff, tempSigmaD), 0.05 * max(prevLumD, muNDiff) + 0.01);
+            float denomD = max(max(sigmaNDiff, tempSigmaD), 0.35 * max(prevLumD, muNDiff) + 0.05);
             float deltaLD = abs(prevLumD - muNDiff) / denomD;
-            float threshD = 2.5;
+            float threshD = isDynamic ? 3.5 : 4.0;
             if (deltaLD > threshD) {
-                float react = clamp((deltaLD - threshD) / 4.0, 0.0, 0.85);
-                nDiff = mix(nDiff, 2.0, react);
+                float react = clamp((deltaLD - threshD) / 3.5, 0.0, 0.90);
+                nDiff = mix(nDiff, 1.5, react);
             }
         }
 
-        float minAlphaDiff = hasMotion ? 0.03 : 0.005;
-        float alphaDiff = max(1.0 / nDiff, minAlphaDiff);
-        accDiff = mix(prevDiffTex.rgb, currDiff, alphaDiff);
+        float alphaDiff = (stationaryPixel && (pc.upscalerCoupled == 0u || coupledEdge < 0.5))
+            ? (1.0 / max(nDiff, 1.0))
+            : max(1.0 / max(nDiff, 1.0), isDynamic ? 0.15 : (hasMotion ? 0.06 : 0.02));
+        accDiff = mix(prevDiffRGB, currDiff, alphaDiff);
 
         accMom.x = mix(prevMom.x, lumDiff, alphaDiff);
         accMom.y = mix(prevMom.y, lumDiff * lumDiff, alphaDiff);
-        varDiff = max(0.0, accMom.y - accMom.x * accMom.x);
+        float rawVarDiff = max(0.0, accMom.y - accMom.x * accMom.x);
 
-        // SVGF Section 4.2: supplement noisy temporal moments with spatial variance when N < 4,
-        // and decay variance by 1 / max(1, N * 0.25) as temporal history converges.
         float spatialBlendD = clamp(1.0 - (nDiff - 1.0) / 3.0, 0.0, 1.0);
-        varDiff = mix(varDiff, max(varDiff, varSpatialDiff), spatialBlendD);
-        varDiff = max(varDiff, varSpatialDiff * 0.25);
+        varDiff = mix(rawVarDiff, max(rawVarDiff, varSpatialDiff), spatialBlendD);
+        float flatInterior = 1.0 - smoothstep(0.04, 0.14, rho);
+        float varDenomD = (stationaryPixel && pc.upscalerCoupled == 0u && nDiff > 64.0)
+            ? mix(nDiff, 64.0 + 0.15 * (nDiff - 64.0), flatInterior)
+            : max(nDiff, 1.0);
+        float varScaleD = (stationaryPixel && (pc.upscalerCoupled == 0u || coupledEdge < 0.5))
+            ? min(1.0, 3.0 / varDenomD)
+            : min(1.0, 4.0 / max(nDiff, 1.0));
+        varDiff *= varScaleD;
     } else {
         accMom.x = lumDiff;
         accMom.y = lumDiff * lumDiff + varSpatialDiff;
         varDiff = varSpatialDiff;
     }
+    float disoccDemodScale = mix(1.0, clamp(demodLumScale, 1.0, 6.0), clamp(1.0 - (nDiff - 1.0) / 3.0, 0.0, 1.0));
+    float priorFloorD = (curZ < 9999.0 && !isEmissive && nDiff < 8.0)
+        ? (0.04 / max(nDiff * nDiff, 1.0)) * clamp(1.0 - (nDiff - 1.0) / 7.0, 0.0, 1.0) * disoccDemodScale
+        : 0.0;
+    varDiff = max(varDiff, priorFloorD);
 
     if (curRoughness >= 0.70 && lumSpec <= 1e-5 && muNSpec <= 1e-5 && dRefl <= 1e-4) {
         accSpec = vec3(0.0);
@@ -743,36 +976,44 @@ void main() {
         accMom.w = 0.0;
         varSpec = 0.0;
     } else if (validSpec) {
-        vec4 prevSpecTex = imageLoad(uHistorySpecular, prevCoordSpec);
-        vec4 prevMom = (sameSpecCoord && valid) ? prevMomPrimary : imageLoad(uHistoryMoments, prevCoordSpec);
+        vec4 prevMom = prevMomSpec;
 
-        if (hasSpecMotion && validNeighbors >= 3.0) {
-            float prevLumS = denoiseLuminance(prevSpecTex.rgb);
+        if ((isDynamic || hasSpecMotion) && validNeighbors >= 3.0) {
+            float prevLumS = denoiseLuminance(prevSpecRGB);
             float tempSigmaS = sqrt(max(0.0, prevMom.w - prevMom.z * prevMom.z));
-            float denomS = max(max(sigmaNSpec, tempSigmaS), 0.05 * max(prevLumS, muNSpec) + 0.01);
+            float denomS = max(max(sigmaNSpec, tempSigmaS), 0.35 * max(prevLumS, muNSpec) + 0.05);
             float deltaLS = abs(prevLumS - muNSpec) / denomS;
-            float threshS = 2.0;
+            float threshS = isDynamic ? 3.0 : 3.5;
             if (deltaLS > threshS) {
-                float reactS = clamp((deltaLS - threshS) / 3.5, 0.0, 0.85);
+                float reactS = clamp((deltaLS - threshS) / 3.0, 0.0, 0.90);
                 nSpec = mix(nSpec, 1.5, reactS);
             }
         }
 
-        float minAlphaSpec = hasSpecMotion ? 0.08 : 0.01;
-        float alphaSpec = max(1.0 / nSpec, minAlphaSpec);
-        accSpec = mix(prevSpecTex.rgb, currSpec, alphaSpec);
+        float alphaSpec = (stationaryPixel && !hasSpecMotion && pc.upscalerCoupled == 0u)
+            ? (1.0 / max(nSpec, 1.0))
+            : max(1.0 / max(nSpec, 1.0), isDynamic ? 0.15 : (hasSpecMotion ? 0.08 : 0.02));
+        accSpec = mix(prevSpecRGB, currSpec, alphaSpec);
 
         accMom.z = mix(prevMom.z, lumSpec, alphaSpec);
         accMom.w = mix(prevMom.w, lumSpec * lumSpec, alphaSpec);
-        varSpec = max(0.0, accMom.w - accMom.z * accMom.z);
+        float rawVarSpec = max(0.0, accMom.w - accMom.z * accMom.z);
 
         float spatialBlendS = clamp(1.0 - (nSpec - 1.0) / 3.0, 0.0, 1.0);
-        varSpec = mix(varSpec, max(varSpec, varSpatialSpec), spatialBlendS);
+        varSpec = mix(rawVarSpec, max(rawVarSpec, varSpatialSpec), spatialBlendS);
+        float varScaleS = (stationaryPixel && !hasSpecMotion && pc.upscalerCoupled == 0u)
+            ? min(1.0, 3.0 / max(nSpec, 1.0))
+            : min(1.0, 4.0 / max(nSpec, 1.0));
+        varSpec *= varScaleS;
     } else {
         accMom.z = lumSpec;
         accMom.w = lumSpec * lumSpec + varSpatialSpec;
         varSpec = varSpatialSpec;
     }
+    float priorFloorS = (curZ < 9999.0 && !isEmissive && curRoughness >= 0.08 && nSpec < 6.0)
+        ? (0.04 / max(nSpec * nSpec, 1.0)) * clamp(1.0 - (nSpec - 1.0) / 5.0, 0.0, 1.0)
+        : 0.0;
+    varSpec = max(varSpec, priorFloorS);
 
     // ---------------- Dual-channel effective edge density ----------------
     float rhoEffective = rho * clamp(nDiff / 8.0, 0.25, 1.0);
@@ -783,7 +1024,7 @@ void main() {
     float clampedVarDiff = clamp(varDiff, 0.0, 65000.0);
     float clampedVarSpec = clamp(varSpec, 0.0, 65000.0);
     bool hasSpecChannel = (curRoughness < 0.70 || denoiseLuminance(outSpec) > 1e-5 || clampedVarSpec > 1e-6);
-    float packedVarDiff = hasSpecChannel ? -max(clampedVarDiff, 1e-5) : clampedVarDiff;
+    float packedVarDiff = hasSpecChannel ? -max(clampedVarDiff, 2e-6) : clampedVarDiff;
 
     imageStore(uOutDiffuse, coord, vec4(outDiff, packedVarDiff));
     imageStore(uOutSpecular, coord, hasSpecChannel ? vec4(outSpec, clampedVarSpec) : vec4(0.0));
