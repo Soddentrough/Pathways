@@ -118,21 +118,90 @@ float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
 // paths one segment longer than the budget -> weight 0. NEE-only lights keep
 // weight 1 (they are NEE'd at every vertex in the reference as well).
 // With indirect lighting disabled there is no BSDF strategy -> weight 1.
-float neeMisWeight(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool canContinue) {
+// Deterministic effective light-sample multiplier for Bounce-0 ReSTIR DI vs Bounce-1 BSDF emitter hits.
+// Depends solely on uniform frame/scene parameters so NEE and BSDF-hit weights sum to 1.0 pointwise.
+float restirDiMisLightScale(uint numLights) {
+    float freshM = float(max(min(numLights, 8u), 1u));
+    bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
+    if (!hasHistory) return freshM;
+    return min(freshM * 3.0, 40.0);
+}
+
+uint restirDiFreshM(uint numLights, uint captureMlData) {
+#ifdef ML_CAPTURE_UPWAYS_V4_BIT
+    if ((captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) return max(min(numLights, 8u), 1u);
+#else
+    if ((captureMlData & 4u) != 0u) return max(min(numLights, 8u), 1u);
+#endif
+    if (numLights <= 1u) return 1u;
+    if (numLights > 4096u) return (captureMlData == 0u) ? 6u : 4u;
+    return min(numLights, 16u);
+}
+
+float restirDiMisLightScale(uint numLights, uint captureMlData) {
+#ifdef ML_CAPTURE_UPWAYS_V4_BIT
+    if ((captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) return float(max(min(numLights, 8u), 1u));
+#else
+    if ((captureMlData & 4u) != 0u) return float(max(min(numLights, 8u), 1u));
+#endif
+    float freshM = float(restirDiFreshM(numLights, captureMlData));
+    bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
+    if (!hasHistory || numLights <= 4u) return freshM;
+    if (captureMlData != 0u || numLights > 4096u) {
+        return min(freshM * 2.5, 24.0);
+    }
+    return min(freshM * 4.0, 64.0);
+}
+
+uint restirSecondaryFreshM(uint bounce, uint numLights, bool isSpecularPath, uint captureMlData) {
+    if (numLights <= 1u) return 1u;
+    bool rawRestirMode = (captureMlData == 0u);
+    if (numLights > 4096u) {
+        if (bounce == 1u) {
+            return isSpecularPath ? 2u : (rawRestirMode ? 2u : 1u);
+        }
+        return 1u;
+    }
+    if (bounce == 1u) {
+        return min(numLights, isSpecularPath ? (rawRestirMode ? 32u : 16u) : (rawRestirMode ? 16u : 8u));
+    }
+    if (bounce == 2u) {
+        return min(numLights, isSpecularPath ? 16u : (rawRestirMode ? 8u : 4u));
+    }
+    return min(numLights, rawRestirMode ? 4u : 2u);
+}
+
+float restirSecondaryMisLightScale(uint spawnBounce, uint numLights, uint captureMlData, uint enableNrc) {
+    if (captureMlData != 0u || enableNrc != 0u || numLights <= 1u) return 1.0;
+    if ((ubo.flags & (1u << 9)) == 0u || (ubo.flags & (1u << 10)) != 0u) return 1.0;
+    if (spawnBounce == 1u) {
+        bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
+        float freshM1 = float(restirSecondaryFreshM(1u, numLights, false, captureMlData));
+        return (freshM1 <= 1.0) ? 1.0 : (hasHistory ? min(freshM1 * 2.5, 40.0) : freshM1);
+    }
+    return float(restirSecondaryFreshM(spawnBounce, numLights, false, captureMlData));
+}
+
+float neeMisWeightScaled(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool canContinue, float lightSampleScale) {
     if ((ubo.flags & UBO_FLAG_DBG_NO_NEE_AREA) != 0u) return 0.0;
     if (!lightUsesMis(lightIdx)) return 1.0;
     if ((ubo.flags & UBO_FLAG_INDIRECT_LIGHT) == 0u) return 1.0;
     if (!canContinue) return 0.0;
     if (misReferenceMode()) return 0.0;
+    float pl = lightPdfSolidAngle * max(lightSampleScale, 1.0);
     float pb = quantizeBsdfPdf(bsdfPdf);
-    return lightPdfSolidAngle / (lightPdfSolidAngle + pb);
+    return pl / (pl + pb);
+}
+
+float neeMisWeight(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool canContinue) {
+    return neeMisWeightScaled(lightIdx, lightPdfSolidAngle, bsdfPdf, canContinue, 1.0);
 }
 
 // ---- BSDF-hit side ------------------------------------------------------------
 // Weight of emission found by a BSDF-sampled ray (origin, dir, hitT) whose
 // previous vertex encoded its sampling pdf as pdfCode.
-float emitterHitMisWeight(uint hitType, uint primId, uint instId, vec3 origin, vec3 dir, float hitT,
-                          uint pdfCode, uint numLights) {
+float emitterHitMisWeightScaled(uint hitType, uint primId, uint instId, vec3 origin, vec3 dir, float hitT,
+                                uint pdfCode, uint numLights, float lightSampleScale) {
     if (hitType != 0u || pdfCode == 0u) return 1.0;
     if ((ubo.flags & UBO_FLAG_DBG_NO_BSDF_EMIT) != 0u) return 0.0;
     if ((ubo.flags & UBO_FLAG_DIRECT_LIGHT) == 0u || numLights == 0u) return 1.0;
@@ -157,8 +226,14 @@ float emitterHitMisWeight(uint hitType, uint primId, uint instId, vec3 origin, v
     if (cosL <= 0.0) return 1.0;       // back side: NEE never samples it
     if (misReferenceMode()) return 1.0;
     float pl = misLightSelectPdf(li, origin, numLights) * (hitT * hitT) / max(L.emission.w * cosL, 1e-12);
+    pl *= max(lightSampleScale, 1.0);
     float pb = decodeBsdfPdf(pdfCode);
     return pb / (pb + pl);
+}
+
+float emitterHitMisWeight(uint hitType, uint primId, uint instId, vec3 origin, vec3 dir, float hitT,
+                          uint pdfCode, uint numLights) {
+    return emitterHitMisWeightScaled(hitType, primId, instId, origin, dir, hitT, pdfCode, numLights, 1.0);
 }
 
 #endif // MIS_COMMON_GLSL

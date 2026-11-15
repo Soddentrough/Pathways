@@ -162,8 +162,9 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/compute/nrc_resolve.comp
     ${SHADER_DIR}/compute/wavefront_resolve.comp
-    ${SHADER_DIR}/compute/upways_temporal.comp
-    ${SHADER_DIR}/compute/upways_neural_guide.comp
+    ${SHADER_DIR}/compute/upways_denoise_prep.comp
+    ${SHADER_DIR}/compute/upways_denoiser_wmma.comp
+    ${SHADER_DIR}/compute/upways_upscaler_wmma.comp
     ${SHADER_DIR}/compute/upways_upscale_resolve.comp
     ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
@@ -259,6 +260,12 @@ add_specialized_wf_shader(wavefront_shade_complex_restir.comp wavefront_shade_co
 add_specialized_wf_shader(wavefront_shade_complex_sec_restir.comp wavefront_shade_complex.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1)
 add_specialized_wf_shader(wavefront_shade_dielectric_restir.comp wavefront_shade_dielectric.comp -DENABLE_RESTIR_PT=1)
 add_specialized_wf_shader(wavefront_shade_emissive_restir.comp wavefront_shade_emissive.comp -DENABLE_RESTIR_PT=1)
+
+# Upways 4.0 FP16 WMMA software-E4M3 fallback variants
+add_specialized_wf_shader(upways_denoise_prep.fp16.comp upways_denoise_prep.comp -DUPWAYS_FP16_WMMA=1)
+add_specialized_wf_shader(upways_denoiser_wmma.fp16.comp upways_denoiser_wmma.comp -DUPWAYS_FP16_WMMA=1)
+add_specialized_wf_shader(upways_upscaler_wmma.fp16.comp upways_upscaler_wmma.comp -DUPWAYS_FP16_WMMA=1)
+add_specialized_wf_shader(upways_upscale_resolve.fp16.comp upways_upscale_resolve.comp -DUPWAYS_FP16_WMMA=1)
 
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 

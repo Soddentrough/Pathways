@@ -158,7 +158,9 @@ public:
         uint32_t hasEnvMap,
         float envIntensity,
         uint32_t useHwRT,
-        const Config& config
+        const Config& config,
+        Image* mlSkipImage = nullptr,
+        Image* mlSpecAlbedoImage = nullptr
     );
 
     // Getters

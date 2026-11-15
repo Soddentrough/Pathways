@@ -9,7 +9,7 @@ namespace pathways {
 // 32-byte ReSTIR DI reservoir. Must match `DiReservoir` in
 // shaders/compute/restir_common.glsl (scalar-only std430 layout).
 struct DiReservoirGPU {
-    uint32_t idxM;        // [15:0] light index, [31:16] M
+    uint32_t idxM;        // [23:0] light index (up to 16.7M lights), [31:24] M (0..255)
     float    wSum;        // RIS weight sum
     float    targetPdf;   // p-hat of the selected sample at the storing pixel
     uint32_t flags;       // [7:0] age, [8] valid, [9] trans lobe, [25:10] oct16(x1 normal)

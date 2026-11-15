@@ -1009,7 +1009,7 @@ int main() {
         // 12c. Direct Illumination Occlusion Confidence Preservation (Fix 1)
         // Simulate a reservoir after finding a candidate light
         pathways::DiReservoirGPU r{};
-        r.idxM = (4u << 16) | 2u; // M = 4, light index = 2
+        r.idxM = (4u << 24) | 640834u; // M = 4 (8-bit), light index = 640,834 (24-bit, > 65535)
         r.wSum = 12.5f;
         r.targetPdf = 2.5f;
         r.flags = 0x100u; // valid bit set
@@ -1029,8 +1029,8 @@ int main() {
         assert_near(secDirectL.x, 0.0f, 1e-6f, "Occluded shadow ray produces zero current-frame radiance");
         assert_true((r.flags & 0x100u) != 0u, "Reservoir valid flag PRESERVED despite occlusion");
         assert_near(r.wSum, 12.5f, 1e-6f, "Reservoir wSum PRESERVED despite occlusion");
-        assert_true((r.idxM >> 16) == 4u, "Reservoir confidence counter M PRESERVED despite occlusion");
-        assert_true((r.idxM & 0xFFFFu) == 2u, "Reservoir light index candidate PRESERVED despite occlusion");
+        assert_true(((r.idxM >> 24) & 0xFFu) == 4u, "Reservoir confidence counter M (8-bit) PRESERVED despite occlusion");
+        assert_true((r.idxM & 0xFFFFFFu) == 640834u, "Reservoir 24-bit light index (>65535) PRESERVED without 16-bit wraparound");
 
         // 12d. Specular Mirror Partitioning (Roughness Gating, Fix 3)
         auto evaluateRoughnessPartitioning = [](float roughness, bool enableRestirFlag) {

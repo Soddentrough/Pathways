@@ -372,6 +372,8 @@ GpuDeviceNode::~GpuDeviceNode() {
     tlasUpdatePipeline.reset();
     rtpKhrPipeline.reset();
     wavefrontPipeline.reset();
+    restirManager.reset();
+    nrcManager.reset();
     if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
     for (uint32_t i = 0; i < NUM_IN_FLIGHT; ++i) {
         if (queryPools[i]) vkDestroyQueryPool(device, queryPools[i], nullptr);
@@ -405,6 +407,8 @@ GpuDeviceNode::~GpuDeviceNode() {
     mlSpecularImage.reset();
     mlAlbedoRoughnessImage.reset();
     mlSpecularMotionImage.reset();
+    mlSkipImage.reset();
+    mlSpecAlbedoImage.reset();
     upscaler.reset();
 }
 
@@ -1191,15 +1195,15 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
     const VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * 8);
     VkDeviceSize cbTotalSize = cbRadAligned;
     if (needMl) {
-        cbTotalSize += 6 * cbPlaneAligned;
+        cbTotalSize += 8 * cbPlaneAligned;
     } else if (copyMv) {
         cbTotalSize += (needNormals ? 2 : 1) * cbPlaneAligned;
     }
 
-    // SampleParallel: radiance (+ mlDiffuse + mlSpecular only when ML guides are active)
+    // SampleParallel: radiance (+ mlDiffuse + mlSpecular + mlSkip only when ML guides are active)
     const VkDeviceSize spRadAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * bpp);
     const VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * 8);
-    const VkDeviceSize spTotalSize = spRadAligned + (needMl ? 2 * spPlaneAligned : 0);
+    const VkDeviceSize spTotalSize = spRadAligned + (needMl ? 3 * spPlaneAligned : 0);
 
     const MultiGpuMode effectiveMode = (m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : m_mode;
     if (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off) {
@@ -1239,6 +1243,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secConfig.gpu_index = secondaryGpuIndex; // Explicit secondary hardware GPU
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
+    {
+        const bool hasFocalBounds =
+            (scene.focalBoundsMin.x < scene.focalBoundsMax.x) &&
+            (scene.focalBoundsMin.y < scene.focalBoundsMax.y) &&
+            (scene.focalBoundsMin.z < scene.focalBoundsMax.z);
+        m_focalBoundsMin = hasFocalBounds ? scene.focalBoundsMin : scene.boundsMin;
+        m_focalBoundsMax = hasFocalBounds ? scene.focalBoundsMax : scene.boundsMax;
+    }
     m_hasDielectrics = scene.hasDielectrics;
     m_dielectricBoundsMin = scene.dielectricBoundsMin;
     m_dielectricBoundsMax = scene.dielectricBoundsMax;
@@ -1830,6 +1842,9 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 }
             });
             updateSecondaryWavefrontDescriptors(secNode.get());
+            if (config.enable_nrc && config.mgpu_mode != MultiGpuMode::Off) {
+                ensureSecondaryNrc(secNode.get());
+            }
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
         } catch (const std::exception& e) {
             Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}. Falling back to RTP.", e.what());
@@ -1958,6 +1973,8 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
             secNode->mlSpecularImage.reset();
             secNode->mlAlbedoRoughnessImage.reset();
             secNode->mlSpecularMotionImage.reset();
+            secNode->mlSkipImage.reset();
+            secNode->mlSpecAlbedoImage.reset();
 
             VkDescriptorImageInfo fallbackInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
             for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
@@ -1968,6 +1985,15 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
                     { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr }
                 };
                 vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
+            }
+            if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
+                VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+                VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+                for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+                    if (secNode->accumTargets[slot]) {
+                        secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+                    }
+                }
             }
             updateSecondaryWavefrontDescriptors(secNode);
         }
@@ -1989,6 +2015,8 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
     secNode->mlSpecularImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
     secNode->mlAlbedoRoughnessImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
     secNode->mlSpecularMotionImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+    secNode->mlSkipImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
+    secNode->mlSpecAlbedoImage = std::make_unique<Image>(secDevice, secAlloc, secW, secH, VK_FORMAT_R16G16B16A16_SFLOAT, mlUsage);
 
     VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     allocInfo.commandPool = secNode->commandPool;
@@ -2003,11 +2031,13 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
 
     VkClearColorValue zeroClr{};
     VkImageSubresourceRange clearRng{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    Image* mlImgs[4] = {
+    Image* mlImgs[6] = {
         secNode->mlDiffuseImage.get(),
         secNode->mlSpecularImage.get(),
         secNode->mlAlbedoRoughnessImage.get(),
-        secNode->mlSpecularMotionImage.get()
+        secNode->mlSpecularMotionImage.get(),
+        secNode->mlSkipImage.get(),
+        secNode->mlSpecAlbedoImage.get()
     };
     for (Image* img : mlImgs) {
         img->transitionLayout(
@@ -2041,6 +2071,15 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr }
         };
         vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
+    }
+    if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
+        VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+        for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+            if (secNode->accumTargets[slot]) {
+                secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+            }
+        }
     }
     updateSecondaryWavefrontDescriptors(secNode);
 }
@@ -2155,6 +2194,50 @@ void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
     }
 }
 
+void MultiGpuManager::ensureSecondaryNrc(GpuDeviceNode* secNode) {
+    if (!secNode || !secNode->context || !secNode->accumTargets[0] || !secNode->wavefrontPipeline) return;
+    if (!m_config.enable_nrc || m_config.mgpu_mode == MultiGpuMode::Off) return;
+
+    VkDevice secDevice = secNode->context->getDevice();
+    VmaAllocator secAlloc = secNode->context->getAllocator();
+    uint32_t nrcW = std::max(m_config.getRenderWidth(), secNode->accumTargets[0]->getWidth());
+    uint32_t nrcH = std::max(m_config.getRenderHeight(), secNode->accumTargets[0]->getHeight());
+
+    if (secNode->nrcManager && secNode->nrcManager->isInitialized() &&
+        secNode->nrcManager->getMaxQueries() == nrcW * nrcH) {
+        return;
+    }
+
+    vkDeviceWaitIdle(secDevice);
+    if (!secNode->nrcManager) {
+        try {
+            auto nrcInferCode = loadShaderSPIRV("nrc_encode_infer.comp.spv");
+            auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
+            auto nrcResolveCode = loadShaderSPIRV("nrc_resolve.comp.spv");
+            secNode->nrcManager = std::make_unique<NRCManager>(
+                secDevice, secAlloc, nrcW, nrcH,
+                nrcInferCode, nrcTrainCode, nrcResolveCode,
+                secNode->context->getPhysicalDevice()
+            );
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to initialize secondary GPU NRC Manager: {}", e.what());
+            secNode->nrcManager.reset();
+            return;
+        }
+    } else {
+        secNode->nrcManager->resize(nrcW, nrcH);
+    }
+
+    VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+        if (secNode->accumTargets[slot]) {
+            secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+        }
+    }
+    updateSecondaryWavefrontDescriptors(secNode);
+}
+
 void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode) {
     if (!secNode || !secNode->wavefrontPipeline || !secNode->accumTargets[0] || !secNode->triangleBuffer) return;
 
@@ -2173,6 +2256,10 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
     VkImageView activeCausticView = (secNode->causticsPipeline && secNode->causticsPipeline->getFilteredCausticImage())
         ? secNode->causticsPipeline->getFilteredCausticImage()->getImageView()
         : (secNode->causticImage ? secNode->causticImage->getImageView() : VK_NULL_HANDLE);
+
+    Buffer* nrcQueryBuf = secNode->nrcManager ? secNode->nrcManager->getQueryQueue() : nullptr;
+    Buffer* nrcTrainBuf = secNode->nrcManager ? secNode->nrcManager->getTrainQueue() : nullptr;
+    Buffer* nrcCountersBuf = secNode->nrcManager ? secNode->nrcManager->getCounters() : nullptr;
 
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
         if (!secNode->cameraUBOs[slot]) continue;
@@ -2195,7 +2282,9 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             tlasHandle,
             envInfo,
             texInfos,
-            VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
+            nrcQueryBuf ? nrcQueryBuf->getBuffer() : VK_NULL_HANDLE,
+            nrcTrainBuf ? nrcTrainBuf->getBuffer() : VK_NULL_HANDLE,
+            nrcCountersBuf ? nrcCountersBuf->getBuffer() : VK_NULL_HANDLE,
             secNode->motionVectorImage ? secNode->motionVectorImage->getImageView() : VK_NULL_HANDLE,
             secNode->normalDepthImage ? secNode->normalDepthImage->getImageView() : VK_NULL_HANDLE,
             secNode->lightTreeBuffer ? secNode->lightTreeBuffer->getBuffer() : VK_NULL_HANDLE,
@@ -2216,7 +2305,9 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             x1CtxBuf ? x1CtxBuf->getBuffer() : VK_NULL_HANDLE,
             giCurrBuf ? giCurrBuf->getBuffer() : VK_NULL_HANDLE,
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
-            secNode->prevNormalDepthImage ? secNode->prevNormalDepthImage->getImageView() : VK_NULL_HANDLE
+            secNode->prevNormalDepthImage ? secNode->prevNormalDepthImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSkipImage ? secNode->mlSkipImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE
         );
     }
 }
@@ -2302,9 +2393,11 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
     ensureSecondaryMlGuides(node);
     ensureSecondaryCaustics(node);
+    ensureSecondaryNrc(node);
     const bool needMl = needSecondaryMlGuides() &&
                         node->mlDiffuseImage && node->mlSpecularImage &&
-                        node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage;
+                        node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage &&
+                        node->mlSkipImage && node->mlSpecAlbedoImage;
 
     // Drain pending dynamic scene updates staged from the primary GPU before recording RT
     bool doInstanceSync = false;
@@ -2505,6 +2598,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         if (needMl) {
             clearAndTrack(node->mlDiffuseImage.get());
             clearAndTrack(node->mlSpecularImage.get());
+            clearAndTrack(node->mlSkipImage.get());
+            clearAndTrack(node->mlSpecAlbedoImage.get());
         }
         if (!clearBarriers.empty()) {
             VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -2535,9 +2630,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.numOpaqueTriangles = packet.numOpaqueTriangles;
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_config.secondary_sort_mode);
         wfSceneData.cameraFlags = packet.cameraUniform.flags;
-        wfSceneData.enableNrc = false;
-        wfSceneData.boundsMin = m_boundsMin;
-        wfSceneData.boundsMax = m_boundsMax;
+        const bool enableSecNrc = m_config.enable_nrc && node->nrcManager && node->nrcManager->isInitialized();
+        wfSceneData.enableNrc = enableSecNrc;
+        wfSceneData.nrcBounce = m_config.nrc_bounce;
+        wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
+        wfSceneData.boundsMin = m_focalBoundsMin;
+        wfSceneData.boundsMax = m_focalBoundsMax;
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
@@ -2553,7 +2651,11 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
         wfSceneData.fullHeight = packet.tileHeight;
-        wfSceneData.captureMlData = needMl ? 3u : 0u;
+        bool needMlV4 = needMl && (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                   m_config.upscaler_mode == UpscalerMode::Upways ||
+                                   m_config.upways_superres ||
+                                   m_config.capture_channels >= 32u);
+        wfSceneData.captureMlData = needMl ? (3u | (needMlV4 ? 4u : 0u)) : 0u;
         wfSceneData.gbufferFlags = (1u << 31) |
                                    (needNormals ? 1u : 0u) |
                                    ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
@@ -2569,12 +2671,26 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             );
         }
 
+        if (enableSecNrc) {
+            node->nrcManager->resetCounters(cmd);
+        }
+
         if (m_config.enable_restir && node->restirManager) {
             node->restirManager->recordClearIfNeeded(cmd);
         }
 
         node->wavefrontPipeline->recordFrame(cmd, slot, dispatchWidth, dispatchHeight,
                                              secSppLoop, packet.cameraUniform.maxBounces, wfSceneData);
+
+        if (enableSecNrc) {
+            node->nrcManager->setBackend(m_config.nrc_backend);
+            float nrcLr = (!packet.cameraMoved && packet.accumulateHistory != 0u) ? 5e-4f : 1.5e-3f;
+            uint32_t nrcBatch = (packet.frameIndex == 0u || packet.accumulateHistory == 0u) ? 512u : 256u;
+            node->nrcManager->recordTraining(cmd, packet.frameIndex, m_focalBoundsMin, m_focalBoundsMax, nrcLr, nrcBatch);
+            node->nrcManager->recordInference(cmd, dispatchWidth, dispatchHeight, m_focalBoundsMin, m_focalBoundsMax,
+                                              0, slot, wfSceneData.captureMlData,
+                                              std::min(m_config.indirect_clamp, 8.0f));
+        }
     } else {
         if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
             node->causticsPipeline->recordFullPass(
@@ -2624,6 +2740,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         descSec.displayHeight = packet.displayHeight;
         descSec.jitterX = packet.jitterX;
         descSec.jitterY = packet.jitterY;
+        descSec.cameraFovY = glm::radians(std::clamp(packet.cameraUniform.viewParams.x, 5.0f, 170.0f));
+        descSec.cameraNear = std::max(packet.cameraUniform.viewParams.z, 0.001f);
+        descSec.cameraFar  = std::max(packet.cameraUniform.viewParams.w, descSec.cameraNear + 1.0f);
+        descSec.frameTimeDeltaMs = 16.667f;
         descSec.enableSharpening = packet.enableSharpening;
         descSec.sharpness = packet.sharpness;
         descSec.resetHistory = packet.resetUpscalerHistory;
@@ -2631,6 +2751,15 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         descSec.frameIndex = packet.frameIndex;
         descSec.totalSamples = packet.totalSamples;
         descSec.inputIsNormalized = false;
+        const glm::vec2 currJit(packet.jitterX, packet.jitterY);
+        const glm::vec2 prevJit = (!packet.resetUpscalerHistory && node->hasPrevUpscalerJitter) ? node->prevUpscalerJitter : currJit;
+        descSec.prevJitterX = prevJit.x;
+        descSec.prevJitterY = prevJit.y;
+        descSec.rawColorIn = VK_NULL_HANDLE;
+        descSec.rawSampleScale = 1.0f / static_cast<float>(std::max(1u, packet.totalSamples));
+        descSec.inputIsDenoised = false;
+        node->prevUpscalerJitter = currJit;
+        node->hasPrevUpscalerJitter = true;
 
         node->upscaler->recordUpscale(descSec);
 
@@ -2678,7 +2807,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         // Batched transition of images to TRANSFER_SRC_OPTIMAL
         std::vector<VkImageMemoryBarrier2> toTransferBarriers;
-        toTransferBarriers.reserve(7);
+        toTransferBarriers.reserve(9);
 
         VkImageSubresourceRange colorRange{};
         colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2714,9 +2843,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularImage->getImage()));
             toTransferBarriers.push_back(makeToTransferBarrier(node->mlAlbedoRoughnessImage->getImage()));
             toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularMotionImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSkipImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecAlbedoImage->getImage()));
         } else if (copySpMlPlanes) {
             toTransferBarriers.push_back(makeToTransferBarrier(node->mlDiffuseImage->getImage()));
             toTransferBarriers.push_back(makeToTransferBarrier(node->mlSpecularImage->getImage()));
+            toTransferBarriers.push_back(makeToTransferBarrier(node->mlSkipImage->getImage()));
         }
 
         VkDependencyInfo toTransferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -2772,13 +2904,15 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
 
         if (copyCbMlPlanes) {
-            Image* cbMlImgs[4] = {
+            Image* cbMlImgs[6] = {
                 node->mlDiffuseImage.get(),
                 node->mlSpecularImage.get(),
                 node->mlAlbedoRoughnessImage.get(),
-                node->mlSpecularMotionImage.get()
+                node->mlSpecularMotionImage.get(),
+                node->mlSkipImage.get(),
+                node->mlSpecAlbedoImage.get()
             };
-            for (uint32_t p = 0; p < 4u; ++p) {
+            for (uint32_t p = 0; p < 6u; ++p) {
                 VkBufferImageCopy copyMl = copyRegion;
                 copyMl.bufferOffset = radOffsetAligned + static_cast<VkDeviceSize>(2u + p) * planeAligned;
                 vkCmdCopyImageToBuffer(cmd, cbMlImgs[p]->getImage(),
@@ -2797,6 +2931,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             vkCmdCopyImageToBuffer(cmd, node->mlSpecularImage->getImage(),
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    targetBuffer, 1, &copySpec);
+
+            VkBufferImageCopy copySkip = copyRegion;
+            copySkip.bufferOffset = radOffsetAligned + 2u * planeAligned;
+            vkCmdCopyImageToBuffer(cmd, node->mlSkipImage->getImage(),
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   targetBuffer, 1, &copySkip);
         }
 
         // Timestamp 3: Copy End
@@ -2804,7 +2944,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         // Batched transition of images back to GENERAL
         std::vector<VkImageMemoryBarrier2> toGeneralBarriers;
-        toGeneralBarriers.reserve(7);
+        toGeneralBarriers.reserve(9);
 
         auto makeToGeneralBarrier = [&](VkImage img) {
             VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -2833,9 +2973,12 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularImage->getImage()));
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlAlbedoRoughnessImage->getImage()));
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularMotionImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSkipImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecAlbedoImage->getImage()));
         } else if (copySpMlPlanes) {
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlDiffuseImage->getImage()));
             toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSpecularImage->getImage()));
+            toGeneralBarriers.push_back(makeToGeneralBarrier(node->mlSkipImage->getImage()));
         }
 
         VkMemoryBarrier2 copyFlushBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -3099,6 +3242,8 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->mlSpecularImage.reset();
         node->mlAlbedoRoughnessImage.reset();
         node->mlSpecularMotionImage.reset();
+        node->mlSkipImage.reset();
+        node->mlSpecAlbedoImage.reset();
         node->causticsPipeline.reset();
 
         // Transition secondary targets to GENERAL layout and clear accumulation
@@ -3178,13 +3323,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             node->mlSpecularImage.reset();
             node->mlAlbedoRoughnessImage.reset();
             node->mlSpecularMotionImage.reset();
+            node->mlSkipImage.reset();
+            node->mlSpecAlbedoImage.reset();
         }
 
         VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, node->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
         const bool hasValidMlGuides = (node->mlDiffuseImage && node->mlSpecularImage &&
-                                       node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage);
+                                       node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage &&
+                                       node->mlSkipImage && node->mlSpecAlbedoImage);
         VkDescriptorImageInfo albInfo{
             VK_NULL_HANDLE,
             hasValidMlGuides ? node->mlAlbedoRoughnessImage->getImageView() : node->normalDepthImage->getImageView(),
@@ -3237,6 +3385,22 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                     node->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
                 }
                 node->restirManager->resize(std::max(renderW, secWidth), renderH);
+            }
+            if (m_config.enable_nrc && m_config.mgpu_mode != MultiGpuMode::Off) {
+                if (node->nrcManager) {
+                    node->nrcManager->resize(std::max(renderW, secWidth), std::max(renderH, secHeight));
+                    VkImageView mlDiffView = node->mlDiffuseImage ? node->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+                    VkImageView mlSpecView = node->mlSpecularImage ? node->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+                    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+                        if (node->accumTargets[slot]) {
+                            node->nrcManager->updateDescriptors(slot, node->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+                        }
+                    }
+                } else {
+                    ensureSecondaryNrc(node.get());
+                }
+            } else if (node->nrcManager) {
+                node->nrcManager.reset();
             }
             updateSecondaryWavefrontDescriptors(node.get());
         }
@@ -3311,6 +3475,9 @@ void MultiGpuManager::setConfig(const Config& config) {
                 updateSecondaryWavefrontDescriptors(secNode);
             }
         }
+        if (m_config.enable_nrc && m_config.mgpu_mode != MultiGpuMode::Off) {
+            ensureSecondaryNrc(secNode);
+        }
         if (upscalerChanged) {
             if (config.upscaler_mode == UpscalerMode::FSR && config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend) {
                 uint32_t renderW = config.getRenderWidth();
@@ -3352,6 +3519,14 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     }
     m_boundsMin = scene.boundsMin;
     m_boundsMax = scene.boundsMax;
+    {
+        const bool hasFocalBounds =
+            (scene.focalBoundsMin.x < scene.focalBoundsMax.x) &&
+            (scene.focalBoundsMin.y < scene.focalBoundsMax.y) &&
+            (scene.focalBoundsMin.z < scene.focalBoundsMax.z);
+        m_focalBoundsMin = hasFocalBounds ? scene.focalBoundsMin : scene.boundsMin;
+        m_focalBoundsMax = hasFocalBounds ? scene.focalBoundsMax : scene.boundsMax;
+    }
     m_hasDielectrics = scene.hasDielectrics;
     m_dielectricBoundsMin = scene.dielectricBoundsMin;
     m_dielectricBoundsMax = scene.dielectricBoundsMax;

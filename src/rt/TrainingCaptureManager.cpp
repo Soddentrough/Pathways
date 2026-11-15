@@ -97,208 +97,236 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     };
 
+    const uint32_t outChannels = m_engine->m_config.capture_channels;
     Image* targetAccumImg = m_engine->m_frameImages[0];
     const VkFormat targetFmt = targetAccumImg ? targetAccumImg->getFormat() : VK_FORMAT_R32G32B32A32_SFLOAT;
     const bool isTargetFp16 = (targetFmt == VK_FORMAT_R16G16B16A16_SFLOAT);
     const bool isTargetRg11 = (targetFmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
 
+    auto sanitizeHalf = [](uint16_t h) -> uint16_t {
+        if ((h & 0x7C00u) == 0x7C00u) {
+            return ((h & 0x03FFu) != 0u) ? 0x0000u : ((h & 0x8000u) ? 0xFBFFu : 0x7BFFu);
+        }
+        return h;
+    };
+    auto safeToFp16 = [](float val) -> uint16_t {
+        if (!std::isfinite(val)) {
+            return (val > 0.0f) ? glm::detail::toFloat16(65500.0f) : glm::detail::toFloat16(0.0f);
+        }
+        return glm::detail::toFloat16(std::clamp(val, -65500.0f, 65500.0f));
+    };
+
     if (isReference) {
         // --- GROUND TRUTH REFERENCE CAPTURE PASS ---
-        // 1. Clear targetAccumImg (m_frameImages[0]) to zero before progressive accumulation
-        {
-            VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-            clearImage(cmd, targetAccumImg);
-            vkEndCommandBuffer(cmd);
-
-            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-            cmdSubmitInfo.commandBuffer = cmd;
-            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-            submitInfo.commandBufferInfoCount = 1;
-            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-        }
-
-        // 2. Accumulate in batches of 16 SPP
-        uint32_t remainingSpp = spp;
-        uint32_t currentSppOffset = 0;
-        constexpr uint32_t BATCH_SIZE = 16;
-
-        WavefrontSceneData wfSceneData{};
-        wfSceneData.numTriangles = m_engine->m_numTriangles;
-        wfSceneData.numSpheres = m_engine->m_numSpheres;
-        wfSceneData.numMaterials = m_engine->m_numMaterials;
-        wfSceneData.numLights = m_engine->m_numLights;
-        wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
-        wfSceneData.envMapIntensity = 1.0f;
-        wfSceneData.useHardwareRT = 1u;
-        wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
-        wfSceneData.accumulateHistory = 1u;
-        wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
-        wfSceneData.numOpaqueTriangles = m_engine->m_numOpaqueTriangles;
-        wfSceneData.secondarySortMode = static_cast<uint32_t>(m_engine->m_config.secondary_sort_mode);
-        wfSceneData.cameraFlags = flags;
-        wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
-        wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
-        wfSceneData.streamlineSecondaryShading = m_engine->m_config.streamline_secondary_shading;
-        wfSceneData.enableDistanceClamping = m_engine->m_config.distance_clamping;
-        wfSceneData.maxSecondaryRayDistance = m_engine->m_config.max_secondary_distance;
-        wfSceneData.indirectClamp = m_engine->m_config.indirect_clamp;
-        wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
-        wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
-        wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
-        wfSceneData.captureMlData = 0;
-
-        uint32_t activeOfflineBounces = m_engine->m_config.max_bounces;
-        while (remainingSpp > 0) {
-            uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
-            wfSceneData.frameIndex = frameIdx * 10000 + currentSppOffset;
-
-            // ubo with spp = 1 so samples accumulate full unscaled radiance; disable TAA projection lock so all 256 samples integrate uniformly over the pixel footprint
-            CameraUniform ubo = m_engine->m_camera->getUniformData(wfSceneData.frameIndex, 1, activeOfflineBounces, flags,
-                                                         false, width, height, 0, /*updatePrev=*/false,
-                                                         m_engine->m_config.capture_halton_length);
-            m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
-
-            VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
-
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, batchSpp, activeOfflineBounces, wfSceneData);
-
-            vkEndCommandBuffer(cmd);
-
-            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-            cmdSubmitInfo.commandBuffer = cmd;
-            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-            submitInfo.commandBufferInfoCount = 1;
-            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-
-            auto profData = m_engine->m_wavefrontPipeline->getProfilingData(0, m_engine->m_timestampPeriod, activeOfflineBounces);
-            if (profData.valid && !profData.bounces.empty()) {
-                uint32_t usedBounces = static_cast<uint32_t>(profData.bounces.size());
-                if (profData.bounces.back().nextCount == 0) {
-                    activeOfflineBounces = usedBounces;
-                } else {
-                    activeOfflineBounces = std::min(m_engine->m_config.max_bounces, usedBounces + 4);
-                }
-            }
-
-            remainingSpp -= batchSpp;
-            currentSppOffset += batchSpp;
-        }
-
-        // 3. Read back targetAccumImg (m_frameImages[0]) and write PTTD reference file
         VkDeviceSize accumPixelBytes = isTargetRg11 ? sizeof(uint32_t) : (isTargetFp16 ? (4 * sizeof(uint16_t)) : (4 * sizeof(float)));
         VkDeviceSize stagingSize = static_cast<VkDeviceSize>(width) * height * accumPixelBytes;
-
         Buffer stagingAccum(allocator, stagingSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                             VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
-        {
-            VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
-            vkResetCommandBuffer(cmd, 0);
+        auto renderReferenceSeed = [&](uint32_t seedBase, uint32_t seedSpp, std::vector<float>& outRgb) {
+            outRgb.assign(static_cast<size_t>(width) * height * 3, 0.0f);
+            {
+                VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+                clearImage(cmd, targetAccumImg);
+                vkEndCommandBuffer(cmd);
 
-            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            vkBeginCommandBuffer(cmd, &beginInfo);
-
-            targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-
-            VkBufferImageCopy copyRegion{};
-            copyRegion.bufferOffset = 0;
-            copyRegion.bufferRowLength = width;
-            copyRegion.bufferImageHeight = height;
-            copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copyRegion.imageSubresource.layerCount = 1;
-            copyRegion.imageExtent = { width, height, 1 };
-
-            vkCmdCopyImageToBuffer(cmd, targetAccumImg->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingAccum.getBuffer(), 1, &copyRegion);
-
-            targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
-                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-            vkEndCommandBuffer(cmd);
-
-            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
-            cmdSubmitInfo.commandBuffer = cmd;
-            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
-            submitInfo.commandBufferInfoCount = 1;
-            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
-            vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
-            vkQueueWaitIdle(queue);
-        }
-
-        stagingAccum.invalidate();
-        std::vector<uint16_t> refPayload(static_cast<size_t>(width) * height * 4);
-        uint16_t sppFp16 = glm::detail::toFloat16(static_cast<float>(spp));
-        float invSpp = (spp > 0u) ? (1.0f / static_cast<float>(spp)) : 1.0f;
-
-        auto safeToFp16 = [](float val) -> uint16_t {
-            if (!std::isfinite(val)) {
-                return (val > 0.0f) ? glm::detail::toFloat16(65500.0f) : glm::detail::toFloat16(0.0f);
+                VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                cmdSubmitInfo.commandBuffer = cmd;
+                VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                submitInfo.commandBufferInfoCount = 1;
+                submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+                vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+                vkQueueWaitIdle(queue);
             }
-            return glm::detail::toFloat16(std::clamp(val, -65500.0f, 65500.0f));
+
+            uint32_t remainingSpp = seedSpp;
+            uint32_t currentSppOffset = 0;
+            constexpr uint32_t BATCH_SIZE = 16;
+
+            WavefrontSceneData wfSceneData{};
+            wfSceneData.numTriangles = m_engine->m_numTriangles;
+            wfSceneData.numSpheres = m_engine->m_numSpheres;
+            wfSceneData.numMaterials = m_engine->m_numMaterials;
+            wfSceneData.numLights = m_engine->m_numLights;
+            wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
+            wfSceneData.envMapIntensity = 1.0f;
+            wfSceneData.useHardwareRT = 1u;
+            wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
+            wfSceneData.accumulateHistory = 1u;
+            wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
+            wfSceneData.numOpaqueTriangles = m_engine->m_numOpaqueTriangles;
+            wfSceneData.secondarySortMode = static_cast<uint32_t>(m_engine->m_config.secondary_sort_mode);
+            wfSceneData.cameraFlags = flags;
+            wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
+            wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
+            wfSceneData.streamlineSecondaryShading = m_engine->m_config.streamline_secondary_shading;
+            wfSceneData.enableDistanceClamping = m_engine->m_config.distance_clamping;
+            wfSceneData.maxSecondaryRayDistance = m_engine->m_config.max_secondary_distance;
+            wfSceneData.indirectClamp = m_engine->m_config.indirect_clamp;
+            wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
+            wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
+            wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
+            wfSceneData.captureMlData = 0;
+
+            uint32_t activeOfflineBounces = m_engine->m_config.max_bounces;
+            while (remainingSpp > 0) {
+                uint32_t batchSpp = std::min(remainingSpp, BATCH_SIZE);
+                wfSceneData.frameIndex = seedBase + frameIdx * 10000u + currentSppOffset;
+
+                CameraUniform ubo = m_engine->m_camera->getUniformData(wfSceneData.frameIndex, 1, activeOfflineBounces, flags,
+                                                             false, width, height, 0, /*updatePrev=*/false,
+                                                             m_engine->m_config.capture_halton_length);
+                m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
+
+                VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+                m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, batchSpp, activeOfflineBounces, wfSceneData);
+                vkEndCommandBuffer(cmd);
+
+                VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                cmdSubmitInfo.commandBuffer = cmd;
+                VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                submitInfo.commandBufferInfoCount = 1;
+                submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+                vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+                vkQueueWaitIdle(queue);
+
+                auto profData = m_engine->m_wavefrontPipeline->getProfilingData(0, m_engine->m_timestampPeriod, activeOfflineBounces);
+                if (profData.valid && !profData.bounces.empty()) {
+                    uint32_t usedBounces = static_cast<uint32_t>(profData.bounces.size());
+                    if (profData.bounces.back().nextCount == 0) {
+                        activeOfflineBounces = usedBounces;
+                    } else {
+                        activeOfflineBounces = std::min(m_engine->m_config.max_bounces, usedBounces + 4);
+                    }
+                }
+
+                remainingSpp -= batchSpp;
+                currentSppOffset += batchSpp;
+            }
+
+            {
+                VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
+                vkResetCommandBuffer(cmd, 0);
+                VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vkBeginCommandBuffer(cmd, &beginInfo);
+
+                targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+
+                VkBufferImageCopy copyRegion{};
+                copyRegion.bufferOffset = 0;
+                copyRegion.bufferRowLength = width;
+                copyRegion.bufferImageHeight = height;
+                copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copyRegion.imageSubresource.layerCount = 1;
+                copyRegion.imageExtent = { width, height, 1 };
+                vkCmdCopyImageToBuffer(cmd, targetAccumImg->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingAccum.getBuffer(), 1, &copyRegion);
+
+                targetAccumImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                vkEndCommandBuffer(cmd);
+
+                VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                cmdSubmitInfo.commandBuffer = cmd;
+                VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                submitInfo.commandBufferInfoCount = 1;
+                submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+                vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+                vkQueueWaitIdle(queue);
+            }
+
+            stagingAccum.invalidate();
+            const float invSeedSpp = (seedSpp > 0u) ? (1.0f / static_cast<float>(seedSpp)) : 1.0f;
+            const size_t numPixels = static_cast<size_t>(width) * height;
+            if (isTargetRg11) {
+                const uint32_t* src = static_cast<const uint32_t*>(stagingAccum.map());
+                for (size_t p = 0; p < numPixels; ++p) {
+                    glm::vec3 rgb = glm::unpackF2x11_1x10(src[p]);
+                    outRgb[p * 3 + 0] = rgb.r * invSeedSpp;
+                    outRgb[p * 3 + 1] = rgb.g * invSeedSpp;
+                    outRgb[p * 3 + 2] = rgb.b * invSeedSpp;
+                }
+                stagingAccum.unmap();
+            } else if (isTargetFp16) {
+                const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
+                for (size_t p = 0; p < numPixels; ++p) {
+                    outRgb[p * 3 + 0] = glm::detail::toFloat32(src[p * 4 + 0]) * invSeedSpp;
+                    outRgb[p * 3 + 1] = glm::detail::toFloat32(src[p * 4 + 1]) * invSeedSpp;
+                    outRgb[p * 3 + 2] = glm::detail::toFloat32(src[p * 4 + 2]) * invSeedSpp;
+                }
+                stagingAccum.unmap();
+            } else {
+                const float* src = static_cast<const float*>(stagingAccum.map());
+                for (size_t p = 0; p < numPixels; ++p) {
+                    outRgb[p * 3 + 0] = src[p * 4 + 0] * invSeedSpp;
+                    outRgb[p * 3 + 1] = src[p * 4 + 1] * invSeedSpp;
+                    outRgb[p * 3 + 2] = src[p * 4 + 2] * invSeedSpp;
+                }
+                stagingAccum.unmap();
+            }
         };
-
-        if (isTargetRg11) {
-            const uint32_t* src = static_cast<const uint32_t*>(stagingAccum.map());
-            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
-                glm::vec3 rgb = glm::unpackF2x11_1x10(src[p]);
-                refPayload[p * 4 + 0] = safeToFp16(rgb.r * invSpp);
-                refPayload[p * 4 + 1] = safeToFp16(rgb.g * invSpp);
-                refPayload[p * 4 + 2] = safeToFp16(rgb.b * invSpp);
-                refPayload[p * 4 + 3] = sppFp16;
-            }
-            stagingAccum.unmap();
-        } else if (isTargetFp16) {
-            const uint16_t* src = static_cast<const uint16_t*>(stagingAccum.map());
-            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
-                refPayload[p * 4 + 0] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 0]) * invSpp);
-                refPayload[p * 4 + 1] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 1]) * invSpp);
-                refPayload[p * 4 + 2] = safeToFp16(glm::detail::toFloat32(src[p * 4 + 2]) * invSpp);
-                refPayload[p * 4 + 3] = sppFp16;
-            }
-            stagingAccum.unmap();
-        } else {
-            const float* src = static_cast<const float*>(stagingAccum.map());
-            for (size_t p = 0; p < static_cast<size_t>(width) * height; ++p) {
-                refPayload[p * 4 + 0] = safeToFp16(src[p * 4 + 0] * invSpp);
-                refPayload[p * 4 + 1] = safeToFp16(src[p * 4 + 1] * invSpp);
-                refPayload[p * 4 + 2] = safeToFp16(src[p * 4 + 2] * invSpp);
-                refPayload[p * 4 + 3] = sppFp16;
-            }
-            stagingAccum.unmap();
-        }
 
         glm::vec3 camPos = m_engine->m_camera ? m_engine->m_camera->getPosition() : glm::vec3(0.0f);
         float fov = m_engine->m_camera ? m_engine->m_camera->getFov() : 45.0f;
         float aspect = m_engine->m_camera ? m_engine->m_camera->getAspect() : (static_cast<float>(width) / height);
         float camPosArr[3] = { camPos.x, camPos.y, camPos.z };
         float zeroJitter[2] = { 0.0f, 0.0f };
-
+        const size_t numPixels = static_cast<size_t>(width) * height;
         std::string refPath = std::format("{}/frame_{:05d}_reference.bin", m_engine->m_config.capture_training_data_dir, frameIdx);
-        ImageDumper::savePTTD(refPath, width, height, 4, 0 /* Float16 */,
-                              frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t),
-                              fov, aspect, camPosArr,
-                              (m_engine->m_config.capture_channels >= 23) ? zeroJitter : nullptr);
-        Logger::info("  -> Saved reference: {} (4 channels, {} SPP)", refPath, spp);
+
+        if (outChannels >= 32u) {
+            const uint32_t sppPerSeed = std::max(8u, spp / 2u);
+            std::vector<float> refA, refB;
+            renderReferenceSeed(200000u, sppPerSeed, refA);
+            renderReferenceSeed(700000u, sppPerSeed, refB);
+
+            std::vector<uint16_t> refPayload(numPixels * 8);
+            const uint16_t sppSeedFp16 = safeToFp16(static_cast<float>(sppPerSeed));
+            for (size_t p = 0; p < numPixels; ++p) {
+                refPayload[p * 8 + 0] = safeToFp16(refA[p * 3 + 0]);
+                refPayload[p * 8 + 1] = safeToFp16(refA[p * 3 + 1]);
+                refPayload[p * 8 + 2] = safeToFp16(refA[p * 3 + 2]);
+                refPayload[p * 8 + 3] = sppSeedFp16;
+                refPayload[p * 8 + 4] = safeToFp16(refB[p * 3 + 0]);
+                refPayload[p * 8 + 5] = safeToFp16(refB[p * 3 + 1]);
+                refPayload[p * 8 + 6] = safeToFp16(refB[p * 3 + 2]);
+                refPayload[p * 8 + 7] = sppSeedFp16;
+            }
+            ImageDumper::savePTTD(refPath, width, height, 8, 0 /* Float16 */,
+                                  frameIdx, sppPerSeed * 2u, refPayload.data(), refPayload.size() * sizeof(uint16_t),
+                                  fov, aspect, camPosArr, zeroJitter);
+            Logger::info("  -> Saved reference: {} (8 channels dual-seed, {}x2 SPP)", refPath, sppPerSeed);
+        } else {
+            std::vector<float> refA;
+            renderReferenceSeed(0u, spp, refA);
+            std::vector<uint16_t> refPayload(numPixels * 4);
+            const uint16_t sppFp16 = safeToFp16(static_cast<float>(spp));
+            for (size_t p = 0; p < numPixels; ++p) {
+                refPayload[p * 4 + 0] = safeToFp16(refA[p * 3 + 0]);
+                refPayload[p * 4 + 1] = safeToFp16(refA[p * 3 + 1]);
+                refPayload[p * 4 + 2] = safeToFp16(refA[p * 3 + 2]);
+                refPayload[p * 4 + 3] = sppFp16;
+            }
+            ImageDumper::savePTTD(refPath, width, height, 4, 0 /* Float16 */,
+                                  frameIdx, spp, refPayload.data(), refPayload.size() * sizeof(uint16_t),
+                                  fov, aspect, camPosArr,
+                                  (outChannels >= 23u) ? zeroJitter : nullptr);
+            Logger::info("  -> Saved reference: {} (4 channels, {} SPP)", refPath, spp);
+        }
 
     } else {
-        // --- NOISY INPUT + ML FEATURE EXTRACTION PASS (PTTD v3) ---
+        // --- NOISY INPUT + ML FEATURE EXTRACTION PASS (PTTD v3 / v4) ---
         // 1. Clear targetAccumImg and ML images to zero
         VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
         vkResetCommandBuffer(cmd, 0);
@@ -312,22 +340,26 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         clearImage(cmd, m_engine->m_mlSpecularImage);
         clearImage(cmd, m_engine->m_mlAlbedoRoughnessImage);
         clearImage(cmd, m_engine->m_mlSpecularMotionImage);
+        if (outChannels >= 32u) {
+            clearImage(cmd, m_engine->m_mlSkipImage);
+            clearImage(cmd, m_engine->m_mlSpecAlbedoImage);
+        }
         clearImage(cmd, m_engine->m_motionVectorImage);
         clearImage(cmd, m_engine->m_normalDepthImage);
         if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
             clearImage(cmd, m_engine->m_prevNormalDepthImage);
         }
 
-        // 2. Set camera UBO (advances m_prevViewProj to track true velocity; enables Halton subpixel jitter for SR)
+        // 2. Set camera UBO (advances m_prevViewProj to track true velocity; enables Halton subpixel jitter for SR / V4)
         const uint32_t inputSpp = std::max(1u, spp);
         const bool enableInputJitter = (m_engine->m_config.capture_halton_length > 1u) &&
-                                       (width < m_engine->m_config.width || height < m_engine->m_config.height);
+                                       (outChannels >= 32u || width < m_engine->m_config.width || height < m_engine->m_config.height);
         CameraUniform ubo = m_engine->m_camera->getUniformData(frameIdx, inputSpp, m_engine->m_config.max_bounces, flags,
                                                      enableInputJitter, width, height, 0, /*updatePrev=*/true,
                                                      m_engine->m_config.capture_halton_length);
         m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
 
-        // 3. Dispatch inputSpp with captureMlData = 1
+        // 3. Dispatch inputSpp with captureMlData
         WavefrontSceneData wfSceneData{};
         wfSceneData.numTriangles = m_engine->m_numTriangles;
         wfSceneData.numSpheres = m_engine->m_numSpheres;
@@ -352,15 +384,11 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
         wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
         wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
-        wfSceneData.captureMlData = 1;
+        wfSceneData.captureMlData = (outChannels >= 32u) ? (1u | 4u) : 1u;
 
         m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, inputSpp, m_engine->m_config.max_bounces, wfSceneData);
 
-        // NOTE: ReSTIR DI resampling happens inline in the wavefront shade
-        // dispatches above; there is no separate ReSTIR pass to record here.
-        // The reservoir grid is captured directly from the manager's buffers.
-
-        // 4. Staging copy for 6 ML images (and ReSTIR reservoir buffer if capture_channels >= 23)
+        // 4. Staging copy for 6 (or 8 for V4) ML images
         VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
         VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
 
@@ -372,11 +400,18 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         VkDeviceSize offsetMV   = offsetSM   + rgba16Size;
         VkDeviceSize totalInputStagingSize = offsetMV + rgba16Size;
 
-        uint32_t outChannels = m_engine->m_config.capture_channels;
+        VkDeviceSize offsetSkip = 0;
+        VkDeviceSize offsetSA   = 0;
+        if (outChannels >= 32u) {
+            offsetSkip = totalInputStagingSize;
+            offsetSA   = offsetSkip + rgba16Size;
+            totalInputStagingSize = offsetSA + rgba16Size;
+        }
+
         VkDeviceSize offsetRes = 0;
         VkDeviceSize resSize = 0;
         Buffer* resBuffer = nullptr;
-        if (outChannels >= 23 && m_engine->m_restirManager && m_engine->isRestirActive()) {
+        if (outChannels >= 23u && outChannels < 32u && m_engine->m_restirManager && m_engine->isRestirActive()) {
             resBuffer = m_engine->m_restirManager->getReservoirBuffer(0);
             if (resBuffer) {
                 offsetRes = totalInputStagingSize;
@@ -415,6 +450,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         copyImgToBuffer(m_engine->m_normalDepthImage, offsetND);
         copyImgToBuffer(m_engine->m_mlSpecularMotionImage, offsetSM);
         copyImgToBuffer(m_engine->m_motionVectorImage, offsetMV);
+        if (outChannels >= 32u) {
+            copyImgToBuffer(m_engine->m_mlSkipImage, offsetSkip);
+            copyImgToBuffer(m_engine->m_mlSpecAlbedoImage, offsetSA);
+        }
 
         if (useCaptureRestir && m_engine->m_normalDepthImage && m_engine->m_prevNormalDepthImage) {
             m_engine->m_normalDepthImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -489,12 +528,57 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         const uint16_t* ndPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetND);
         const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
+        const uint16_t* skipPixels = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSkip) : nullptr;
+        const uint16_t* saPixels   = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSA)   : nullptr;
         const DiReservoirGPU* resPixels = resBuffer ? reinterpret_cast<const DiReservoirGPU*>(basePtr + offsetRes) : nullptr;
 
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
+        const uint16_t zeroHalf = glm::packHalf1x16(0.0f);
 
         for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
-            if (outChannels >= 20) {
+            if (outChannels >= 32u) {
+                // Upways 4.0 (PTTD v4, 32 channels)
+                // Group 0 (0..3): Demodulated Diffuse Irradiance RGB + DiffHitDist
+                inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 2]  = diffPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 3]  = diffPixels[p * 4 + 3];
+                // Group 1 (4..7): Demodulated Specular Radiance RGB + ReactiveMask
+                inputPayload[p * outChannels + 4]  = specPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 5]  = specPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 6]  = specPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 7]  = specPixels[p * 4 + 3];
+                // Group 2 (8..11): Diffuse Demod Albedo RGB + Roughness
+                inputPayload[p * outChannels + 8]  = arPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 9]  = arPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 10] = arPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 11] = arPixels[p * 4 + 3];
+                // Group 3 (12..15): EnvBRDF Specular Demod Albedo RGB + ReSTIR_M_Norm
+                inputPayload[p * outChannels + 12] = saPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 13] = saPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 14] = saPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 15] = saPixels[p * 4 + 3];
+                // Group 4 (16..19): Skip (Emissive + Sky) RGB + MatClassNorm
+                inputPayload[p * outChannels + 16] = skipPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 17] = skipPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 18] = skipPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 19] = skipPixels[p * 4 + 3];
+                // Group 5 (20..23): View-Space Shading Normal XYZ + Linear Depth
+                inputPayload[p * outChannels + 20] = ndPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 21] = ndPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 22] = ndPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 23] = ndPixels[p * 4 + 3];
+                // Group 6 (24..27): Surface MV XY + Specular MV XY
+                inputPayload[p * outChannels + 24] = mvPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 25] = mvPixels[p * 4 + 1];
+                inputPayload[p * outChannels + 26] = smPixels[p * 4 + 0];
+                inputPayload[p * outChannels + 27] = smPixels[p * 4 + 1];
+                // Group 7 (28..31): LinDepthDelta + SpecInvDepthSigned + SpecHitDist + Reserved(0)
+                inputPayload[p * outChannels + 28] = mvPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 29] = smPixels[p * 4 + 2];
+                inputPayload[p * outChannels + 30] = smPixels[p * 4 + 3];
+                inputPayload[p * outChannels + 31] = zeroHalf;
+            } else if (outChannels >= 20) {
                 // Vector 0 (Ch 00..03): Diffuse Radiance RGB + Roughness
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
                 inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1]; // diffuse G
@@ -579,9 +663,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         stagingInput.unmap();
 
         for (uint16_t& h : inputPayload) {
-            if ((h & 0x7C00u) == 0x7C00u) {
-                h = ((h & 0x03FFu) != 0u) ? 0x0000u : ((h & 0x8000u) ? 0xFBFFu : 0x7BFFu);
-            }
+            h = sanitizeHalf(h);
         }
 
         glm::vec3 camPos = m_engine->m_camera ? m_engine->m_camera->getPosition() : glm::vec3(0.0f);
@@ -597,6 +679,132 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                               (outChannels >= 23 || enableInputJitter) ? jitterArr : nullptr);
         Logger::info("  -> Saved input    : {} ({} channels, {} SPP, jitter=({:.4f}, {:.4f}))",
                      inpPath, outChannels, inputSpp, jitterArr[0], jitterArr[1]);
+
+        if (outChannels >= 32u) {
+            // Unbiased dual-seed LR demodulated target (ReSTIR OFF, exact same Halton jitter & resolution)
+            const uint32_t lrFlags = flags & ~((1u << 9) | (1u << 24));
+            const uint32_t lrSppPerSeed = std::clamp(m_engine->m_config.capture_reference_spp / 4u, 8u, 64u);
+            Buffer stagingLr(allocator, rgba16Size * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                             VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+            auto renderLrRefSeed = [&](uint32_t seedBase, uint32_t targetSpp,
+                                       std::vector<float>& outDiffRgb, std::vector<float>& outSpecRgb) {
+                outDiffRgb.assign(static_cast<size_t>(numPixels) * 3, 0.0f);
+                outSpecRgb.assign(static_cast<size_t>(numPixels) * 3, 0.0f);
+                uint32_t remaining = targetSpp;
+                uint32_t offsetSpp = 0;
+                constexpr uint32_t BATCH_SIZE = 16;
+
+                WavefrontSceneData lrScene = wfSceneData;
+                lrScene.cameraFlags = lrFlags;
+                lrScene.accumulateHistory = 0u;
+                lrScene.captureMlData = (1u | 4u);
+
+                while (remaining > 0u) {
+                    const uint32_t batchSpp = std::min(remaining, BATCH_SIZE);
+                    CameraUniform lrUbo = m_engine->m_camera->getUniformData(
+                        frameIdx, batchSpp, m_engine->m_config.max_bounces, lrFlags,
+                        enableInputJitter, width, height, 0, /*updatePrev=*/false,
+                        m_engine->m_config.capture_halton_length);
+                    lrUbo.frameIndex = seedBase + frameIdx * 1000u + offsetSpp;
+                    m_engine->m_cameraUBOs[0]->copyFrom(&lrUbo, sizeof(CameraUniform));
+                    lrScene.frameIndex = lrUbo.frameIndex;
+
+                    VkCommandBuffer lrCmd = m_engine->m_commandBuffers[0];
+                    vkResetCommandBuffer(lrCmd, 0);
+                    VkCommandBufferBeginInfo lrBegin{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                    lrBegin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    vkBeginCommandBuffer(lrCmd, &lrBegin);
+
+                    clearImage(lrCmd, targetAccumImg);
+                    clearImage(lrCmd, m_engine->m_mlDiffuseImage);
+                    clearImage(lrCmd, m_engine->m_mlSpecularImage);
+                    clearImage(lrCmd, m_engine->m_mlAlbedoRoughnessImage);
+                    clearImage(lrCmd, m_engine->m_mlSpecularMotionImage);
+                    clearImage(lrCmd, m_engine->m_mlSkipImage);
+                    clearImage(lrCmd, m_engine->m_mlSpecAlbedoImage);
+
+                    m_engine->m_wavefrontPipeline->recordFrame(lrCmd, 0, width, height, batchSpp,
+                                                               m_engine->m_config.max_bounces, lrScene);
+
+                    auto copyLrBuf = [&](Image* img, VkDeviceSize bufOffset) {
+                        if (!img) return;
+                        img->transitionLayout(lrCmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                        VkBufferImageCopy region{};
+                        region.bufferOffset = bufOffset;
+                        region.bufferRowLength = width;
+                        region.bufferImageHeight = height;
+                        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        region.imageSubresource.layerCount = 1;
+                        region.imageExtent = { width, height, 1 };
+                        vkCmdCopyImageToBuffer(lrCmd, img->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               stagingLr.getBuffer(), 1, &region);
+                        img->transitionLayout(lrCmd, VK_IMAGE_LAYOUT_GENERAL,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+                    };
+                    copyLrBuf(m_engine->m_mlDiffuseImage, 0);
+                    copyLrBuf(m_engine->m_mlSpecularImage, rgba16Size);
+                    vkEndCommandBuffer(lrCmd);
+
+                    VkCommandBufferSubmitInfo lrSubCmd{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+                    lrSubCmd.commandBuffer = lrCmd;
+                    VkSubmitInfo2 lrSub{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+                    lrSub.commandBufferInfoCount = 1;
+                    lrSub.pCommandBufferInfos = &lrSubCmd;
+                    vkQueueSubmit2(queue, 1, &lrSub, VK_NULL_HANDLE);
+                    vkQueueWaitIdle(queue);
+
+                    stagingLr.invalidate();
+                    const uint8_t* lrPtr = static_cast<const uint8_t*>(stagingLr.map());
+                    const uint16_t* dPtr = reinterpret_cast<const uint16_t*>(lrPtr);
+                    const uint16_t* sPtr = reinterpret_cast<const uint16_t*>(lrPtr + rgba16Size);
+                    const float wBatch = static_cast<float>(batchSpp);
+                    for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+                        outDiffRgb[p * 3 + 0] += wBatch * glm::detail::toFloat32(sanitizeHalf(dPtr[p * 4 + 0]));
+                        outDiffRgb[p * 3 + 1] += wBatch * glm::detail::toFloat32(sanitizeHalf(dPtr[p * 4 + 1]));
+                        outDiffRgb[p * 3 + 2] += wBatch * glm::detail::toFloat32(sanitizeHalf(dPtr[p * 4 + 2]));
+                        outSpecRgb[p * 3 + 0] += wBatch * glm::detail::toFloat32(sanitizeHalf(sPtr[p * 4 + 0]));
+                        outSpecRgb[p * 3 + 1] += wBatch * glm::detail::toFloat32(sanitizeHalf(sPtr[p * 4 + 1]));
+                        outSpecRgb[p * 3 + 2] += wBatch * glm::detail::toFloat32(sanitizeHalf(sPtr[p * 4 + 2]));
+                    }
+                    stagingLr.unmap();
+
+                    remaining -= batchSpp;
+                    offsetSpp += batchSpp;
+                }
+                const float invTotal = (targetSpp > 0u) ? (1.0f / static_cast<float>(targetSpp)) : 1.0f;
+                for (float& v : outDiffRgb) v *= invTotal;
+                for (float& v : outSpecRgb) v *= invTotal;
+            };
+
+            std::vector<float> diffA, specA, diffB, specB;
+            renderLrRefSeed(100000u, lrSppPerSeed, diffA, specA);
+            renderLrRefSeed(500000u, lrSppPerSeed, diffB, specB);
+
+            std::vector<uint16_t> lrPayload(static_cast<size_t>(numPixels) * 12);
+            for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
+                lrPayload[p * 12 + 0]  = safeToFp16(diffA[p * 3 + 0]);
+                lrPayload[p * 12 + 1]  = safeToFp16(diffA[p * 3 + 1]);
+                lrPayload[p * 12 + 2]  = safeToFp16(diffA[p * 3 + 2]);
+                lrPayload[p * 12 + 3]  = safeToFp16(specA[p * 3 + 0]);
+                lrPayload[p * 12 + 4]  = safeToFp16(specA[p * 3 + 1]);
+                lrPayload[p * 12 + 5]  = safeToFp16(specA[p * 3 + 2]);
+                lrPayload[p * 12 + 6]  = safeToFp16(diffB[p * 3 + 0]);
+                lrPayload[p * 12 + 7]  = safeToFp16(diffB[p * 3 + 1]);
+                lrPayload[p * 12 + 8]  = safeToFp16(diffB[p * 3 + 2]);
+                lrPayload[p * 12 + 9]  = safeToFp16(specB[p * 3 + 0]);
+                lrPayload[p * 12 + 10] = safeToFp16(specB[p * 3 + 1]);
+                lrPayload[p * 12 + 11] = safeToFp16(specB[p * 3 + 2]);
+            }
+            std::string lrRefPath = std::format("{}/frame_{:05d}_lr_ref.bin", m_engine->m_config.capture_training_data_dir, frameIdx);
+            ImageDumper::savePTTD(lrRefPath, width, height, 12, 0 /* Float16 */,
+                                  frameIdx, lrSppPerSeed * 2u, lrPayload.data(), lrPayload.size() * sizeof(uint16_t),
+                                  fov, aspect, camPosArr, jitterArr);
+            Logger::info("  -> Saved lr_ref   : {} (12 channels dual-seed, {}x2 SPP)", lrRefPath, lrSppPerSeed);
+        }
     }
 }
 
@@ -893,7 +1101,7 @@ void TrainingCaptureManager::run() {
     Logger::info("  Frames to Capture: {}", m_engine->m_config.capture_frames);
     Logger::info("  Reference SPP    : {}", m_engine->m_config.capture_reference_spp);
     Logger::info("  Capture Channels : {} (PTTD v{})", m_engine->m_config.capture_channels,
-                 m_engine->m_config.capture_channels >= 23 ? 3 : (m_engine->m_config.capture_channels == 20 ? 2 : 1));
+                 m_engine->m_config.capture_channels >= 32 ? 4 : (m_engine->m_config.capture_channels >= 23 ? 3 : (m_engine->m_config.capture_channels == 20 ? 2 : 1)));
     Logger::info("  Capture Normals  : {}", m_engine->m_config.capture_normals ? "YES" : "NO");
     Logger::info("  Camera Mode      : {}",
                  m_engine->m_config.capture_camera_mode == CaptureCameraMode::Static ? "Static (Stationary)" :

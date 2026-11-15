@@ -119,7 +119,9 @@ public:
                                 VkBuffer x1ContextBuffer = VK_NULL_HANDLE,
                                 VkBuffer giReservoirBuffer = VK_NULL_HANDLE,
                                 VkBuffer giHistoryReservoirBuffer = VK_NULL_HANDLE,
-                                VkImageView prevNormalDepthImageView = VK_NULL_HANDLE);
+                                VkImageView prevNormalDepthImageView = VK_NULL_HANDLE,
+                                VkImageView mlSkipImageView = VK_NULL_HANDLE,
+                                VkImageView mlSpecAlbedoImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }

@@ -1,58 +1,72 @@
 #pragma once
 
-#include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
+#include <vulkan/vulkan.h>
+
 #include <glm/glm.hpp>
+
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "vulkan/Buffer.hpp"
-#include "vulkan/Image.hpp"
-#include "core/Config.hpp"
-
 namespace pathways {
 
-// Unified 56-byte push constant block shared across all 3 passes of Upways 3.0 (FP8 RDNA 4)
+class Buffer;
+class Image;
+
+inline constexpr uint32_t UPWAYS_FLAG_RESET_HISTORY      = 1u;
+inline constexpr uint32_t UPWAYS_FLAG_ENABLE_SUPERRES    = 2u;
+inline constexpr uint32_t UPWAYS_FLAG_ZERO_RESIDUAL_MODE = 4u;
+
+/**
+ * Exact 56-byte push constant layout shared across all four Upways 4.0 compute shaders:
+ *   upways_denoise_prep.comp, upways_denoiser_wmma.comp,
+ *   upways_upscaler_wmma.comp, upways_upscale_resolve.comp.
+ */
 struct UpwaysPushConstants {
-    uint32_t renderWidth;
-    uint32_t renderHeight;
-    uint32_t displayWidth;
-    uint32_t displayHeight;
-    float jitterX;
-    float jitterY;
-    float preExposure;
-    uint32_t resetHistory;
-    uint32_t preserveJitterGuide;
-    uint32_t stageId;
-    uint32_t srcWidth;
-    uint32_t srcHeight;
-    uint32_t dstWidth;
-    uint32_t dstHeight;
+    uint32_t lrWidth;
+    uint32_t lrHeight;
+    uint32_t hrWidth;
+    uint32_t hrHeight;
+    float    jitterX;
+    float    jitterY;
+    uint32_t frameIndex;
+    uint32_t flags;
+    uint32_t offX0;
+    uint32_t offHw0;
+    uint32_t offS0;
+    uint32_t offB1;
+    uint32_t offB2;
+    float    exposureScale;
 };
-static_assert(sizeof(UpwaysPushConstants) == 56, "UpwaysPushConstants must be 56 bytes");
+
+static_assert(sizeof(UpwaysPushConstants) == 56, "UpwaysPushConstants must be exactly 56 bytes");
 
 struct UpwaysPyramidDims {
-    uint32_t w0 = 1;
-    uint32_t h0 = 1;
-    uint32_t w1 = 1;
-    uint32_t h1 = 1;
-    uint32_t w2 = 1;
-    uint32_t h2 = 1;
-    VkDeviceSize totalBytes = 256;
+    uint32_t     w0 = 1u, h0 = 1u;
+    uint32_t     w1 = 1u, h1 = 1u;
+    uint32_t     w2 = 1u, h2 = 1u;
+    uint32_t     offX0 = 0u;
+    uint32_t     offHw0 = 0u;
+    uint32_t     offS0 = 0u;
+    uint32_t     offB1 = 0u;
+    uint32_t     offB2 = 0u;
+    uint32_t     totalUints = 64u;
+    VkDeviceSize totalBytes = 256ULL;
 };
 
-inline constexpr uint32_t upwaysAlign256(uint32_t bytes) noexcept {
-    return (bytes + 255u) & ~255u;
+inline constexpr uint32_t upwaysAlign64Uints(uint32_t v) noexcept {
+    return (v + 63u) & ~63u;
 }
 
 inline constexpr UpwaysPyramidDims computeUpwaysPyramidDims(uint32_t w0In, uint32_t h0In) noexcept {
     UpwaysPyramidDims d{};
-    d.w0 = w0In > 1u ? w0In : 1u;
-    d.h0 = h0In > 1u ? h0In : 1u;
+    d.w0 = std::max(1u, w0In);
+    d.h0 = std::max(1u, h0In);
     d.w1 = (d.w0 + 1u) >> 1u;
     d.h1 = (d.h0 + 1u) >> 1u;
     d.w2 = (d.w1 + 1u) >> 1u;
@@ -62,35 +76,74 @@ inline constexpr UpwaysPyramidDims computeUpwaysPyramidDims(uint32_t w0In, uint3
     const uint32_t n1 = d.w1 * d.h1;
     const uint32_t n2 = d.w2 * d.h2;
 
-    uint32_t total = 0u;
-    total += upwaysAlign256(32u * n0);  // offX0
-    total += upwaysAlign256(16u * n0);  // offHw0
-    total += upwaysAlign256(32u * n0);  // offS0
-    total += upwaysAlign256(32u * n1);  // offL1In
-    total += upwaysAlign256(64u * n1);  // offS1
-    total += upwaysAlign256(64u * n2);  // offL2In
-    total += upwaysAlign256(128u * n2); // offB1
-    total += upwaysAlign256(64u * n2);  // offB2
-    total += upwaysAlign256(32u * n1);  // offD1
-    d.totalBytes = total > 256u ? static_cast<VkDeviceSize>(total) : static_cast<VkDeviceSize>(256u);
+    d.offX0 = 0u;
+    d.offHw0 = upwaysAlign64Uints(n1 * 24u);
+    d.offS0 = d.offHw0 + upwaysAlign64Uints(std::max(n1 * 8u, n0 * 4u));
+    d.offB1 = 0u;
+    d.offB2 = d.offS0 + upwaysAlign64Uints(n1 * 8u);
+    d.totalUints = d.offB2 + upwaysAlign64Uints(n2 * 8u);
+    d.totalBytes = std::max<VkDeviceSize>(static_cast<VkDeviceSize>(d.totalUints) * 4ULL, 256ULL);
     return d;
 }
 
+// CPU-side parity math matching upways_common.glsl (safeLog1p / safeExpm1 / demod / remod)
+inline float upwaysSafeLog1p(float x) noexcept {
+    return std::log1p(std::clamp(x, 0.0f, 65504.0f));
+}
+
+inline glm::vec3 upwaysSafeLog1p(const glm::vec3& v) noexcept {
+    return { upwaysSafeLog1p(v.x), upwaysSafeLog1p(v.y), upwaysSafeLog1p(v.z) };
+}
+
+inline float upwaysSafeExpm1(float x) noexcept {
+    return std::max(std::expm1(std::clamp(x, 0.0f, 11.0898f)), 0.0f);
+}
+
+inline glm::vec3 upwaysSafeExpm1(const glm::vec3& v) noexcept {
+    return { upwaysSafeExpm1(v.x), upwaysSafeExpm1(v.y), upwaysSafeExpm1(v.z) };
+}
+
+inline glm::vec3 upwaysDemodulate(const glm::vec3& radiance, const glm::vec3& albedo, float floorEps = 0.01f) noexcept {
+    return radiance / glm::max(albedo, glm::vec3(floorEps));
+}
+
+inline glm::vec3 upwaysRemodulate(
+    const glm::vec3& diffAlbedo,
+    const glm::vec3& specAlbedo,
+    const glm::vec3& diffIrr,
+    const glm::vec3& specIrr,
+    const glm::vec3& skipRgb = glm::vec3(0.0f)
+) noexcept {
+    return diffAlbedo * diffIrr + specAlbedo * specIrr + skipRgb;
+}
+
 struct UpwaysPassTimings {
-    double temporalMs = 0.0;       // Pass 1: upways_temporal.comp (Demodulation, 3x3 Closest-Depth MV Dilation & FP8 L0 Marshaling)
-    double neuralGuideMs = 0.0;    // Pass 2: upways_neural_guide.comp (6-Stage L0/L1/L2 FP8 E4M3 WMMA Spatiotemporal Backbone)
-    double upscaleResolveMs = 0.0; // Pass 3: upways_upscale_resolve.comp (Continuous Subpixel Ray-Locus Gather & Catmull-Rom Resolve)
-    double historyCopyMs = 0.0;    // Zero-copy ping-pong swap (0.0 ms; zero vkCmdCopyImage bytes)
-    double totalMs = 0.0;          // Total Upways GPU time across all passes
-    bool valid = false;
+    double prepMs = 0.0;      // Pass 1: upways_denoise_prep.comp
+    double denoiserMs = 0.0;  // Pass 2: upways_denoiser_wmma.comp (Stages 0..3)
+    double upscalerMs = 0.0;  // Pass 3: upways_upscaler_wmma.comp
+    double resolveMs = 0.0;   // Pass 4: upways_upscale_resolve.comp
+    double totalMs = 0.0;
+    bool   valid = false;
 };
 
+/**
+ * Upways 4.0 RDNA 4 FP8 E4M3fn WMMA Two-Module Spatiotemporal Denoiser & Super-Resolution Pipeline.
+ *
+ * Module A (UpwaysDenoiser):
+ *   Pass 1: upways_denoise_prep.comp    -> temporal reprojection, disocclusion, FP8 X0 packing
+ *   Pass 2: upways_denoiser_wmma.comp   -> 4-stage L1/L2 FP8 WMMA hourglass + clean diffuse/specular/radiance
+ * Module B (UpwaysUpscaler):
+ *   Pass 3: upways_upscaler_wmma.comp   -> 16 -> 32 -> 32 -> 16 subpixel delta & blend logit prediction
+ *   Pass 4: upways_upscale_resolve.comp -> bicubic LR base + neural residual + HR temporal TAAU
+ */
 class UpwaysPipeline {
 public:
-    static constexpr uint32_t MAX_QUERY_SLOTS = 2;
-    static constexpr uint32_t QUERIES_PER_SLOT = 5;
-    static constexpr uint32_t NUM_NEURAL_STAGES = 6;
-    static constexpr uint32_t NEURAL_HIDDEN_LAYERS = 4;
+    static constexpr uint32_t MAX_QUERY_SLOTS    = 2;
+    static constexpr uint32_t QUERIES_PER_SLOT   = 5;
+    static constexpr uint32_t NUM_DENOISER_STAGES = 4;
+    static constexpr uint32_t BASE_ANCHOR_LAYERS = 4;
+
+    static bool supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice);
 
     UpwaysPipeline(
         VkDevice device,
@@ -100,232 +153,194 @@ public:
         uint32_t inputHeight,
         uint32_t outputWidth,
         uint32_t outputHeight,
-        const std::vector<char>& temporalSpv,
-        const std::vector<char>& neuralGuideSpv,
+        const std::vector<char>& denoisePrepSpv,
+        const std::vector<char>& denoiserWmmaSpv,
+        const std::vector<char>& upscalerWmmaSpv,
         const std::vector<char>& upscaleResolveSpv,
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
-        VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT
+        VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
+        bool useFp8CoopMatrix = true
     );
     ~UpwaysPipeline();
 
     UpwaysPipeline(const UpwaysPipeline&) = delete;
     UpwaysPipeline& operator=(const UpwaysPipeline&) = delete;
 
-    void resize(uint32_t inputWidth, uint32_t inputHeight, uint32_t outputWidth, uint32_t outputHeight, bool enableSuperRes);
-
-    // Retained as no-op for caller compatibility (Upways 3.0 uses zero-copy ping-pong history).
-    void setHistorySourceImages(VkImage /*normalDepthImage*/, VkImage /*specularMotionImage*/) {}
-
-    void updateDescriptors(
-        VkImageView demodDiffuseView,
-        VkImageView demodSpecularView,
-        VkImageView normalDepthView,
-        VkImageView albedoRoughnessView,
-        VkImageView surfaceMotionView,
-        VkImageView specularMotionView,
-        VkImageView restirMetadataView = VK_NULL_HANDLE,
-        VkImageView displayAlbedoView = VK_NULL_HANDLE,
-        VkImageView displayNormalsView = VK_NULL_HANDLE
-    );
-
-    void updateDescriptors(
-        VkImageView accumImageView,
-        VkImageView normalDepthImageView,
-        VkImageView motionVectorImageView,
-        VkImageView albedoRoughnessImageView,
-        VkImageView specularMotionImageView,
-        VkImageView diffuseImageView,
-        VkImageView specularImageView,
-        VkBuffer /*restirReservoirBuffer*/,
-        VkImageView /*confidenceOutputImageView*/,
-        VkBuffer /*restirReservoirBuffer1*/
-    ) {
-        updateDescriptors(
-            diffuseImageView ? diffuseImageView : accumImageView,
-            specularImageView ? specularImageView : accumImageView,
-            normalDepthImageView,
-            albedoRoughnessImageView,
-            motionVectorImageView,
-            specularMotionImageView ? specularMotionImageView : motionVectorImageView,
-            VK_NULL_HANDLE,
-            albedoRoughnessImageView,
-            normalDepthImageView
-        );
-    }
-
-    void recordFrame(
-        VkCommandBuffer cmd,
-        uint32_t frameIndex,
-        bool resetHistory,
-        bool cameraMoved,
-        const glm::mat4& currInvView = glm::mat4(1.0f),
-        const glm::mat4& prevViewProj = glm::mat4(1.0f),
-        const glm::mat4& invProj = glm::mat4(1.0f),
-        const glm::mat4& prevView = glm::mat4(1.0f),
-        const glm::vec2& jitterOffset = glm::vec2(0.0f),
-        uint32_t totalSamples = 1u,
-        bool coupledWithExternalUpscaler = false,
-        bool heuristicFallback = false
-    );
-
-    void recordFrame(
-        VkCommandBuffer cmd,
-        uint32_t frameIndex,
-        bool resetHistory,
-        bool cameraMoved,
-        int32_t /*tileOffsetX*/,
-        int32_t /*tileOffsetY*/,
-        int32_t /*tileWidth*/,
-        int32_t /*tileHeight*/,
-        int32_t /*apronWidth*/,
-        uint32_t totalSamples = 1u,
-        bool heuristicFallback = false
-    ) {
-        recordFrame(
-            cmd, frameIndex, resetHistory, cameraMoved,
-            glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f),
-            glm::vec2(0.0f), totalSamples, false, heuristicFallback
-        );
-    }
-
     void transitionInitialLayouts(VkCommandBuffer cmd);
-    void collectQueryResults(int32_t targetSlot = -1);
+
+    void resize(
+        uint32_t inputWidth,
+        uint32_t inputHeight,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        bool enableSuperRes
+    );
+
+    void updateDescriptors(
+        VkImageView mlDiffuseView,
+        VkImageView mlSpecularView,
+        VkImageView albedoRoughnessView,
+        VkImageView specAlbedoView,
+        VkImageView skipView,
+        VkImageView normalDepthView,
+        VkImageView motionVectorView,
+        VkImageView specularMotionView = VK_NULL_HANDLE
+    );
+
+    void recordFrame(
+        VkCommandBuffer cmd,
+        uint32_t frameIndex,
+        bool resetHistory,
+        glm::vec2 jitter,
+        bool coupledWithExternalUpscaler = false,
+        bool zeroResidualMode = false,
+        float exposureScale = 1.0f
+    );
+
+    [[nodiscard]] Image* getOutputImage() const { return m_outputImage.get(); }
+    [[nodiscard]] Image* getCleanRadLrImage() const { return m_cleanRadLr.get(); }
+    [[nodiscard]] uint32_t getInputWidth() const { return m_inputWidth; }
+    [[nodiscard]] uint32_t getInputHeight() const { return m_inputHeight; }
+    [[nodiscard]] uint32_t getOutputWidth() const { return m_outputWidth; }
+    [[nodiscard]] uint32_t getOutputHeight() const { return m_outputHeight; }
+    [[nodiscard]] bool isSuperResEnabled() const { return m_enableSuperRes; }
+    [[nodiscard]] bool isHistoryValid() const { return m_historyValid; }
+    [[nodiscard]] bool usesFp8CoopMatrix() const { return m_useFp8CoopMatrix; }
+    [[nodiscard]] bool isInitialized() const {
+        return m_prepPipeline != VK_NULL_HANDLE &&
+               m_resolvePipeline != VK_NULL_HANDLE &&
+               m_denoiserPipelines[0] != VK_NULL_HANDLE;
+    }
 
     [[nodiscard]] const UpwaysPassTimings& getLastPassTimings() const { return m_lastTimings; }
-    [[nodiscard]] std::array<float, 5> getPassTimingsMs() const {
+    [[nodiscard]] std::array<float, 4> getPassTimingsMs() const {
         return {
-            static_cast<float>(m_lastTimings.temporalMs),
-            static_cast<float>(m_lastTimings.neuralGuideMs),
-            static_cast<float>(m_lastTimings.upscaleResolveMs),
-            static_cast<float>(m_lastTimings.historyCopyMs),
-            0.0f
+            static_cast<float>(m_lastTimings.prepMs),
+            static_cast<float>(m_lastTimings.denoiserMs),
+            static_cast<float>(m_lastTimings.upscalerMs),
+            static_cast<float>(m_lastTimings.resolveMs)
         };
     }
 
-    Image* getOutputImage() const { return m_outputImage.get(); }
-    uint32_t getInputWidth() const { return m_inputWidth; }
-    uint32_t getInputHeight() const { return m_inputHeight; }
-    uint32_t getOutputWidth() const { return m_outputWidth; }
-    uint32_t getOutputHeight() const { return m_outputHeight; }
-    bool isSuperResEnabled() const { return m_superRes; }
-    bool isInitialized() const { return m_initialized; }
-    bool isHistoryValid() const { return m_historyValid; }
-
 private:
     struct ArrayImage2D {
-        VkImage image = VK_NULL_HANDLE;
+        VkImage       image = VK_NULL_HANDLE;
         VmaAllocation allocation = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        uint32_t width = 0;
-        uint32_t height = 0;
-        uint32_t layers = 0;
+        VkImageView   view = VK_NULL_HANDLE;
+        uint32_t      width = 0;
+        uint32_t      height = 0;
+        uint32_t      layers = 0;
     };
 
-    void initBuffers(const std::string& weightsPath);
-    void initImages();
+    void createArrayImage(ArrayImage2D& outImg, uint32_t width, uint32_t height, uint32_t layers);
+    void destroyArrayImage(ArrayImage2D& img);
+
+    void initWeights(const std::string& weightsPath);
     void initRenderResources(uint32_t slotMask);
+    void initDisplayResources();
     void ensureActiveSlotSized();
-    void createNeuralHiddenArray(ArrayImage2D& outImg, uint32_t width, uint32_t height, uint32_t layers);
-    void destroyNeuralHiddenArrays();
-    void createLinearSampler();
+    void refreshDescriptors();
+
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void refreshDescriptors();
+    VkShaderModule createShaderModule(const std::vector<char>& code);
     void createPipelines(
-        const std::vector<char>& temporalSpv,
-        const std::vector<char>& neuralGuideSpv,
+        const std::vector<char>& denoisePrepSpv,
+        const std::vector<char>& denoiserWmmaSpv,
+        const std::vector<char>& upscalerWmmaSpv,
         const std::vector<char>& upscaleResolveSpv
     );
-    VkShaderModule createShaderModule(const std::vector<char>& code);
 
-    VkDevice m_device = VK_NULL_HANDLE;
+    void collectQueryResults(uint32_t targetSlot, bool waitForResult);
+
+    VkDevice         m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
-    VmaAllocator m_allocator = VK_NULL_HANDLE;
-    double m_timestampPeriodNs = 1.0;
-    uint32_t m_inputWidth = 0;
-    uint32_t m_inputHeight = 0;
-    uint32_t m_outputWidth = 0;
-    uint32_t m_outputHeight = 0;
+    VmaAllocator     m_allocator = VK_NULL_HANDLE;
+
+    uint32_t         m_inputWidth = 0;
+    uint32_t         m_inputHeight = 0;
+    uint32_t         m_outputWidth = 0;
+    uint32_t         m_outputHeight = 0;
+    bool             m_enableSuperRes = false;
+    bool             m_useFp8CoopMatrix = true;
+    VkFormat         m_imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     UpwaysPyramidDims m_pyramidDims{};
-    bool m_superRes = false;
-    VkFormat m_format = VK_FORMAT_R16G16B16A16_SFLOAT;
-    bool m_initialized = false;
-    bool m_initialLayoutsTransitioned = false;
-    bool m_hrTransitioned = false;
-    bool m_transientsTransitioned = false;
-    bool m_lrSlotTransitioned[2] = { false, false };
-    uint32_t m_lrSlotWidth[2] = { 0, 0 };
-    uint32_t m_lrSlotHeight[2] = { 0, 0 };
-    bool m_historyValid = false;
-    uint32_t m_pingPongIndex = 0;
 
-    VkQueryPool m_queryPool = VK_NULL_HANDLE;
-    bool m_slotQueriesRecorded[MAX_QUERY_SLOTS] = { false, false };
-    UpwaysPassTimings m_lastTimings{};
+    bool             m_hasSubgroupSizeControl = false;
+    bool             m_hasComputeFullSubgroups = false;
 
-    // External render-resolution G-buffer views cached across resizes
-    VkImageView m_cachedDemodDiffuseView = VK_NULL_HANDLE;
-    VkImageView m_cachedDemodSpecularView = VK_NULL_HANDLE;
-    VkImageView m_cachedNormalDepthView = VK_NULL_HANDLE;
-    VkImageView m_cachedAlbedoRoughnessView = VK_NULL_HANDLE;
-    VkImageView m_cachedSurfaceMotionView = VK_NULL_HANDLE;
-    VkImageView m_cachedSpecularMotionView = VK_NULL_HANDLE;
-    VkImageView m_cachedAuxMetadataView = VK_NULL_HANDLE;
+    uint32_t         m_pingPongIndex = 0;
+    bool             m_historyValid = false;
+    bool             m_initialLayoutsTransitioned = false;
+    bool             m_hrTransitioned = false;
+    bool             m_transientsTransitioned = false;
+    std::array<bool, 2> m_lrSlotTransitioned = { false, false };
+    std::array<uint32_t, 2> m_slotWidth = { 0u, 0u };
+    std::array<uint32_t, 2> m_slotHeight = { 0u, 0u };
 
-    // Hardware bilinear / 5-tap Catmull-Rom linear clamp sampler
-    VkSampler m_linearSampler = VK_NULL_HANDLE;
-
-    // Device-local SSBOs
+    // Static model weights + dynamic activation/subpixel SSBOs
     std::unique_ptr<Buffer> m_weightBuffer;
-    std::unique_ptr<Buffer> m_pyramidBuffer;
-    std::unique_ptr<Buffer> m_subpixelParamsBuffer;
+    std::unique_ptr<Buffer> m_actBuffer;
+    std::unique_ptr<Buffer> m_srSubpixelBuffer;
+    std::unique_ptr<Image>  m_dummyBlackImage;
 
-    // Render-resolution transient images (RGBA16F)
-    std::unique_ptr<Image> m_tLogDiff;
-    std::unique_ptr<Image> m_tLogSpec;
-    std::unique_ptr<Image> m_tGuideDiff;
-    std::unique_ptr<Image> m_tGuideSpec;
-    std::unique_ptr<Image> m_tDilatedMv;
-    std::unique_ptr<Image> m_tTemporalConf;
+    // Ping-pong LR history (indexed by [prev] / [curr])
+    std::unique_ptr<Image> m_diffHist[2];    // RGBA16F
+    std::unique_ptr<Image> m_specHist[2];    // RGBA16F
+    std::unique_ptr<Image> m_geomHist[2];    // RGBA16F
+    std::unique_ptr<Image> m_hiddenHist[2];  // R32_UINT
 
-    // Ping-pong render-resolution geometry & 4-layer 16-ch neural hidden history
-    std::unique_ptr<Image> m_geomNd[2];
-    std::unique_ptr<Image> m_geomHitT[2];
-    ArrayImage2D m_neuralHidden[2];
+    // Single-frame LR intermediate targets
+    ArrayImage2D           m_baseAnchorLr;   // 4-layer RGBA16F
+    std::unique_ptr<Image> m_cleanRadLr;     // RGBA16F
 
-    // Ping-pong display-resolution hardware-sampled irradiance & BRDF guide history
-    std::unique_ptr<Image> m_irrDiffHr[2];
-    std::unique_ptr<Image> m_irrSpecHr[2];
-    std::unique_ptr<Image> m_guideDiffHr[2];
-    std::unique_ptr<Image> m_guideSpecHr[2];
+    // Display-resolution HR ping-pong & final output
+    std::unique_ptr<Image> m_colorHr[2];     // RGBA16F
+    std::unique_ptr<Image> m_outputImage;    // RGBA16F
 
-    // Resolved HDR output & 1x1 zero fallback image
-    std::unique_ptr<Image> m_outputImage;
-    std::unique_ptr<Image> m_dummyBlackImage;
+    // Cached external render-space views (8 G-buffer planes)
+    VkImageView m_cachedMlDiffView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlSpecView = VK_NULL_HANDLE;
+    VkImageView m_cachedAlbRoughView = VK_NULL_HANDLE;
+    VkImageView m_cachedSpecAlbView = VK_NULL_HANDLE;
+    VkImageView m_cachedSkipView = VK_NULL_HANDLE;
+    VkImageView m_cachedNormalDepthView = VK_NULL_HANDLE;
+    VkImageView m_cachedMotionVectorView = VK_NULL_HANDLE;
+    VkImageView m_cachedSpecularMotionView = VK_NULL_HANDLE;
 
-    // Descriptor pool, layouts & ping-pong sets
+    // Descriptors & compute pipelines
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_temporalDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_neuralGuideDescLayout = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_upscaleDescLayout = VK_NULL_HANDLE;
 
-    VkDescriptorSet m_temporalDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_neuralGuideDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDescriptorSet m_upscaleDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_prepDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_denoiserDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_upscalerDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_resolveDescLayout = VK_NULL_HANDLE;
 
-    // Compute pipeline cache, layouts & stage-specialized pipelines
-    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
-    VkPipelineLayout m_temporalPipeLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_neuralGuidePipeLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_upscalePipeLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_prepDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDescriptorSet, 2> m_denoiserDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSet m_upscalerDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_resolveDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
-    VkPipeline m_temporalPipeline = VK_NULL_HANDLE;
-    std::array<VkPipeline, NUM_NEURAL_STAGES> m_neuralGuidePipelines = {
-        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE,
-        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE
+    VkPipelineCache  m_pipelineCache = VK_NULL_HANDLE;
+    VkPipelineLayout m_prepPipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_denoiserPipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_upscalerPipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_resolvePipeLayout = VK_NULL_HANDLE;
+
+    VkPipeline m_prepPipeline = VK_NULL_HANDLE;
+    std::array<VkPipeline, NUM_DENOISER_STAGES> m_denoiserPipelines = {
+        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE
     };
-    VkPipeline m_upscalePipeline = VK_NULL_HANDLE;
+    VkPipeline m_upscalerPipeline = VK_NULL_HANDLE;
+    VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
+
+    // Hardware timestamp query pool
+    VkQueryPool m_queryPool = VK_NULL_HANDLE;
+    float       m_timestampPeriodNs = 1.0f;
+    uint32_t    m_querySlot = 0;
+    std::array<bool, MAX_QUERY_SLOTS> m_querySlotSubmitted = { false, false };
+    UpwaysPassTimings m_lastTimings{};
 };
 
 } // namespace pathways

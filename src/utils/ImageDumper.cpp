@@ -555,10 +555,10 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
             out << std::format("          \"denoiser_upscale_ms\": {:.3f},\n", c.pipeline_stages.denoiser_upscale_ms)
                 << std::format("          \"denoiser_mode\": \"{}\",\n", c.pipeline_stages.denoiser_mode);
             if (c.pipeline_stages.denoiser_mode == "upways") {
-                out << std::format("          \"upways_temporal_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[0])
-                    << std::format("          \"upways_neural_guide_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
-                    << std::format("          \"upways_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
-                    << std::format("          \"upways_history_copy_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3]);
+                out << std::format("          \"upways_denoise_prep_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[0])
+                    << std::format("          \"upways_denoiser_wmma_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[1])
+                    << std::format("          \"upways_upscaler_wmma_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[2])
+                    << std::format("          \"upways_upscale_resolve_ms\": {:.3f},\n", c.pipeline_stages.denoise_pass_ms[3]);
             }
         }
         out << std::format("          \"tonemap_ms\": {:.3f}\n", c.pipeline_stages.tonemap_ms);
@@ -640,7 +640,9 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
     };
 
     PTTDHeader header;
-    header.version = (channels >= 23 || jitterXY != nullptr) ? 3 : ((channels == 20) ? 2 : 1);
+    header.version = (channels == 32u || channels == 12u || channels == 8u)
+        ? 4u
+        : ((channels >= 23u || jitterXY != nullptr) ? 3u : ((channels == 20u) ? 2u : 1u));
     header.width = width;
     header.height = height;
     header.channels = channels;

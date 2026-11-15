@@ -344,7 +344,9 @@ void RayTracingOrchestrator::recordRayTracing(
     uint32_t hasEnvMap,
     float envIntensity,
     uint32_t useHwRT,
-    const Config& config
+    const Config& config,
+    Image* mlSkipImage,
+    Image* mlSpecAlbedoImage
 ) {
     if (params.skipRayTracing) return;
 
@@ -389,6 +391,12 @@ void RayTracingOrchestrator::recordRayTracing(
             if (mlSpecularImage) {
                 vkCmdClearColorImage(cmd, mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
             }
+            if (mlSkipImage) {
+                vkCmdClearColorImage(cmd, mlSkipImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+            }
+            if (mlSpecAlbedoImage) {
+                vkCmdClearColorImage(cmd, mlSpecAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+            }
         }
 
         std::vector<VkImageMemoryBarrier2> clearBarriers;
@@ -411,6 +419,8 @@ void RayTracingOrchestrator::recordRayTracing(
         if (needMlBuffers) {
             addClearBarrier(mlDiffuseImage);
             addClearBarrier(mlSpecularImage);
+            addClearBarrier(mlSkipImage);
+            addClearBarrier(mlSpecAlbedoImage);
         }
 
         if (!clearBarriers.empty()) {
@@ -437,14 +447,17 @@ void RayTracingOrchestrator::recordRayTracing(
         wfSceneData.cameraFlags = params.cameraFlags;
 
         bool enableNrcThisFrame = config.enable_nrc;
-        if (params.isMultiGpu) {
-            enableNrcThisFrame = false; // Secondary GPU has no NRC inference network; disable to maintain dual-GPU radiometric parity
-        }
         wfSceneData.enableNrc = enableNrcThisFrame;
         wfSceneData.nrcBounce = config.nrc_bounce;
         wfSceneData.nrcTrainRatio = config.nrc_train_ratio;
-        wfSceneData.boundsMin = sceneData.boundsMin;
-        wfSceneData.boundsMax = sceneData.boundsMax;
+        const bool hasFocalBounds =
+            (sceneData.focalBoundsMin.x < sceneData.focalBoundsMax.x) &&
+            (sceneData.focalBoundsMin.y < sceneData.focalBoundsMax.y) &&
+            (sceneData.focalBoundsMin.z < sceneData.focalBoundsMax.z);
+        const glm::vec3 nrcBMin = hasFocalBounds ? sceneData.focalBoundsMin : sceneData.boundsMin;
+        const glm::vec3 nrcBMax = hasFocalBounds ? sceneData.focalBoundsMax : sceneData.boundsMax;
+        wfSceneData.boundsMin = nrcBMin;
+        wfSceneData.boundsMax = nrcBMax;
         wfSceneData.streamlineSecondaryShading = config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = config.max_secondary_distance;
@@ -483,9 +496,11 @@ void RayTracingOrchestrator::recordRayTracing(
         }
 
         bool needNormals = (config.upscaler_mode == UpscalerMode::Upways ||
+                            config.upscaler_mode == UpscalerMode::FSR ||
                             config.denoiser_mode == DenoiserMode::Upways ||
                             config.denoiser_mode == DenoiserMode::Svgf ||
                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                            params.isRestirActive ||
                             config.enable_caustics ||
                             !config.capture_training_data_dir.empty());
         bool needGbuffers = needNormals || params.isRestirActive || (config.upscaler_mode == UpscalerMode::FSR);
@@ -495,7 +510,13 @@ void RayTracingOrchestrator::recordRayTracing(
                           config.upscaler_mode == UpscalerMode::Upways ||
                           config.upways_superres ||
                           !config.capture_training_data_dir.empty());
-        wfSceneData.captureMlData = (captureMl ? 1u : 0u) | ((captureMl && keepAccumWithMl) ? 2u : 0u);
+        bool captureMlV4 = (config.denoiser_mode == DenoiserMode::Upways ||
+                            config.upscaler_mode == UpscalerMode::Upways ||
+                            config.upways_superres ||
+                            config.capture_channels >= 32u);
+        wfSceneData.captureMlData = (captureMl ? 1u : 0u)
+                                  | ((captureMl && keepAccumWithMl) ? 2u : 0u)
+                                  | (captureMlV4 ? 4u : 0u);
         wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (needGbuffers ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
@@ -529,12 +550,17 @@ void RayTracingOrchestrator::recordRayTracing(
             m_nrcManager->setBackend(config.nrc_backend);
             uint32_t nrcW = params.isMultiGpu ? params.fullWidth : params.dispatchWidth;
             uint32_t nrcH = params.isMultiGpu ? params.fullHeight : params.dispatchHeight;
-            m_nrcManager->recordInference(cmd, nrcW, nrcH, sceneData.boundsMin, sceneData.boundsMax,
-                                          0, params.frameSlot, wfSceneData.captureMlData);
-            float nrcLr = (!params.cameraMovedLastFrame && !params.accumReset && config.progressive_accumulation)
-                ? 2e-4f
-                : 8e-4f;
-            m_nrcManager->recordTraining(cmd, params.frameIndex, sceneData.boundsMin, sceneData.boundsMax, nrcLr, 1024);
+            const bool nrcWarmStart = (params.frameIndex < 4u || params.accumReset);
+            const bool nrcSteady = (!nrcWarmStart && params.frameIndex >= 8u);
+            float nrcLr = (nrcWarmStart
+                ? 2.0e-3f
+                : ((!params.cameraMovedLastFrame && config.progressive_accumulation) ? 5e-4f : 8e-4f))
+                * (nrcSteady ? 1.25f : 1.0f);
+            uint32_t nrcBatch = nrcWarmStart ? 128u : (nrcSteady ? 32u : 64u);
+            m_nrcManager->recordInferenceAndTraining(cmd, nrcW, nrcH, nrcBMin, nrcBMax,
+                                                     0, params.frameSlot, wfSceneData.captureMlData,
+                                                     std::min(config.indirect_clamp, 24.0f),
+                                                     params.frameIndex, nrcLr, nrcBatch);
         }
 
         const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile);

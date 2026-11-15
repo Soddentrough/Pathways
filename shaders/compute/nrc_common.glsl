@@ -21,13 +21,42 @@ struct NRCQuery {
 };
 
 struct NRCTrainingRecord {
-    vec4 pos_roughness;    // pos.xyz, roughness (w)
-    vec4 normal_flags;     // normal.xyz, flags (w)
-    vec4 dir_pixelIndex;   // dir.xyz, pixelIndex (w as uintBitsToFloat)
-    vec4 albedo_pad;       // albedo.rgb, pad (w)
-    vec4 throughput;       // throughput.rgb, pad (w)
-    vec4 targetRadiance;   // targetRadiance.rgb, pad (w)
+    vec4 pos_roughness;      // queryPos.xyz, queryRoughness (w)
+    vec4 normal_flags;       // queryNormal.xyz, flags (w)
+    vec4 dir_pixelIndex;     // queryDir.xyz, pixelIndex (w as uintBitsToFloat)
+    vec4 albedo_pad;         // queryAlbedo.rgb, pad (w)
+    vec4 throughput;         // tailBsdfWeight.rgb, hasTail (w: >0.5 to bootstrap MLP at tail vertex)
+    vec4 targetRadiance;     // localSuffixDirectRadiance.rgb, pad (w)
+    vec4 tailPos_roughness;  // tailPos.xyz, tailRoughness (w)
+    vec4 tailPacked;         // oct(tailNormal), oct(tailDir), unorm4x8(tailAlbedo), pad
 };
+
+vec2 nrcOctEncode(vec3 n) {
+    float l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    vec2 p = (l1 > 1e-6) ? (n.xy / l1) : vec2(0.0);
+    if (n.z < 0.0) {
+        vec2 s = vec2(p.x >= 0.0 ? 1.0 : -1.0, p.y >= 0.0 ? 1.0 : -1.0);
+        p = (1.0 - abs(p.yx)) * s;
+    }
+    return clamp(p, -1.0, 1.0);
+}
+
+vec3 nrcOctDecode(vec2 e) {
+    vec3 v = vec3(e.x, e.y, 1.0 - abs(e.x) - abs(e.y));
+    if (v.z < 0.0) {
+        vec2 s = vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+        v.xy = (1.0 - abs(v.yx)) * s;
+    }
+    return normalize(v);
+}
+
+uint nrcPackUnitVec3(vec3 v) {
+    return packSnorm2x16(nrcOctEncode(v));
+}
+
+vec3 nrcUnpackUnitVec3(uint p) {
+    return nrcOctDecode(unpackSnorm2x16(p));
+}
 
 struct NRCCountersBuffer {
     uint queryCount;

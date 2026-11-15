@@ -1193,6 +1193,8 @@ void Engine::updateAllImageDescriptors() {
     imgParams.mlSpecularMotionImage = m_mlSpecularMotionImage;
     imgParams.mlDiffuseImage = m_mlDiffuseImage;
     imgParams.mlSpecularImage = m_mlSpecularImage;
+    imgParams.mlSkipImage = m_mlSkipImage;
+    imgParams.mlSpecAlbedoImage = m_mlSpecAlbedoImage;
     imgParams.frameImages = m_frameImages;
 
     m_descriptorManager->updatePrimaryImageDescriptors(imgParams);
@@ -1251,6 +1253,8 @@ void Engine::syncRenderTargetPointers() {
         m_mlSpecularMotionImage = m_renderTargets->getMlSpecularMotionImage();
         m_mlDiffuseImage = m_renderTargets->getMlDiffuseImage();
         m_mlSpecularImage = m_renderTargets->getMlSpecularImage();
+        m_mlSkipImage = m_renderTargets->getMlSkipImage();
+        m_mlSpecAlbedoImage = m_renderTargets->getMlSpecAlbedoImage();
         for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
             m_frameImages[i] = m_renderTargets->getFrameImage(i);
         }
@@ -1264,6 +1268,8 @@ void Engine::syncRenderTargetPointers() {
         m_mlSpecularMotionImage = nullptr;
         m_mlDiffuseImage = nullptr;
         m_mlSpecularImage = nullptr;
+        m_mlSkipImage = nullptr;
+        m_mlSpecAlbedoImage = nullptr;
         m_frameImages.fill(nullptr);
     }
 }
@@ -1274,7 +1280,8 @@ void Engine::updateUpwaysDescriptors() {
             m_postProcess.get(), m_accumImage, m_outputImage,
             m_normalDepthImage, m_motionVectorImage,
             m_mlAlbedoRoughnessImage, m_mlSpecularMotionImage,
-            m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0]
+            m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0],
+            m_mlSkipImage, m_mlSpecAlbedoImage
         );
     }
 }
@@ -1295,7 +1302,8 @@ void Engine::updateFsrDescriptors() {
             m_postProcess.get(), colorIn, m_outputImage,
             m_normalDepthImage, m_motionVectorImage,
             m_mlAlbedoRoughnessImage, m_mlSpecularMotionImage,
-            m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0]
+            m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0],
+            m_mlSkipImage, m_mlSpecAlbedoImage
         );
     }
 }
@@ -1444,6 +1452,8 @@ void Engine::updateWavefrontSceneDescriptors() {
     wfParams.mlSpecularMotionImage = m_mlSpecularMotionImage;
     wfParams.mlDiffuseImage = m_mlDiffuseImage;
     wfParams.mlSpecularImage = m_mlSpecularImage;
+    wfParams.mlSkipImage = m_mlSkipImage;
+    wfParams.mlSpecAlbedoImage = m_mlSpecAlbedoImage;
     wfParams.filteredCausticImage = (m_causticsPipeline && m_causticsPipeline->getFilteredCausticImage())
         ? m_causticsPipeline->getFilteredCausticImage() : nullptr;
 
@@ -1486,6 +1496,8 @@ void Engine::updateMergeDescriptors() {
     mergeParams.mlSpecularImage = m_mlSpecularImage;
     mergeParams.mlAlbedoRoughnessImage = m_mlAlbedoRoughnessImage;
     mergeParams.mlSpecularMotionImage = m_mlSpecularMotionImage;
+    mergeParams.mlSkipImage = m_mlSkipImage;
+    mergeParams.mlSpecAlbedoImage = m_mlSpecAlbedoImage;
     mergeParams.frameImages = m_frameImages;
     mergeParams.width = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
     mergeParams.height = renderH;
@@ -1680,11 +1692,6 @@ void Engine::renderFrame() {
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
         m_lastTonemapMs = gpuTonemapMs;
         m_lastUpwaysMs = gpuUpwaysMs;
-        if (m_superResolution) {
-            if (auto* upw = m_superResolution->getUpwaysPipeline()) {
-                upw->collectQueryResults(static_cast<int32_t>(m_currentFrame));
-            }
-        }
         if (m_denoiser && m_denoiser->isInitialized()) {
             m_denoiser->collectQueryResults();
         }
@@ -2117,8 +2124,11 @@ void Engine::renderFrame() {
         }
     }
 
-    // Advance video billboard decoder if active
-    if (m_videoBillboard && m_videoBillboard->isOpen()) {
+    const bool coasterFrozen = (m_config.camera_path_freeze_time >= 0.0f);
+    const bool allowSceneAnimation = !coasterFrozen && m_config.animate_objects && (m_config.animation_speed > 0.0001f);
+
+    // Advance video billboard decoder if active (pause when scene animation is frozen/disabled)
+    if (allowSceneAnimation && m_videoBillboard && m_videoBillboard->isOpen()) {
         float dt = 1.0f / 24.0f;
         if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
             dt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
@@ -2131,8 +2141,7 @@ void Engine::renderFrame() {
     if (!m_config.headless && m_lastPresentationTimeMs > 0.01 && m_lastPresentationTimeMs < 1000.0) {
         animDt = static_cast<float>(m_lastPresentationTimeMs * 0.001);
     }
-    const bool coasterFrozen = (m_config.camera_path_freeze_time >= 0.0f);
-    bool isAnimating = !coasterFrozen && m_config.animate_objects && (m_config.animation_speed > 0.0001f) &&
+    bool isAnimating = allowSceneAnimation &&
                        (!m_sceneData.animatedInstances.empty() || m_sceneData.isMineshaftCoaster);
     if (isAnimating) {
         updateAnimatedInstances(animDt);
@@ -2298,6 +2307,20 @@ void Engine::renderFrame() {
     if (m_videoBillboard && m_videoBillboard->hasNewFrame()) {
         flags |= (1 << 12); // Dynamic video bypass flag
     }
+    if (allowSceneAnimation) {
+        flags |= (1u << 13); // UBO scene animation enabled (gates procedural holo time)
+    }
+    const bool needGbufferGuides = (m_config.upscaler_mode == UpscalerMode::Upways ||
+                                    m_config.upscaler_mode == UpscalerMode::FSR ||
+                                    m_config.denoiser_mode == DenoiserMode::Upways ||
+                                    m_config.denoiser_mode == DenoiserMode::Svgf ||
+                                    m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                    isRestirActive() ||
+                                    m_config.enable_caustics ||
+                                    !m_config.capture_training_data_dir.empty());
+    if (needGbufferGuides) {
+        flags |= (1u << 14); // Active G-buffer guides (NormalDepth + MotionVector)
+    }
     bool historyInvalidate = hardReset || sceneLoadingActive;
     if (historyInvalidate) {
         // Hard history reset flag for ReSTIR temporal taps. Camera motion
@@ -2355,13 +2378,14 @@ void Engine::renderFrame() {
         }
     }
 
-    bool hasDenoiser = (m_config.denoiser_mode != DenoiserMode::None ||
-                        m_config.upscaler_mode == UpscalerMode::Upways);
-    bool isStationaryAccum = m_config.progressive_accumulation && !hasDenoiser && !m_cameraMovedLastFrame && (m_accumulatedSamples >= 1);
-    (void)0;
-
     uint32_t renderW = m_config.getRenderWidth();
     uint32_t renderH = m_config.getRenderHeight();
+    bool fsrUpscaling = (m_config.upscaler_mode == UpscalerMode::FSR) &&
+                        (renderW < m_config.width || renderH < m_config.height);
+    bool hasDenoiser = (m_config.denoiser_mode != DenoiserMode::None ||
+                        m_config.upscaler_mode == UpscalerMode::Upways);
+    bool isStationaryAccum = m_config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !m_cameraMovedLastFrame && (m_accumulatedSamples >= 1);
+    (void)0;
     bool fsrJitterActive = (m_config.upscaler_mode == UpscalerMode::FSR) &&
                            !(m_config.fsr_version == FsrVersion::Fsr4 && (!m_context || !m_context->supportsFsr4()));
     bool upwaysSuperResActive = (m_config.upscaler_mode == UpscalerMode::Upways) &&
@@ -2505,7 +2529,9 @@ void Engine::renderFrame() {
                 m_sceneData,
                 m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_numOpaqueTriangles,
                 hasEnvMap, envIntensity, useHwRT,
-                m_config
+                m_config,
+                m_mlSkipImage,
+                m_mlSpecAlbedoImage
             );
         }
 
@@ -2575,9 +2601,7 @@ void Engine::renderFrame() {
             }
 
             if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
-                const bool fastUpscalerCoupled =
-                    (m_config.upscaler_mode == UpscalerMode::FSR) ||
-                    (m_config.progressive_accumulation && !m_cameraMovedLastFrame && m_accumulatedSamples >= 64);
+                const bool fastUpscalerCoupled = (m_config.upscaler_mode == UpscalerMode::FSR);
                 m_denoiser->recordDenoise(
                     cmd, m_currentFrame, resetTemporal,
                     m_accumulatedSamples, -1.0f,
@@ -2626,7 +2650,11 @@ void Engine::renderFrame() {
                         fsrInputImage, m_normalDepthImage, m_motionVectorImage,
                         m_mgpu.get(), denoisedInput ? nullptr : m_secTransferBuffer, m_currentFrame,
                         m_postProcess.get(), m_outputImage,
-                        [this]() { updateFsrDescriptors(); }
+                        [this]() { updateFsrDescriptors(); },
+                        m_camera.get(),
+                        static_cast<float>((m_lastFrameTimeMs > 0.1 && m_lastFrameTimeMs < 1000.0) ? m_lastFrameTimeMs : 16.667),
+                        (!denoisedInput && (!m_mgpu || !m_mgpu->isMultiGpuActive())) ? m_frameImages[m_currentFrame] : nullptr,
+                        denoisedInput
                     );
                 }
             }
@@ -2823,6 +2851,7 @@ void Engine::renderFrame() {
         }
 
         if (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) {
+            const bool fastUpscalerCoupled = (m_config.upscaler_mode == UpscalerMode::FSR);
             m_denoiser->recordDenoise(
                 activeCmd, m_currentFrame, resetTemporal,
                 m_accumulatedSamples, -1.0f,
@@ -2831,7 +2860,8 @@ void Engine::renderFrame() {
                 m_mlAlbedoRoughnessImage, m_accumImage,
                 m_mlSpecularMotionImage,
                 buildDenoiserCameraMatrices(renderW, renderH),
-                m_config.denoiser_mode
+                m_config.denoiser_mode,
+                fastUpscalerCoupled
             );
             svgfRun = true;
         }
@@ -2860,13 +2890,18 @@ void Engine::renderFrame() {
                     fsrInputImage = m_superResolution->getUpwaysPipeline()->getOutputImage();
                     denoisedInput = true;
                 }
+                const bool fsrUpscaling = (renderW < m_config.width || renderH < m_config.height);
                 fsrRun = m_superResolution->dispatchFsr(
                     activeCmd, resetTemporal, m_config, m_frameIndex,
                     m_cameraMovedLastFrame, denoisedInput ? 1u : m_accumulatedSamples,
                     fsrInputImage, m_normalDepthImage, m_motionVectorImage,
                     m_mgpu.get(), denoisedInput ? nullptr : m_secTransferBuffer, m_currentFrame,
                     m_postProcess.get(), m_outputImage,
-                    [this]() { updateFsrDescriptors(); }
+                    [this]() { updateFsrDescriptors(); },
+                    m_camera.get(),
+                    static_cast<float>((m_lastFrameTimeMs > 0.1 && m_lastFrameTimeMs < 1000.0) ? m_lastFrameTimeMs : 16.667),
+                    (!denoisedInput && (m_cameraMovedLastFrame || fsrUpscaling)) ? m_frameImages[mgpuPlan.slot] : nullptr,
+                    denoisedInput
                 );
             }
         }
@@ -3730,6 +3765,7 @@ void Engine::run() {
         m_accumulationComplete = false;
         m_resetAccumulation = true;
         if (m_causticsPipeline) m_causticsPipeline->resetHistory();
+        if (m_nrcManager) m_nrcManager->resetWeights();
         m_temporalResetRequested = true;
         m_lastFrameTimeMs = 0.0;
         m_lastActiveRenderFrameTimeMs = 0.0;

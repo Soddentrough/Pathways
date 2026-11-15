@@ -17,7 +17,12 @@ struct FfxSdkPrepPushConstants {
     uint32_t renderWidth;
     uint32_t renderHeight;
     float sampleScale;
+    float rawSampleScale;
     float nearZ;
+    float jitterDeltaX;   // currJitterX - prevJitterX in render pixels
+    float jitterDeltaY;   // currJitterY - prevJitterY in render pixels
+    uint32_t totalSamples;
+    uint32_t flags;       // bit 0: resetHistory, bit 1: cameraMoved, bit 2: inputIsDenoised, bit 3: hasSeparateRaw
 };
 
 class FsrUpscaler : public IUpscaler {
@@ -71,7 +76,7 @@ private:
     void initImages();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView motionVectorsView, VkImageView depthView);
+    void updateDescriptorSets(uint32_t slot, VkImageView inputColorView, VkImageView rawColorView, VkImageView motionVectorsView, VkImageView depthView);
     void createPipelines(const std::vector<char>& sdkPrepSpv);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
@@ -99,7 +104,11 @@ private:
     std::unique_ptr<Image> m_sdkColorInput;
     std::unique_ptr<Image> m_sdkDepthInput;
     std::unique_ptr<Image> m_sdkMotionVectorsInput;
+    std::unique_ptr<Image> m_linearColorHistory[2];
+    std::unique_ptr<Image> m_linearGuideHistory[2];
     bool m_historyValid = false;
+    bool m_historyImagesInitialized = false;
+    uint32_t m_historyParity = 0;
 
     VkDescriptorPool m_descPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_sdkPrepDescLayout = VK_NULL_HANDLE;
@@ -108,9 +117,9 @@ private:
     VkDescriptorSet m_sdkPrepDescSets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     VkImageView m_lastBoundInputViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkImageView m_lastBoundRawViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView m_lastBoundMvViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkImageView m_lastBoundDepthViews[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    uint32_t m_nextPrepSlot = 0;
     std::string m_instanceName = "GPU 0 Primary Viewport";
 };
 

@@ -32,6 +32,8 @@ layout(binding = 26, rgba16f) uniform image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
+layout(binding = 40, rgba16f) uniform image2D uMlSkipImage;
+layout(binding = 41, rgba16f) uniform image2D uMlSpecAlbedoImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -235,12 +237,21 @@ void main() {
                     imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), outAlpha));
                 }
                 if (pc.captureMlData != 0u) {
-                    if (pc.sppSampleIndex == 0u) {
-                        imageStore(uMlDiffuseImage, storeCoord, vec4(skyColor, 0.0));
-                        // uMlSpecularImage is already zero-cleared by vkCmdClearColorImage
+                    if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) {
+                        if (pc.sppSampleIndex == 0u) {
+                            imageStore(uMlSkipImage, storeCoord, vec4(skyColor, 0.0));
+                        } else {
+                            vec4 prevSkip = imageLoad(uMlSkipImage, storeCoord);
+                            imageStore(uMlSkipImage, storeCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyColor, seed), 0.0));
+                        }
                     } else {
-                        vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
-                        imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+                        if (pc.sppSampleIndex == 0u) {
+                            imageStore(uMlDiffuseImage, storeCoord, vec4(skyColor, 0.0));
+                            // uMlSpecularImage is already zero-cleared by vkCmdClearColorImage
+                        } else {
+                            vec4 prevDiff = imageLoad(uMlDiffuseImage, storeCoord);
+                            imageStore(uMlDiffuseImage, storeCoord, vec4(addFp16Stochastic(prevDiff.rgb, skyColor, seed), 0.0));
+                        }
                     }
                 }
                 if ((ubo.flags & (1u << 9)) != 0u && pc.sppSampleIndex == 0u) {
@@ -358,8 +369,8 @@ void main() {
                                             0u, 0u)
                     : -16.0;
 
+                vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                 if (needNormals) {
-                    vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                     if (matId < pc.numMaterials && closestTri >= 0) {
                         Material mat = materials[matId];
                         if (mat.normalTex > 0u && mat.normalTex <= 512u) {
@@ -403,7 +414,8 @@ void main() {
                         if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                             emissiveVal *= SAMPLE_SCENE_TEXTURE_LOD(mat.emissiveTex, quantUv, rayConeBaseLod).rgb;
                         }
-                        if (archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
+                        if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u &&
+                            archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
                             albedoVal = clamp(albedoVal + emissiveVal, vec3(0.0), vec3(1.0));
                         }
                         roughnessVal = mat.roughness;
@@ -432,12 +444,34 @@ void main() {
                     float dSpec = 1.0 / (1.0 + max(primaryDepth, 0.0));
                     float isPrimaryEmissive = (archetype == MATERIAL_ARCHETYPE_EMISSIVE) ? 1.0 : 0.0;
                     float clampedMet = clamp(metallicVal, 0.0, 1.0);
+                    float clampedTrans = clamp(transmissionVal, 0.0, 1.0);
                     float physicalRoughness = clamp(mix(roughnessVal, clearcoatRoughnessVal, clearcoatVal), 0.0, 1.0);
-                    vec3 mlAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(albedoVal, vec3(0.004));
-                    imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(mlAlbedo, physicalRoughness));
-                    imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (transmissionVal >= 0.5) ? -dSpec : dSpec, 0.0));
-                    if (isPrimaryEmissive > 0.0) imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
-                    if (clampedMet > 0.0) imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
+                    if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) {
+                        float rawDiffFactor = 1.0 - clampedMet;
+                        vec3 demodDiff = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(albedoVal * rawDiffFactor, vec3(0.04));
+                        vec3 rawF0 = mix(vec3(0.04), clamp(albedoVal, vec3(0.0), vec3(1.0)), clampedMet);
+                        vec3 approxSpec = ffxApproximateBRDF(rawF0, physicalRoughness, shadingNormal, -direction);
+                        vec3 demodSpec = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(clamp(approxSpec, vec3(0.0), vec3(1.0)), vec3(0.02));
+                        float prevM = (pc.sppSampleIndex == 0u) ? 0.0 : imageLoad(uMlSpecAlbedoImage, storeCoord).a;
+                        float reactiveInit = (isPrimaryEmissive > 0.0)
+                            ? 0.5
+                            : max(clampedMet, (clampedTrans >= 0.5) ? 0.85 : max(clearcoatVal * 0.4, 0.0));
+                        imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(demodDiff, physicalRoughness));
+                        imageStore(uMlSpecAlbedoImage, storeCoord, vec4(demodSpec, prevM));
+                        imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (clampedTrans >= 0.5) ? -dSpec : dSpec, 0.0));
+                        if (pc.sppSampleIndex == 0u) {
+                            imageStore(uMlSkipImage, storeCoord, vec4(0.0, 0.0, 0.0, float(archetype) / 3.0));
+                        }
+                        if (reactiveInit > 0.0) {
+                            imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, reactiveInit));
+                        }
+                    } else {
+                        vec3 mlAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(albedoVal, vec3(0.004));
+                        imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(mlAlbedo, physicalRoughness));
+                        imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (transmissionVal >= 0.5) ? -dSpec : dSpec, 0.0));
+                        if (isPrimaryEmissive > 0.0) imageStore(uMlDiffuseImage, storeCoord, vec4(0.0, 0.0, 0.0, isPrimaryEmissive));
+                        if (clampedMet > 0.0) imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, clampedMet));
+                    }
                 }
             }
         }
@@ -468,6 +502,9 @@ void main() {
             if (pc.captureMlData != 0u) {
                 imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(0.0, 0.0, 0.0, 1.0));
                 imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, 0.0, 0.0));
+                if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) {
+                    imageStore(uMlSpecAlbedoImage, storeCoord, vec4(0.0));
+                }
             }
         }
     }

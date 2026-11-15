@@ -14,9 +14,12 @@ layout(local_size_x = 32) in;
 layout(binding = 0) uniform image2D uAccumImage;
 layout(binding = 23, rgba16f) uniform readonly image2D uMotionVectorImage;
 layout(binding = 33, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
+layout(binding = 26, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
 layout(binding = 27, rgba16f) uniform image2D uMlSpecularMotionImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
+layout(binding = 40, rgba16f) uniform image2D uMlSkipImage;
+layout(binding = 41, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -57,6 +60,11 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
 #endif
 
 #include "mis_common.glsl"
+layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+
+layout(binding = 7) uniform sampler2D environmentMap;
+DECLARE_SCENE_TEXTURES_BINDING(8)
+
 #if ENABLE_RESTIR_PT
 #include "restir_common.glsl"
 #include "bsdf_standard.glsl"
@@ -77,11 +85,16 @@ layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
     GiReservoir giHistoryReservoirs[];
 };
 
-#include "restir_gi_reuse.glsl"
+#ifndef ENABLE_INLINE_SHADOWS
+#define ENABLE_INLINE_SHADOWS 1
 #endif
 
-layout(binding = 7) uniform sampler2D environmentMap;
-DECLARE_SCENE_TEXTURES_BINDING(8)
+#if ENABLE_INLINE_SHADOWS
+#include "wavefront_shadow_inline.glsl"
+#endif
+
+#include "restir_gi_reuse.glsl"
+#endif
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
@@ -159,11 +172,14 @@ void main() {
             } else if (pc.currentBounce == 1u) {
                 X1Context giCtx = x1Contexts[pixelIndex];
                 if (x1ContextValid(giCtx)) {
+                    uint giReuseSeed = seed ^ 0xC2B2AE35u;
+                    pcg_hash(giReuseSeed);
                     restirGiRunReuse(
                         pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
                         pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                        pc.useHardwareRT == 1u, pc.numSpheres, pc.numOpaqueTriangles,
                         giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
-                        seed, hasGiShadowRay, giShadowCandidate
+                        giReuseSeed, hasGiShadowRay, giShadowCandidate
                     );
                 } else if (pc.sppSampleIndex == 0u) {
                     giReservoirs[pixelIndex] = invalidGiReservoir();
@@ -195,18 +211,30 @@ void main() {
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), prev.a));
             }
             if (pc.captureMlData != 0u) {
-                if (isSpecularPath) {
+                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                if (isV4 && pc.currentBounce == 0u) {
+                    vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
+                    imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, accumRadiance, seed), prevSkip.a));
+                } else if (isSpecularPath) {
+                    vec3 outSpec = isV4
+                        ? demodulateMlSafe(accumRadiance, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                        : accumRadiance;
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), prevSpec.a));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                 } else {
+                    vec3 outDiff = isV4
+                        ? demodulateMlSafe(accumRadiance, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                        : accumRadiance;
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), prevDiff.a));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                 }
             }
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, 10000.0, true);
         } else {
             vec3 hitPoint = origin + rayDir * hitT;
             RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
+            RECORD_DIFFUSE_HIT_DIST(pixelIndex, hitT, false);
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             if (!frontFace) hitNormal = -hitNormal;
 
@@ -216,7 +244,8 @@ void main() {
             if ((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                 // High-End Cyberpunk Volumetric Hologram Shading:
                 vec3 vidSample = SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
-                float time = float(pc.frameIndex) * 0.01666667;
+                uint holoFrame = ((ubo.flags & (1u << 13)) != 0u) ? (ubo.frameIndex & 0xFFFFFu) : 0u;
+                float time = float(holoFrame) * 0.01666667;
 
                 // 1. Dual-Frequency Holographic Scanlines & Phosphor Raster:
                 float sweep = sin(hitPoint.y * 24.0 - time * 4.0) * 0.5 + 0.5;
@@ -256,7 +285,8 @@ void main() {
                 emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
             } else if ((mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {
                 vec3 hitPoint = origin + rayDir * hitT;
-                float time = float(pc.frameIndex) * 0.01666667;
+                uint holoFrame = ((ubo.flags & (1u << 13)) != 0u) ? (ubo.frameIndex & 0xFFFFFu) : 0u;
+                float time = float(holoFrame) * 0.01666667;
                 float scanline = sin(hitPoint.y * 24.0 - time * 8.0) * 0.5 + 0.5;
                 float fineScan = sin(hitPoint.y * 96.0 + time * 3.0) * 0.5 + 0.5;
                 vec3 dummyG;
@@ -272,8 +302,16 @@ void main() {
 
             // MIS weight against NEE at the spawning vertex (mis_common.glsl).
             uint inPdfCode = unpackRayPdfCode(state);
+            float emitLightScale = (pc.currentBounce >= 2u)
+                ? restirSecondaryMisLightScale(pc.currentBounce - 1u, pc.numLights, pc.captureMlData, pc.enableNrc)
+                : 1.0;
+#if ENABLE_RESTIR_PT
+            if (((ubo.flags & (1u << 9)) != 0u) && pc.currentBounce == 1u && x1ContextHasDiRestirMis(x1Contexts[pixelIndex])) {
+                emitLightScale = restirDiMisLightScale(pc.numLights, pc.captureMlData);
+            }
+#endif
             float emitMisW = (pc.currentBounce == 0u) ? 1.0
-                : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights);
+                : emitterHitMisWeightScaled(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale);
             vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (pc.currentBounce > 0u) {
                 float effClamp = (!isSpecularPath && inPdfCode == 0u && pc.currentBounce >= 2u)
@@ -292,13 +330,23 @@ void main() {
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), isDynamicVideo));
             }
             if (pc.captureMlData != 0u) {
-                if (isSpecularPath) {
+                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                if (isV4 && pc.currentBounce == 0u) {
+                    vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
+                    imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, accumRadiance, seed), prevSkip.a));
+                } else if (isSpecularPath) {
+                    vec3 outSpec = isV4
+                        ? demodulateMlSafe(accumRadiance, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                        : accumRadiance;
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, accumRadiance, seed), prevSpec.a));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                 } else {
+                    vec3 outDiff = isV4
+                        ? demodulateMlSafe(accumRadiance, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                        : accumRadiance;
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    float emissiveFlag = (pc.currentBounce == 0u) ? 1.0 : prevDiff.a;
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, accumRadiance, seed), emissiveFlag));
+                    float emissiveFlag = (!isV4 && pc.currentBounce == 0u) ? 1.0 : prevDiff.a;
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), emissiveFlag));
                 }
             }
         }

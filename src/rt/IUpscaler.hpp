@@ -33,6 +33,12 @@ struct UpscalerDispatchDesc {
     uint32_t frameIndex = 0;
     uint32_t totalSamples = 1;
     bool inputIsNormalized = false;
+    VkImageView rawColorIn = VK_NULL_HANDLE;      // Optional current-frame unaccumulated 1-SPP linear radiance (renderW x renderH)
+    float rawSampleScale = 1.0f;                  // Scale factor for rawColorIn
+    float prevJitterX = 0.0f;                     // Previous frame Halton jitter X in render pixels [-0.5, 0.5]
+    float prevJitterY = 0.0f;                     // Previous frame Halton jitter Y in render pixels [-0.5, 0.5]
+    float preExposure = 1.0f;                     // Camera scene exposure hint for FidelityFX SDK tonemapping
+    bool inputIsDenoised = false;                 // True when colorIn comes from E-SVGF / RayRegen / Upways denoiser
 };
 
 class IUpscaler {

@@ -50,14 +50,16 @@ int main() {
     check_true(offsetof(NRCQuery, throughput) == 64, "throughput must be at byte 64");
     std::cout << "  -> NRCQuery layout verified (80B std430 aligned)." << std::endl;
 
-    check_true(sizeof(NRCTrainingRecord) == 96, "NRCTrainingRecord must be exactly 96 bytes (6x vec4)");
+    check_true(sizeof(NRCTrainingRecord) == 128, "NRCTrainingRecord must be exactly 128 bytes (8x vec4)");
     check_true(offsetof(NRCTrainingRecord, pos_roughness) == 0, "pos_roughness must be at byte 0");
     check_true(offsetof(NRCTrainingRecord, normal_flags) == 16, "normal_flags must be at byte 16");
     check_true(offsetof(NRCTrainingRecord, dir_pixelIndex) == 32, "dir_pixelIndex must be at byte 32");
     check_true(offsetof(NRCTrainingRecord, albedo_pad) == 48, "albedo_pad must be at byte 48");
     check_true(offsetof(NRCTrainingRecord, throughput) == 64, "throughput must be at byte 64");
     check_true(offsetof(NRCTrainingRecord, targetRadiance) == 80, "targetRadiance must be at byte 80");
-    std::cout << "  -> NRCTrainingRecord layout verified (96B std430 aligned)." << std::endl;
+    check_true(offsetof(NRCTrainingRecord, tailPos_roughness) == 96, "tailPos_roughness must be at byte 96");
+    check_true(offsetof(NRCTrainingRecord, tailPacked) == 112, "tailPacked must be at byte 112");
+    std::cout << "  -> NRCTrainingRecord layout verified (128B std430 aligned)." << std::endl;
 
     check_true(sizeof(NRCCountersBuffer) == 16, "NRCCountersBuffer must be exactly 16 bytes (4x uint32_t)");
     check_true(offsetof(NRCCountersBuffer, queryCount) == 0, "queryCount must be at byte 0");

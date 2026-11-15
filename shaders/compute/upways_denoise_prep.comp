@@ -1,0 +1,631 @@
+#version 460
+#extension GL_EXT_control_flow_attributes : enable
+#include "upways_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0,  rgba16f)  readonly  uniform image2D      uMlDiffuse;
+layout(set = 0, binding = 1,  rgba16f)  readonly  uniform image2D      uMlSpecular;
+layout(set = 0, binding = 2,  rgba16f)  readonly  uniform image2D      uMlAlbedoRoughness;
+layout(set = 0, binding = 3,  rgba16f)  readonly  uniform image2D      uMlSpecAlbedo;
+layout(set = 0, binding = 4,  rgba16f)  readonly  uniform image2D      uMlSkip;
+layout(set = 0, binding = 5,  rgba16f)  readonly  uniform image2D      uNormalDepth;
+layout(set = 0, binding = 6,  rgba16f)  readonly  uniform image2D      uMotionVectors;
+layout(set = 0, binding = 7,  rgba16f)  readonly  uniform image2D      uSpecularMotion;
+layout(set = 0, binding = 8,  rgba16f)  readonly  uniform image2D      uPrevDiffLr;
+layout(set = 0, binding = 9,  rgba16f)  readonly  uniform image2D      uPrevSpecLr;
+layout(set = 0, binding = 10, rgba16f)  readonly  uniform image2D      uPrevGeomLr;
+layout(set = 0, binding = 11, r32ui)    readonly  uniform uimage2D     uPrevHiddenLr;
+layout(set = 0, binding = 12, rgba16f)  writeonly uniform image2DArray tBaseAnchorLr;
+layout(set = 0, binding = 13, rgba16f)  writeonly uniform image2D      uCurrGeomLr;
+layout(set = 0, binding = 14)           writeonly buffer  DenoiseActFp8Buf { uvec2 act2[]; } g_act;
+
+// 18x10 cooperative G-buffer tile: 180 * 40 B = 7,200 B (< 8 KB -> 16 waves/SIMD)
+shared uvec2 s_diff[180];       // packHalf2x16(eD.rg), packHalf2x16(vec2(eD.b, dHD))
+shared uvec2 s_spec[180];       // packHalf2x16(eS.rg), packHalf2x16(vec2(eS.b, rM))
+shared uvec2 s_nrmDep[180];     // packHalf2x16(nrm.xy), packHalf2x16(vec2(nrm.z, dep))
+shared uvec2 s_logDiff[180];    // packHalf2x16(safeLog1p(eD).rg), packHalf2x16(vec2(safeLog1p(eD).b, 0.0))
+shared uvec2 s_logSpec[180];    // packHalf2x16(safeLog1p(eS).rg), packHalf2x16(vec2(safeLog1p(eS).b, 0.0))
+
+void writeQuadSlot(int qx, int qy, int corner, int W1, uint f0, uint f1, uint f2, uint f3, uint f4, uint f5) {
+    uint base2 = (pc.offX0 >> 1u) + uint(qy * W1 + qx) * 12u + uint(corner) * 3u;
+    g_act.act2[base2 + 0u] = uvec2(f0, f1);
+    g_act.act2[base2 + 1u] = uvec2(f2, f3);
+    g_act.act2[base2 + 2u] = uvec2(f4, f5);
+}
+
+void evalWarpGeomTap(
+    vec4 pg, bool inOk, float bw, float linDepth, vec3 viewNormal,
+    bool evalSpec, float relThreshS, out float wD, out float wS
+) {
+    float pDepth = ((floatBitsToUint(pg.a) & 0x7FFFFFFFu) < 0x7F800000u) ? clamp(pg.a, 0.0, 10000.0) : 10000.0;
+    float vOk    = (inOk && pDepth < 9999.0) ? bw : 0.0;
+    vec3  pNrmR  = clamp(pg.rgb, vec3(-1.0), vec3(1.0));
+    float len2   = dot(pNrmR, pNrmR);
+    vec3  pNrm   = (len2 > 1e-10) ? (pNrmR * inversesqrt(len2)) : vec3(0.0, 0.0, 1.0);
+    float relE   = abs(pDepth - linDepth) / max(max(linDepth, pDepth), 1e-3);
+    float ndot   = max(dot(viewNormal, pNrm), 0.0);
+    float ndot2  = ndot * ndot;
+    wD = vOk * exp2(-max(relE - 0.06, 0.0) * 17.3123405) * (ndot2 * ndot2);
+    if (evalSpec) {
+        wS = vOk * exp2(-max(relE - relThreshS, 0.0) * 14.4269504) * ndot2;
+    } else {
+        wS = 0.0;
+    }
+}
+
+void accumPrevDiffHidden4(
+    vec4 pd0, vec4 pd1, vec4 pd2, vec4 pd3,
+    uint ph0, uint ph1, uint ph2, uint ph3,
+    float wD0, float wD1, float wD2, float wD3, float sumTapW,
+    out float diffConf, out vec3 yDiffPrev, out float prevNDiff, out uint hWarpPacked
+) {
+    vec3 accPrevD = wD0 * clampFp16Rgb(pd0.rgb)
+                  + wD1 * clampFp16Rgb(pd1.rgb)
+                  + wD2 * clampFp16Rgb(pd2.rgb)
+                  + wD3 * clampFp16Rgb(pd3.rgb);
+    float accPrevND = wD0 * clamp(pd0.a, 0.0, 64.0)
+                    + wD1 * clamp(pd1.a, 0.0, 64.0)
+                    + wD2 * clamp(pd2.a, 0.0, 64.0)
+                    + wD3 * clamp(pd3.a, 0.0, 64.0);
+    vec4 accPrevH = wD0 * unpackFp8Vec4(ph0)
+                  + wD1 * unpackFp8Vec4(ph1)
+                  + wD2 * unpackFp8Vec4(ph2)
+                  + wD3 * unpackFp8Vec4(ph3);
+
+    float invSumW = 1.0 / sumTapW;
+    diffConf    = clamp(sumTapW, 0.0, 1.0);
+    yDiffPrev   = accPrevD * invSumW;
+    prevNDiff   = accPrevND * invSumW;
+    vec4 hAcc   = accPrevH * invSumW;
+    hWarpPacked = packFp8Vec4(clamp(hAcc, vec4(-4.0), vec4(4.0)) * diffConf);
+}
+
+void accumPrevSpec4(
+    vec4 ps0, vec4 ps1, vec4 ps2, vec4 ps3,
+    float wS0, float wS1, float wS2, float wS3, float sumTapWS,
+    out float specConf, out vec3 ySpecPrev, out float prevNSpec
+) {
+    vec3 accPrevS = wS0 * clampFp16Rgb(ps0.rgb)
+                  + wS1 * clampFp16Rgb(ps1.rgb)
+                  + wS2 * clampFp16Rgb(ps2.rgb)
+                  + wS3 * clampFp16Rgb(ps3.rgb);
+    float accPrevNS = wS0 * clamp(ps0.a, 0.0, 64.0)
+                    + wS1 * clamp(ps1.a, 0.0, 64.0)
+                    + wS2 * clamp(ps2.a, 0.0, 64.0)
+                    + wS3 * clamp(ps3.a, 0.0, 64.0);
+
+    float invSumWS = 1.0 / sumTapWS;
+    specConf  = clamp(sumTapWS, 0.0, 1.0);
+    ySpecPrev = accPrevS * invSumWS;
+    prevNSpec = accPrevNS * invSumWS;
+}
+
+void accumPrep3x3Tap(
+    uint qAp, float linDepth, float invDepthE2, vec3 viewNormal,
+    bool smoothSpec, float roughSpecGate,
+    inout vec3 wSumDiff, inout float sumBilatWD,
+    inout vec3 wSumSpec, inout float sumBilatWS,
+    inout vec3 sumLogDiff, inout vec3 sumLogDiff2,
+    inout vec3 sumLogSpec, inout vec3 sumLogSpec2,
+    inout float validHits, inout float nbrWSum,
+    inout float nbrLumD, inout float nbrLumD2,
+    inout float nbrLumS, inout float nbrLumS2
+) {
+    uvec2 qND01  = s_nrmDep[qAp];
+    uvec2 qD01   = s_diff[qAp];
+    uvec2 qS01   = s_spec[qAp];
+
+    vec2  qND1   = unpackHalf2x16(qND01.y);
+    float qDepth = qND1.y;
+    float vTap   = (qDepth < 9999.0) ? 1.0 : 0.0;
+    vec3  qNrm   = vec3(unpackHalf2x16(qND01.x), qND1.x);
+    vec3  nqDiff = vec3(unpackHalf2x16(qD01.x), unpackHalf2x16(qD01.y).x);
+    vec3  nqSpec = vec3(unpackHalf2x16(qS01.x), unpackHalf2x16(qS01.y).x);
+
+    uvec2 qLD01  = s_logDiff[qAp];
+    uvec2 qLS01  = s_logSpec[qAp];
+
+    float rD     = (qDepth - linDepth) * invDepthE2;
+    float dW     = vTap * exp2(-min(rD * rD, 115.0));
+    float ndot   = max(dot(viewNormal, qNrm), 0.0);
+    float ndot2  = ndot * ndot;
+    float nW     = ndot2 * ndot2;
+    float bwD    = dW * nW;
+    float bwSn   = bwD * nW;
+    float bwS    = (smoothSpec ? bwSn : bwD) * roughSpecGate;
+
+    float lumD   = dot(nqDiff, vec3(0.2126, 0.7152, 0.0722));
+    float lumS   = dot(nqSpec, vec3(0.2126, 0.7152, 0.0722));
+    nbrWSum     += bwD;
+    nbrLumD     += bwD * lumD;
+    nbrLumD2    += bwD * lumD * lumD;
+    nbrLumS     += bwD * lumS;
+    nbrLumS2    += bwD * lumS * lumS;
+
+    wSumDiff    += bwD * nqDiff;
+    sumBilatWD  += bwD;
+    wSumSpec    += bwS * nqSpec;
+    sumBilatWS  += bwS;
+
+    vec3  lD     = vec3(unpackHalf2x16(qLD01.x), unpackHalf2x16(qLD01.y).x);
+    vec3  lS     = vec3(unpackHalf2x16(qLS01.x), unpackHalf2x16(qLS01.y).x);
+    sumLogDiff  += vTap * lD;
+    sumLogDiff2 += vTap * (lD * lD);
+    sumLogSpec  += vTap * lS;
+    sumLogSpec2 += vTap * (lS * lS);
+    validHits   += vTap;
+}
+
+void storePrepTilePixel(uint ap, vec4 mlD, vec4 mlS, vec4 ndq) {
+    vec3  eD  = clampFp16Rgb(sanitizeRgb(mlD.rgb));
+    float dHD = clamp(sanitizeFloat(mlD.a, 0.0), 0.0, 1.0);
+    vec3  eS  = clampFp16Rgb(sanitizeRgb(mlS.rgb));
+    float rM  = clamp(sanitizeFloat(mlS.a, 0.0), 0.0, 1.0);
+
+    vec3  nR   = vec3(sanitizeFloat(ndq.r, 0.0), sanitizeFloat(ndq.g, 0.0), sanitizeFloat(ndq.b, 1.0));
+    float len2 = dot(nR, nR);
+    vec3  nrm  = (len2 > 1e-10) ? (nR * inversesqrt(len2)) : vec3(0.0, 0.0, 1.0);
+    float dep  = clamp(sanitizeFloat(ndq.a, 10000.0), 0.0, 10000.0);
+    uvec2 pND  = uvec2(packHalf2x16(nrm.xy), packHalf2x16(vec2(nrm.z, dep)));
+
+    uvec2 pDiff = uvec2(packHalf2x16(eD.rg), packHalf2x16(vec2(eD.b, dHD)));
+    uvec2 pSpec = uvec2(packHalf2x16(eS.rg), packHalf2x16(vec2(eS.b, rM)));
+    vec3  eDq   = vec3(unpackHalf2x16(pDiff.x), unpackHalf2x16(pDiff.y).x);
+    vec3  eSq   = vec3(unpackHalf2x16(pSpec.x), unpackHalf2x16(pSpec.y).x);
+    vec3  lD    = safeLog1p(eDq);
+    vec3  lS    = safeLog1p(eSq);
+
+    s_diff[ap]    = pDiff;
+    s_spec[ap]    = pSpec;
+    s_nrmDep[ap]  = pND;
+    s_logDiff[ap] = uvec2(packHalf2x16(lD.rg), packHalf2x16(vec2(lD.b, 0.0)));
+    s_logSpec[ap] = uvec2(packHalf2x16(lS.rg), packHalf2x16(vec2(lS.b, 0.0)));
+}
+
+void main() {
+    int   W   = int(pc.lrWidth);
+    int   H   = int(pc.lrHeight);
+    int   wgX = int(gl_WorkGroupID.x * 16u);
+    int   wgY = int(gl_WorkGroupID.y * 8u);
+    uint  t   = gl_LocalInvocationIndex; // 0..127
+
+    // 1. Cooperatively populate 18x10 G-buffer tile across all 128 workgroup threads
+    {
+        uint  ay0  = uint(float(t) * (1.0 / 18.0 + 1e-6));
+        uint  ax0  = t - ay0 * 18u;
+        ivec2 q0   = clamp(ivec2(wgX + int(ax0) - 1, wgY + int(ay0) - 1), ivec2(0), ivec2(W - 1, H - 1));
+        vec4  mlD0 = imageLoad(uMlDiffuse, q0);
+        vec4  mlS0 = imageLoad(uMlSpecular, q0);
+        vec4  ndq0 = imageLoad(uNormalDepth, q0);
+
+        vec4  mlD1 = vec4(0.0);
+        vec4  mlS1 = vec4(0.0);
+        vec4  ndq1 = vec4(0.0);
+        uint  ap1  = t + 128u;
+        if (t < 52u) {
+            uint  ay1 = uint(float(ap1) * (1.0 / 18.0 + 1e-6));
+            uint  ax1 = ap1 - ay1 * 18u;
+            ivec2 q1  = clamp(ivec2(wgX + int(ax1) - 1, wgY + int(ay1) - 1), ivec2(0), ivec2(W - 1, H - 1));
+            mlD1 = imageLoad(uMlDiffuse, q1);
+            mlS1 = imageLoad(uMlSpecular, q1);
+            ndq1 = imageLoad(uNormalDepth, q1);
+        }
+
+        storePrepTilePixel(t, mlD0, mlS0, ndq0);
+        if (t < 52u) {
+            storePrepTilePixel(ap1, mlD1, mlS1, ndq1);
+        }
+    }
+    barrier();
+
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= W || p.y >= H) {
+        return;
+    }
+
+    uint lx  = gl_LocalInvocationID.x;
+    uint ly  = gl_LocalInvocationID.y;
+    uint cAp = (ly + 1u) * 18u + (lx + 1u);
+
+    uvec2 cND01        = s_nrmDep[cAp];
+    vec2  cND0         = unpackHalf2x16(cND01.x);
+    vec2  cND1         = unpackHalf2x16(cND01.y);
+    vec3  viewNormal   = vec3(cND0, cND1.x);
+    float linDepth     = cND1.y;
+
+    vec2 mvSurfRaw = imageLoad(uMotionVectors, p).rg;
+    vec2 mvSpecRaw = imageLoad(uSpecularMotion, p).rg;
+    vec4 mlAlb     = imageLoad(uMlAlbedoRoughness, p);
+    vec4 mlSAlb    = imageLoad(uMlSpecAlbedo, p);
+    vec4 mlSkipP   = imageLoad(uMlSkip, p);
+
+    vec3  aDiffInit = clamp(mlAlb.rgb, vec3(0.0), vec3(1.0));
+    float roughInit = ((floatBitsToUint(mlAlb.a) & 0x7FFFFFFFu) < 0x7F800000u) ? clamp(mlAlb.a, 0.0, 1.0) : 1.0;
+    vec3  aSpecInit = clamp(mlSAlb.rgb, vec3(0.0), vec3(1.0));
+    float matRaw    = clamp(mlSkipP.a, 0.0, 1.0);
+    float matInit   = unpackHalf2x16(packHalf2x16(vec2(matRaw, 0.0))).x;
+
+    bool  isSky     = isSkyOrEmissiveOnly(linDepth, matInit, aDiffInit, aSpecInit);
+    bool  isDielMat = abs(matInit - 0.6667) < 0.12;
+
+    // Pack center G-buffer values into 6 VGPRs before issuing cold-DRAM backward warps
+    uvec2 cD01_pre  = s_diff[cAp];
+    vec3  eDiffFold = vec3(unpackHalf2x16(cD01_pre.x), unpackHalf2x16(cD01_pre.y).x);
+    if (isDielMat && !isSky) {
+        vec3  skipClean = sanitizeRgb(mlSkipP.rgb);
+        vec3  eFold     = clampFp16Rgb(eDiffFold + skipClean / max(aDiffInit, vec3(0.04)));
+        uvec2 pFold     = uvec2(packHalf2x16(eFold.rg), packHalf2x16(vec2(eFold.b, 0.0)));
+        eDiffFold       = vec3(unpackHalf2x16(pFold.x), unpackHalf2x16(pFold.y).x);
+    }
+
+    uvec2 pAlbRough   = uvec2(packHalf2x16(aDiffInit.rg), packHalf2x16(vec2(aDiffInit.b, roughInit)));
+    uvec2 pSAlbMat    = uvec2(packHalf2x16(aSpecInit.rg), packHalf2x16(vec2(aSpecInit.b, matInit)));
+    uvec2 pDiffCenter = uvec2(packHalf2x16(eDiffFold.rg), packHalf2x16(vec2(eDiffFold.b, unpackHalf2x16(cD01_pre.y).y)));
+
+    // 2. Explicit imageLoad 4-tap bilinear backward warps (batched cold-DRAM VMEM while live VGPRs = 14)
+    vec2  surfaceMv = vec2(sanitizeFloat(mvSurfRaw.x, 0.0), sanitizeFloat(mvSurfRaw.y, 0.0));
+    vec2  specMv    = vec2(sanitizeFloat(mvSpecRaw.x, 0.0), sanitizeFloat(mvSpecRaw.y, 0.0));
+
+    bool  reset    = (pc.flags & UPWAYS_FLAG_RESET_HISTORY) != 0u;
+    bool  enableSR = (pc.flags & UPWAYS_FLAG_ENABLE_SUPERRES) != 0u;
+    vec2  lrSizeF  = vec2(float(W), float(H));
+    vec2  currUV   = (vec2(p) + vec2(0.5)) / lrSizeF;
+
+    vec2  prevUV_d       = currUV - surfaceMv;
+    bool  inBndD         = (!reset && !isSky)
+                         && all(greaterThanEqual(prevUV_d, vec2(0.0)))
+                         && all(lessThan(prevUV_d, vec2(1.0)));
+    float mvPx           = length(surfaceMv * lrSizeF);
+
+    float rawSpecDeltaPx = length((specMv - surfaceMv) * lrSizeF);
+    float specMvBlend    = 1.0 - smoothstep(0.15, 0.40, unpackHalf2x16(pAlbRough.y).y);
+    vec2  effSpecMv      = (rawSpecDeltaPx < 1e-3) ? surfaceMv : mix(surfaceMv, specMv, specMvBlend);
+    float specMvPx       = length(effSpecMv * lrSizeF);
+    float specDeltaPx    = length((effSpecMv - surfaceMv) * lrSizeF);
+    vec2  prevUV_s       = currUV - effSpecMv;
+    bool  inBndS         = (!reset && !isSky)
+                         && all(greaterThanEqual(prevUV_s, vec2(0.0)))
+                         && all(lessThan(prevUV_s, vec2(1.0)));
+    bool  sameMv         = inBndD && inBndS && all(equal(effSpecMv, surfaceMv));
+    float relThreshS     = 0.06 + 0.05 * min(specDeltaPx, 6.0);
+
+    vec3  yDiffPrev   = vec3(0.0);
+    float prevNDiff   = 0.0;
+    float diffConf    = 0.0;
+    uint  hWarpPacked = 0u;
+    vec3  ySpecPrev   = vec3(0.0);
+    float prevNSpec   = 0.0;
+    float specConf    = 0.0;
+
+    if (inBndD) {
+        vec2  pCoord = prevUV_d * lrSizeF - vec2(0.5);
+        vec2  fCoord = floor(pCoord);
+        vec2  fracD  = clamp(pCoord - fCoord, vec2(0.0), vec2(1.0));
+        int   x0D    = int(fCoord.x);
+        int   y0D    = int(fCoord.y);
+        ivec2 tc0    = clamp(ivec2(x0D,     y0D    ), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc1    = clamp(ivec2(x0D + 1, y0D    ), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc2    = clamp(ivec2(x0D,     y0D + 1), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc3    = clamp(ivec2(x0D + 1, y0D + 1), ivec2(0), ivec2(W - 1, H - 1));
+        bool  ok0    = (x0D     >= 0 && x0D     < W && y0D     >= 0 && y0D     < H);
+        bool  ok1    = (x0D + 1 >= 0 && x0D + 1 < W && y0D     >= 0 && y0D     < H);
+        bool  ok2    = (x0D     >= 0 && x0D     < W && y0D + 1 >= 0 && y0D + 1 < H);
+        bool  ok3    = (x0D + 1 >= 0 && x0D + 1 < W && y0D + 1 >= 0 && y0D + 1 < H);
+        float bw0    = (1.0 - fracD.x) * (1.0 - fracD.y);
+        float bw1    = fracD.x         * (1.0 - fracD.y);
+        float bw2    = (1.0 - fracD.x) * fracD.y;
+        float bw3    = fracD.x         * fracD.y;
+
+        float wD0, wD1, wD2, wD3, wS0, wS1, wS2, wS3;
+        vec4 pg0 = imageLoad(uPrevGeomLr, tc0);
+        vec4 pg1 = imageLoad(uPrevGeomLr, tc1);
+        vec4 pg2 = imageLoad(uPrevGeomLr, tc2);
+        vec4 pg3 = imageLoad(uPrevGeomLr, tc3);
+        evalWarpGeomTap(pg0, ok0, bw0, linDepth, viewNormal, sameMv, relThreshS, wD0, wS0);
+        evalWarpGeomTap(pg1, ok1, bw1, linDepth, viewNormal, sameMv, relThreshS, wD1, wS1);
+        evalWarpGeomTap(pg2, ok2, bw2, linDepth, viewNormal, sameMv, relThreshS, wD2, wS2);
+        evalWarpGeomTap(pg3, ok3, bw3, linDepth, viewNormal, sameMv, relThreshS, wD3, wS3);
+
+        float sumTapW  = wD0 + wD1 + wD2 + wD3;
+        float sumTapWS = wS0 + wS1 + wS2 + wS3;
+
+        if (sameMv && sumTapW > 1e-4 && sumTapWS > 1e-4) {
+            vec4 pd0 = imageLoad(uPrevDiffLr, tc0);
+            vec4 pd1 = imageLoad(uPrevDiffLr, tc1);
+            vec4 pd2 = imageLoad(uPrevDiffLr, tc2);
+            vec4 pd3 = imageLoad(uPrevDiffLr, tc3);
+            uint ph0 = imageLoad(uPrevHiddenLr, tc0).r;
+            uint ph1 = imageLoad(uPrevHiddenLr, tc1).r;
+            uint ph2 = imageLoad(uPrevHiddenLr, tc2).r;
+            uint ph3 = imageLoad(uPrevHiddenLr, tc3).r;
+            vec4 ps0 = imageLoad(uPrevSpecLr, tc0);
+            vec4 ps1 = imageLoad(uPrevSpecLr, tc1);
+            vec4 ps2 = imageLoad(uPrevSpecLr, tc2);
+            vec4 ps3 = imageLoad(uPrevSpecLr, tc3);
+            accumPrevDiffHidden4(
+                pd0, pd1, pd2, pd3, ph0, ph1, ph2, ph3,
+                wD0, wD1, wD2, wD3, sumTapW,
+                diffConf, yDiffPrev, prevNDiff, hWarpPacked
+            );
+            accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
+        } else {
+            if (sumTapW > 1e-4) {
+                vec4 pd0 = imageLoad(uPrevDiffLr, tc0);
+                vec4 pd1 = imageLoad(uPrevDiffLr, tc1);
+                vec4 pd2 = imageLoad(uPrevDiffLr, tc2);
+                vec4 pd3 = imageLoad(uPrevDiffLr, tc3);
+                uint ph0 = imageLoad(uPrevHiddenLr, tc0).r;
+                uint ph1 = imageLoad(uPrevHiddenLr, tc1).r;
+                uint ph2 = imageLoad(uPrevHiddenLr, tc2).r;
+                uint ph3 = imageLoad(uPrevHiddenLr, tc3).r;
+                accumPrevDiffHidden4(
+                    pd0, pd1, pd2, pd3, ph0, ph1, ph2, ph3,
+                    wD0, wD1, wD2, wD3, sumTapW,
+                    diffConf, yDiffPrev, prevNDiff, hWarpPacked
+                );
+            }
+            if (sameMv && sumTapWS > 1e-4) {
+                vec4 ps0 = imageLoad(uPrevSpecLr, tc0);
+                vec4 ps1 = imageLoad(uPrevSpecLr, tc1);
+                vec4 ps2 = imageLoad(uPrevSpecLr, tc2);
+                vec4 ps3 = imageLoad(uPrevSpecLr, tc3);
+                accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
+            }
+        }
+    }
+
+    if (inBndS && !sameMv) {
+        vec2  sCoord = prevUV_s * lrSizeF - vec2(0.5);
+        vec2  fCoord = floor(sCoord);
+        vec2  frac   = clamp(sCoord - fCoord, vec2(0.0), vec2(1.0));
+        int   x0     = int(fCoord.x);
+        int   y0     = int(fCoord.y);
+        ivec2 tc0    = clamp(ivec2(x0,     y0    ), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc1    = clamp(ivec2(x0 + 1, y0    ), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc2    = clamp(ivec2(x0,     y0 + 1), ivec2(0), ivec2(W - 1, H - 1));
+        ivec2 tc3    = clamp(ivec2(x0 + 1, y0 + 1), ivec2(0), ivec2(W - 1, H - 1));
+        bool  ok0    = (x0     >= 0 && x0     < W && y0     >= 0 && y0     < H);
+        bool  ok1    = (x0 + 1 >= 0 && x0 + 1 < W && y0     >= 0 && y0     < H);
+        bool  ok2    = (x0     >= 0 && x0     < W && y0 + 1 >= 0 && y0 + 1 < H);
+        bool  ok3    = (x0 + 1 >= 0 && x0 + 1 < W && y0 + 1 >= 0 && y0 + 1 < H);
+        float bw0    = (1.0 - frac.x) * (1.0 - frac.y);
+        float bw1    = frac.x         * (1.0 - frac.y);
+        float bw2    = (1.0 - frac.x) * frac.y;
+        float bw3    = frac.x         * frac.y;
+
+        float dummyD0, dummyD1, dummyD2, dummyD3;
+        float wS0, wS1, wS2, wS3;
+        vec4 pg0_s = imageLoad(uPrevGeomLr, tc0);
+        vec4 pg1_s = imageLoad(uPrevGeomLr, tc1);
+        vec4 pg2_s = imageLoad(uPrevGeomLr, tc2);
+        vec4 pg3_s = imageLoad(uPrevGeomLr, tc3);
+        evalWarpGeomTap(pg0_s, ok0, bw0, linDepth, viewNormal, true, relThreshS, dummyD0, wS0);
+        evalWarpGeomTap(pg1_s, ok1, bw1, linDepth, viewNormal, true, relThreshS, dummyD1, wS1);
+        evalWarpGeomTap(pg2_s, ok2, bw2, linDepth, viewNormal, true, relThreshS, dummyD2, wS2);
+        evalWarpGeomTap(pg3_s, ok3, bw3, linDepth, viewNormal, true, relThreshS, dummyD3, wS3);
+
+        float sumTapWS = wS0 + wS1 + wS2 + wS3;
+        if (sumTapWS > 1e-4) {
+            vec4 ps0 = imageLoad(uPrevSpecLr, tc0);
+            vec4 ps1 = imageLoad(uPrevSpecLr, tc1);
+            vec4 ps2 = imageLoad(uPrevSpecLr, tc2);
+            vec4 ps3 = imageLoad(uPrevSpecLr, tc3);
+            accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
+        }
+    }
+
+    // 3. 3x3 Spatial Statistics + 8-Neighbor Firefly Moments from LDS tile (pure LDS/VALU)
+    uvec2 cD01          = s_diff[cAp];
+    uvec2 cS01          = s_spec[cAp];
+    uvec2 cLD01         = s_logDiff[cAp];
+    uvec2 cLS01         = s_logSpec[cAp];
+    vec3  wSumDiff      = vec3(unpackHalf2x16(cD01.x),  unpackHalf2x16(cD01.y).x);
+    vec3  wSumSpec      = vec3(unpackHalf2x16(cS01.x),  unpackHalf2x16(cS01.y).x);
+    vec3  cLD           = vec3(unpackHalf2x16(cLD01.x), unpackHalf2x16(cLD01.y).x);
+    vec3  cLS           = vec3(unpackHalf2x16(cLS01.x), unpackHalf2x16(cLS01.y).x);
+    float roughS2       = unpackHalf2x16(pAlbRough.y).y;
+    bool  smoothSpec    = (roughS2 < 0.08);
+    float roughSpecGate = isDielMat
+        ? max(0.70, smoothstep(0.03, 0.20, roughS2))
+        : mix(0.55, 1.0, smoothstep(0.02, 0.20, roughS2));
+
+    float sumBilatWD  = 1.0;
+    float sumBilatWS  = 1.0;
+
+    vec3  sumLogDiff  = cLD;
+    vec3  sumLogDiff2 = cLD * cLD;
+    vec3  sumLogSpec  = cLS;
+    vec3  sumLogSpec2 = cLS * cLS;
+    float validHits   = 1.0;
+
+    float nbrWSum     = 0.0;
+    float nbrLumD     = 0.0;
+    float nbrLumD2    = 0.0;
+    float nbrLumS     = 0.0;
+    float nbrLumS2    = 0.0;
+
+    if (!isSky) {
+        float invDepthE2 = 4.80448964 / max(linDepth, 1e-3);
+        uint  baseAp     = ly * 18u + lx;
+        [[dont_unroll]] for (uint k = 0u; k < 8u; ++k) {
+            uint off = (k < 4u)
+                ? ((0x25011412u >> (k * 8u)) & 0xFFu)
+                : ((0x26240200u >> ((k - 4u) * 8u)) & 0xFFu);
+            accumPrep3x3Tap(
+                baseAp + off, linDepth, invDepthE2, viewNormal, smoothSpec, roughSpecGate,
+                wSumDiff, sumBilatWD, wSumSpec, sumBilatWS,
+                sumLogDiff, sumLogDiff2, sumLogSpec, sumLogSpec2, validHits,
+                nbrWSum, nbrLumD, nbrLumD2, nbrLumS, nbrLumS2
+            );
+        }
+    }
+
+    vec3 muDiffCurr = clampFp16Rgb(wSumDiff / max(sumBilatWD, 1e-6));
+    vec3 muSpecCurr = clampFp16Rgb(wSumSpec / max(sumBilatWS, 1e-6));
+
+    float invHits     = 1.0 / max(validHits, 1.0);
+    vec3  logMuDiff   = sumLogDiff * invHits;
+    vec3  logVarDiff  = max(sumLogDiff2 * invHits - logMuDiff * logMuDiff, vec3(0.0));
+    vec3  logStdDiff  = sqrt(logVarDiff);
+
+    vec3  logMuSpec   = sumLogSpec * invHits;
+    vec3  logVarSpec  = max(sumLogSpec2 * invHits - logMuSpec * logMuSpec, vec3(0.0));
+    vec3  logStdSpec  = sqrt(logVarSpec);
+
+    vec3  eDiff        = vec3(unpackHalf2x16(pDiffCenter.x), unpackHalf2x16(pDiffCenter.y).x);
+    float diffHitDist  = unpackHalf2x16(pDiffCenter.y).y;
+    uvec2 cS01_post    = s_spec[cAp];
+    vec3  eSpec        = vec3(unpackHalf2x16(cS01_post.x), unpackHalf2x16(cS01_post.y).x);
+    float reactiveMask = unpackHalf2x16(cS01_post.y).y;
+    vec3  aDiff        = vec3(unpackHalf2x16(pAlbRough.x), unpackHalf2x16(pAlbRough.y).x);
+    float roughness    = unpackHalf2x16(pAlbRough.y).y;
+    vec3  aSpec        = vec3(unpackHalf2x16(pSAlbMat.x), unpackHalf2x16(pSAlbMat.y).x);
+    float matClass     = unpackHalf2x16(pSAlbMat.y).y;
+
+    // 8-neighbor bilateral firefly soft-clamp on diffuse irradiance (scaled by 1 / luma(aDiff) + temporal bound)
+    float dielBypassD = isDielMat ? (1.0 - smoothstep(0.045, 0.090, roughness)) : 0.0;
+    vec3  eDiffUse    = eDiff;
+    if (!isSky && nbrWSum > 0.25 && dielBypassD < 0.999) {
+        float convD       = (mvPx < 0.05) ? smoothstep(4.0, 48.0, prevNDiff) : 0.0;
+        float demodScaleD = 1.0 / clamp(upwaysLuma(aDiff), 0.04, 1.0);
+        float invNW       = 1.0 / nbrWSum;
+        float muLD        = nbrLumD * invNW;
+        float stdLD       = sqrt(max(nbrLumD2 * invNW - muLD * muLD, 0.0));
+        float sigKD       = mix(3.5, 8.0, convD);
+        float histBoundD  = (diffConf > 0.5) ? (upwaysLuma(yDiffPrev) * sigKD) : 0.0;
+        float minThrD     = mix(14.0, 36.0, convD) * demodScaleD;
+        float thrD        = max(max(muLD + sigKD * stdLD, histBoundD), minThrD);
+        float cLumD       = upwaysLuma(eDiff);
+        if (cLumD > thrD) {
+            float deltaLumD   = cLumD - thrD;
+            float clLum       = thrD + deltaLumD / (1.0 + deltaLumD / max(thrD, 0.5));
+            vec3  clampedDiff = eDiff * (clLum / max(cLumD, 1e-5));
+            eDiffUse = mix(clampedDiff, eDiff, dielBypassD);
+        }
+    }
+
+    vec3  accDiff;
+    float nDiff;
+    if (diffConf > 0.0) {
+        vec3 yDiffUsed;
+        if (mvPx < 0.05) {
+            float maxNDiff = enableSR ? 24.0 : 64.0;
+            yDiffUsed = yDiffPrev;
+            nDiff = clamp(prevNDiff * diffConf + 1.0, 1.0, maxNDiff);
+        } else {
+            float motionT  = clamp(mvPx / 8.0, 0.0, 1.0);
+            float maxNDiff = mix(10.0, 4.0, motionT);
+            float sigmaD   = mix(2.75, 1.75, motionT);
+            vec3  padD     = vec3(mix(0.10, 0.03, motionT));
+            vec3  logPrevD    = safeLog1p(yDiffPrev);
+            vec3  logClampedD = clamp(logPrevD, logMuDiff - sigmaD * logStdDiff - padD, logMuDiff + sigmaD * logStdDiff + padD);
+            yDiffUsed = clampFp16Rgb(safeExpm1(logClampedD));
+            vec3  clampDistD  = abs(logPrevD - logClampedD) / max(logStdDiff + vec3(0.08), vec3(1e-3));
+            float rejectD     = clamp(max(clampDistD.r, max(clampDistD.g, clampDistD.b)) * 0.5, 0.0, 0.85);
+            nDiff = clamp(prevNDiff * diffConf * (1.0 - rejectD) + 1.0, 1.0, maxNDiff);
+        }
+        accDiff = clampFp16Rgb(mix(yDiffUsed, eDiffUse, 1.0 / nDiff));
+    } else {
+        accDiff = isSky ? eDiff : eDiffUse;
+        nDiff   = 1.0;
+    }
+
+    float convS        = (mvPx < 0.05 && specMvPx < 0.05) ? smoothstep(2.0, 24.0, prevNSpec) : 0.0;
+    float specBypassHi = mix(0.045, 0.090, convS);
+    float mirrorBypass = isDielMat
+        ? (1.0 - smoothstep(0.045, 0.090, roughness))
+        : (1.0 - smoothstep(0.030, specBypassHi, roughness));
+    vec3  eSpecUse     = eSpec;
+    if (!isSky && nbrWSum > 0.25 && mirrorBypass < 0.999) {
+        float invNW      = 1.0 / nbrWSum;
+        float muLS       = nbrLumS * invNW;
+        float stdLS      = sqrt(max(nbrLumS2 * invNW - muLS * muLS, 0.0));
+        float sigKS      = mix(3.5, 8.0, convS);
+        float histBoundS = (specConf > 0.5) ? (upwaysLuma(ySpecPrev) * sigKS) : 0.0;
+        float minThrS    = mix(24.0, 120.0, convS) / clamp(upwaysLuma(aSpec), 0.02, 1.0);
+        float thrS       = max(max(muLS + sigKS * stdLS, histBoundS), minThrS);
+        float cLumS      = upwaysLuma(eSpec);
+        if (cLumS > thrS) {
+            float deltaLumS   = cLumS - thrS;
+            float clLum       = thrS + deltaLumS / (1.0 + deltaLumS / max(thrS, 0.5));
+            vec3  clampedSpec = eSpec * (clLum / max(cLumS, 1e-5));
+            eSpecUse = mix(clampedSpec, eSpec, mirrorBypass);
+        }
+    }
+
+    vec3  accSpec;
+    float nSpec;
+    if (specConf > 0.0) {
+        vec3 ySpecUsed;
+        if (mvPx < 0.05 && specMvPx < 0.05) {
+            float maxNSpec = enableSR ? 24.0 : 64.0;
+            ySpecUsed = ySpecPrev;
+            nSpec = clamp(prevNSpec * specConf + 1.0, 1.0, maxNSpec);
+        } else {
+            float motionTS = clamp(max(mvPx, specMvPx) / 8.0, 0.0, 1.0);
+            float maxNSpec = mix(8.0, 3.0, motionTS);
+            float sigmaS   = mix(2.75, 1.75, motionTS);
+            vec3  padS     = vec3(mix(0.25, 0.05, clamp(roughness / 0.20, 0.0, 1.0)));
+            vec3  logPrevS    = safeLog1p(ySpecPrev);
+            vec3  logClampedS = clamp(logPrevS, logMuSpec - sigmaS * logStdSpec - padS, logMuSpec + sigmaS * logStdSpec + padS);
+            ySpecUsed = clampFp16Rgb(safeExpm1(logClampedS));
+            vec3  clampDistS  = abs(logPrevS - logClampedS) / max(logStdSpec + vec3(0.10), vec3(1e-3));
+            float rejectS     = clamp(max(clampDistS.r, max(clampDistS.g, clampDistS.b)) * 0.5, 0.0, 0.85);
+            nSpec = clamp(prevNSpec * specConf * (1.0 - rejectS) + 1.0, 1.0, maxNSpec);
+        }
+        accSpec = clampFp16Rgb(mix(ySpecUsed, eSpecUse, 1.0 / nSpec));
+    } else {
+        accSpec = isSky ? eSpec : eSpecUse;
+        nSpec   = 1.0;
+    }
+
+    // 4. Write unblurred temporal accumulators, sample counts & geometry into tBaseAnchorLr
+    vec3  radCurr      = aDiff * eDiffUse + aSpec * eSpecUse;
+    vec3  radPrev      = aDiff * yDiffPrev + aSpec * ySpecPrev;
+    float confGate     = isDielMat ? min(diffConf, specConf) : max(diffConf, specConf);
+    float fallbackErr  = upwaysLuma(aDiff * logStdDiff + aSpec * logStdSpec);
+    float tempErr      = clamp(
+        (confGate > 0.5) ? abs(safeLog1pF(upwaysLuma(radCurr)) - safeLog1pF(upwaysLuma(radPrev))) : fallbackErr,
+        0.0,
+        4.0
+    );
+    float skyOrMat     = isSky ? -1.0 : matClass;
+    float outTempErr   = isSky ? 0.0  : tempErr;
+    imageStore(tBaseAnchorLr, ivec3(p, 0), vec4(accDiff, skyOrMat));
+    imageStore(tBaseAnchorLr, ivec3(p, 1), vec4(accSpec, outTempErr));
+    imageStore(tBaseAnchorLr, ivec3(p, 2), vec4(nDiff, nSpec, diffConf, roughness));
+
+    imageStore(uCurrGeomLr, p, vec4(viewNormal, linDepth));
+
+    // 5. Pack 24 ch/L0px into 2x2 L1 space-to-depth quads (96 ch = 24 u32/L1px)
+    float currBlendD = (mvPx < 0.05) ? min(1.0, 4.0 / nDiff) : 1.0;
+    float currBlendS = (mvPx < 0.05 && specMvPx < 0.05) ? min(1.0, 4.0 / nSpec) : 1.0;
+    vec3  guideDiff  = mix(accDiff, muDiffCurr, currBlendD);
+    vec3  guideSpec  = mix(accSpec, muSpecCurr, currBlendS);
+
+    uint f0 = packFp8Vec4(vec4(safeLog1p(accDiff), diffHitDist * 4.0));
+    uint f1 = packFp8Vec4(vec4(safeLog1p(guideDiff), log2(nDiff) * (4.0 / 6.0)));
+    uint f2 = packFp8Vec4(vec4(safeLog1p(accSpec), log2(nSpec) * (4.0 / 6.0)));
+    uint f3 = packFp8Vec4(vec4(safeLog1p(guideSpec), roughness * 4.0));
+    uint f4 = packFp8Vec4(vec4(viewNormal.x * 4.0, viewNormal.y * 4.0, safeLog1pF(linDepth), reactiveMask * 4.0));
+    uint f5 = hWarpPacked;
+
+    int W1     = (W + 1) >> 1;
+    int qx     = p.x >> 1;
+    int qy     = p.y >> 1;
+    int corner = ((p.y & 1) << 1) | (p.x & 1);
+    writeQuadSlot(qx, qy, corner, W1, f0, f1, f2, f3, f4, f5);
+
+    bool repX = (p.x == W - 1) && ((p.x & 1) == 0);
+    bool repY = (p.y == H - 1) && ((p.y & 1) == 0);
+    if (repX) {
+        writeQuadSlot(qx, qy, corner | 1, W1, f0, f1, f2, f3, f4, f5);
+    }
+    if (repY) {
+        writeQuadSlot(qx, qy, corner | 2, W1, f0, f1, f2, f3, f4, f5);
+    }
+    if (repX && repY) {
+        writeQuadSlot(qx, qy, corner | 3, W1, f0, f1, f2, f3, f4, f5);
+    }
+}

@@ -122,7 +122,7 @@ void PostProcessPipeline::createDescriptorLayouts() {
         throw std::runtime_error("Failed to create FSR3 blend descriptor set layout");
     }
 
-    // 5. Multi-GPU Merge Layout: (0: img, 1..2: buf, 3..4: img, 5..7: buf, 8..11: ML guide imgs)
+    // 5. Multi-GPU Merge Layout: (0: img, 1..2: buf, 3..4: img, 5..7: buf, 8..13: ML guide imgs)
     std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -135,7 +135,9 @@ void PostProcessPipeline::createDescriptorLayouts() {
         { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     mergeLayoutInfo.bindingCount = static_cast<uint32_t>(mergeBindings.size());
@@ -533,7 +535,9 @@ void PostProcessPipeline::updateMergeDescriptors(
     Image* mlDiffuseImage,
     Image* mlSpecularImage,
     Image* mlAlbedoRoughnessImage,
-    Image* mlSpecularMotionImage)
+    Image* mlSpecularMotionImage,
+    Image* mlSkipImage,
+    Image* mlSpecAlbedoImage)
 {
     if (slot >= 2 || m_mergeDescSets[slot] == VK_NULL_HANDLE || secBuffer == VK_NULL_HANDLE) return;
     (void)width;
@@ -578,6 +582,8 @@ void PostProcessPipeline::updateMergeDescriptors(
     VkDescriptorImageInfo mlSpecInfo = makeImgInfo(mlSpecularImage);
     VkDescriptorImageInfo mlAlbInfo  = makeImgInfo(mlAlbedoRoughnessImage);
     VkDescriptorImageInfo mlSmvInfo  = makeImgInfo(mlSpecularMotionImage);
+    VkDescriptorImageInfo mlSkipInfo = makeImgInfo(mlSkipImage);
+    VkDescriptorImageInfo mlSalbInfo = makeImgInfo(mlSpecAlbedoImage);
 
     std::vector<VkWriteDescriptorSet> mergeWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &frameInfo, nullptr, nullptr },
@@ -591,7 +597,9 @@ void PostProcessPipeline::updateMergeDescriptors(
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlDiffInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 9, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlAlbInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSmvInfo, nullptr, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSmvInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSkipInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSalbInfo, nullptr, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
 }

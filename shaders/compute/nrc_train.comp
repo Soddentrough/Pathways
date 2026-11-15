@@ -1,4 +1,6 @@
 #version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_GOOGLE_include_directive : enable
 
@@ -6,14 +8,13 @@
 
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
-// 16 KB shared memory staging buffers:
-// 4 buffers of 4096 bytes (32 lanes * 64 features * sizeof(float16_t))
-// Completely eliminates thread-local array allocations and prevents 267 KB scratch spills.
-shared float16_t s_act0[32 * 64];   // 4 KB: input features x
-shared float16_t s_act1[32 * 64];   // 4 KB: hidden layer 0 activations h0
-shared float16_t s_act2[32 * 64];   // 4 KB: hidden layer 1 activations h1 (reused for delta0)
-shared float16_t s_delta[32 * 64];  // 4 KB: delta1
-shared float16_t s_delta2[32 * 3];  // 192 B: output layer delta2 (3 channels per lane)
+// 16.5 KB shared memory staging buffers for 32 samples (two 16-row WMMA half-batches):
+shared float16_t s_act0[32 * 64];     // 4 KB: input features x
+shared float16_t s_act1[32 * 64];     // 4 KB: hidden layer 0 activations h0
+shared float16_t s_act2[32 * 64];     // 4 KB: hidden layer 1 activations h1 (reused for delta0)
+shared float16_t s_delta[32 * 64];    // 4 KB: delta1
+shared float16_t s_delta2[32 * 3];    // 192 B: output layer delta2 (3 channels per lane)
+shared float16_t s_gradTile[16 * 16]; // 512 B: 16x16 WMMA weight gradient tile scratch
 
 layout(std430, set = 0, binding = 0) readonly buffer InTrainQueue {
     NRCTrainingRecord records[];
@@ -26,6 +27,7 @@ layout(std430, set = 0, binding = 1) buffer InOutWeights {
 layout(std430, set = 0, binding = 2) buffer InOutWeightMomentum {
     float weightM[NRC_TOTAL_WEIGHTS];
     float weightV[NRC_TOTAL_WEIGHTS];
+    float masterW[NRC_TOTAL_WEIGHTS];
 };
 
 layout(std430, set = 0, binding = 3) readonly buffer InCounters {
@@ -37,232 +39,358 @@ layout(push_constant) uniform PushConstants {
     uint batchSize;
     float learningRate;
     uint frameIndex;
+    uint adamStepBase;
+    uint numSteps;
+    uint pad0;
+    uint pad1;
     vec4 worldMin;
     vec4 invWorldExtent;
 } pc;
 
 const float BETA1 = 0.9;
-const float BETA2 = 0.999;
+const float BETA2 = 0.99;
 const float EPSILON_ADAM = 1e-8;
 
-void main() {
-    uint lane = gl_LocalInvocationIndex;
-    uint maxTrain = min(min(pc.trainCount, pc.batchSize), counters.trainCount);
-    if (maxTrain == 0u) return;
+uint nrcTrainHash(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
 
-    // Strided stochastic mini-batch sampling across all recorded training paths
-    uint stride = max(1u, maxTrain / 32u);
-    uint offset = (pc.frameIndex * 17u + gl_WorkGroupID.x * 7u) % stride;
-    uint tid = min(lane * stride + offset, maxTrain - 1u);
-
-    bool valid = (lane < min(32u, maxTrain));
-    NRCTrainingRecord rec = valid ? records[tid] : records[0];
-    vec3 L_target = rec.targetRadiance.xyz;
-    if (any(isnan(L_target)) || any(isinf(L_target))) valid = false;
-    L_target = clamp(L_target, vec3(0.0), vec3(10.0));
-
-    vec3 normPos = valid ? clamp((rec.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0)) : vec3(0.0);
-
-    // 1. Feature Extraction (64 features written into s_act0 as float16_t)
-    for (uint i = 0u; i < 64u; ++i) {
-        s_act0[lane * 64u + i] = float16_t(0.0);
+void encodeFeaturesToAct0(uint lane, vec3 worldPos, vec3 normal, vec3 viewDir, float roughness, vec3 albedo, bool activeSample) {
+    uint rowBase = lane * 64u;
+    if (!activeSample) {
+        for (uint i = 0u; i < 64u; ++i) {
+            s_act0[rowBase + i] = float16_t(0.0);
+        }
+        return;
     }
 
-    if (valid) {
-        const float PI = 3.14159265359;
-        for (uint axis = 0u; axis < 3u; ++axis) {
-            float coord = normPos[axis];
-            for (uint l = 0u; l < 4u; ++l) {
-                float freq = float(1 << l) * PI;
-                uint baseIdx = axis * 8u + l * 2u;
-                s_act0[lane * 64u + baseIdx + 0u] = float16_t(sin(coord * freq));
-                s_act0[lane * 64u + baseIdx + 1u] = float16_t(cos(coord * freq));
+    vec3 normPos = clamp((worldPos - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+    const float PI = 3.14159265359;
+    // 42 features (channels 0..41): 3 axes x 7 octaves via double-angle sin/cos recurrence
+    for (uint axis = 0u; axis < 3u; ++axis) {
+        float th = normPos[axis] * PI;
+        float s = sin(th);
+        float c = cos(th);
+        float amp = 1.0;
+        uint axisBase = rowBase + axis * 14u;
+        for (uint l = 0u; l < 7u; ++l) {
+            s_act0[axisBase + l * 2u + 0u] = float16_t(s * amp);
+            s_act0[axisBase + l * 2u + 1u] = float16_t(c * amp);
+            if (l < 6u) {
+                float s2 = 2.0 * s * c;
+                float c2 = c * c - s * s;
+                s = s2;
+                c = c2;
+                amp *= 0.75;
             }
         }
-
-        s_act0[lane * 64u + 24u] = float16_t(rec.normal_flags.x);
-        s_act0[lane * 64u + 25u] = float16_t(rec.normal_flags.y);
-        s_act0[lane * 64u + 26u] = float16_t(rec.normal_flags.z);
-        s_act0[lane * 64u + 27u] = float16_t(rec.dir_pixelIndex.x);
-        s_act0[lane * 64u + 28u] = float16_t(rec.dir_pixelIndex.y);
-        s_act0[lane * 64u + 29u] = float16_t(rec.dir_pixelIndex.z);
-        s_act0[lane * 64u + 30u] = float16_t(rec.pos_roughness.w);
-        s_act0[lane * 64u + 31u] = float16_t(rec.albedo_pad.x);
-        s_act0[lane * 64u + 32u] = float16_t(rec.albedo_pad.y);
-        s_act0[lane * 64u + 33u] = float16_t(rec.albedo_pad.z);
     }
-    barrier();
 
-    // 2. Forward Pass
-    // Layer 0: 34 -> 64
-    for (uint j = 0u; j < 64u; ++j) {
-        float sum = float(weights[NRC_B0_OFFSET + j]);
-        for (uint i = 0u; i < 34u; ++i) {
-            sum += float(s_act0[lane * 64u + i]) * float(weights[NRC_W0_OFFSET + i * 64u + j]);
+    // 12 features (channels 42..53): 6 3D cross-axis diagonals x 2 (sin/cos)
+    float diagCoords[6] = float[6](
+        0.5 * (normPos.x + normPos.y),
+        0.5 * (normPos.y + normPos.z),
+        0.5 * (normPos.z + normPos.x),
+        0.5 * (normPos.x - normPos.y) + 0.5,
+        0.5 * (normPos.y - normPos.z) + 0.5,
+        0.5 * (normPos.z - normPos.x) + 0.5
+    );
+    for (uint d = 0u; d < 6u; ++d) {
+        float ang = diagCoords[d] * (6.0 * PI);
+        s_act0[rowBase + 42u + d * 2u + 0u] = float16_t(sin(ang) * 0.5);
+        s_act0[rowBase + 42u + d * 2u + 1u] = float16_t(cos(ang) * 0.5);
+    }
+
+    s_act0[rowBase + 54u] = float16_t(normal.x);
+    s_act0[rowBase + 55u] = float16_t(normal.y);
+    s_act0[rowBase + 56u] = float16_t(normal.z);
+    s_act0[rowBase + 57u] = float16_t(viewDir.x);
+    s_act0[rowBase + 58u] = float16_t(viewDir.y);
+    s_act0[rowBase + 59u] = float16_t(viewDir.z);
+    s_act0[rowBase + 60u] = float16_t(roughness);
+    s_act0[rowBase + 61u] = float16_t(albedo.x);
+    s_act0[rowBase + 62u] = float16_t(albedo.y);
+    s_act0[rowBase + 63u] = float16_t(albedo.z);
+}
+
+vec3 runForwardPass(uint lane) {
+    barrier();
+    // Layer 0: 64 -> 64 via two 16-row Wave32 WMMA half-batches
+    for (uint b = 0u; b < 2u; ++b) {
+        uint rowOff = b * 1024u;
+        for (uint col = 0u; col < 4u; ++col) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            for (uint k = 0u; k < 4u; ++k) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_act0, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+                uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (col * 16u);
+                coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                c0 = coopMatMulAdd(aTile, bTile, c0);
+            }
+            coopMatStore(c0, s_act1, rowOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
         }
-        s_act1[lane * 64u + j] = float16_t((sum > 0.0) ? sum : (0.01 * sum));
+    }
+    barrier();
+    for (uint i = lane; i < 32u * 64u; i += 32u) {
+        float16_t b0 = weights[NRC_B0_OFFSET + (i & 63u)];
+        float16_t v = s_act1[i] + b0;
+        s_act1[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
     }
     barrier();
 
-    // Layer 1: 64 -> 64
-    for (uint j = 0u; j < 64u; ++j) {
-        float sum = float(weights[NRC_B1_OFFSET + j]);
-        for (uint i = 0u; i < 64u; ++i) {
-            sum += float(s_act1[lane * 64u + i]) * float(weights[NRC_W1_OFFSET + i * 64u + j]);
+    // Layer 1: 64 -> 64 via two 16-row Wave32 WMMA half-batches
+    for (uint b = 0u; b < 2u; ++b) {
+        uint rowOff = b * 1024u;
+        for (uint col = 0u; col < 4u; ++col) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 =
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            for (uint k = 0u; k < 4u; ++k) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_act1, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+                uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (col * 16u);
+                coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                c1 = coopMatMulAdd(aTile, bTile, c1);
+            }
+            coopMatStore(c1, s_act2, rowOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
         }
-        s_act2[lane * 64u + j] = float16_t((sum > 0.0) ? sum : (0.01 * sum));
+    }
+    barrier();
+    for (uint i = lane; i < 32u * 64u; i += 32u) {
+        float16_t b1 = weights[NRC_B1_OFFSET + (i & 63u)];
+        float16_t v = s_act2[i] + b1;
+        s_act2[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
     }
     barrier();
 
-    // Layer 2: 64 -> 16 (first 3 channels for loss)
+    // Layer 2: 64 -> 16 (first 3 RGB channels, parallel across 32 lanes)
     vec3 pred = vec3(float(weights[NRC_B2_OFFSET + 0u]),
-                      float(weights[NRC_B2_OFFSET + 1u]),
-                      float(weights[NRC_B2_OFFSET + 2u]));
+                     float(weights[NRC_B2_OFFSET + 1u]),
+                     float(weights[NRC_B2_OFFSET + 2u]));
     for (uint i = 0u; i < 64u; ++i) {
         float h1_val = float(s_act2[lane * 64u + i]);
         pred.x += h1_val * float(weights[NRC_W2_OFFSET + i * 16u + 0u]);
         pred.y += h1_val * float(weights[NRC_W2_OFFSET + i * 16u + 1u]);
         pred.z += h1_val * float(weights[NRC_W2_OFFSET + i * 16u + 2u]);
     }
+    return pred;
+}
 
-    // 3. Loss & Output Gradient: Target-Relative L1 Loss (Müller et al.)
-    pred = max(vec3(0.0), pred);
-    vec3 diff = pred - L_target;
-    vec3 denom = L_target + vec3(0.01);
-    vec3 dL_dy = valid ? (sign(diff) / denom) : vec3(0.0);
+void adamUpdateParam(uint idx, float grad, float lrStep) {
+    float m = BETA1 * weightM[idx] + (1.0 - BETA1) * grad;
+    float v = BETA2 * weightV[idx] + (1.0 - BETA2) * grad * grad;
+    weightM[idx] = m;
+    weightV[idx] = v;
+    float newW = clamp(masterW[idx] - (lrStep / (sqrt(v) + EPSILON_ADAM)) * m, -32.0, 32.0);
+    masterW[idx] = newW;
+    weights[idx] = float16_t(newW);
+}
 
-    s_delta2[lane * 3u + 0u] = float16_t(dL_dy.x);
-    s_delta2[lane * 3u + 1u] = float16_t(dL_dy.y);
-    s_delta2[lane * 3u + 2u] = float16_t(dL_dy.z);
+void main() {
+    uint lane = gl_LocalInvocationIndex;
+    uint availTrain = min(pc.trainCount, counters.trainCount);
+    if (availTrain == 0u || pc.numSteps == 0u) return;
 
-    // Compute delta1 into s_delta BEFORE mutating W2 weights in-place:
-    // Backprop to Layer 1: delta1 = (W2 * delta2) * LeakyReLU'(h1)
-    for (uint i = 0u; i < 64u; ++i) {
-        float sum = dL_dy.x * float(weights[NRC_W2_OFFSET + i * 16u + 0u])
-                  + dL_dy.y * float(weights[NRC_W2_OFFSET + i * 16u + 1u])
-                  + dL_dy.z * float(weights[NRC_W2_OFFSET + i * 16u + 2u]);
-        float h1_val = float(s_act2[lane * 64u + i]);
-        s_delta[lane * 64u + i] = float16_t((h1_val > 0.0) ? sum : (0.01 * sum));
-    }
-    barrier();
+    uint numSamples = min(32u, availTrain);
+    float invBatch = 1.0 / float(numSamples);
+    const float GRAD_SCALE = 16.0;
+    const float INV_GRAD_SCALE = 1.0 / 16.0;
 
-    float lr = pc.learningRate;
-    uint wgBase = gl_WorkGroupID.x * 32u;
-    uint numSamples = (maxTrain > wgBase) ? min(32u, maxTrain - wgBase) : 0u;
-    float invBatch = (numSamples > 0u) ? (1.0 / float(numSamples)) : 0.0;
+    for (uint step = 0u; step < pc.numSteps; ++step) {
+        uint seed = nrcTrainHash((pc.frameIndex + 1u) * 747796405u + (step * 32u + lane) * 2891336453u + 1u);
+        uint tid = seed % availTrain;
 
-    // --- LAYER 2 Weight Update ---
-    // Threads 0..2 update biases and weights
-    if (gl_WorkGroupID.x == 0u && lane < 3u && numSamples > 0u) {
-        uint j = lane;
-        float g_b = 0.0;
-        for (uint s = 0u; s < numSamples; ++s) {
-            g_b += float(s_delta2[s * 3u + j]);
-        }
-        g_b = clamp(g_b * invBatch, -10.0, 10.0);
-        uint bIdx = NRC_B2_OFFSET + j;
-        float mb = BETA1 * weightM[bIdx] + (1.0 - BETA1) * g_b;
-        float vb = BETA2 * weightV[bIdx] + (1.0 - BETA2) * g_b * g_b;
-        weightM[bIdx] = mb;
-        weightV[bIdx] = vb;
-        float new_b = float(weights[bIdx]) - (lr / (sqrt(vb) + EPSILON_ADAM)) * mb;
-        weights[bIdx] = float16_t(clamp(new_b, -65000.0, 65000.0));
+        bool valid = (lane < numSamples);
+        NRCTrainingRecord rec = valid ? records[tid] : records[0];
 
+        vec3 L_local = rec.targetRadiance.rgb;
+        if (any(isnan(L_local)) || any(isinf(L_local))) valid = false;
+        L_local = clamp(L_local, vec3(0.0), vec3(24.0));
+
+        vec3 tailWeight = rec.throughput.rgb;
+        bool hasTail = valid && (rec.throughput.w > 0.5) && !any(isnan(tailWeight)) && !any(isinf(tailWeight));
+        tailWeight = hasTail ? clamp(tailWeight, vec3(0.0), vec3(0.85)) : vec3(0.0);
+
+        // 1. Stop-gradient self-training bootstrap evaluation at tail vertex (Müller et al. 2021)
+        vec3 tailNormal = hasTail ? nrcUnpackUnitVec3(floatBitsToUint(rec.tailPacked.x)) : vec3(0.0, 1.0, 0.0);
+        vec3 tailDir = hasTail ? nrcUnpackUnitVec3(floatBitsToUint(rec.tailPacked.y)) : vec3(0.0, 0.0, 1.0);
+        vec3 tailAlbedo = hasTail ? unpackUnorm4x8(floatBitsToUint(rec.tailPacked.z)).rgb : vec3(0.0);
+
+        encodeFeaturesToAct0(lane, rec.tailPos_roughness.xyz, tailNormal, tailDir,
+                             rec.tailPos_roughness.w, tailAlbedo, hasTail);
+        vec3 tailRawPred = runForwardPass(lane);
+        barrier();
+
+        vec3 tailPred = (hasTail && !any(isnan(tailRawPred)) && !any(isinf(tailRawPred)))
+            ? clamp(tailRawPred, vec3(0.0), vec3(24.0))
+            : vec3(0.0);
+        vec3 L_target = clamp(L_local + tailWeight * tailPred, vec3(0.0), vec3(24.0));
+
+        // 2. Forward Pass on query vertex
+        encodeFeaturesToAct0(lane, rec.pos_roughness.xyz, rec.normal_flags.xyz, rec.dir_pixelIndex.xyz,
+                             rec.pos_roughness.w, rec.albedo_pad.rgb, valid);
+        vec3 pred = runForwardPass(lane);
+        if (any(isnan(pred)) || any(isinf(pred))) pred = vec3(0.0);
+        vec3 predPos = max(vec3(0.0), pred);
+
+        // 3. Stabilized Relative L2 Loss with mixed-precision loss scaling for FP16 WMMA backprop
+        float predLum = dot(predPos, vec3(0.2126, 0.7152, 0.0722));
+        float denom = predLum * predLum + 1.0;
+        vec3 rawGrad = (2.0 * (predPos - L_target)) / denom;
+        vec3 dL_dy = valid ? (clamp(rawGrad, vec3(-16.0), vec3(16.0)) * (invBatch * GRAD_SCALE)) : vec3(0.0);
+
+        s_delta2[lane * 3u + 0u] = float16_t(dL_dy.x);
+        s_delta2[lane * 3u + 1u] = float16_t(dL_dy.y);
+        s_delta2[lane * 3u + 2u] = float16_t(dL_dy.z);
+
+        // Compute delta1 into s_delta BEFORE mutating W2 weights in-place
         for (uint i = 0u; i < 64u; ++i) {
+            float sum = dL_dy.x * float(weights[NRC_W2_OFFSET + i * 16u + 0u])
+                      + dL_dy.y * float(weights[NRC_W2_OFFSET + i * 16u + 1u])
+                      + dL_dy.z * float(weights[NRC_W2_OFFSET + i * 16u + 2u]);
+            float h1_val = float(s_act2[lane * 64u + i]);
+            s_delta[lane * 64u + i] = valid ? float16_t((h1_val > 0.0) ? sum : (0.01 * sum)) : float16_t(0.0);
+        }
+        barrier();
+
+        // Bias-corrected Adam learning rate for this step
+        uint stepT = pc.adamStepBase + step + 1u;
+        float bc1 = max(1.0 - pow(BETA1, float(min(stepT, 10000u))), 1e-4);
+        float bc2 = max(1.0 - pow(BETA2, float(min(stepT, 10000u))), 1e-4);
+        float lrStep = pc.learningRate * (sqrt(bc2) / bc1);
+
+        // --- LAYER 2 Weight Update (parallel across all 32 lanes) ---
+        if (lane < 3u) {
+            float g_b = 0.0;
+            for (uint s = 0u; s < numSamples; ++s) {
+                g_b += float(s_delta2[s * 3u + lane]);
+            }
+            adamUpdateParam(NRC_B2_OFFSET + lane, clamp(g_b * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
+        }
+        for (uint idx = lane; idx < 192u; idx += 32u) {
+            uint i = idx / 3u;
+            uint j = idx % 3u;
             float g_w = 0.0;
             for (uint s = 0u; s < numSamples; ++s) {
                 g_w += float(s_delta2[s * 3u + j]) * float(s_act2[s * 64u + i]);
             }
-            g_w = clamp(g_w * invBatch, -10.0, 10.0);
-            uint wIdx = NRC_W2_OFFSET + i * 16u + j;
-            float mw = BETA1 * weightM[wIdx] + (1.0 - BETA1) * g_w;
-            float vw = BETA2 * weightV[wIdx] + (1.0 - BETA2) * g_w * g_w;
-            weightM[wIdx] = mw;
-            weightV[wIdx] = vw;
-            float new_w = float(weights[wIdx]) - (lr / (sqrt(vw) + EPSILON_ADAM)) * mw;
-            weights[wIdx] = float16_t(clamp(new_w, -65000.0, 65000.0));
+            adamUpdateParam(NRC_W2_OFFSET + i * 16u + j, clamp(g_w * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
         }
-    }
-    barrier();
+        barrier();
 
-    // Now compute delta0 into s_act2!
-    // Backprop to Layer 0: delta0 = (W1 * delta1) * LeakyReLU'(h0)
-    for (uint i = 0u; i < 64u; ++i) {
-        float sum = 0.0;
-        for (uint j = 0u; j < 64u; ++j) {
-            sum += float(s_delta[lane * 64u + j]) * float(weights[NRC_W1_OFFSET + i * 64u + j]);
+        // Compute delta0 into s_act2 via WMMA (delta1 * W1^T) BEFORE mutating W1 weights in-place
+        for (uint b = 0u; b < 2u; ++b) {
+            uint rowOff = b * 1024u;
+            for (uint col = 0u; col < 4u; ++col) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> d0 =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+                for (uint k = 0u; k < 4u; ++k) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                    coopMatLoad(aTile, s_delta, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+                    uint wOff = NRC_W1_OFFSET + (col * 16u * 64u) + (k * 16u);
+                    coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+
+                    d0 = coopMatMulAdd(aTile, bTile, d0);
+                }
+                coopMatStore(d0, s_act2, rowOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            }
         }
-        float h0_val = float(s_act1[lane * 64u + i]);
-        s_act2[lane * 64u + i] = float16_t((h0_val > 0.0) ? sum : (0.01 * sum));
-    }
-    barrier();
+        barrier();
+        for (uint idx = lane; idx < 32u * 64u; idx += 32u) {
+            uint sampleRow = idx >> 6u;
+            float h0_val = float(s_act1[idx]);
+            float sum = float(s_act2[idx]);
+            s_act2[idx] = (sampleRow < numSamples)
+                ? float16_t((h0_val > 0.0) ? sum : (0.01 * sum))
+                : float16_t(0.0);
+        }
+        barrier();
 
-    // --- LAYER 1 Weight Update ---
-    if (gl_WorkGroupID.x == 0u && numSamples > 0u) {
+        // --- LAYER 1 Weight Update via WMMA dW1 = s_act1^T * s_delta ---
         for (uint pass = 0u; pass < 2u; ++pass) {
             uint j = lane + pass * 32u;
             float g_b = 0.0;
             for (uint s = 0u; s < numSamples; ++s) {
                 g_b += float(s_delta[s * 64u + j]);
             }
-            g_b = clamp(g_b * invBatch, -10.0, 10.0);
-            uint bIdx = NRC_B1_OFFSET + j;
-            float mb = BETA1 * weightM[bIdx] + (1.0 - BETA1) * g_b;
-            float vb = BETA2 * weightV[bIdx] + (1.0 - BETA2) * g_b * g_b;
-            weightM[bIdx] = mb;
-            weightV[bIdx] = vb;
-            float new_b = float(weights[bIdx]) - (lr / (sqrt(vb) + EPSILON_ADAM)) * mb;
-            weights[bIdx] = float16_t(clamp(new_b, -65000.0, 65000.0));
+            adamUpdateParam(NRC_B1_OFFSET + j, clamp(g_b * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
+        }
+        for (uint rowTile = 0u; rowTile < 4u; ++rowTile) {
+            for (uint colTile = 0u; colTile < 4u; ++colTile) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+                for (uint b = 0u; b < 2u; ++b) {
+                    uint rowOff = b * 1024u;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                    coopMatLoad(aTile, s_act1, rowOff + rowTile * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
 
-            for (uint i = 0u; i < 64u; ++i) {
-                float g_w = 0.0;
-                for (uint s = 0u; s < numSamples; ++s) {
-                    g_w += float(s_delta[s * 64u + j]) * float(s_act1[s * 64u + i]);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+                    coopMatLoad(bTile, s_delta, rowOff + colTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                    dw = coopMatMulAdd(aTile, bTile, dw);
                 }
-                g_w = clamp(g_w * invBatch, -10.0, 10.0);
-                uint wIdx = NRC_W1_OFFSET + i * 64u + j;
-                float mw = BETA1 * weightM[wIdx] + (1.0 - BETA1) * g_w;
-                float vw = BETA2 * weightV[wIdx] + (1.0 - BETA2) * g_w * g_w;
-                weightM[wIdx] = mw;
-                weightV[wIdx] = vw;
-                float new_w = float(weights[wIdx]) - (lr / (sqrt(vw) + EPSILON_ADAM)) * mw;
-                weights[wIdx] = float16_t(clamp(new_w, -65000.0, 65000.0));
+                coopMatStore(dw, s_gradTile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                barrier();
+                for (uint idx = lane; idx < 256u; idx += 32u) {
+                    uint r = idx >> 4u;
+                    uint c = idx & 15u;
+                    uint wIdx = NRC_W1_OFFSET + (rowTile * 16u + r) * 64u + (colTile * 16u + c);
+                    adamUpdateParam(wIdx, clamp(float(s_gradTile[idx]) * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
+                }
+                barrier();
             }
         }
-    }
-    barrier();
 
-    // --- LAYER 0 Weight Update ---
-    if (gl_WorkGroupID.x == 0u && numSamples > 0u) {
+        // --- LAYER 0 Weight Update via WMMA dW0 = s_act0^T * s_act2 ---
         for (uint pass = 0u; pass < 2u; ++pass) {
             uint j = lane + pass * 32u;
             float g_b = 0.0;
             for (uint s = 0u; s < numSamples; ++s) {
                 g_b += float(s_act2[s * 64u + j]);
             }
-            g_b = clamp(g_b * invBatch, -10.0, 10.0);
-            uint bIdx = NRC_B0_OFFSET + j;
-            float mb = BETA1 * weightM[bIdx] + (1.0 - BETA1) * g_b;
-            float vb = BETA2 * weightV[bIdx] + (1.0 - BETA2) * g_b * g_b;
-            weightM[bIdx] = mb;
-            weightV[bIdx] = vb;
-            float new_b = float(weights[bIdx]) - (lr / (sqrt(vb) + EPSILON_ADAM)) * mb;
-            weights[bIdx] = float16_t(clamp(new_b, -65000.0, 65000.0));
+            adamUpdateParam(NRC_B0_OFFSET + j, clamp(g_b * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
+        }
+        for (uint rowTile = 0u; rowTile < 4u; ++rowTile) {
+            for (uint colTile = 0u; colTile < 4u; ++colTile) {
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+                for (uint b = 0u; b < 2u; ++b) {
+                    uint rowOff = b * 1024u;
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                    coopMatLoad(aTile, s_act0, rowOff + rowTile * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
 
-            for (uint i = 0u; i < 34u; ++i) {
-                float g_w = 0.0;
-                for (uint s = 0u; s < numSamples; ++s) {
-                    g_w += float(s_act2[s * 64u + j]) * float(s_act0[s * 64u + i]);
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+                    coopMatLoad(bTile, s_act2, rowOff + colTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+
+                    dw = coopMatMulAdd(aTile, bTile, dw);
                 }
-                g_w = clamp(g_w * invBatch, -10.0, 10.0);
-                uint wIdx = NRC_W0_OFFSET + i * 64u + j;
-                float mw = BETA1 * weightM[wIdx] + (1.0 - BETA1) * g_w;
-                float vw = BETA2 * weightV[wIdx] + (1.0 - BETA2) * g_w * g_w;
-                weightM[wIdx] = mw;
-                weightV[wIdx] = vw;
-                float new_w = float(weights[wIdx]) - (lr / (sqrt(vw) + EPSILON_ADAM)) * mw;
-                weights[wIdx] = float16_t(clamp(new_w, -65000.0, 65000.0));
+                coopMatStore(dw, s_gradTile, 0u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+                barrier();
+                for (uint idx = lane; idx < 256u; idx += 32u) {
+                    uint i = rowTile * 16u + (idx >> 4u);
+                    if (i < 64u) {
+                        uint c = idx & 15u;
+                        uint wIdx = NRC_W0_OFFSET + i * 64u + (colTile * 16u + c);
+                        adamUpdateParam(wIdx, clamp(float(s_gradTile[idx]) * INV_GRAD_SCALE, -10.0, 10.0), lrStep);
+                    }
+                }
+                barrier();
             }
         }
+        memoryBarrierBuffer();
+        barrier();
     }
 }

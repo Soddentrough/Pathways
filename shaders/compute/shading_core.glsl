@@ -112,7 +112,7 @@ void traceClosestSceneHit(
 #endif // SHADING_CORE_SKIP_SCENE_HIT
 
 #ifdef SHADING_CORE_ENABLE_NEE
-bool evalStandardDirectNEE(
+bool evalStandardDirectNEEScaled(
     StdBsdf bsdf,
     vec3 hitPoint,
     vec3 hitNormal,
@@ -120,6 +120,7 @@ bool evalStandardDirectNEE(
     uint numLights,
     uint numCandidates,
     bool canContinue,
+    float lightSampleScale,
     inout uint seed,
     out vec3 outShadowOrigin,
     out vec3 outLightDir,
@@ -207,7 +208,7 @@ bool evalStandardDirectNEE(
 
         float sourcePdf = max(candPdfSolidAngle * lightPickPdf, 1e-20);
         float misW = (lightType == 0u || lightType == 3u)
-            ? neeMisWeight(lightIdx, sourcePdf, bsdfPdf, canContinue)
+            ? neeMisWeightScaled(lightIdx, sourcePdf, bsdfPdf, canContinue, lightSampleScale)
             : 1.0;
         if (misW <= 0.0) continue;
 
@@ -237,6 +238,27 @@ bool evalStandardDirectNEE(
     outDiffContrib = selDiffScaled * risScale;
     outSpecContrib = selSpecScaled * risScale;
     return true;
+}
+
+bool evalStandardDirectNEE(
+    StdBsdf bsdf,
+    vec3 hitPoint,
+    vec3 hitNormal,
+    vec3 V,
+    uint numLights,
+    uint numCandidates,
+    bool canContinue,
+    inout uint seed,
+    out vec3 outShadowOrigin,
+    out vec3 outLightDir,
+    out float outLightDist,
+    out vec3 outDiffContrib,
+    out vec3 outSpecContrib
+) {
+    return evalStandardDirectNEEScaled(
+        bsdf, hitPoint, hitNormal, V, numLights, numCandidates, canContinue, 1.0, seed,
+        outShadowOrigin, outLightDir, outLightDist, outDiffContrib, outSpecContrib
+    );
 }
 #endif // SHADING_CORE_ENABLE_NEE
 

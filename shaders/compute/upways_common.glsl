@@ -1,335 +1,251 @@
-// upways_common.glsl — Shared Vulkan 1.4 + RDNA 4 (gfx1201) FP8 definitions, offsets, and math helpers.
-// Mirrors upways/data/protocol.py, upways/marshaling.py, upways/network.py, upways/upscaler.py, and upways/export.py 1:1.
+// Upways 4.0 shared GLSL definitions, layout constants, FP8/FP16 helpers, and explicit bilinear warps.
+// Must remain strictly identical between Upways and Pathways repositories.
 
-#ifndef UPWAYS_COMMON_GLSL
-#define UPWAYS_COMMON_GLSL
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#ifndef UPWAYS_FP16_WMMA
+#extension GL_EXT_float_e4m3 : require
+#endif
 
-const float SKY_DEPTH_THRESHOLD       = 9999.0;
-const float SPEC_SKY_DIST_THRESHOLD   = 999.0;
-const float EMISSIVE_ALBEDO_SQ_EPS    = 1e-5;
-const float MIN_DEMOD_ALBEDO          = 0.01;
-const float MAX_LOG1P_IRRADIANCE      = 11.0903549; // log1p(65504.0)
-const float INV_MAX_LOG1P_IRRADIANCE  = 1.0 / 11.0903549;
-const float FP8_E4M3_MAX              = 448.0;
-const float FP8_ACT_SCALE             = 16.0;
-const float FP8_ACT_INV_SCALE         = 0.0625;
-
-// Exact Section 1 (FP8 E4M3 WMMA 16x16 blocks) & Section 2 (FP32 scales, biases, 3x3 DW, skip_scale) offsets
-// Generated deterministically by upways.export.compute_shader_weight_offsets() (87,232 bytes total)
-const uint ENC0_PW1_W_FP8_OFFSET      = 0u;
-const uint ENC0_PW1_S_F32_OFFSET      = 0u;
-const uint ENC0_PW1_B_F32_OFFSET      = 32u;
-const uint REC_PROJ_W_FP8_OFFSET      = 1024u;
-const uint REC_PROJ_S_F32_OFFSET      = 64u;
-const uint ENC0_PW2_W_FP8_OFFSET      = 1536u;
-const uint ENC0_PW2_S_F32_OFFSET      = 96u;
-const uint ENC0_PW2_B_F32_OFFSET      = 128u;
-const uint ENC1_PW1_W_FP8_OFFSET      = 2560u;
-const uint ENC1_PW1_S_F32_OFFSET      = 160u;
-const uint ENC1_PW1_B_F32_OFFSET      = 224u;
-const uint ENC1_PW2_W_FP8_OFFSET      = 4608u;
-const uint ENC1_PW2_S_F32_OFFSET      = 288u;
-const uint ENC1_PW2_B_F32_OFFSET      = 352u;
-const uint BOT1_PW1_W_FP8_OFFSET      = 8704u;
-const uint BOT1_PW1_S_F32_OFFSET      = 416u;
-const uint BOT1_PW1_B_F32_OFFSET      = 544u;
-const uint BOT1_PW2_W_FP8_OFFSET      = 16896u;
-const uint BOT1_PW2_S_F32_OFFSET      = 672u;
-const uint BOT1_PW2_B_F32_OFFSET      = 800u;
-const uint BOT2_PW1_W_FP8_OFFSET      = 33280u;
-const uint BOT2_PW1_S_F32_OFFSET      = 928u;
-const uint BOT2_PW1_B_F32_OFFSET      = 1056u;
-const uint BOT2_PW2_W_FP8_OFFSET      = 49664u;
-const uint BOT2_PW2_S_F32_OFFSET      = 1184u;
-const uint BOT2_PW2_B_F32_OFFSET      = 1248u;
-const uint DEC1_PW1_W_FP8_OFFSET      = 57856u;
-const uint DEC1_PW1_S_F32_OFFSET      = 1312u;
-const uint DEC1_PW1_B_F32_OFFSET      = 1376u;
-const uint DEC1_PW2_W_FP8_OFFSET      = 61952u;
-const uint DEC1_PW2_S_F32_OFFSET      = 1440u;
-const uint DEC1_PW2_B_F32_OFFSET      = 1472u;
-const uint DEC0_PW1_W_FP8_OFFSET      = 64000u;
-const uint DEC0_PW1_S_F32_OFFSET      = 1504u;
-const uint DEC0_PW1_B_F32_OFFSET      = 1536u;
-const uint DEC0_PW2_W_FP8_OFFSET      = 65024u;
-const uint DEC0_PW2_S_F32_OFFSET      = 1568u;
-const uint DEC0_PW2_B_F32_OFFSET      = 1600u;
-const uint HEAD_OUT_W_FP8_OFFSET      = 66048u;
-const uint HEAD_OUT_S_F32_OFFSET      = 1632u;
-const uint HEAD_OUT_B_F32_OFFSET      = 1648u;
-const uint HEAD_REC_W_FP8_OFFSET      = 66560u;
-const uint HEAD_REC_S_F32_OFFSET      = 1664u;
-const uint HEAD_REC_B_F32_OFFSET      = 1696u;
-
-const uint ENC0_DW_W_F32_OFFSET       = 1728u;
-const uint ENC1_DW_W_F32_OFFSET       = 2016u;
-const uint BOT1_DW_W_F32_OFFSET       = 2304u;
-const uint BOT2_DW_W_F32_OFFSET       = 2880u;
-const uint DEC1_DW_W_F32_OFFSET       = 4032u;
-const uint DEC0_DW_W_F32_OFFSET       = 4608u;
-const uint SKIP_SCALE_F32_OFFSET      = 4896u;
-
-layout(push_constant) uniform UpwaysPushConstants {
-    uint renderWidth;
-    uint renderHeight;
-    uint displayWidth;
-    uint displayHeight;
-    float jitterX;
-    float jitterY;
-    float preExposure;
-    uint resetHistory;
-    uint preserveJitterGuide;
-    uint stageId;
-    uint srcWidth;
-    uint srcHeight;
-    uint dstWidth;
-    uint dstHeight;
+// -----------------------------------------------------------------------------
+// Push Constants (56 bytes exact)
+// -----------------------------------------------------------------------------
+layout(push_constant) uniform UpwaysPC {
+    uint  lrWidth;        // 0
+    uint  lrHeight;       // 4
+    uint  hrWidth;        // 8
+    uint  hrHeight;       // 12
+    float jitterX;        // 16 (LR pixels, Camera::ubo.jitterOffset.x)
+    float jitterY;        // 20 (LR pixels, Camera::ubo.jitterOffset.y)
+    uint  frameIndex;     // 24
+    uint  flags;          // 28: bit 0 = resetHistory, bit 1 = enableSuperRes, bit 2 = zeroResidualMode
+    uint  offX0;          // 32 (uint32 element offset in DenoiseActFp8Buf)
+    uint  offHw0;         // 36 (shared with offSrIn)
+    uint  offS0;          // 40
+    uint  offB1;          // 44
+    uint  offB2;          // 48
+    float exposureScale;  // 52
 } pc;
 
-struct PyramidLayout {
-    uint w0, h0, n0;
-    uint w1, h1, n1;
-    uint w2, h2, n2;
-    uint offX0;
-    uint offHw0;
-    uint offS0;
-    uint offL1In;
-    uint offS1;
-    uint offL2In;
-    uint offB1;
-    uint offB2;
-    uint offD1;
-    uint totalBytes;
-};
+const uint UPWAYS_FLAG_RESET_HISTORY      = 1u;
+const uint UPWAYS_FLAG_ENABLE_SUPERRES    = 2u;
+const uint UPWAYS_FLAG_ZERO_RESIDUAL_MODE = 4u;
 
-uint pyrAlign256(uint bytes) {
-    return (bytes + 255u) & ~255u;
+// -----------------------------------------------------------------------------
+// Weight Offsets (Total = 24,064 bytes: 15,616 B FP8 + 8,448 B FP32)
+// -----------------------------------------------------------------------------
+// FP8 E4M3fn Pointwise matrices: uint32 offsets inside WeightFp8Buf (3,904 uint32s)
+// Each 16x16 (K=16, N=16) col-major tile occupies 64 uint32s (256 B), stride = 4 uint32s.
+const uint U32_W_ENC1_PW1 = 0u;     // 96 -> 32  (6x2 tiles = 768 u32)
+const uint U32_W_ENC1_PW2 = 768u;   // 32 -> 32  (2x2 tiles = 256 u32)
+const uint U32_W_BOT2_PW1 = 1024u;  // 32 -> 64  (2x4 tiles = 512 u32)
+const uint U32_W_BOT2_PW2 = 1536u;  // 64 -> 32  (4x2 tiles = 512 u32)
+const uint U32_W_DEC1_PW1 = 2048u;  // 64 -> 48  (4x3 tiles = 768 u32)
+const uint U32_W_DEN_HEAD = 2816u;  // 48 -> 48  (3x3 tiles = 576 u32, 4x12 active outputs)
+const uint U32_W_SR_PW1   = 3392u;  // 16 -> 32  (1x2 tiles = 128 u32)
+const uint U32_W_SR_PW2   = 3520u;  // 32 -> 32  (2x2 tiles = 256 u32)
+const uint U32_W_SR_HEAD  = 3776u;  // 32 -> 16  (2x1 tiles = 128 u32)
+const uint TOTAL_WEIGHT_FP8_U32 = 3904u;
+
+// FP32 Scales, Biases, and Depthwise 3x3 ([9][C]): float offsets inside WeightFp32Buf (2,112 floats)
+const uint F32_S_ENC1_PW1 = 0u;
+const uint F32_S_ENC1_PW2 = 32u;
+const uint F32_S_BOT2_PW1 = 64u;
+const uint F32_S_BOT2_PW2 = 128u;
+const uint F32_S_DEC1_PW1 = 160u;
+const uint F32_S_DEN_HEAD = 208u;
+const uint F32_S_SR_PW1   = 256u;
+const uint F32_S_SR_PW2   = 288u;
+const uint F32_S_SR_HEAD  = 320u;
+
+const uint F32_B_ENC1_PW1 = 336u;
+const uint F32_B_ENC1_PW2 = 368u;
+const uint F32_B_BOT2_PW1 = 400u;
+const uint F32_B_BOT2_PW2 = 464u;
+const uint F32_B_DEC1_PW1 = 496u;
+const uint F32_B_DEN_HEAD = 544u;
+const uint F32_B_SR_PW1   = 592u;
+const uint F32_B_SR_PW2   = 624u;
+const uint F32_B_SR_HEAD  = 656u;
+
+const uint F32_DW_ENC1_W  = 672u;   // 9 * 32 = 288
+const uint F32_DW_BOT2_W  = 960u;   // 9 * 32 = 288
+const uint F32_DW_DEC1_W  = 1248u;  // 9 * 64 = 576
+const uint F32_DW_SR1_W   = 1824u;  // 9 * 16 = 144
+
+const uint F32_DW_ENC1_B  = 1968u;  // 32
+const uint F32_DW_BOT2_B  = 2000u;  // 32
+const uint F32_DW_DEC1_B  = 2032u;  // 64
+const uint F32_DW_SR1_B   = 2096u;  // 16
+const uint TOTAL_WEIGHT_FP32_F32 = 2112u;
+
+// -----------------------------------------------------------------------------
+// Scalar & Math Helpers
+// -----------------------------------------------------------------------------
+float upwaysLrelu(float x) {
+    return x >= 0.0 ? x : 0.125 * x;
 }
 
-PyramidLayout computePyramidLayout(uint w0, uint h0) {
-    PyramidLayout pl;
-    pl.w0 = max(w0, 1u);
-    pl.h0 = max(h0, 1u);
-    pl.n0 = pl.w0 * pl.h0;
-
-    pl.w1 = (pl.w0 + 1u) >> 1u;
-    pl.h1 = (pl.h0 + 1u) >> 1u;
-    pl.n1 = pl.w1 * pl.h1;
-
-    pl.w2 = (pl.w1 + 1u) >> 1u;
-    pl.h2 = (pl.h1 + 1u) >> 1u;
-    pl.n2 = pl.w2 * pl.h2;
-
-    uint cur = 0u;
-    pl.offX0   = cur; cur += pyrAlign256(32u * pl.n0);
-    pl.offHw0  = cur; cur += pyrAlign256(16u * pl.n0);
-    pl.offS0   = cur; cur += pyrAlign256(32u * pl.n0);
-    pl.offL1In = cur; cur += pyrAlign256(32u * pl.n1);
-    pl.offS1   = cur; cur += pyrAlign256(64u * pl.n1);
-    pl.offL2In = cur; cur += pyrAlign256(64u * pl.n2);
-    pl.offB1   = cur; cur += pyrAlign256(128u * pl.n2);
-    pl.offB2   = cur; cur += pyrAlign256(64u * pl.n2);
-    pl.offD1   = cur; cur += pyrAlign256(32u * pl.n1);
-    pl.totalBytes = max(cur, 256u);
-    return pl;
+vec4 upwaysLrelu4(vec4 v) {
+    return mix(0.125 * v, v, greaterThanEqual(v, vec4(0.0)));
 }
 
-float sanitizeScalar(float x, float posInfReplacement) {
-    float clean = isnan(x) ? 0.0 : x;
-    return isinf(clean) ? ((clean > 0.0) ? posInfReplacement : 0.0) : clean;
+float upwaysLuma(vec3 c) {
+    return dot(max(c, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));
 }
 
-vec3 sanitizeVec3Input(vec3 v) {
-    return vec3(
-        sanitizeScalar(v.x, 65504.0),
-        sanitizeScalar(v.y, 65504.0),
-        sanitizeScalar(v.z, 65504.0)
-    );
+float safeLog1pF(float x) {
+    return log(1.0 + clamp(x, 0.0, 65504.0));
 }
 
-vec4 sanitizeVec4Input(vec4 v) {
-    return vec4(
-        sanitizeScalar(v.x, 65504.0),
-        sanitizeScalar(v.y, 65504.0),
-        sanitizeScalar(v.z, 65504.0),
-        sanitizeScalar(v.w, 65504.0)
-    );
+vec3 safeLog1p(vec3 v) {
+    return log(vec3(1.0) + clamp(v, vec3(0.0), vec3(65504.0)));
 }
 
-vec3 sanitizeRadiance(vec3 v) {
-    vec3 c = vec3(
-        (isnan(v.x) || isinf(v.x)) ? 0.0 : v.x,
-        (isnan(v.y) || isinf(v.y)) ? 0.0 : v.y,
-        (isnan(v.z) || isinf(v.z)) ? 0.0 : v.z
-    );
+vec3 safeExpm1(vec3 v) {
+    return max(exp(clamp(v, vec3(0.0), vec3(11.0898))) - vec3(1.0), vec3(0.0));
+}
+
+vec3 clampFp16Rgb(vec3 c) {
     return clamp(c, vec3(0.0), vec3(65504.0));
 }
 
-float upwaysLog1p(float x) {
-    float u = 1.0 + x;
-    if (u <= 1.0) {
-        return (x == 0.0) ? 0.0 : log(max(u, 1e-38));
+vec3 sanitizeRgb(vec3 c) {
+    return mix(vec3(0.0), c, lessThan(floatBitsToUint(c), uvec3(0x7F800000u)));
+}
+
+float sanitizeFloat(float v, float fallback) {
+    return ((floatBitsToUint(v) & 0x7FFFFFFFu) < 0x7F800000u) ? v : fallback;
+}
+
+bool isSkyOrEmissiveOnly(float linearDepth, float matClass, vec3 aDiff, vec3 aSpec) {
+    if (linearDepth >= 9999.0) {
+        return true;
     }
-    return log(u) * (x / (u - 1.0));
+    float maxA = max(max(aDiff.r, max(aDiff.g, aDiff.b)), max(aSpec.r, max(aSpec.g, aSpec.b)));
+    return (matClass < 0.05 && maxA < 1e-5);
 }
 
-vec3 upwaysLog1pVec3(vec3 v) {
-    return vec3(upwaysLog1p(v.x), upwaysLog1p(v.y), upwaysLog1p(v.z));
-}
-
-float upwaysExpm1(float x) {
-    if (abs(x) < 1e-4) {
-        return x + 0.5 * x * x;
+// -----------------------------------------------------------------------------
+// Software / Hardware OCP E4M3fn Pack & Unpack (bit-exact with floate4m3_t)
+// -----------------------------------------------------------------------------
+uint encodeE4M3Byte(float x) {
+#ifndef UPWAYS_FP16_WMMA
+    float xc = clamp(x, -448.0, 448.0);
+    return uint(uint8_t(floate4m3BitsToIntEXT(floate4m3_t(xc))));
+#else
+    if (isnan(x)) {
+        return 0x7Fu;
     }
-    return exp(x) - 1.0;
-}
-
-vec3 upwaysExpm1Vec3(vec3 v) {
-    return vec3(upwaysExpm1(v.x), upwaysExpm1(v.y), upwaysExpm1(v.z));
-}
-
-float upwaysSoftplus(float x) {
-    float clamped = clamp(x, -40.0, 20.0);
-    return (x > 20.0) ? x : upwaysLog1p(exp(clamped));
-}
-
-float leakyRelu01(float x) {
-    return (x >= 0.0) ? x : (0.1 * x);
-}
-
-float safeTanh(float x) {
-    float c = clamp(x, -16.0, 16.0);
-    float e2x = exp(-2.0 * abs(c));
-    float t = (1.0 - e2x) / (1.0 + e2x);
-    return (c >= 0.0) ? t : -t;
-}
-
-float safeSigmoid(float x) {
-    float c = clamp(x, -20.0, 20.0);
-    return 1.0 / (1.0 + exp(-c));
-}
-
-void decodeMetallicAndEmissive(float rawCh7, vec3 albedo, out float metallic, out float isEmissive) {
-    float albedoSq = dot(albedo, albedo);
-    bool isPureEmissive = (rawCh7 > 0.5) && (albedoSq <= EMISSIVE_ALBEDO_SQ_EPS);
-    bool isEmissiveMask = (rawCh7 > 1.5) || isPureEmissive;
-    isEmissive = isEmissiveMask ? 1.0 : 0.0;
-    metallic = isPureEmissive ? 0.0 : clamp(rawCh7, 0.0, 1.0);
-}
-
-vec3 computeDemodulationFactor(vec3 albedo, float linearDepth) {
-    float albedoSq = dot(albedo, albedo);
-    bool isSkyOrEmissive = (linearDepth >= SKY_DEPTH_THRESHOLD) || (albedoSq <= EMISSIVE_ALBEDO_SQ_EPS);
-    return isSkyOrEmissive ? vec3(1.0) : max(albedo, vec3(MIN_DEMOD_ALBEDO));
-}
-
-vec3 computeSpecularModulation(vec3 albedo, float metallic, float roughness, float nViewZ, float linearDepth) {
-    float albedoSq = dot(albedo, albedo);
-    bool isBypass = (linearDepth >= SKY_DEPTH_THRESHOLD) || (metallic <= 1e-4) || (albedoSq <= EMISSIVE_ALBEDO_SQ_EPS);
-    if (isBypass) {
-        return vec3(1.0);
+    uint signBit = (x < 0.0) ? 0x80u : 0x00u;
+    float ax = min(abs(x), 448.0);
+    if (ax < 0.0009765625) {
+        return signBit; // < 2^-10 rounds to +-0
     }
-    vec3 f0Metal = max(clamp(albedo, vec3(0.0), vec3(1.0)), vec3(0.04));
-    float cosTheta = clamp(abs(nViewZ), 0.0, 1.0);
-    float omc = 1.0 - cosTheta;
-    float omc2 = omc * omc;
-    float fresnel = omc2 * omc2 * omc * (1.0 - clamp(roughness, 0.0, 1.0));
-    float wFres = 0.25 * fresnel;
-    vec3 metalMod = f0Metal * (1.0 - wFres) + vec3(wFres);
-    float mClamped = clamp(metallic, 0.0, 1.0);
-    return vec3(1.0 - mClamped) + mClamped * metalMod;
-}
-
-// 4-quadrant bilinear footprint summary for display->render history downsampling when scale > 2.0x.
-// Matches warp_area_4tap_uv() in upways/marshaling.py 1:1.
-vec4 sampleHistoryAreaLr(sampler2D tex, vec2 prevUv, uvec2 renderSize) {
-    uvec2 srcSize = uvec2(textureSize(tex, 0));
-    float scaleX = float(srcSize.x) / float(max(renderSize.x, 1u));
-    float scaleY = float(srcSize.y) / float(max(renderSize.y, 1u));
-    float offX = clamp((scaleX - 2.0) * 0.5, 0.0, 1.0) / float(max(srcSize.x, 1u));
-    float offY = clamp((scaleY - 2.0) * 0.5, 0.0, 1.0) / float(max(srcSize.y, 1u));
-    if (offX == 0.0 && offY == 0.0) {
-        return textureLod(tex, prevUv, 0.0);
+    if (ax < 0.015625) {
+        // Subnormals: step 2^-9, nearest-even
+        float scaled = ax * 512.0;
+        uint q = uint(roundEven(scaled));
+        if (q >= 8u) {
+            return signBit | (1u << 3u);
+        }
+        return signBit | (q & 0x7u);
     }
-    vec4 s00 = textureLod(tex, prevUv + vec2(-offX, -offY), 0.0);
-    vec4 s01 = textureLod(tex, prevUv + vec2( offX, -offY), 0.0);
-    vec4 s10 = textureLod(tex, prevUv + vec2(-offX,  offY), 0.0);
-    vec4 s11 = textureLod(tex, prevUv + vec2( offX,  offY), 0.0);
-    return 0.25 * (s00 + s01 + s10 + s11);
-}
-
-// 5-tap Jimenez Catmull-Rom bicubic 4-channel backward warp with anti-ringing min/max clamp.
-// Matches warp_catmull_rom_5tap() in upways/marshaling.py 1:1.
-vec4 sampleCatmullRom5Tap(
-    sampler2D tex,
-    ivec2 dstPos,
-    uvec2 dstSize,
-    uvec2 srcSize,
-    vec2 mvUv,
-    out float inBoundsMask
-) {
-    vec2 uv = (vec2(dstPos) + 0.5) / vec2(dstSize);
-    vec2 prevUv = uv - mvUv;
-    bool inBounds = (prevUv.x >= 0.0) && (prevUv.x <= 1.0) && (prevUv.y >= 0.0) && (prevUv.y <= 1.0);
-    inBoundsMask = inBounds ? 1.0 : 0.0;
-    if (!inBounds) {
-        return vec4(0.0);
+    int exp2;
+    float mant = frexp(ax, exp2); // ax = mant * 2^exp2, mant in [0.5, 1)
+    int e = exp2 - 1 + 7;         // unbiased = exp2 - 1, bias = 7
+    float frac = (mant * 2.0 - 1.0) * 8.0;
+    uint m = uint(roundEven(frac));
+    if (m >= 8u) {
+        m = 0u;
+        e += 1;
     }
-
-    vec2 clampedUv = clamp(prevUv, vec2(0.0), vec2(1.0));
-    vec2 srcF = vec2(srcSize);
-    vec2 pos = clampedUv * srcF;
-    vec2 tc1 = floor(pos - 0.5) + 0.5;
-    vec2 f = pos - tc1;
-    vec2 f2 = f * f;
-    vec2 f3 = f2 * f;
-
-    vec2 w0 = -0.5 * f3 + f2 - 0.5 * f;
-    vec2 w1 =  1.5 * f3 - 2.5 * f2 + 1.0;
-    vec2 w2 = -1.5 * f3 + 2.0 * f2 + 0.5 * f;
-    vec2 w3 =  0.5 * f3 - 0.5 * f2;
-
-    vec2 w12 = w1 + w2;
-    vec2 off12 = w2 / w12;
-
-    vec2 tc0  = (tc1 - 1.0) / srcF;
-    vec2 tc12 = (tc1 + off12) / srcF;
-    vec2 tc3  = (tc1 + 2.0) / srcF;
-
-    float wt0 = w12.x * w0.y;
-    float wt1 = w0.x  * w12.y;
-    float wt2 = w12.x * w12.y;
-    float wt3 = w3.x  * w12.y;
-    float wt4 = w12.x * w3.y;
-    float wtSum = max(wt0 + wt1 + wt2 + wt3 + wt4, 1e-6);
-
-    vec4 c = textureLod(tex, vec2(tc12.x, tc0.y),  0.0);
-    vec4 raw = c * wt0;
-    f16vec4 cMin = f16vec4(c);
-    f16vec4 cMax = f16vec4(c);
-
-    c = textureLod(tex, vec2(tc0.x,  tc12.y), 0.0);
-    raw += c * wt1;
-    cMin = min(cMin, f16vec4(c));
-    cMax = max(cMax, f16vec4(c));
-
-    c = textureLod(tex, vec2(tc12.x, tc12.y), 0.0);
-    raw += c * wt2;
-    cMin = min(cMin, f16vec4(c));
-    cMax = max(cMax, f16vec4(c));
-
-    c = textureLod(tex, vec2(tc3.x,  tc12.y), 0.0);
-    raw += c * wt3;
-    cMin = min(cMin, f16vec4(c));
-    cMax = max(cMax, f16vec4(c));
-
-    c = textureLod(tex, vec2(tc12.x, tc3.y),  0.0);
-    raw += c * wt4;
-    cMin = min(cMin, f16vec4(c));
-    cMax = max(cMax, f16vec4(c));
-
-    vec4 res = clamp(raw / wtSum, vec4(cMin), vec4(cMax));
-    return vec4(clamp(res.rgb, vec3(0.0), vec3(MAX_LOG1P_IRRADIANCE)), clamp(res.a, 0.0, 1.0));
+    if (e > 15 || (e == 15 && m > 6u)) {
+        e = 15;
+        m = 6u; // 448.0 max finite E4M3fn (0x7E)
+    }
+    return signBit | (uint(e) << 3u) | (m & 0x7u);
+#endif
 }
 
-#endif // UPWAYS_COMMON_GLSL
+float decodeE4M3Byte(uint b) {
+#ifndef UPWAYS_FP16_WMMA
+    return float(intBitsToFloate4m3EXT(int8_t(uint8_t(b & 0xFFu))));
+#else
+    uint u = b & 0xFFu;
+    float s = ((u & 0x80u) != 0u) ? -1.0 : 1.0;
+    uint e = (u >> 3u) & 0xFu;
+    uint m = u & 0x7u;
+    if (e == 0u) {
+        return s * (float(m) / 512.0);
+    }
+    if (e == 15u && m == 7u) {
+        return 0.0;
+    }
+    return s * exp2(float(int(e) - 7)) * (1.0 + float(m) / 8.0);
+#endif
+}
+
+uint packFp8Vec4(vec4 v) {
+#ifndef UPWAYS_FP16_WMMA
+    vec4 vc = clamp(v, vec4(-448.0), vec4(448.0));
+    return pack32(floate4m3BitsToUintEXT(fe4m3vec4(vc)));
+#else
+    return encodeE4M3Byte(v.x)
+         | (encodeE4M3Byte(v.y) << 8u)
+         | (encodeE4M3Byte(v.z) << 16u)
+         | (encodeE4M3Byte(v.w) << 24u);
+#endif
+}
+
+vec4 unpackFp8Vec4(uint u) {
+#ifndef UPWAYS_FP16_WMMA
+    return vec4(uintBitsToFloate4m3EXT(unpack8(u)));
+#else
+    return vec4(
+        decodeE4M3Byte(u),
+        decodeE4M3Byte(u >> 8u),
+        decodeE4M3Byte(u >> 16u),
+        decodeE4M3Byte(u >> 24u)
+    );
+#endif
+}
+
+vec4 quantFp8Sim4(vec4 v) {
+    return unpackFp8Vec4(packFp8Vec4(v));
+}
+
+// Bilinear tap computation matching PyTorch & HLSL integer imageLoad
+struct BilinearTaps {
+    ivec2 i00;
+    ivec2 i10;
+    ivec2 i01;
+    ivec2 i11;
+    vec4  w; // (w00, w10, w01, w11)
+};
+
+BilinearTaps computeBilinearTaps(vec2 coord, ivec2 dims) {
+    vec2 f = floor(coord);
+    vec2 frac = clamp(coord - f, vec2(0.0), vec2(1.0));
+    int x0 = int(f.x);
+    int y0 = int(f.y);
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    ivec2 hi = dims - ivec2(1);
+    BilinearTaps t;
+    t.i00 = ivec2(clamp(x0, 0, hi.x), clamp(y0, 0, hi.y));
+    t.i10 = ivec2(clamp(x1, 0, hi.x), clamp(y0, 0, hi.y));
+    t.i01 = ivec2(clamp(x0, 0, hi.x), clamp(y1, 0, hi.y));
+    t.i11 = ivec2(clamp(x1, 0, hi.x), clamp(y1, 0, hi.y));
+    t.w = vec4(
+        (1.0 - frac.x) * (1.0 - frac.y),
+        frac.x * (1.0 - frac.y),
+        (1.0 - frac.x) * frac.y,
+        frac.x * frac.y
+    );
+    return t;
+}

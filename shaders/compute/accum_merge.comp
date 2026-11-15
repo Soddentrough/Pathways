@@ -38,11 +38,13 @@ layout(std430, binding = 7) readonly buffer SecondaryAccumBufferPacked {
     uint secondaryRadiancePacked[];
 };
 
-// Bindings 8..11: Primary GPU Demodulated Denoiser / Upscaler ML Guides (RGBA16F)
+// Bindings 8..13: Primary GPU Demodulated Denoiser / Upscaler ML Guides (RGBA16F)
 layout(binding = 8) uniform image2D uPrimaryMlDiffuse;
 layout(binding = 9) uniform image2D uPrimaryMlSpecular;
 layout(binding = 10) uniform image2D uPrimaryMlAlbedoRoughness;
 layout(binding = 11) uniform image2D uPrimaryMlSpecularMotion;
+layout(binding = 12) uniform image2D uPrimaryMlSkip;
+layout(binding = 13) uniform image2D uPrimaryMlSpecAlbedo;
 
 layout(push_constant) uniform PushConstants {
     uint width;
@@ -187,10 +189,14 @@ void main() {
             uvec2 rawSpec = secondaryWords16[((radAligned + 3u * planeAligned) >> 3u) + linearIndex];
             uvec2 rawAlb  = secondaryWords16[((radAligned + 4u * planeAligned) >> 3u) + linearIndex];
             uvec2 rawSmv  = secondaryWords16[((radAligned + 5u * planeAligned) >> 3u) + linearIndex];
+            uvec2 rawSkip = secondaryWords16[((radAligned + 6u * planeAligned) >> 3u) + linearIndex];
+            uvec2 rawSalb = secondaryWords16[((radAligned + 7u * planeAligned) >> 3u) + linearIndex];
             imageStore(uPrimaryMlDiffuse, pixelCoord, vec4(unpackHalf2x16(rawDiff.x), unpackHalf2x16(rawDiff.y)));
             imageStore(uPrimaryMlSpecular, pixelCoord, vec4(unpackHalf2x16(rawSpec.x), unpackHalf2x16(rawSpec.y)));
             imageStore(uPrimaryMlAlbedoRoughness, pixelCoord, vec4(unpackHalf2x16(rawAlb.x), unpackHalf2x16(rawAlb.y)));
             imageStore(uPrimaryMlSpecularMotion, pixelCoord, vec4(unpackHalf2x16(rawSmv.x), unpackHalf2x16(rawSmv.y)));
+            imageStore(uPrimaryMlSkip, pixelCoord, vec4(unpackHalf2x16(rawSkip.x), unpackHalf2x16(rawSkip.y)));
+            imageStore(uPrimaryMlSpecAlbedo, pixelCoord, vec4(unpackHalf2x16(rawSalb.x), unpackHalf2x16(rawSalb.y)));
         }
     } else {
         // --- Mode 2: Sample Parallelism (Temporal Sample Accumulation) ---
@@ -230,6 +236,11 @@ void main() {
             vec4 secSpec = vec4(unpackHalf2x16(rawSpec.x), unpackHalf2x16(rawSpec.y));
             vec4 primSpec = imageLoad(uPrimaryMlSpecular, pixelCoord);
             imageStore(uPrimaryMlSpecular, pixelCoord, vec4(primSpec.rgb + secSpec.rgb, primSpec.a));
+
+            uvec2 rawSkip = secondaryWords16[((radAligned + 2u * planeAligned) >> 3u) + linearIndex];
+            vec4 secSkip = vec4(unpackHalf2x16(rawSkip.x), unpackHalf2x16(rawSkip.y));
+            vec4 primSkip = imageLoad(uPrimaryMlSkip, pixelCoord);
+            imageStore(uPrimaryMlSkip, pixelCoord, vec4(primSkip.rgb + secSkip.rgb, primSkip.a));
         }
     }
 }

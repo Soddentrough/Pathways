@@ -43,11 +43,6 @@ void TelemetryReporter::dumpOutputFiles() {
 
     vkDeviceWaitIdle(device);
 
-    if (m_engine->m_superResolution) {
-        if (auto* upw = m_engine->m_superResolution->getUpwaysPipeline()) {
-            upw->collectQueryResults();
-        }
-    }
     if (m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
         m_engine->m_denoiser->collectQueryResults();
     }
@@ -486,22 +481,22 @@ FrameStats TelemetryReporter::getStats() const {
         const auto& pt = upw->getLastPassTimings();
         stats.denoiser_mode_str = "Upways";
         stats.denoise_pass_names = {
-            "upwaysTemporal", "upwaysNeuralGuide", "upwaysUpscaleResolve", "upwaysHistoryCopy", "unused"
+            "upwaysDenoisePrep", "upwaysDenoiserWmma", "upwaysUpscalerWmma", "upwaysUpscaleResolve", "unused"
         };
-        stats.denoise_pass_ms[0] = pt.temporalMs;
-        stats.denoise_pass_ms[1] = pt.neuralGuideMs;
-        stats.denoise_pass_ms[2] = pt.upscaleResolveMs;
-        stats.denoise_pass_ms[3] = pt.historyCopyMs;
+        stats.denoise_pass_ms[0] = pt.prepMs;
+        stats.denoise_pass_ms[1] = pt.denoiserMs;
+        stats.denoise_pass_ms[2] = pt.upscalerMs;
+        stats.denoise_pass_ms[3] = pt.resolveMs;
         stats.denoise_pass_ms[4] = 0.0;
 
         stats.denoiser_profiler_stats.valid = pt.valid || (stats.upways_time_ms > 0.0001);
         stats.denoiser_profiler_stats.mode = "upways";
-        stats.denoiser_profiler_stats.temporal_ms = pt.temporalMs;
-        stats.denoiser_profiler_stats.neural_guide_ms = pt.neuralGuideMs;
+        stats.denoiser_profiler_stats.temporal_ms = pt.prepMs;
+        stats.denoiser_profiler_stats.neural_guide_ms = pt.denoiserMs;
         stats.denoiser_profiler_stats.atrous_step2_ms = 0.0;
         stats.denoiser_profiler_stats.atrous_step6_ms = 0.0;
-        stats.denoiser_profiler_stats.upscale_resolve_ms = pt.upscaleResolveMs;
-        stats.denoiser_profiler_stats.history_copy_ms = pt.historyCopyMs;
+        stats.denoiser_profiler_stats.upscale_resolve_ms = pt.upscalerMs;
+        stats.denoiser_profiler_stats.history_copy_ms = pt.resolveMs;
         stats.denoiser_profiler_stats.total_pass_ms = pt.totalMs;
         stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
     } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Svgf ||
@@ -1002,10 +997,10 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
         auto* upw = m_engine->m_superResolution->getUpwaysPipeline();
         const auto& pt = upw->getLastPassTimings();
         if (pt.valid) {
-            denoisePasses[0] = pt.temporalMs;
-            denoisePasses[1] = pt.neuralGuideMs;
-            denoisePasses[2] = pt.upscaleResolveMs;
-            denoisePasses[3] = pt.historyCopyMs;
+            denoisePasses[0] = pt.prepMs;
+            denoisePasses[1] = pt.denoiserMs;
+            denoisePasses[2] = pt.upscalerMs;
+            denoisePasses[3] = pt.resolveMs;
             numDenoisePasses = 4;
             if (denoiserUpscaleMs <= 0.0001) {
                 denoiserUpscaleMs = pt.totalMs;

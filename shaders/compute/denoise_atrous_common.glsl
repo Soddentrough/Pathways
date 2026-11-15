@@ -8,7 +8,7 @@
 #include "denoise_common.glsl"
 
 // Filters the DIFFUSE lobe (RGBA16F: RGB radiance, A variance).
-// Fine passes (stepSize <= 2) evaluate the full 9-tap 3x3 B-spline wavelet kernel;
+// Fine passes (stepSize <= 3) evaluate the full 9-tap 3x3 B-spline wavelet kernel;
 // coarse passes (stepSize >= 4) evaluate a wave-uniform 5-tap complementary
 // axial/diagonal wavelet stencil (+ at s=4, x at s=8) since Passes 2-3 already
 // produce a contiguous 13x13 2D B-spline footprint that bridges the 4/8-px stride.
@@ -20,6 +20,7 @@ vec4 atrousFilterDiffuse(
     vec3 centerPos,
     float centerLum,
     float centerVar,
+    bool centerZeroAlb,
     float phiNormal,
     float phiPlaneDepth,
     float phiLuminance,
@@ -27,6 +28,7 @@ vec4 atrousFilterDiffuse(
     float aspectRatio,
     ivec2 imgMax)
 {
+    stepSize = abs(stepSize);
     float cleanCenterVar = abs(centerDiffuse.a);
     if (centerPos.z <= 0.0 || centerPos.z >= 9999.0 || cleanCenterVar <= 1e-6) {
         return vec4(centerDiffuse.rgb, cleanCenterVar);
@@ -50,7 +52,7 @@ vec4 atrousFilterDiffuse(
     float invDepthTolerance = 1.0 / max(phiPlaneDepth * float(stepSize) * pixelFootprint, fp16QuantizationFloor);
     float centerPlaneDot = dot(centerPos, nView);
 
-    if (stepSize >= 3) {
+    if (stepSize >= 4) {
         const ivec2 AXIAL_TAPS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
         const ivec2 DIAG_TAPS[4]  = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
         const float kWeight = (stepSize <= 4) ? 0.09375 : 0.0625;
@@ -70,10 +72,13 @@ vec4 atrousFilterDiffuse(
             float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolerance;
             if (depthArg >= 8.0) continue;
 
+            vec3 tapAlb = imageLoad(uAlbedoRoughness, tapCoord).rgb;
+            if ((dot(tapAlb, tapAlb) <= 1e-5) != centerZeroAlb) continue;
+
             vec4 tapData = imageLoad(uInDiffuse, tapCoord);
             float tapVar = abs(tapData.a);
             float tapLum = denoiseLuminance(tapData.rgb);
-            float lumArg = abs(centerLum - tapLum) / (phiLuminance * sqrt(max(max(centerVar, tapVar * 0.25), 1e-4)) + 1e-4);
+            float lumArg = abs(centerLum - tapLum) / (phiLuminance * sqrt(max(max(centerVar, tapVar * 0.5), 4e-6)) + 2e-5);
 
             float c2 = cosAngle * cosAngle;
             float c4 = c2 * c2;
@@ -107,10 +112,13 @@ vec4 atrousFilterDiffuse(
                 float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolerance;
                 if (depthArg >= 8.0) continue;
 
+                vec3 tapAlb = imageLoad(uAlbedoRoughness, tapCoord).rgb;
+                if ((dot(tapAlb, tapAlb) <= 1e-5) != centerZeroAlb) continue;
+
                 vec4 tapData = imageLoad(uInDiffuse, tapCoord);
                 float tapVar = abs(tapData.a);
                 float tapLum = denoiseLuminance(tapData.rgb);
-                float lumArg = abs(centerLum - tapLum) / (phiLuminance * sqrt(max(max(centerVar, tapVar * 0.25), 1e-4)) + 1e-4);
+                float lumArg = abs(centerLum - tapLum) / (phiLuminance * sqrt(max(max(centerVar, tapVar * 0.5), 4e-6)) + 2e-5);
 
                 float c2 = cosAngle * cosAngle;
                 float c4 = c2 * c2;
@@ -148,19 +156,28 @@ vec4 atrousFilterSpecular(
     float aspectRatio,
     ivec2 imgMax)
 {
-    if (centerPos.z <= 0.0 || centerPos.z >= 9999.0 || (centerLum <= 1e-4 && rawSpecData.a <= 1e-5)) {
+    bool isCoupled = (stepSize < 0) || (stepSize == 6);
+    stepSize = abs(stepSize);
+    if (centerPos.z <= 0.0 || centerPos.z >= 9999.0) {
         return rawSpecData;
     }
 
-    float mirrorBypass = 1.0 - smoothstep(0.005, 0.025, roughness);
+    float mirrorBypass = (centerVar > 0.02)
+        ? (1.0 - smoothstep(0.008, 0.015, roughness))
+        : (1.0 - smoothstep(0.012, 0.040, roughness));
     if (mirrorBypass >= 0.999) {
         return rawSpecData;
     }
 
     vec3 rawSpecular = rawSpecData.rgb;
-    float roughnessScale = clamp(max(roughness * roughness, (roughness >= 0.03 && centerVar > 5e-4) ? 0.25 : 0.1), 0.1, 1.0);
+    float noisyRoughFloor = (stepSize == 6 && roughness >= 0.08 && centerVar > 1e-3)
+        ? 0.60
+        : ((isCoupled && roughness >= 0.10 && centerVar > 1e-3)
+            ? 0.45
+            : ((roughness >= 0.016 && centerVar > 1e-3) ? 0.35 : 0.10));
+    float roughnessScale = clamp(max(roughness * roughness * 1.5, noisyRoughFloor), 0.10, 1.0);
     float effectivePhiNormal = min(phiNormal / max(roughness * roughness, 0.05), 256.0);
-    float effPhiLum = (roughness >= 0.50) ? (phiLuminance * 2.0) : ((roughness >= 0.03 && centerVar > 2e-4) ? (phiLuminance * 2.5) : phiLuminance);
+    float basePhiLum = (roughness >= 0.50) ? (phiLuminance * 1.5) : phiLuminance;
 
     const float centerW = 0.140625;
     vec3 specAcc = rawSpecular * centerW;
@@ -178,12 +195,11 @@ vec4 atrousFilterSpecular(
     float pixelFootprint = 2.0 * centerPos.z * tanHalfFovY * (1.0 / max(resolution.y, 1.0));
     float fp16QuantizationFloor = max(centerPos.z * 0.0009765625, 1e-4);
     float invDepthTolerance = 1.0 / max(phiPlaneDepth * float(stepSize) * pixelFootprint, fp16QuantizationFloor);
-    float invLumDenom = 1.0 / (effPhiLum * sqrt(max(centerVar, 1e-4)) + 1e-4);
 
     float centerPlaneDot = dot(centerPos, nView);
     int specStep = max(1, int(round(float(stepSize) * roughnessScale)));
 
-    if (specStep >= 3) {
+    if (specStep >= 4) {
         const ivec2 AXIAL_TAPS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
         const ivec2 DIAG_TAPS[4]  = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
         const float kWeight = (specStep <= 4) ? 0.09375 : 0.0625;
@@ -205,7 +221,7 @@ vec4 atrousFilterSpecular(
 
             vec4 tapData = imageLoad(uInSpecular, tapCoord);
             float tapLum = denoiseLuminance(tapData.rgb);
-            float lumArg = abs(centerLum - tapLum) * invLumDenom;
+            float lumArg = abs(centerLum - tapLum) / (basePhiLum * sqrt(max(max(centerVar, max(tapData.a, 0.0) * 0.50), 1e-4)) + 1e-4);
 
             float16_t wNorm = float16_t(pow(cosAngle, effectivePhiNormal));
             float16_t wEdge = float16_t(exp2(-(depthArg + lumArg) * 1.44269504));
@@ -237,7 +253,7 @@ vec4 atrousFilterSpecular(
 
                 vec4 tapData = imageLoad(uInSpecular, tapCoord);
                 float tapLum = denoiseLuminance(tapData.rgb);
-                float lumArg = abs(centerLum - tapLum) * invLumDenom;
+                float lumArg = abs(centerLum - tapLum) / (basePhiLum * sqrt(max(max(centerVar, max(tapData.a, 0.0) * 0.50), 1e-4)) + 1e-4);
 
                 float16_t wNorm = float16_t(pow(cosAngle, effectivePhiNormal));
                 float16_t wEdge = float16_t(exp2(-(depthArg + lumArg) * 1.44269504));

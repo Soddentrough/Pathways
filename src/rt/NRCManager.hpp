@@ -22,13 +22,16 @@ struct NRCQuery {
 };
 
 struct NRCTrainingRecord {
-    glm::vec4 pos_roughness;    // pos.xyz, roughness (w)
-    glm::vec4 normal_flags;     // normal.xyz, flags (w)
-    glm::vec4 dir_pixelIndex;   // dir.xyz, pixelIndex (w as float)
-    glm::vec4 albedo_pad;       // albedo.rgb, pad (w)
-    glm::vec4 throughput;       // throughput.rgb, pad (w)
-    glm::vec4 targetRadiance;   // targetRadiance.rgb, pad (w)
+    glm::vec4 pos_roughness;      // queryPos.xyz, queryRoughness (w)
+    glm::vec4 normal_flags;       // queryNormal.xyz, flags (w)
+    glm::vec4 dir_pixelIndex;     // queryDir.xyz, pixelIndex (w as float)
+    glm::vec4 albedo_pad;         // queryAlbedo.rgb, pad (w)
+    glm::vec4 throughput;         // tailBsdfWeight.rgb, hasTail (w: >0.5 to bootstrap MLP at tail vertex)
+    glm::vec4 targetRadiance;     // localSuffixDirectRadiance.rgb, pad (w)
+    glm::vec4 tailPos_roughness;  // tailPos.xyz, tailRoughness (w)
+    glm::vec4 tailPacked;         // oct(tailNormal), oct(tailDir), unorm4x8(tailAlbedo), pad
 };
+static_assert(sizeof(NRCTrainingRecord) == 128, "NRCTrainingRecord must remain 128 bytes");
 
 struct NRCCountersBuffer {
     uint32_t queryCount;
@@ -51,16 +54,25 @@ public:
     NRCManager& operator=(const NRCManager&) = delete;
 
     void resize(uint32_t width, uint32_t height);
-    void updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE);
-    void updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE);
+    void updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
+                           VkImageView mlSpecularImageView = VK_NULL_HANDLE);
+    void updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
+                           VkImageView mlSpecularImageView = VK_NULL_HANDLE);
 
     void resetCounters(VkCommandBuffer cmd);
+    void resetWeights() { initWeights(); }
     void recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t height,
                          glm::vec3 worldMin, glm::vec3 worldMax, uint32_t queryCountOverride = 0,
-                         uint32_t frameSlot = 0, uint32_t captureMlData = 0);
+                         uint32_t frameSlot = 0, uint32_t captureMlData = 0, float maxRadiance = 10.0f);
     void recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
                         glm::vec3 worldMin, glm::vec3 worldMax, float learningRate = 1e-3f,
                         uint32_t batchSize = 8192);
+    void recordInferenceAndTraining(VkCommandBuffer cmd, uint32_t width, uint32_t height,
+                                    glm::vec3 worldMin, glm::vec3 worldMax,
+                                    uint32_t queryCountOverride = 0, uint32_t frameSlot = 0,
+                                    uint32_t captureMlData = 0, float maxRadiance = 10.0f,
+                                    uint32_t frameIndex = 0, float learningRate = 1e-3f,
+                                    uint32_t batchSize = 8192);
 
     Buffer* getQueryQueue() const { return m_queryQueue.get(); }
     Buffer* getTrainQueue() const { return m_trainQueue.get(); }
@@ -94,11 +106,13 @@ private:
     uint32_t m_height = 0;
     uint32_t m_maxQueries = 0;
     uint32_t m_maxTrainRecords = 0;
+    uint32_t m_adamStep = 0;
     bool m_initialized = false;
     bool m_needsGpuInit = true;
     NrcBackend m_backend = NrcBackend::Auto;
     void* m_ffxRcContext = nullptr;
     std::vector<uint16_t> m_initialWeights;
+    std::vector<float> m_initialMasterWeights;
 
     // GPU Buffers
     std::unique_ptr<Buffer> m_weights;

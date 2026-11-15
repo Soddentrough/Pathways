@@ -8,8 +8,10 @@
 layout(local_size_x = 32) in;
 
 layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 26, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
 layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
 layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
+layout(binding = 41, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
 
 layout(binding = 1) uniform CameraUBO {
     mat4 viewInverse;
@@ -167,11 +169,18 @@ void main() {
         if (pc.captureMlData != 0u) {
             vec3 diffRad = radiance * (1.0 - specFrac);
             vec3 specRad = radiance * specFrac;
+            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
             if (dot(diffRad, diffRad) > 1e-12) {
+                if (isV4) {
+                    diffRad = demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb);
+                }
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
                 imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffRad, seed), prevDiff.a));
             }
             if (dot(specRad, specRad) > 1e-12) {
+                if (isV4) {
+                    specRad = demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb);
+                }
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
                 imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specRad, seed), prevSpec.a));
             }

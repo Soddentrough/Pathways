@@ -2583,6 +2583,8 @@ SceneData ProceduralScene::createCyberCityScene() {
     // =========================================================================
     glm::vec3 bMin(1e30f);
     glm::vec3 bMax(-1e30f);
+    glm::vec3 coreMin(1e30f);
+    glm::vec3 coreMax(-1e30f);
     glm::vec3 dMin(1e30f);
     glm::vec3 dMax(-1e30f);
     std::vector<glm::vec3> blasMin(scene.blasRanges.size(), glm::vec3(1e30f));
@@ -2612,6 +2614,7 @@ SceneData ProceduralScene::createCyberCityScene() {
 
     for (const auto& inst : scene.instances) {
         if (inst.blasIndex >= scene.blasRanges.size()) continue;
+        const bool isCoreDistrict = (inst.blasIndex != CYBER_BLAS_PERIMETER_GROUND);
         const glm::vec3& lMin = blasMin[inst.blasIndex];
         const glm::vec3& lMax = blasMax[inst.blasIndex];
         for (int c = 0; c < 8; ++c) {
@@ -2623,6 +2626,10 @@ SceneData ProceduralScene::createCyberCityScene() {
             glm::vec3 wCorner = glm::vec3(inst.transform * glm::vec4(corner, 1.0f));
             bMin = glm::min(bMin, wCorner);
             bMax = glm::max(bMax, wCorner);
+            if (isCoreDistrict) {
+                coreMin = glm::min(coreMin, wCorner);
+                coreMax = glm::max(coreMax, wCorner);
+            }
         }
 
         if (blasHasDielectric[inst.blasIndex]) {
@@ -2644,9 +2651,15 @@ SceneData ProceduralScene::createCyberCityScene() {
     scene.boundsMin = bMin;
     scene.boundsMax = bMax;
     scene.sceneRadius = glm::length(bMax - bMin) * 0.5f;
-    scene.focalBoundsMin = bMin;
-    scene.focalBoundsMax = bMax;
-    scene.focalRadius = scene.sceneRadius;
+    if (coreMin.x <= coreMax.x) {
+        scene.focalBoundsMin = coreMin;
+        scene.focalBoundsMax = coreMax;
+        scene.focalRadius = glm::length(coreMax - coreMin) * 0.5f;
+    } else {
+        scene.focalBoundsMin = bMin;
+        scene.focalBoundsMax = bMax;
+        scene.focalRadius = scene.sceneRadius;
+    }
 
     if (dMin.x <= dMax.x) {
         scene.hasDielectrics = true;

@@ -13,8 +13,8 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uInDiffuse;    // from m_historyDiffuse[currSlot]
-layout(set = 0, binding = 1, rgba16f) readonly uniform image2D uInSpecular;   // from m_historySpecular[currSlot]
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D uInDiffuse;    // from m_historyDiffuse[currSlot]
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D uInSpecular;   // from m_historySpecular[currSlot]
 layout(set = 0, binding = 2, rgba16f) readonly uniform image2D uNormalDepth;
 layout(set = 0, binding = 3, rgba16f) readonly uniform image2D uAlbedoRoughness;
 layout(set = 0, binding = 4, rgba16f) writeonly uniform image2D uOutDiffuse;  // -> m_pingPongDiffuse[0]
@@ -35,6 +35,7 @@ layout(push_constant) uniform AtrousPushConstants {
 
 shared vec4 s_nd[10][11];
 shared vec4 s_diff[10][11];
+shared uint s_zeroAlb[10][11];
 
 void main() {
     ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 8;
@@ -50,8 +51,11 @@ void main() {
     inDiffuse.a = abs(inDiffuse.a);
 
     vec4 nd = imageLoad(uNormalDepth, clampedCoord);
+    vec4 albRough = imageLoad(uAlbedoRoughness, clampedCoord);
+    bool centerZeroAlb = (dot(albRough.rgb, albRough.rgb) <= 1e-5) && (nd.w < 9999.0);
     s_diff[ty + 1][tx + 1] = inDiffuse;
     s_nd[ty + 1][tx + 1] = nd;
+    s_zeroAlb[ty + 1][tx + 1] = centerZeroAlb ? 1u : 0u;
 
     if (linearIdx < 36u) {
         int lx, ly;
@@ -69,15 +73,18 @@ void main() {
         ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
         vec4 aDiff = imageLoad(uInDiffuse, apronCoord);
         aDiff.a = abs(aDiff.a);
+        vec4 aND = imageLoad(uNormalDepth, apronCoord);
+        vec3 aAlb = imageLoad(uAlbedoRoughness, apronCoord).rgb;
         s_diff[ly][lx] = aDiff;
-        s_nd[ly][lx] = imageLoad(uNormalDepth, apronCoord);
+        s_nd[ly][lx] = aND;
+        s_zeroAlb[ly][lx] = ((dot(aAlb, aAlb) <= 1e-5) && (aND.w < 9999.0)) ? 1u : 0u;
     }
     barrier();
 
     if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) return;
 
-    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-4 && !hasSpec))) {
-        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
+    if (subgroupAll(nd.w >= 9999.0 || (inDiffuse.a <= 1e-6 && !hasSpec))) {
+        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 2e-6) : inDiffuse.a));
         imageStore(uOutSpecular, coord, hasSpec ? imageLoad(uInSpecular, coord) : vec4(0.0));
         return;
     }
@@ -104,7 +111,7 @@ void main() {
         float pixelFootprint = 2.0 * centerPos.z * pc.tanHalfFovY * (1.0 / max(resolution.y, 1.0));
         float fp16QuantizationFloor = max(centerPos.z * 0.0009765625, 1e-4);
         float invDepthTolerance = 1.0 / max(pc.phiPlaneDepth * pixelFootprint, fp16QuantizationFloor);
-        float centerVar = max(inDiffuse.a, 1e-4);
+        float centerVar = max(inDiffuse.a, 4e-6);
         float centerPlaneDot = dot(centerPos, nView);
 
         int clx = tx + 1;
@@ -118,6 +125,7 @@ void main() {
 
                 vec4 tapND = s_nd[cly + y][clx + x];
                 if (tapND.w <= 0.0 || tapND.w >= 9999.0) continue;
+                if ((s_zeroAlb[cly + y][clx + x] != 0u) != centerZeroAlb) continue;
 
                 float cosAngle = max(dot(centerNormal, tapND.xyz), 0.0);
                 if (cosAngle <= 0.15) continue;
@@ -129,7 +137,7 @@ void main() {
 
                 vec4 tapData = s_diff[cly + y][clx + x];
                 float tapLum = denoiseLuminance(tapData.rgb);
-                float lumArg = abs(centerLumD - tapLum) / (pc.phiLuminance * sqrt(max(max(centerVar, tapData.a * 0.25), 1e-4)) + 1e-4);
+                float lumArg = abs(centerLumD - tapLum) / (pc.phiLuminance * sqrt(max(max(centerVar, tapData.a * 0.5), 4e-6)) + 2e-5);
 
                 float c2 = cosAngle * cosAngle;
                 float c4 = c2 * c2;
@@ -149,12 +157,12 @@ void main() {
     }
 
     float outVarD = clamp(filteredDiffuse.a, 0.0, 65000.0);
-    imageStore(uOutDiffuse, coord, vec4(clamp(filteredDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 1e-5) : outVarD));
+    imageStore(uOutDiffuse, coord, vec4(clamp(filteredDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 2e-6) : outVarD));
 
     if (hasSpec) {
         vec4 inSpecular = imageLoad(uInSpecular, coord);
         float centerLumS = denoiseLuminance(inSpecular.rgb);
-        float roughness = imageLoad(uAlbedoRoughness, coord).a;
+        float roughness = albRough.a;
         vec4 filteredSpecular = atrousFilterSpecular(
             coord, pc.stepSize, inSpecular,
             nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),

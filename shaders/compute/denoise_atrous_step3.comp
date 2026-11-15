@@ -46,8 +46,8 @@ void main() {
 
     // 1. Fast wavefront early-exit: coherent 32-lane wave in dense edges or already-converged
     //    low-variance surfaces skips mid-scale taps and passes through radiance
-    if (subgroupAll(effectiveRho >= 0.55 || (inDiffuse.a < 1e-4 && (!hasSpec || inSpecular.a < 1e-4)))) {
-        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 1e-5) : inDiffuse.a));
+    if (subgroupAll(effectiveRho >= 0.55 || (inDiffuse.a < 1e-6 && (!hasSpec || inSpecular.a < 1e-6)))) {
+        imageStore(uOutDiffuse, coord, vec4(inDiffuse.rgb, hasSpec ? -max(inDiffuse.a, 2e-6) : inDiffuse.a));
         imageStore(uOutSpecular, coord, hasSpec ? inSpecular : vec4(0.0));
         return;
     }
@@ -56,21 +56,25 @@ void main() {
     vec4 nd = imageLoad(uNormalDepth, coord);
     vec3 centerPos = unprojectToView(coord, nd.w, pc.tanHalfFovY, pc.aspectRatio, vec2(pc.width, pc.height));
 
+    vec4 albRough = imageLoad(uAlbedoRoughness, coord);
+    bool centerZeroAlb = (dot(albRough.rgb, albRough.rgb) <= 1e-5) && (nd.w < 9999.0);
+
     float centerLumD = denoiseLuminance(inDiffuse.rgb);
     vec4 filteredDiffuse = atrousFilterDiffuse(
         coord, pc.stepSize, inDiffuse,
-        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 1e-4),
+        nd.xyz, centerPos, centerLumD, max(inDiffuse.a, 4e-6),
+        centerZeroAlb,
         pc.phiNormal, pc.phiPlaneDepth, pc.phiLuminance,
         pc.tanHalfFovY, pc.aspectRatio, imgMax);
 
     float edgeBlend = smoothstep(0.45, 0.55, effectiveRho);
     vec4 finalDiffuse = mix(filteredDiffuse, inDiffuse, edgeBlend);
     float outVarD = clamp(finalDiffuse.a, 0.0, 65000.0);
-    imageStore(uOutDiffuse, coord, vec4(clamp(finalDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 1e-5) : outVarD));
+    imageStore(uOutDiffuse, coord, vec4(clamp(finalDiffuse.rgb, 0.0, 65000.0), hasSpec ? -max(outVarD, 2e-6) : outVarD));
 
     if (hasSpec) {
         float centerLumS = denoiseLuminance(inSpecular.rgb);
-        float roughness = imageLoad(uAlbedoRoughness, coord).a;
+        float roughness = albRough.a;
         vec4 filteredSpecular = atrousFilterSpecular(
             coord, pc.stepSize, inSpecular,
             nd.xyz, centerPos, centerLumS, max(inSpecular.a, 1e-4),

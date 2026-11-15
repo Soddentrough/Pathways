@@ -166,7 +166,9 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 36, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // HistoryReservoirsBuffer
         { 37, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // X1ContextsBuffer (ReSTIR PT)
         { 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiCurrentReservoirsBuffer
-        { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // GiHistoryReservoirsBuffer
+        { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiHistoryReservoirsBuffer
+        { 40, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSkipImage
+        { 41, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uMlSpecAlbedoImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -181,7 +183,7 @@ void WavefrontPipeline::createDescriptorLayout() {
 
 void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 96 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
@@ -341,7 +343,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                 VkBuffer x1ContextBuffer,
                                                 VkBuffer giReservoirBuffer,
                                                 VkBuffer giHistoryReservoirBuffer,
-                                                VkImageView prevNormalDepthImageView) {
+                                                VkImageView prevNormalDepthImageView,
+                                                VkImageView mlSkipImageView,
+                                                VkImageView mlSpecAlbedoImageView) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -361,6 +365,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo diffImageInfo{ VK_NULL_HANDLE, diffView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView specView = (mlSpecularImageView != VK_NULL_HANDLE) ? mlSpecularImageView : defaultStorageView;
     VkDescriptorImageInfo specImageInfo{ VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView skipView = (mlSkipImageView != VK_NULL_HANDLE) ? mlSkipImageView : defaultStorageView;
+    VkDescriptorImageInfo skipImageInfo{ VK_NULL_HANDLE, skipView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView specAlbView = (mlSpecAlbedoImageView != VK_NULL_HANDLE) ? mlSpecAlbedoImageView : defaultStorageView;
+    VkDescriptorImageInfo specAlbImageInfo{ VK_NULL_HANDLE, specAlbView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : defaultStorageView;
     VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
 
@@ -463,6 +471,8 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 37, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &x1CtxInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 38, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 39, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giHistoryInfo, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 40, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &skipImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 41, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specAlbImageInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
