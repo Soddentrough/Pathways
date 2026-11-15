@@ -229,40 +229,61 @@ void evalPwNTile(
     subgroupBarrier();
 }
 
-vec4 evalDw3x3L1(uint baseAp, uint wTapStride4, uint c4, uint dwWOff, uint dwBOff) {
+uvec2 evalDw3x3L1Pair(uint baseAp, uint wTapStride4, uint c4Even, uint dwWOff, uint dwBOff) {
     const uint kOff[9] = uint[9](0u, 1u, 2u, 18u, 19u, 20u, 36u, 37u, 38u);
-    vec4 acc    = g_w32.w32v[(dwBOff >> 2u) + c4];
-    uint wBase4 = (dwWOff >> 2u) + c4;
+    uint bIdx4  = (dwBOff >> 2u) + c4Even;
+    vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
+    vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
+    uint wBase4 = (dwWOff >> 2u) + c4Even;
     [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        vec4 x = readSB(baseAp + kOff[tap], c4, 8u);
-        vec4 w = g_w32.w32v[wBase4 + tap * wTapStride4];
-        acc += x * w;
+        uint apTap = baseAp + kOff[tap];
+        uint wIdx4 = wBase4 + tap * wTapStride4;
+        vec4 x0 = readSB(apTap, c4Even + 0u, 8u);
+        vec4 x1 = readSB(apTap, c4Even + 1u, 8u);
+        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+        acc0 += x0 * w0;
+        acc1 += x1 * w1;
     }
-    return upwaysLrelu4(acc);
+    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
 }
 
-vec4 evalDw3x3Stage2Lo(uint baseAp, uint c4, uint dwWOff, uint dwBOff) {
+uvec2 evalDw3x3Stage2LoPair(uint baseAp, uint c4Even, uint dwWOff, uint dwBOff) {
     const uint kOff[9] = uint[9](0u, 2u, 4u, 40u, 42u, 44u, 80u, 82u, 84u);
-    vec4 acc    = g_w32.w32v[(dwBOff >> 2u) + c4];
-    uint wBase4 = (dwWOff >> 2u) + c4;
+    uint bIdx4  = (dwBOff >> 2u) + c4Even;
+    vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
+    vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
+    uint wBase4 = (dwWOff >> 2u) + c4Even;
     [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        vec4 x = readSB2Lo(baseAp + kOff[tap], c4);
-        vec4 w = g_w32.w32v[wBase4 + tap * 8u];
-        acc += x * w;
+        uint apTap = baseAp + kOff[tap];
+        uint wIdx4 = wBase4 + tap * 8u;
+        vec4 x0 = readSB2Lo(apTap, c4Even + 0u);
+        vec4 x1 = readSB2Lo(apTap, c4Even + 1u);
+        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+        acc0 += x0 * w0;
+        acc1 += x1 * w1;
     }
-    return upwaysLrelu4(acc);
+    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
 }
 
-vec4 evalDw3x3Stage2Hi(uint baseAp, uint c4_67, uint dwWOff, uint dwBOff) {
+uvec2 evalDw3x3Stage2HiPair(uint baseAp, uint dwWOff, uint dwBOff) {
     const uint kOff[9] = uint[9](0u, 2u, 4u, 40u, 42u, 44u, 80u, 82u, 84u);
-    vec4 acc    = g_w32.w32v[(dwBOff >> 2u) + 6u + c4_67];
-    uint wBase4 = (dwWOff >> 2u) + 6u + c4_67;
+    uint bIdx4  = (dwBOff >> 2u) + 6u;
+    vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
+    vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
+    uint wBase4 = (dwWOff >> 2u) + 6u;
     [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        vec4 x = readSB2Hi(baseAp + kOff[tap], c4_67);
-        vec4 w = g_w32.w32v[wBase4 + tap * 8u];
-        acc += x * w;
+        uint apTap = baseAp + kOff[tap];
+        uint wIdx4 = wBase4 + tap * 8u;
+        vec4 x0 = readSB2Hi(apTap, 0u);
+        vec4 x1 = readSB2Hi(apTap, 1u);
+        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+        acc0 += x0 * w0;
+        acc1 += x1 * w1;
     }
-    return upwaysLrelu4(acc);
+    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
 }
 
 // Stage 0: ENC1_PW1 (L1: 96 -> 32, offX0 -> offHw0)
@@ -351,31 +372,23 @@ void runStage1Enc1DwPw2() {
     uint f1_7 = packFp8Vec4(readSB(coreApron, 7u, 8u));
 
     uint baseAp1 = ly * 18u + lx;
-    uint d0 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 0u, F32_DW_ENC1_W, F32_DW_ENC1_B));
+    uvec2 d01 = evalDw3x3L1Pair(baseAp1, 8u, 0u, F32_DW_ENC1_W, F32_DW_ENC1_B);
     subgroupBarrier();
-    uint d1 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 1u, F32_DW_ENC1_W, F32_DW_ENC1_B));
+    uvec2 d23 = evalDw3x3L1Pair(baseAp1, 8u, 2u, F32_DW_ENC1_W, F32_DW_ENC1_B);
     subgroupBarrier();
-    uint d2 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 2u, F32_DW_ENC1_W, F32_DW_ENC1_B));
+    uvec2 d45 = evalDw3x3L1Pair(baseAp1, 8u, 4u, F32_DW_ENC1_W, F32_DW_ENC1_B);
     subgroupBarrier();
-    uint d3 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 3u, F32_DW_ENC1_W, F32_DW_ENC1_B));
-    subgroupBarrier();
-    uint d4 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 4u, F32_DW_ENC1_W, F32_DW_ENC1_B));
-    subgroupBarrier();
-    uint d5 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 5u, F32_DW_ENC1_W, F32_DW_ENC1_B));
-    subgroupBarrier();
-    uint d6 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 6u, F32_DW_ENC1_W, F32_DW_ENC1_B));
-    subgroupBarrier();
-    uint d7 = packFp8Vec4(evalDw3x3L1(baseAp1, 8u, 7u, F32_DW_ENC1_W, F32_DW_ENC1_B));
+    uvec2 d67 = evalDw3x3L1Pair(baseAp1, 8u, 6u, F32_DW_ENC1_W, F32_DW_ENC1_B);
     barrier();
 
-    writeSAFromGlobalU32(t, 0u, 8u, d0);
-    writeSAFromGlobalU32(t, 1u, 8u, d1);
-    writeSAFromGlobalU32(t, 2u, 8u, d2);
-    writeSAFromGlobalU32(t, 3u, 8u, d3);
-    writeSAFromGlobalU32(t, 4u, 8u, d4);
-    writeSAFromGlobalU32(t, 5u, 8u, d5);
-    writeSAFromGlobalU32(t, 6u, 8u, d6);
-    writeSAFromGlobalU32(t, 7u, 8u, d7);
+    writeSAFromGlobalU32(t, 0u, 8u, d01.x);
+    writeSAFromGlobalU32(t, 1u, 8u, d01.y);
+    writeSAFromGlobalU32(t, 2u, 8u, d23.x);
+    writeSAFromGlobalU32(t, 3u, 8u, d23.y);
+    writeSAFromGlobalU32(t, 4u, 8u, d45.x);
+    writeSAFromGlobalU32(t, 5u, 8u, d45.y);
+    writeSAFromGlobalU32(t, 6u, 8u, d67.x);
+    writeSAFromGlobalU32(t, 7u, 8u, d67.y);
     barrier();
 
     int  gx       = wgX + int(lx);
@@ -451,31 +464,23 @@ void runStage2Bot2() {
 
     {
         uint baseAp2 = ly * 20u + lx;
-        uint d0 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 0u, F32_DW_BOT2_W, F32_DW_BOT2_B));
+        uvec2 d01 = evalDw3x3Stage2LoPair(baseAp2, 0u, F32_DW_BOT2_W, F32_DW_BOT2_B);
         subgroupBarrier();
-        uint d1 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 1u, F32_DW_BOT2_W, F32_DW_BOT2_B));
+        uvec2 d23 = evalDw3x3Stage2LoPair(baseAp2, 2u, F32_DW_BOT2_W, F32_DW_BOT2_B);
         subgroupBarrier();
-        uint d2 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 2u, F32_DW_BOT2_W, F32_DW_BOT2_B));
+        uvec2 d45 = evalDw3x3Stage2LoPair(baseAp2, 4u, F32_DW_BOT2_W, F32_DW_BOT2_B);
         subgroupBarrier();
-        uint d3 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 3u, F32_DW_BOT2_W, F32_DW_BOT2_B));
-        subgroupBarrier();
-        uint d4 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 4u, F32_DW_BOT2_W, F32_DW_BOT2_B));
-        subgroupBarrier();
-        uint d5 = packFp8Vec4(evalDw3x3Stage2Lo(baseAp2, 5u, F32_DW_BOT2_W, F32_DW_BOT2_B));
-        subgroupBarrier();
-        uint d6 = packFp8Vec4(evalDw3x3Stage2Hi(baseAp2, 0u, F32_DW_BOT2_W, F32_DW_BOT2_B));
-        subgroupBarrier();
-        uint d7 = packFp8Vec4(evalDw3x3Stage2Hi(baseAp2, 1u, F32_DW_BOT2_W, F32_DW_BOT2_B));
+        uvec2 d67 = evalDw3x3Stage2HiPair(baseAp2, F32_DW_BOT2_W, F32_DW_BOT2_B);
         barrier();
 
-        writeSAFromGlobalU32(t, 0u, 8u, d0);
-        writeSAFromGlobalU32(t, 1u, 8u, d1);
-        writeSAFromGlobalU32(t, 2u, 8u, d2);
-        writeSAFromGlobalU32(t, 3u, 8u, d3);
-        writeSAFromGlobalU32(t, 4u, 8u, d4);
-        writeSAFromGlobalU32(t, 5u, 8u, d5);
-        writeSAFromGlobalU32(t, 6u, 8u, d6);
-        writeSAFromGlobalU32(t, 7u, 8u, d7);
+        writeSAFromGlobalU32(t, 0u, 8u, d01.x);
+        writeSAFromGlobalU32(t, 1u, 8u, d01.y);
+        writeSAFromGlobalU32(t, 2u, 8u, d23.x);
+        writeSAFromGlobalU32(t, 3u, 8u, d23.y);
+        writeSAFromGlobalU32(t, 4u, 8u, d45.x);
+        writeSAFromGlobalU32(t, 5u, 8u, d45.y);
+        writeSAFromGlobalU32(t, 6u, 8u, d67.x);
+        writeSAFromGlobalU32(t, 7u, 8u, d67.y);
     }
     barrier();
 
@@ -558,9 +563,7 @@ void decodeStage3NormalDepth(vec4 nd, out vec3 nrm, out float zD) {
     zD  = clamp(sanitizeFloat(nd.a, 10000.0), 0.0, 10000.0);
 }
 
-void loadStage3AnchorQuad(
-    uint quadIdx, int l0WgX, int l0WgY, int halo, uint quadW, float invQuadW, int W0, int H0
-) {
+void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint quadW, float invQuadW, int W0, int H0) {
     uint qy = uint(float(quadIdx) * invQuadW);
     uint qx = quadIdx - qy * quadW;
     int  bx = l0WgX + int(qx * 2u) - halo;
@@ -571,136 +574,118 @@ void loadStage3AnchorQuad(
     ivec2 qp2 = clamp(ivec2(bx,     by + 1), ivec2(0), ivec2(W0 - 1, H0 - 1));
     ivec2 qp3 = clamp(ivec2(bx + 1, by + 1), ivec2(0), ivec2(W0 - 1, H0 - 1));
 
-    // Issue all 12 global imageLoads upfront so RADV overlaps VMEM requests before waiting
     vec4 a0_0 = imageLoad(tBaseAnchorLr, ivec3(qp0, 0));
     vec4 a1_0 = imageLoad(tBaseAnchorLr, ivec3(qp0, 1));
     vec4 nd_0 = imageLoad(uNormalDepth,  qp0);
+
     vec4 a0_1 = imageLoad(tBaseAnchorLr, ivec3(qp1, 0));
     vec4 a1_1 = imageLoad(tBaseAnchorLr, ivec3(qp1, 1));
     vec4 nd_1 = imageLoad(uNormalDepth,  qp1);
+
     vec4 a0_2 = imageLoad(tBaseAnchorLr, ivec3(qp2, 0));
     vec4 a1_2 = imageLoad(tBaseAnchorLr, ivec3(qp2, 1));
     vec4 nd_2 = imageLoad(uNormalDepth,  qp2);
+
     vec4 a0_3 = imageLoad(tBaseAnchorLr, ivec3(qp3, 0));
     vec4 a1_3 = imageLoad(tBaseAnchorLr, ivec3(qp3, 1));
     vec4 nd_3 = imageLoad(uNormalDepth,  qp3);
-
-    vec3  accD0 = clampFp16Rgb(a0_0.rgb);
-    vec3  accS0 = clampFp16Rgb(a1_0.rgb);
-    vec3  nrm0; float zD0;
-    decodeStage3NormalDepth(nd_0, nrm0, zD0);
-    bool  qSky0 = (a0_0.w < -0.5);
-    float matC0 = qSky0 ? 0.0 : clamp(a0_0.w, 0.0, 1.0);
-    float tErr0 = qSky0 ? 0.0 : clamp(a1_0.w, 0.0, 4.0);
-
-    vec3  accD1 = clampFp16Rgb(a0_1.rgb);
-    vec3  accS1 = clampFp16Rgb(a1_1.rgb);
-    vec3  nrm1; float zD1;
-    decodeStage3NormalDepth(nd_1, nrm1, zD1);
-    bool  qSky1 = (a0_1.w < -0.5);
-    float matC1 = qSky1 ? 0.0 : clamp(a0_1.w, 0.0, 1.0);
-    float tErr1 = qSky1 ? 0.0 : clamp(a1_1.w, 0.0, 4.0);
-
-    vec3  accD2 = clampFp16Rgb(a0_2.rgb);
-    vec3  accS2 = clampFp16Rgb(a1_2.rgb);
-    vec3  nrm2; float zD2;
-    decodeStage3NormalDepth(nd_2, nrm2, zD2);
-    bool  qSky2 = (a0_2.w < -0.5);
-    float matC2 = qSky2 ? 0.0 : clamp(a0_2.w, 0.0, 1.0);
-    float tErr2 = qSky2 ? 0.0 : clamp(a1_2.w, 0.0, 4.0);
-
-    vec3  accD3 = clampFp16Rgb(a0_3.rgb);
-    vec3  accS3 = clampFp16Rgb(a1_3.rgb);
-    vec3  nrm3; float zD3;
-    decodeStage3NormalDepth(nd_3, nrm3, zD3);
-    bool  qSky3 = (a0_3.w < -0.5);
-    float matC3 = qSky3 ? 0.0 : clamp(a0_3.w, 0.0, 1.0);
-    float tErr3 = qSky3 ? 0.0 : clamp(a1_3.w, 0.0, 4.0);
-
-    uint packedSkyMat = packFp8Vec4(vec4(qSky0 ? -1.0 : matC0, qSky1 ? -1.0 : matC1, qSky2 ? -1.0 : matC2, qSky3 ? -1.0 : matC3));
-    vec4 decSkyMat    = unpackFp8Vec4(packedSkyMat);
-    bool qDiel0 = (decSkyMat.x >= -0.5) && (abs(decSkyMat.x - 0.6667) < 0.12);
-    bool qDiel1 = (decSkyMat.y >= -0.5) && (abs(decSkyMat.y - 0.6667) < 0.12);
-    bool qDiel2 = (decSkyMat.z >= -0.5) && (abs(decSkyMat.z - 0.6667) < 0.12);
-    bool qDiel3 = (decSkyMat.w >= -0.5) && (abs(decSkyMat.w - 0.6667) < 0.12);
-
-    vec3 valA0 = accD0;
-    vec3 valA1 = accD1;
-    vec3 valA2 = accD2;
-    vec3 valA3 = accD3;
-
-    if (qDiel0 || qDiel1 || qDiel2 || qDiel3) {
-        vec4 alb0 = vec4(0.0), sal0 = vec4(0.0);
-        vec4 alb1 = vec4(0.0), sal1 = vec4(0.0);
-        vec4 alb2 = vec4(0.0), sal2 = vec4(0.0);
-        vec4 alb3 = vec4(0.0), sal3 = vec4(0.0);
-        if (qDiel0) {
-            alb0 = imageLoad(uMlAlbedoRoughness, qp0);
-            sal0 = imageLoad(uMlSpecAlbedo, qp0);
-        }
-        if (qDiel1) {
-            alb1 = imageLoad(uMlAlbedoRoughness, qp1);
-            sal1 = imageLoad(uMlSpecAlbedo, qp1);
-        }
-        if (qDiel2) {
-            alb2 = imageLoad(uMlAlbedoRoughness, qp2);
-            sal2 = imageLoad(uMlSpecAlbedo, qp2);
-        }
-        if (qDiel3) {
-            alb3 = imageLoad(uMlAlbedoRoughness, qp3);
-            sal3 = imageLoad(uMlSpecAlbedo, qp3);
-        }
-        if (qDiel0) {
-            vec3 aD = clamp(alb0.rgb, vec3(0.0), vec3(1.0));
-            vec3 aS = clamp(sal0.rgb, vec3(0.0), vec3(1.0));
-            valA0 = clampFp16Rgb(aD * accD0 + aS * accS0);
-        }
-        if (qDiel1) {
-            vec3 aD = clamp(alb1.rgb, vec3(0.0), vec3(1.0));
-            vec3 aS = clamp(sal1.rgb, vec3(0.0), vec3(1.0));
-            valA1 = clampFp16Rgb(aD * accD1 + aS * accS1);
-        }
-        if (qDiel2) {
-            vec3 aD = clamp(alb2.rgb, vec3(0.0), vec3(1.0));
-            vec3 aS = clamp(sal2.rgb, vec3(0.0), vec3(1.0));
-            valA2 = clampFp16Rgb(aD * accD2 + aS * accS2);
-        }
-        if (qDiel3) {
-            vec3 aD = clamp(alb3.rgb, vec3(0.0), vec3(1.0));
-            vec3 aS = clamp(sal3.rgb, vec3(0.0), vec3(1.0));
-            valA3 = clampFp16Rgb(aD * accD3 + aS * accS3);
-        }
-    }
 
     uint s0 = quadIdx * 4u + 0u;
     uint s1 = quadIdx * 4u + 1u;
     uint s2 = quadIdx * 4u + 2u;
     uint s3 = quadIdx * 4u + 3u;
 
+    vec3  accD0 = clampFp16Rgb(a0_0.rgb);
+    vec3  accS0 = clampFp16Rgb(a1_0.rgb);
+    {
+        vec3 nrm0; float zD0;
+        decodeStage3NormalDepth(nd_0, nrm0, zD0);
+        s_buf[s0 * 4u + 2u] = packHalf2x16(accS0.gb);
+        s_buf[s0 * 4u + 3u] = packHalf2x16(vec2(nrm0.z, zD0));
+        s_acc[s0]           = uintBitsToFloat(packHalf2x16(nrm0.xy));
+    }
+    bool  qSky0 = (a0_0.w < -0.5);
+    float matC0 = qSky0 ? 0.0 : clamp(a0_0.w, 0.0, 1.0);
+    float tErr0 = qSky0 ? 0.0 : clamp(a1_0.w, 0.0, 4.0);
+
+    vec3  accD1 = clampFp16Rgb(a0_1.rgb);
+    vec3  accS1 = clampFp16Rgb(a1_1.rgb);
+    {
+        vec3 nrm1; float zD1;
+        decodeStage3NormalDepth(nd_1, nrm1, zD1);
+        s_buf[s1 * 4u + 2u] = packHalf2x16(accS1.gb);
+        s_buf[s1 * 4u + 3u] = packHalf2x16(vec2(nrm1.z, zD1));
+        s_acc[s1]           = uintBitsToFloat(packHalf2x16(nrm1.xy));
+    }
+    bool  qSky1 = (a0_1.w < -0.5);
+    float matC1 = qSky1 ? 0.0 : clamp(a0_1.w, 0.0, 1.0);
+    float tErr1 = qSky1 ? 0.0 : clamp(a1_1.w, 0.0, 4.0);
+
+    vec3  accD2 = clampFp16Rgb(a0_2.rgb);
+    vec3  accS2 = clampFp16Rgb(a1_2.rgb);
+    {
+        vec3 nrm2; float zD2;
+        decodeStage3NormalDepth(nd_2, nrm2, zD2);
+        s_buf[s2 * 4u + 2u] = packHalf2x16(accS2.gb);
+        s_buf[s2 * 4u + 3u] = packHalf2x16(vec2(nrm2.z, zD2));
+        s_acc[s2]           = uintBitsToFloat(packHalf2x16(nrm2.xy));
+    }
+    bool  qSky2 = (a0_2.w < -0.5);
+    float matC2 = qSky2 ? 0.0 : clamp(a0_2.w, 0.0, 1.0);
+    float tErr2 = qSky2 ? 0.0 : clamp(a1_2.w, 0.0, 4.0);
+
+    vec3  accD3 = clampFp16Rgb(a0_3.rgb);
+    vec3  accS3 = clampFp16Rgb(a1_3.rgb);
+    {
+        vec3 nrm3; float zD3;
+        decodeStage3NormalDepth(nd_3, nrm3, zD3);
+        s_buf[s3 * 4u + 2u] = packHalf2x16(accS3.gb);
+        s_buf[s3 * 4u + 3u] = packHalf2x16(vec2(nrm3.z, zD3));
+        s_acc[s3]           = uintBitsToFloat(packHalf2x16(nrm3.xy));
+    }
+    bool  qSky3 = (a0_3.w < -0.5);
+    float matC3 = qSky3 ? 0.0 : clamp(a0_3.w, 0.0, 1.0);
+    float tErr3 = qSky3 ? 0.0 : clamp(a1_3.w, 0.0, 4.0);
+
+    uint packedSkyMat = packFp8Vec4(vec4(qSky0 ? -1.0 : matC0, qSky1 ? -1.0 : matC1, qSky2 ? -1.0 : matC2, qSky3 ? -1.0 : matC3));
+    vec4 decSkyMat    = unpackFp8Vec4(packedSkyMat);
+    uint dielMask =
+        (((decSkyMat.x >= -0.5) && (abs(decSkyMat.x - 0.6667) < 0.12)) ? 1u : 0u) |
+        (((decSkyMat.y >= -0.5) && (abs(decSkyMat.y - 0.6667) < 0.12)) ? 2u : 0u) |
+        (((decSkyMat.z >= -0.5) && (abs(decSkyMat.z - 0.6667) < 0.12)) ? 4u : 0u) |
+        (((decSkyMat.w >= -0.5) && (abs(decSkyMat.w - 0.6667) < 0.12)) ? 8u : 0u);
+
+    vec3 valA0 = accD0;
+    vec3 valA1 = accD1;
+    vec3 valA2 = accD2;
+    vec3 valA3 = accD3;
+
+    if (dielMask != 0u) {
+        [[dont_unroll]] for (uint sub = 0u; sub < 4u; ++sub) {
+            if ((dielMask & (1u << sub)) != 0u) {
+                ivec2 qp = clamp(ivec2(bx + int(sub & 1u), by + int(sub >> 1u)), ivec2(0), ivec2(W0 - 1, H0 - 1));
+                vec3 aD = clamp(imageLoad(uMlAlbedoRoughness, qp).rgb, vec3(0.0), vec3(1.0));
+                vec3 aS = clamp(imageLoad(uMlSpecAlbedo,      qp).rgb, vec3(0.0), vec3(1.0));
+                vec3 accDSub = (sub < 2u) ? ((sub == 0u) ? accD0 : accD1) : ((sub == 2u) ? accD2 : accD3);
+                vec3 accSSub = (sub < 2u) ? ((sub == 0u) ? accS0 : accS1) : ((sub == 2u) ? accS2 : accS3);
+                vec3 vA = clampFp16Rgb(aD * accDSub + aS * accSSub);
+                if (sub == 0u)      { valA0 = vA; }
+                else if (sub == 1u) { valA1 = vA; }
+                else if (sub == 2u) { valA2 = vA; }
+                else                { valA3 = vA; }
+            }
+        }
+    }
+
     // Uniform AoS layout: [valA.rg, (valA.b, accS.r), accS.gb, (nrm.z, zD)] + s_acc[s] = nrm.xy
     s_buf[s0 * 4u + 0u] = packHalf2x16(valA0.rg);
     s_buf[s0 * 4u + 1u] = packHalf2x16(vec2(valA0.b, accS0.r));
-    s_buf[s0 * 4u + 2u] = packHalf2x16(accS0.gb);
-    s_buf[s0 * 4u + 3u] = packHalf2x16(vec2(nrm0.z, zD0));
-    s_acc[s0]           = uintBitsToFloat(packHalf2x16(nrm0.xy));
-
     s_buf[s1 * 4u + 0u] = packHalf2x16(valA1.rg);
     s_buf[s1 * 4u + 1u] = packHalf2x16(vec2(valA1.b, accS1.r));
-    s_buf[s1 * 4u + 2u] = packHalf2x16(accS1.gb);
-    s_buf[s1 * 4u + 3u] = packHalf2x16(vec2(nrm1.z, zD1));
-    s_acc[s1]           = uintBitsToFloat(packHalf2x16(nrm1.xy));
-
     s_buf[s2 * 4u + 0u] = packHalf2x16(valA2.rg);
     s_buf[s2 * 4u + 1u] = packHalf2x16(vec2(valA2.b, accS2.r));
-    s_buf[s2 * 4u + 2u] = packHalf2x16(accS2.gb);
-    s_buf[s2 * 4u + 3u] = packHalf2x16(vec2(nrm2.z, zD2));
-    s_acc[s2]           = uintBitsToFloat(packHalf2x16(nrm2.xy));
-
     s_buf[s3 * 4u + 0u] = packHalf2x16(valA3.rg);
     s_buf[s3 * 4u + 1u] = packHalf2x16(vec2(valA3.b, accS3.r));
-    s_buf[s3 * 4u + 2u] = packHalf2x16(accS3.gb);
-    s_buf[s3 * 4u + 3u] = packHalf2x16(vec2(nrm3.z, zD3));
-    s_acc[s3]           = uintBitsToFloat(packHalf2x16(nrm3.xy));
 
     s_buf[2880u + quadIdx] = packedSkyMat;
     s_acc[720u  + quadIdx] = uintBitsToFloat(packFp8Vec4(vec4(tErr0 * 16.0, tErr1 * 16.0, tErr2 * 16.0, tErr3 * 16.0)));
@@ -709,7 +694,8 @@ void loadStage3AnchorQuad(
 void evalTapStage3(
     uvec4 qb, uint qnPacked, float qSkyOrMat,
     float zPred, float kTapW, float specRingW, float invZTol_e2,
-    vec3 viewNormal, float absNz, float matClass, bool isDielMat, bool smoothSpec,
+    vec3 viewNormal, float absNz, float matClass, float matTol, float matMismatchW,
+    bool isDielMat, bool smoothSpec,
     float cLog2LA, float cLog2LB, float invSigLA_e2, float invSigLB_e2,
     inout vec3 sumA, inout float sumWA, inout vec3 sumB, inout float sumWB
 ) {
@@ -726,48 +712,39 @@ void evalTapStage3(
     float relPe2    = (qDepth - zPred) * invZTol_e2;
     float relPe2_sq = relPe2 * relPe2;
     float ndot      = max(dot(viewNormal, qNrm), 0.0);
-    float matDiff   = abs(qSkyOrMat - matClass);
-    float mWA       = isDielMat
-        ? ((matDiff < 0.12) ? 1.0 : 0.0)
-        : ((matDiff < 0.15) ? 1.0 : 0.15);
-    float baseG     = (((qSkyOrMat >= -0.5) && (relPe2_sq < 13.287712) && (ndot > 0.05)) ? 1.0 : 0.0) * mWA;
+    float mWA       = (abs(qSkyOrMat - matClass) < matTol) ? 1.0 : matMismatchW;
+    float baseG     = ((qSkyOrMat >= -0.5) && (relPe2_sq < 13.287712) && (ndot > 0.05)) ? mWA : 0.0;
 
     float ndot2 = ndot * ndot;
     float nW4   = ndot2 * ndot2;
-    float nW32  = nW4;
-    if (isDielMat || smoothSpec) {
-        float nW8  = nW4 * nW4;
-        float nW16 = nW8 * nW8;
-        nW32       = nW16 * nW16;
-    }
-    float nWA = isDielMat  ? nW32 : nW4;
-    float nWB = smoothSpec ? nW32 : nW4;
+    float nW8   = nW4 * nW4;
+    float nW16  = nW8 * nW8;
+    float nW32  = nW16 * nW16;
+    float nWA   = isDielMat  ? nW32 : nW4;
+    float nWB   = smoothSpec ? nW32 : nW4;
 
     float qLog2LA = log2(1.0 + dot(qValA, vec3(0.2126, 0.7152, 0.0722)));
     float dLA     = (qLog2LA - cLog2LA) * invSigLA_e2;
-    float errA    = relPe2_sq + dLA * dLA;
-    if (isDielMat) {
-        float dNz = absNz - abs(qNrm.z);
-        errA += 519.37021 * dNz * dNz;
-    }
+    float dNz     = absNz - abs(qNrm.z);
+    float errA    = relPe2_sq + dLA * dLA + (isDielMat ? (519.37021 * dNz * dNz) : 0.0);
+
     float wA = (baseG * kTapW * nWA) * exp2(max(-errA, -115.0));
     sumA  += wA * qValA;
     sumWA += wA;
 
-    if (!isDielMat) {
-        float qLog2LB = log2(1.0 + dot(qSpec, vec3(0.2126, 0.7152, 0.0722)));
-        float dLB     = (qLog2LB - cLog2LB) * invSigLB_e2;
-        float wB      = (baseG * specRingW * nWB) * exp2(max(-(relPe2_sq + dLB * dLB), -115.0));
-        sumB  += wB * qSpec;
-        sumWB += wB;
-    }
+    float qLog2LB = log2(1.0 + dot(qSpec, vec3(0.2126, 0.7152, 0.0722)));
+    float dLB     = (qLog2LB - cLog2LB) * invSigLB_e2;
+    float wB      = (baseG * specRingW * nWB) * exp2(max(-(relPe2_sq + dLB * dLB), -115.0));
+    sumB  += wB * qSpec;
+    sumWB += wB;
 }
 
 void evalRingSlotsStage3(
     uint s0, uint s1, uint s2, uint s3,
     float m0, float m1, float m2, float m3,
     vec4 zPred4, float kTapW, float specRingW, float invZTol_e2,
-    vec3 viewNormal, float absNz, float matClass, bool isDielMat, bool smoothSpec,
+    vec3 viewNormal, float absNz, float matClass, float matTol, float matMismatchW,
+    bool isDielMat, bool smoothSpec,
     float cLog2LA, float cLog2LB, float invSigLA_e2, float invSigLB_e2,
     inout vec3 sumA, inout float sumWA, inout vec3 sumB, inout float sumWB
 ) {
@@ -779,10 +756,10 @@ void evalRingSlotsStage3(
     uint  n1 = floatBitsToUint(s_acc[s1]);
     uint  n2 = floatBitsToUint(s_acc[s2]);
     uint  n3 = floatBitsToUint(s_acc[s3]);
-    evalTapStage3(b0, n0, m0, zPred4.x, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
-    evalTapStage3(b1, n1, m1, zPred4.y, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
-    evalTapStage3(b2, n2, m2, zPred4.z, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
-    evalTapStage3(b3, n3, m3, zPred4.w, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
+    evalTapStage3(b0, n0, m0, zPred4.x, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
+    evalTapStage3(b1, n1, m1, zPred4.y, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
+    evalTapStage3(b2, n2, m2, zPred4.z, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
+    evalTapStage3(b3, n3, m3, zPred4.w, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
 }
 
 void processStage3Corner(
@@ -839,6 +816,10 @@ void processStage3Corner(
     vec3  eDiffClean;
     vec3  eSpecClean;
     vec3  nextDiffHist;
+    vec3  nextSpecHist = accSpec;
+    float nDiff        = 1.0;
+    float nSpec        = 1.0;
+    float diffConf     = 0.0;
     if (isSky) {
         eDiffClean   = cValA;
         eSpecClean   = accSpec;
@@ -919,6 +900,9 @@ void processStage3Corner(
         float nSpecE    = clamp(a2_meta.y, 1.0, 64.0);
         float diffConfE = clamp(a2_meta.z, 0.0, 1.0);
         float roughness = clamp(a2_meta.w, 0.0, 1.0);
+        nDiff           = nDiffE;
+        nSpec           = nSpecE;
+        diffConf        = diffConfE;
 
         bool  smoothSpec       = (roughness < 0.08) && !isDielMat;
         float nCapD            = min(nDiffE, 64.0);
@@ -933,9 +917,7 @@ void processStage3Corner(
         float noiseGateB       = smoothstep(0.007, 0.022, sigmaRemB);
         float absNz            = abs(viewNormal.z);
         float dielGrazingGate  = smoothstep(0.005, 0.050, absNz);
-        float roughSpatialGate = isDielMat
-            ? dielGrazingGate
-            : mix(0.80, 1.0, max(smoothstep(0.04, 0.20, roughness), noiseGateB));
+        float baseRoughGateS   = max(smoothstep(0.04, 0.20, roughness), noiseGateB);
         float wideScale        = mix(0.35, 1.0, smoothstep(2.0, 12.0, max(nCapD, nCapS)));
         float wideGateB        = max(smoothstep(0.045, 0.12, roughness), 0.85 * noiseGateB);
         float baseZScale       = max(linDepth, 1e-3) * (isDielMat ? 0.025 : 0.020);
@@ -949,89 +931,102 @@ void processStage3Corner(
         float sigLB       = smoothSpec
             ? mix(0.90 * invSqrtNS + 0.025, max(3.5 * sigmaRemB, 1.65 * invSqrtNS + 0.040), noiseGateB)
             : max(3.5 * sigmaRemB, 1.85 * invSqrtNS + 0.050);
-        float invSigLA_e2 = 0.58870501 / sigLA;
-        float invSigLB_e2 = 0.58870501 / sigLB;
+
+        float statConvD = 0.0;
+        float statRampD = 0.0;
+        float statRampS = 0.0;
+        float mcNoisy   = 0.0;
+        if (!enableSR) {
+            statConvD       = (diffConfE > 0.98) ? smoothstep(10.5, 16.0, nDiffE) : 0.0;
+            statRampD       = (diffConfE > 0.98) ? smoothstep(14.0, 44.0, nDiffE) : 0.0;
+            statRampS       = (diffConfE > 0.95) ? smoothstep(14.0, 44.0, nSpecE) : 0.0;
+            mcNoisy         = smoothstep(0.035, 0.110, meanTempErr);
+            baseRoughGateS  = max(baseRoughGateS, statRampS * mcNoisy);
+            float statWideS = statRampS * mcNoisy * smoothstep(0.010, 0.035, roughness);
+            wideGateB       = max(wideGateB, 0.80 * statWideS);
+            float statSigLA = (statRampD * mcNoisy) * (isDielMat ? 0.22 : (0.14 + 0.16 * smoothstep(0.12, 0.30, roughness)));
+            sigLA           = max(sigLA, statSigLA);
+            float statSigLB = statRampS * mix(0.12, 0.22, mcNoisy);
+            sigLB           = max(sigLB, statSigLB);
+        }
+        float roughSpatialGate = isDielMat ? dielGrazingGate : mix(0.80, 1.0, baseRoughGateS);
+        float invSigLA_e2      = 0.58870501 / sigLA;
+        float invSigLB_e2      = 0.58870501 / sigLB;
 
         vec3  sumA  = centerA;
         float sumWA = 1.0;
         vec3  sumB  = accSpec;
         float sumWB = 1.0;
 
-        float invRawZ     = 0.84932180 / baseZScale;
-        float invZTol0_e2 = min(invRawZ,              8493.2180);
-        float invZTol1_e2 = min(invRawZ * 0.85786438, 8493.2180);
+        float invRawZ      = 0.84932180 / baseZScale;
+        float matTol       = isDielMat ? 0.12 : 0.15;
+        float matMismatchW = isDielMat ? 0.0  : 0.15;
 
-        // Ring 0: axial +/-1
+        // Ring 0: 4 axial +/-1 neighbors
         evalRingSlotsStage3(
             slotL, slotR, slotU, slotD,
             matL, matR, matU, matD,
             vec4(linDepth - dzdx, linDepth + dzdx, linDepth - dzdy, linDepth + dzdy),
-            1.00, roughSpatialGate, invZTol0_e2,
-            viewNormal, absNz, matClass, isDielMat, smoothSpec,
+            1.00, roughSpatialGate, min(invRawZ, 8493.2180),
+            viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec,
             cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2,
             sumA, sumWA, sumB, sumWB
         );
 
-        // Ring 1: diagonal +/-1
+        // Ring 1: 4 diagonal (+/-1, +/-1) neighbors
         {
-            uint subDiag   = subC ^ 3u;
-            uint shiftDiag = subDiag * 8u;
-            uint r1_s0     = (uint(int(qL1) + dqU1) << 2u) | subDiag;
-            uint r1_s1     = (uint(int(qR1) + dqU1) << 2u) | subDiag;
-            uint r1_s2     = (uint(int(qL1) + dqD1) << 2u) | subDiag;
-            uint r1_s3     = (uint(int(qR1) + dqD1) << 2u) | subDiag;
-            uint smHV      = s_buf[2880u + (qH + qV - qC)];
-            uint smRowC_L  = (bxC == 0u) ? smH  : smC;
-            uint smRowC_R  = (bxC == 0u) ? smC  : smH;
-            uint smRowV_L  = (bxC == 0u) ? smHV : smV;
-            uint smRowV_R  = (bxC == 0u) ? smV  : smHV;
-            uint sm0       = (byC == 0u) ? smRowV_L : smRowC_L;
-            uint sm1       = (byC == 0u) ? smRowV_R : smRowC_R;
-            uint sm2       = (byC == 0u) ? smRowC_L : smRowV_L;
-            uint sm3       = (byC == 0u) ? smRowC_R : smRowV_R;
+            uint  subDiag   = subC ^ 3u;
+            uint  shiftDiag = subDiag * 8u;
+            uint  rs0       = (uint(int(qL1) + dqU1) << 2u) | subDiag;
+            uint  rs1       = (uint(int(qR1) + dqU1) << 2u) | subDiag;
+            uint  rs2       = (uint(int(qL1) + dqD1) << 2u) | subDiag;
+            uint  rs3       = (uint(int(qR1) + dqD1) << 2u) | subDiag;
+            uint  smHV      = s_buf[2880u + (qH + qV - qC)];
+            uint  smRowC_L  = (bxC == 0u) ? smH  : smC;
+            uint  smRowC_R  = (bxC == 0u) ? smC  : smH;
+            uint  smRowV_L  = (bxC == 0u) ? smHV : smV;
+            uint  smRowV_R  = (bxC == 0u) ? smV  : smHV;
+            uint  sm0       = (byC == 0u) ? smRowV_L : smRowC_L;
+            uint  sm1       = (byC == 0u) ? smRowV_R : smRowC_R;
+            uint  sm2       = (byC == 0u) ? smRowC_L : smRowV_L;
+            uint  sm3       = (byC == 0u) ? smRowC_R : smRowV_R;
+            float rm0       = decodeE4M3Byte(sm0 >> shiftDiag);
+            float rm1       = decodeE4M3Byte(sm1 >> shiftDiag);
+            float rm2       = decodeE4M3Byte(sm2 >> shiftDiag);
+            float rm3       = decodeE4M3Byte(sm3 >> shiftDiag);
             evalRingSlotsStage3(
-                r1_s0, r1_s1, r1_s2, r1_s3,
-                decodeE4M3Byte(sm0 >> shiftDiag),
-                decodeE4M3Byte(sm1 >> shiftDiag),
-                decodeE4M3Byte(sm2 >> shiftDiag),
-                decodeE4M3Byte(sm3 >> shiftDiag),
-                vec4(
-                    linDepth - dzdx - dzdy,
-                    linDepth + dzdx - dzdy,
-                    linDepth - dzdx + dzdy,
-                    linDepth + dzdx + dzdy
-                ),
-                0.70, 0.70 * roughSpatialGate, invZTol1_e2,
-                viewNormal, absNz, matClass, isDielMat, smoothSpec,
+                rs0, rs1, rs2, rs3,
+                rm0, rm1, rm2, rm3,
+                vec4(linDepth - dzdx - dzdy, linDepth + dzdx - dzdy, linDepth - dzdx + dzdy, linDepth + dzdx + dzdy),
+                0.70, 0.70 * roughSpatialGate, min(invRawZ * 0.85786438, 8493.2180),
+                viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec,
                 cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2,
                 sumA, sumWA, sumB, sumWB
             );
         }
 
-        // Ring 2 (1.0x native only): axial +/-2
+        // Ring 2 (1.0x mode only): 4 axial +/-2 neighbors
         if (!enableSR) {
-            uint rowStep = quadW << 2u;
-            uint qH_opp  = (bxC == 0u) ? (qC + 1u)    : (qC - 1u);
-            uint qV_opp  = (byC == 0u) ? (qC + quadW) : (qC - quadW);
-            uint smH2    = s_buf[2880u + qH_opp];
-            uint smV2    = s_buf[2880u + qV_opp];
-            float r2_kTapW     = 1.10 * wideScale;
-            float r2_specRingW = r2_kTapW * wideGateB * roughSpatialGate;
-            float invZTol2_e2  = min(invRawZ * 0.71428571, 8493.2180);
+            uint  rowStep = quadW << 2u;
+            uint  qH_opp  = (bxC == 0u) ? (qC + 1u)    : (qC - 1u);
+            uint  qV_opp  = (byC == 0u) ? (qC + quadW) : (qC - quadW);
+            uint  smH2    = s_buf[2880u + qH_opp];
+            uint  smV2    = s_buf[2880u + qV_opp];
+            uint  rs0     = cSlot - 4u;
+            uint  rs1     = cSlot + 4u;
+            uint  rs2     = cSlot - rowStep;
+            uint  rs3     = cSlot + rowStep;
+            float rm0     = decodeE4M3Byte(((bxC == 0u) ? smH  : smH2) >> shiftC);
+            float rm1     = decodeE4M3Byte(((bxC == 0u) ? smH2 : smH ) >> shiftC);
+            float rm2     = decodeE4M3Byte(((byC == 0u) ? smV  : smV2) >> shiftC);
+            float rm3     = decodeE4M3Byte(((byC == 0u) ? smV2 : smV ) >> shiftC);
+            float rkTapW  = 1.10 * wideScale;
             evalRingSlotsStage3(
-                cSlot - 4u, cSlot + 4u, cSlot - rowStep, cSlot + rowStep,
-                decodeE4M3Byte(((bxC == 0u) ? smH  : smH2) >> shiftC),
-                decodeE4M3Byte(((bxC == 0u) ? smH2 : smH ) >> shiftC),
-                decodeE4M3Byte(((byC == 0u) ? smV  : smV2) >> shiftC),
-                decodeE4M3Byte(((byC == 0u) ? smV2 : smV ) >> shiftC),
-                vec4(
-                    linDepth - 2.0 * dzdx,
-                    linDepth + 2.0 * dzdx,
-                    linDepth - 2.0 * dzdy,
-                    linDepth + 2.0 * dzdy
-                ),
-                r2_kTapW, r2_specRingW, invZTol2_e2,
-                viewNormal, absNz, matClass, isDielMat, smoothSpec,
+                rs0, rs1, rs2, rs3,
+                rm0, rm1, rm2, rm3,
+                vec4(linDepth - 2.0 * dzdx, linDepth + 2.0 * dzdx, linDepth - 2.0 * dzdy, linDepth + 2.0 * dzdy),
+                rkTapW, rkTapW * wideGateB * roughSpatialGate, min(invRawZ * 0.71428571, 8493.2180),
+                viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec,
                 cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2,
                 sumA, sumWA, sumB, sumWB
             );
@@ -1060,11 +1055,19 @@ void processStage3Corner(
         float spatialMixS   = roughSpatialGate
                             * clamp((0.84 + 0.12 * (0.25 * logitAlphaS)) * spatialDecayS * noiseCeilS, 0.0, 0.92);
 
+        if (!enableSR) {
+            float statTargetMixD = isDielMat
+                                 ? (0.78 * dielGrazingGate)
+                                 : mix(0.55, 0.82, smoothstep(0.12, 0.30, roughness));
+            spatialMixD          = mix(spatialMixD, max(spatialMixD, statTargetMixD), statRampD * mcNoisy);
+            float statTargetMixS = smoothSpec ? mix(0.38, 0.72, mcNoisy) : mix(0.55, 0.80, mcNoisy);
+            spatialMixS          = mix(spatialMixS, max(spatialMixS, statTargetMixS), statRampS);
+        }
+
         if (isDielMat) {
             vec3 aDiffD       = clamp(mlAlb.rgb,  vec3(0.0), vec3(1.0));
             vec3 aSpecD       = clamp(mlSAlb.rgb, vec3(0.0), vec3(1.0));
             vec3 accDiff      = clampFp16Rgb(imageLoad(tBaseAnchorLr, ivec3(gp, 0)).rgb);
-            nextDiffHist      = accDiff;
             vec3 baseRad      = mix(cValA, muAPost, spatialMixD);
             vec3 dielRes      = (aDiffD * (resDiff * resDecayD) + aSpecD * (resSpec * resDecayS))
                               / max(aDiffD + aSpecD, vec3(0.06));
@@ -1076,6 +1079,13 @@ void processStage3Corner(
             vec3 remRad       = max(cleanSurfRad - (aDiffD * scaledD + aSpecD * scaledS), vec3(0.0));
             eDiffClean        = clampFp16Rgb(scaledD + remRad / max(aDiffD, vec3(0.04)));
             eSpecClean        = clampFp16Rgb(scaledS);
+            nextDiffHist      = accDiff;
+            nextSpecHist      = clampFp16Rgb(accSpec);
+            if (!enableSR) {
+                float statFeedDiel = 0.14 * statConvD * mcNoisy * dielGrazingGate;
+                nextDiffHist       = clampFp16Rgb(mix(accDiff, eDiffClean, statFeedDiel));
+                nextSpecHist       = clampFp16Rgb(mix(accSpec, eSpecClean, statFeedDiel));
+            }
         } else {
             vec3 accDiff    = cValA;
             nextDiffHist    = accDiff;
@@ -1084,25 +1094,25 @@ void processStage3Corner(
             vec3 baseSpec   = mix(accSpec, muSpecPost, spatialMixS);
             eDiffClean      = clampFp16Rgb(safeExpm1(safeLog1p(baseDiff) + resDiff * resDecayD));
             eSpecClean      = clampFp16Rgb(safeExpm1(safeLog1p(baseSpec) + resSpec * resDecayS));
-            if (!enableSR && roughness >= 0.30 && diffConfE > 0.99 && nDiffE > 11.0) {
-                float statFeedD = (0.14 * noiseGateA) * min(1.0, 16.0 / nDiffE);
-                nextDiffHist = clampFp16Rgb(mix(accDiff, muAPost, statFeedD));
+            if (!enableSR) {
+                float statFeedD = ((statConvD > 0.0) && (roughness >= 0.15))
+                    ? (mix(0.14 * noiseGateA, 0.16 * mcNoisy, statRampD) * smoothstep(0.12, 0.25, roughness))
+                    : 0.0;
+                nextDiffHist    = clampFp16Rgb(mix(accDiff, muAPost, statFeedD));
+                float statFeedS = (statRampS > 0.0) ? ((smoothSpec ? 0.13 : 0.16) * statRampS * mcNoisy) : 0.0;
+                nextSpecHist    = clampFp16Rgb(mix(accSpec, muSpecPost, statFeedS));
             }
         }
     }
 
-    float nDiff      = isSky ? 1.0 : clamp(a2_meta.x, 1.0, 64.0);
-    float nSpec      = isSky ? 1.0 : clamp(a2_meta.y, 1.0, 64.0);
-    float diffConf   = isSky ? 0.0 : clamp(a2_meta.z, 0.0, 1.0);
     vec3  aDiff      = clamp(mlAlb.rgb,  vec3(0.0), vec3(1.0));
     vec3  aSpec      = clamp(mlSAlb.rgb, vec3(0.0), vec3(1.0));
     vec3  rawSkipRgb = sanitizeRgb(mlSkip.rgb);
     vec3  skipRgb    = isDielMat ? vec3(0.0) : rawSkipRgb;
     vec3  cleanRad   = clampFp16Rgb(aDiff * eDiffClean + aSpec * eSpecClean + skipRgb);
-    float outConf    = isSky ? 1.0 : clamp(max(diffConf, (nDiff - 1.0) / 8.0), 0.0, 1.0);
 
     imageStore(uCurrDiffLr, gp, vec4(nextDiffHist, nDiff));
-    imageStore(uCurrSpecLr, gp, vec4(accSpec, nSpec));
+    imageStore(uCurrSpecLr, gp, vec4(nextSpecHist, nSpec));
 
     uint nextHiddenPacked = 0u;
     if (!zeroResidual && !isSky) {
@@ -1111,6 +1121,7 @@ void processStage3Corner(
     imageStore(uCurrHiddenLr, gp, uvec4(nextHiddenPacked, 0u, 0u, 0u));
 
     if (enableSR) {
+        float outConf = isSky ? 1.0 : clamp(max(diffConf, (nDiff - 1.0) / 8.0), 0.0, 1.0);
         imageStore(tCleanRadLr, gp, vec4(cleanRad, outConf));
         uint srBase2 = (pc.offHw0 >> 1u) + uint(gp.y * W0 + gp.x) * 2u;
         uint p0 = packFp8Vec4(vec4(safeLog1p(eDiffClean), viewNormal.x * 4.0));
@@ -1150,22 +1161,21 @@ void runStage3Dec1() {
         [[dont_unroll]] for (uint pass = 0u; pass < 2u; ++pass) {
             uint ap = pass * 128u + t;
             if (ap < 180u) {
-                uint ayU = uint(float(ap) * (1.0 / 18.0 + 1e-6));
-                int  ax  = int(ap - ayU * 18u);
-                int  ay  = int(ayU);
+                uint  ayU = uint(float(ap) * (1.0 / 18.0 + 1e-6));
+                int   ax  = int(ap - ayU * 18u);
+                int   ay  = int(ayU);
                 ivec2 gp1 = clamp(ivec2(wgX + ax - 1, wgY + ay - 1), ivec2(0), ivec2(W1 - 1, H1 - 1));
-                vec2 srcCoord = (vec2(gp1) + vec2(0.5)) * upScale - vec2(0.5);
-                BilinearTaps bt = computeBilinearTaps(srcCoord, ivec2(W2, H2));
+                BilinearTaps bt = computeBilinearTaps((vec2(gp1) + vec2(0.5)) * upScale - vec2(0.5), ivec2(W2, H2));
 
-                uint b00_2 = (pc.offB2 >> 1u) + uint(bt.i00.y * W2 + bt.i00.x) * 4u;
-                uint b10_2 = (pc.offB2 >> 1u) + uint(bt.i10.y * W2 + bt.i10.x) * 4u;
-                uint b01_2 = (pc.offB2 >> 1u) + uint(bt.i01.y * W2 + bt.i01.x) * 4u;
-                uint b11_2 = (pc.offB2 >> 1u) + uint(bt.i11.y * W2 + bt.i11.x) * 4u;
+                uint b00 = (pc.offB2 >> 1u) + uint(bt.i00.y * W2 + bt.i00.x) * 4u;
+                uint b10 = (pc.offB2 >> 1u) + uint(bt.i10.y * W2 + bt.i10.x) * 4u;
+                uint b01 = (pc.offB2 >> 1u) + uint(bt.i01.y * W2 + bt.i01.x) * 4u;
+                uint b11 = (pc.offB2 >> 1u) + uint(bt.i11.y * W2 + bt.i11.x) * 4u;
 
-                uvec2 v00_0 = g_act.act2[b00_2 + 0u], v00_1 = g_act.act2[b00_2 + 1u], v00_2 = g_act.act2[b00_2 + 2u], v00_3 = g_act.act2[b00_2 + 3u];
-                uvec2 v10_0 = g_act.act2[b10_2 + 0u], v10_1 = g_act.act2[b10_2 + 1u], v10_2 = g_act.act2[b10_2 + 2u], v10_3 = g_act.act2[b10_2 + 3u];
-                uvec2 v01_0 = g_act.act2[b01_2 + 0u], v01_1 = g_act.act2[b01_2 + 1u], v01_2 = g_act.act2[b01_2 + 2u], v01_3 = g_act.act2[b01_2 + 3u];
-                uvec2 v11_0 = g_act.act2[b11_2 + 0u], v11_1 = g_act.act2[b11_2 + 1u], v11_2 = g_act.act2[b11_2 + 2u], v11_3 = g_act.act2[b11_2 + 3u];
+                uvec2 v00_0 = g_act.act2[b00 + 0u], v00_1 = g_act.act2[b00 + 1u], v00_2 = g_act.act2[b00 + 2u], v00_3 = g_act.act2[b00 + 3u];
+                uvec2 v10_0 = g_act.act2[b10 + 0u], v10_1 = g_act.act2[b10 + 1u], v10_2 = g_act.act2[b10 + 2u], v10_3 = g_act.act2[b10 + 3u];
+                uvec2 v01_0 = g_act.act2[b01 + 0u], v01_1 = g_act.act2[b01 + 1u], v01_2 = g_act.act2[b01 + 2u], v01_3 = g_act.act2[b01 + 3u];
+                uvec2 v11_0 = g_act.act2[b11 + 0u], v11_1 = g_act.act2[b11 + 1u], v11_2 = g_act.act2[b11 + 2u], v11_3 = g_act.act2[b11 + 3u];
 
                 writeSB(ap, 0u, 8u, bt.w.x * unpackFp8Vec4(v00_0.x) + bt.w.y * unpackFp8Vec4(v10_0.x) + bt.w.z * unpackFp8Vec4(v01_0.x) + bt.w.w * unpackFp8Vec4(v11_0.x));
                 writeSB(ap, 1u, 8u, bt.w.x * unpackFp8Vec4(v00_0.y) + bt.w.y * unpackFp8Vec4(v10_0.y) + bt.w.z * unpackFp8Vec4(v01_0.y) + bt.w.w * unpackFp8Vec4(v11_0.y));
@@ -1180,21 +1190,13 @@ void runStage3Dec1() {
         barrier();
 
         uint baseAp3 = ly * 18u + lx;
-        uint dLo0 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 0u, F32_DW_DEC1_W, F32_DW_DEC1_B));
+        uvec2 dLo01 = evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W, F32_DW_DEC1_B);
         subgroupBarrier();
-        uint dLo1 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 1u, F32_DW_DEC1_W, F32_DW_DEC1_B));
+        uvec2 dLo23 = evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W, F32_DW_DEC1_B);
         subgroupBarrier();
-        uint dLo2 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 2u, F32_DW_DEC1_W, F32_DW_DEC1_B));
+        uvec2 dLo45 = evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W, F32_DW_DEC1_B);
         subgroupBarrier();
-        uint dLo3 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 3u, F32_DW_DEC1_W, F32_DW_DEC1_B));
-        subgroupBarrier();
-        uint dLo4 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 4u, F32_DW_DEC1_W, F32_DW_DEC1_B));
-        subgroupBarrier();
-        uint dLo5 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 5u, F32_DW_DEC1_W, F32_DW_DEC1_B));
-        subgroupBarrier();
-        uint dLo6 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 6u, F32_DW_DEC1_W, F32_DW_DEC1_B));
-        subgroupBarrier();
-        uint dLo7 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 7u, F32_DW_DEC1_W, F32_DW_DEC1_B));
+        uvec2 dLo67 = evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W, F32_DW_DEC1_B);
         barrier();
 
         [[dont_unroll]] for (uint pass = 0u; pass < 2u; ++pass) {
@@ -1221,39 +1223,31 @@ void runStage3Dec1() {
         }
         barrier();
 
-        uint dHi0 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 0u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
+        uvec2 dHi01 = evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
         subgroupBarrier();
-        uint dHi1 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 1u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
+        uvec2 dHi23 = evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
         subgroupBarrier();
-        uint dHi2 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 2u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
+        uvec2 dHi45 = evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
         subgroupBarrier();
-        uint dHi3 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 3u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
-        subgroupBarrier();
-        uint dHi4 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 4u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
-        subgroupBarrier();
-        uint dHi5 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 5u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
-        subgroupBarrier();
-        uint dHi6 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 6u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
-        subgroupBarrier();
-        uint dHi7 = packFp8Vec4(evalDw3x3L1(baseAp3, 16u, 7u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u));
+        uvec2 dHi67 = evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
         barrier();
 
-        writeSAFromGlobalU32(t,  0u, 16u, dLo0);
-        writeSAFromGlobalU32(t,  1u, 16u, dLo1);
-        writeSAFromGlobalU32(t,  2u, 16u, dLo2);
-        writeSAFromGlobalU32(t,  3u, 16u, dLo3);
-        writeSAFromGlobalU32(t,  4u, 16u, dLo4);
-        writeSAFromGlobalU32(t,  5u, 16u, dLo5);
-        writeSAFromGlobalU32(t,  6u, 16u, dLo6);
-        writeSAFromGlobalU32(t,  7u, 16u, dLo7);
-        writeSAFromGlobalU32(t,  8u, 16u, dHi0);
-        writeSAFromGlobalU32(t,  9u, 16u, dHi1);
-        writeSAFromGlobalU32(t, 10u, 16u, dHi2);
-        writeSAFromGlobalU32(t, 11u, 16u, dHi3);
-        writeSAFromGlobalU32(t, 12u, 16u, dHi4);
-        writeSAFromGlobalU32(t, 13u, 16u, dHi5);
-        writeSAFromGlobalU32(t, 14u, 16u, dHi6);
-        writeSAFromGlobalU32(t, 15u, 16u, dHi7);
+        writeSAFromGlobalU32(t,  0u, 16u, dLo01.x);
+        writeSAFromGlobalU32(t,  1u, 16u, dLo01.y);
+        writeSAFromGlobalU32(t,  2u, 16u, dLo23.x);
+        writeSAFromGlobalU32(t,  3u, 16u, dLo23.y);
+        writeSAFromGlobalU32(t,  4u, 16u, dLo45.x);
+        writeSAFromGlobalU32(t,  5u, 16u, dLo45.y);
+        writeSAFromGlobalU32(t,  6u, 16u, dLo67.x);
+        writeSAFromGlobalU32(t,  7u, 16u, dLo67.y);
+        writeSAFromGlobalU32(t,  8u, 16u, dHi01.x);
+        writeSAFromGlobalU32(t,  9u, 16u, dHi01.y);
+        writeSAFromGlobalU32(t, 10u, 16u, dHi23.x);
+        writeSAFromGlobalU32(t, 11u, 16u, dHi23.y);
+        writeSAFromGlobalU32(t, 12u, 16u, dHi45.x);
+        writeSAFromGlobalU32(t, 13u, 16u, dHi45.y);
+        writeSAFromGlobalU32(t, 14u, 16u, dHi67.x);
+        writeSAFromGlobalU32(t, 15u, 16u, dHi67.y);
     }
     barrier();
 

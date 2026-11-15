@@ -47,8 +47,38 @@ void evalWarpGeomTap(
     float ndot   = max(dot(viewNormal, pNrm), 0.0);
     float ndot2  = ndot * ndot;
     wD = vOk * exp2(-max(relE - 0.06, 0.0) * 17.3123405) * (ndot2 * ndot2);
-    float vSpec  = evalSpec ? vOk : 0.0;
-    wS = vSpec * exp2(-max(relE - relThreshS, 0.0) * 14.4269504) * ndot2;
+    if (evalSpec) {
+        wS = vOk * exp2(-max(relE - relThreshS, 0.0) * 14.4269504) * ndot2;
+    } else {
+        wS = 0.0;
+    }
+}
+
+void accumPrevDiffHidden4(
+    vec4 pd0, vec4 pd1, vec4 pd2, vec4 pd3,
+    uint ph0, uint ph1, uint ph2, uint ph3,
+    float wD0, float wD1, float wD2, float wD3, float sumTapW,
+    out float diffConf, out vec3 yDiffPrev, out float prevNDiff, out uint hWarpPacked
+) {
+    vec3 accPrevD = wD0 * clampFp16Rgb(pd0.rgb)
+                  + wD1 * clampFp16Rgb(pd1.rgb)
+                  + wD2 * clampFp16Rgb(pd2.rgb)
+                  + wD3 * clampFp16Rgb(pd3.rgb);
+    float accPrevND = wD0 * clamp(pd0.a, 0.0, 64.0)
+                    + wD1 * clamp(pd1.a, 0.0, 64.0)
+                    + wD2 * clamp(pd2.a, 0.0, 64.0)
+                    + wD3 * clamp(pd3.a, 0.0, 64.0);
+    vec4 accPrevH = wD0 * unpackFp8Vec4(ph0)
+                  + wD1 * unpackFp8Vec4(ph1)
+                  + wD2 * unpackFp8Vec4(ph2)
+                  + wD3 * unpackFp8Vec4(ph3);
+
+    float invSumW = 1.0 / sumTapW;
+    diffConf    = clamp(sumTapW, 0.0, 1.0);
+    yDiffPrev   = accPrevD * invSumW;
+    prevNDiff   = accPrevND * invSumW;
+    vec4 hAcc   = accPrevH * invSumW;
+    hWarpPacked = packFp8Vec4(clamp(hAcc, vec4(-4.0), vec4(4.0)) * diffConf);
 }
 
 void accumPrevSpec4(
@@ -219,79 +249,21 @@ void main() {
     bool  isSky     = isSkyOrEmissiveOnly(linDepth, matInit, aDiffInit, aSpecInit);
     bool  isDielMat = abs(matInit - 0.6667) < 0.12;
 
-    // 2. 3x3 Spatial Statistics + 8-Neighbor Firefly Moments from LDS tile (overlaps mvSurf/mvSpec latency)
-    uvec2 cD01          = s_diff[cAp];
-    uvec2 cS01          = s_spec[cAp];
-    vec3  eDiffInit     = vec3(unpackHalf2x16(cD01.x), unpackHalf2x16(cD01.y).x);
-    vec3  eSpecInit     = vec3(unpackHalf2x16(cS01.x), unpackHalf2x16(cS01.y).x);
-    bool  smoothSpec    = (roughInit < 0.08);
-    float roughSpecGate = isDielMat
-        ? max(0.70, smoothstep(0.03, 0.20, roughInit))
-        : mix(0.55, 1.0, smoothstep(0.02, 0.20, roughInit));
-
-    vec3 wSumDiff = eDiffInit;
+    // Pack center G-buffer values into 6 VGPRs before issuing cold-DRAM backward warps
+    uvec2 cD01_pre  = s_diff[cAp];
+    vec3  eDiffFold = vec3(unpackHalf2x16(cD01_pre.x), unpackHalf2x16(cD01_pre.y).x);
     if (isDielMat && !isSky) {
         vec3  skipClean = sanitizeRgb(mlSkipP.rgb);
-        vec3  eFold     = clampFp16Rgb(eDiffInit + skipClean / max(aDiffInit, vec3(0.04)));
+        vec3  eFold     = clampFp16Rgb(eDiffFold + skipClean / max(aDiffInit, vec3(0.04)));
         uvec2 pFold     = uvec2(packHalf2x16(eFold.rg), packHalf2x16(vec2(eFold.b, 0.0)));
-        eDiffInit       = vec3(unpackHalf2x16(pFold.x), unpackHalf2x16(pFold.y).x);
+        eDiffFold       = vec3(unpackHalf2x16(pFold.x), unpackHalf2x16(pFold.y).x);
     }
 
     uvec2 pAlbRough   = uvec2(packHalf2x16(aDiffInit.rg), packHalf2x16(vec2(aDiffInit.b, roughInit)));
     uvec2 pSAlbMat    = uvec2(packHalf2x16(aSpecInit.rg), packHalf2x16(vec2(aSpecInit.b, matInit)));
-    uvec2 pDiffCenter = uvec2(packHalf2x16(eDiffInit.rg), packHalf2x16(vec2(eDiffInit.b, unpackHalf2x16(cD01.y).y)));
+    uvec2 pDiffCenter = uvec2(packHalf2x16(eDiffFold.rg), packHalf2x16(vec2(eDiffFold.b, unpackHalf2x16(cD01_pre.y).y)));
 
-    uvec2 cLD01 = s_logDiff[cAp];
-    uvec2 cLS01 = s_logSpec[cAp];
-    vec3  cLD   = vec3(unpackHalf2x16(cLD01.x), unpackHalf2x16(cLD01.y).x);
-    vec3  cLS   = vec3(unpackHalf2x16(cLS01.x), unpackHalf2x16(cLS01.y).x);
-
-    vec3  wSumSpec    = eSpecInit;
-    float sumBilatWD  = 1.0;
-    float sumBilatWS  = 1.0;
-
-    vec3  sumLogDiff  = cLD;
-    vec3  sumLogDiff2 = cLD * cLD;
-    vec3  sumLogSpec  = cLS;
-    vec3  sumLogSpec2 = cLS * cLS;
-    float validHits   = 1.0;
-
-    float nbrWSum     = 0.0;
-    float nbrLumD     = 0.0;
-    float nbrLumD2    = 0.0;
-    float nbrLumS     = 0.0;
-    float nbrLumS2    = 0.0;
-
-    if (!isSky) {
-        float invDepthE2 = 4.80448964 / max(linDepth, 1e-3);
-        uint  baseAp     = ly * 18u + lx;
-        // Match exact tap order k=0..7: (-1,0)=18, (+1,0)=20, (0,-1)=1, (0,+1)=37, (-1,-1)=0, (+1,-1)=2, (-1,+1)=36, (+1,+1)=38
-        [[dont_unroll]] for (uint k = 0u; k < 8u; ++k) {
-            uint off = (k < 4u)
-                ? ((0x25011412u >> (k * 8u)) & 0xFFu)
-                : ((0x26240200u >> ((k - 4u) * 8u)) & 0xFFu);
-            accumPrep3x3Tap(
-                baseAp + off, linDepth, invDepthE2, viewNormal, smoothSpec, roughSpecGate,
-                wSumDiff, sumBilatWD, wSumSpec, sumBilatWS,
-                sumLogDiff, sumLogDiff2, sumLogSpec, sumLogSpec2, validHits,
-                nbrWSum, nbrLumD, nbrLumD2, nbrLumS, nbrLumS2
-            );
-        }
-    }
-
-    vec3 muDiffCurr = clampFp16Rgb(wSumDiff / max(sumBilatWD, 1e-6));
-    vec3 muSpecCurr = clampFp16Rgb(wSumSpec / max(sumBilatWS, 1e-6));
-
-    float invHits     = 1.0 / max(validHits, 1.0);
-    vec3  logMuDiff   = sumLogDiff * invHits;
-    vec3  logVarDiff  = max(sumLogDiff2 * invHits - logMuDiff * logMuDiff, vec3(0.0));
-    vec3  logStdDiff  = sqrt(logVarDiff);
-
-    vec3  logMuSpec   = sumLogSpec * invHits;
-    vec3  logVarSpec  = max(sumLogSpec2 * invHits - logMuSpec * logMuSpec, vec3(0.0));
-    vec3  logStdSpec  = sqrt(logVarSpec);
-
-    // 3. Explicit imageLoad 4-tap bilinear backward warps (batched VMEM)
+    // 2. Explicit imageLoad 4-tap bilinear backward warps (batched cold-DRAM VMEM while live VGPRs = 14)
     vec2  surfaceMv = vec2(sanitizeFloat(mvSurfRaw.x, 0.0), sanitizeFloat(mvSurfRaw.y, 0.0));
     vec2  specMv    = vec2(sanitizeFloat(mvSpecRaw.x, 0.0), sanitizeFloat(mvSpecRaw.y, 0.0));
 
@@ -358,7 +330,7 @@ void main() {
         float sumTapW  = wD0 + wD1 + wD2 + wD3;
         float sumTapWS = wS0 + wS1 + wS2 + wS3;
 
-        if (sumTapW > 1e-4) {
+        if (sameMv && sumTapW > 1e-4 && sumTapWS > 1e-4) {
             vec4 pd0 = imageLoad(uPrevDiffLr, tc0);
             vec4 pd1 = imageLoad(uPrevDiffLr, tc1);
             vec4 pd2 = imageLoad(uPrevDiffLr, tc2);
@@ -367,33 +339,39 @@ void main() {
             uint ph1 = imageLoad(uPrevHiddenLr, tc1).r;
             uint ph2 = imageLoad(uPrevHiddenLr, tc2).r;
             uint ph3 = imageLoad(uPrevHiddenLr, tc3).r;
-
-            vec3 accPrevD = wD0 * clampFp16Rgb(pd0.rgb)
-                          + wD1 * clampFp16Rgb(pd1.rgb)
-                          + wD2 * clampFp16Rgb(pd2.rgb)
-                          + wD3 * clampFp16Rgb(pd3.rgb);
-            float accPrevND = wD0 * clamp(pd0.a, 0.0, 64.0)
-                            + wD1 * clamp(pd1.a, 0.0, 64.0)
-                            + wD2 * clamp(pd2.a, 0.0, 64.0)
-                            + wD3 * clamp(pd3.a, 0.0, 64.0);
-            vec4 accPrevH = wD0 * unpackFp8Vec4(ph0)
-                          + wD1 * unpackFp8Vec4(ph1)
-                          + wD2 * unpackFp8Vec4(ph2)
-                          + wD3 * unpackFp8Vec4(ph3);
-
-            float invSumW = 1.0 / sumTapW;
-            diffConf    = clamp(sumTapW, 0.0, 1.0);
-            yDiffPrev   = accPrevD * invSumW;
-            prevNDiff   = accPrevND * invSumW;
-            vec4 hAcc   = accPrevH * invSumW;
-            hWarpPacked = packFp8Vec4(clamp(hAcc, vec4(-4.0), vec4(4.0)) * diffConf);
-        }
-        if (sameMv && sumTapWS > 1e-4) {
             vec4 ps0 = imageLoad(uPrevSpecLr, tc0);
             vec4 ps1 = imageLoad(uPrevSpecLr, tc1);
             vec4 ps2 = imageLoad(uPrevSpecLr, tc2);
             vec4 ps3 = imageLoad(uPrevSpecLr, tc3);
+            accumPrevDiffHidden4(
+                pd0, pd1, pd2, pd3, ph0, ph1, ph2, ph3,
+                wD0, wD1, wD2, wD3, sumTapW,
+                diffConf, yDiffPrev, prevNDiff, hWarpPacked
+            );
             accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
+        } else {
+            if (sumTapW > 1e-4) {
+                vec4 pd0 = imageLoad(uPrevDiffLr, tc0);
+                vec4 pd1 = imageLoad(uPrevDiffLr, tc1);
+                vec4 pd2 = imageLoad(uPrevDiffLr, tc2);
+                vec4 pd3 = imageLoad(uPrevDiffLr, tc3);
+                uint ph0 = imageLoad(uPrevHiddenLr, tc0).r;
+                uint ph1 = imageLoad(uPrevHiddenLr, tc1).r;
+                uint ph2 = imageLoad(uPrevHiddenLr, tc2).r;
+                uint ph3 = imageLoad(uPrevHiddenLr, tc3).r;
+                accumPrevDiffHidden4(
+                    pd0, pd1, pd2, pd3, ph0, ph1, ph2, ph3,
+                    wD0, wD1, wD2, wD3, sumTapW,
+                    diffConf, yDiffPrev, prevNDiff, hWarpPacked
+                );
+            }
+            if (sameMv && sumTapWS > 1e-4) {
+                vec4 ps0 = imageLoad(uPrevSpecLr, tc0);
+                vec4 ps1 = imageLoad(uPrevSpecLr, tc1);
+                vec4 ps2 = imageLoad(uPrevSpecLr, tc2);
+                vec4 ps3 = imageLoad(uPrevSpecLr, tc3);
+                accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
+            }
         }
     }
 
@@ -436,6 +414,64 @@ void main() {
             accumPrevSpec4(ps0, ps1, ps2, ps3, wS0, wS1, wS2, wS3, sumTapWS, specConf, ySpecPrev, prevNSpec);
         }
     }
+
+    // 3. 3x3 Spatial Statistics + 8-Neighbor Firefly Moments from LDS tile (pure LDS/VALU)
+    uvec2 cD01          = s_diff[cAp];
+    uvec2 cS01          = s_spec[cAp];
+    uvec2 cLD01         = s_logDiff[cAp];
+    uvec2 cLS01         = s_logSpec[cAp];
+    vec3  wSumDiff      = vec3(unpackHalf2x16(cD01.x),  unpackHalf2x16(cD01.y).x);
+    vec3  wSumSpec      = vec3(unpackHalf2x16(cS01.x),  unpackHalf2x16(cS01.y).x);
+    vec3  cLD           = vec3(unpackHalf2x16(cLD01.x), unpackHalf2x16(cLD01.y).x);
+    vec3  cLS           = vec3(unpackHalf2x16(cLS01.x), unpackHalf2x16(cLS01.y).x);
+    float roughS2       = unpackHalf2x16(pAlbRough.y).y;
+    bool  smoothSpec    = (roughS2 < 0.08);
+    float roughSpecGate = isDielMat
+        ? max(0.70, smoothstep(0.03, 0.20, roughS2))
+        : mix(0.55, 1.0, smoothstep(0.02, 0.20, roughS2));
+
+    float sumBilatWD  = 1.0;
+    float sumBilatWS  = 1.0;
+
+    vec3  sumLogDiff  = cLD;
+    vec3  sumLogDiff2 = cLD * cLD;
+    vec3  sumLogSpec  = cLS;
+    vec3  sumLogSpec2 = cLS * cLS;
+    float validHits   = 1.0;
+
+    float nbrWSum     = 0.0;
+    float nbrLumD     = 0.0;
+    float nbrLumD2    = 0.0;
+    float nbrLumS     = 0.0;
+    float nbrLumS2    = 0.0;
+
+    if (!isSky) {
+        float invDepthE2 = 4.80448964 / max(linDepth, 1e-3);
+        uint  baseAp     = ly * 18u + lx;
+        [[dont_unroll]] for (uint k = 0u; k < 8u; ++k) {
+            uint off = (k < 4u)
+                ? ((0x25011412u >> (k * 8u)) & 0xFFu)
+                : ((0x26240200u >> ((k - 4u) * 8u)) & 0xFFu);
+            accumPrep3x3Tap(
+                baseAp + off, linDepth, invDepthE2, viewNormal, smoothSpec, roughSpecGate,
+                wSumDiff, sumBilatWD, wSumSpec, sumBilatWS,
+                sumLogDiff, sumLogDiff2, sumLogSpec, sumLogSpec2, validHits,
+                nbrWSum, nbrLumD, nbrLumD2, nbrLumS, nbrLumS2
+            );
+        }
+    }
+
+    vec3 muDiffCurr = clampFp16Rgb(wSumDiff / max(sumBilatWD, 1e-6));
+    vec3 muSpecCurr = clampFp16Rgb(wSumSpec / max(sumBilatWS, 1e-6));
+
+    float invHits     = 1.0 / max(validHits, 1.0);
+    vec3  logMuDiff   = sumLogDiff * invHits;
+    vec3  logVarDiff  = max(sumLogDiff2 * invHits - logMuDiff * logMuDiff, vec3(0.0));
+    vec3  logStdDiff  = sqrt(logVarDiff);
+
+    vec3  logMuSpec   = sumLogSpec * invHits;
+    vec3  logVarSpec  = max(sumLogSpec2 * invHits - logMuSpec * logMuSpec, vec3(0.0));
+    vec3  logStdSpec  = sqrt(logVarSpec);
 
     vec3  eDiff        = vec3(unpackHalf2x16(pDiffCenter.x), unpackHalf2x16(pDiffCenter.y).x);
     float diffHitDist  = unpackHalf2x16(pDiffCenter.y).y;
