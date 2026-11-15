@@ -1349,8 +1349,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         Logger::info("GltfLoader: Scene had no lights; generated directional sun fallback matching procedural sky");
     }
 
-    Logger::info("GltfLoader generated SceneData: {} Triangles, {} Spheres, {} Materials, {} Lights",
-                 data.triangles.size(), data.spheres.size(), data.materials.size(), data.lights.size());
+    Logger::info("GltfLoader generated SceneData: {} Triangles, {} Materials, {} Lights",
+                 data.triangles.size(), data.materials.size(), data.lights.size());
 
     return data;
 }

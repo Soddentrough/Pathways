@@ -127,23 +127,19 @@ float restirDiMisLightScale(uint numLights) {
     return min(freshM * 3.0, 40.0);
 }
 
-uint restirDiFreshM(uint numLights, uint captureMlData) {
-#ifdef ML_CAPTURE_UPWAYS_V4_BIT
-    if ((captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) return max(min(numLights, 8u), 1u);
-#else
-    if ((captureMlData & 4u) != 0u) return max(min(numLights, 8u), 1u);
+#ifndef ML_CAPTURE_ML_DENOISER_MASK
+#define ML_CAPTURE_ML_DENOISER_MASK 12u
 #endif
+
+uint restirDiFreshM(uint numLights, uint captureMlData) {
+    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return max(min(numLights, 8u), 1u);
     if (numLights <= 1u) return 1u;
     if (numLights > 4096u) return (captureMlData == 0u) ? 6u : 4u;
     return min(numLights, 16u);
 }
 
 float restirDiMisLightScale(uint numLights, uint captureMlData) {
-#ifdef ML_CAPTURE_UPWAYS_V4_BIT
-    if ((captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) return float(max(min(numLights, 8u), 1u));
-#else
-    if ((captureMlData & 4u) != 0u) return float(max(min(numLights, 8u), 1u));
-#endif
+    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return float(max(min(numLights, 8u), 1u));
     float freshM = float(restirDiFreshM(numLights, captureMlData));
     bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
     if (!hasHistory || numLights <= 4u) return freshM;

@@ -14,7 +14,7 @@
 #define RQ_OBJ rq
 #endif
 
-bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numSpheres, uint numOpaqueTriangles) {
+bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numOpaqueTriangles) {
     bool occluded = false;
 
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
@@ -78,27 +78,6 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
             }
         }
         occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
-    }
-
-
-    if (!occluded && numSpheres > 0u) {
-        bool enableCaustics = (ubo.flags & (1u << 8)) != 0u;
-        for (uint i = 0; i < numSpheres; ++i) {
-            uint sMatId = spheres[i].materialId;
-            ShadeMaterial sMat = shadeMaterials[sMatId];
-            uint sType = smGetTypeFlags(sMat) & MATERIAL_TYPE_MASK;
-            bool isDielectric = (sType == 2u || smIsTransmissive(sMat));
-            if (transparentShadows) {
-                if (sType == 3u || (!enableCaustics && isDielectric)) continue;
-                if (enableCaustics && isDielectric && smIsThin(sMat)) continue;
-            }
-            float spT;
-            vec3 spNorm;
-            if (intersectSphere(origin, dir, spheres[i], EPSILON, maxDist - EPSILON * 2.0, spT, spNorm)) {
-                occluded = true;
-                break;
-            }
-        }
     }
 
     return occluded;

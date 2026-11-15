@@ -121,9 +121,9 @@ static void addBeam(std::vector<TriangleGPU>& triangles,
 
 
 
-static void addSphere(std::vector<TriangleGPU>& triangles,
-                      glm::vec3 center, float radius, uint32_t matId,
-                      int rings = 24, int sectors = 24) {
+void ProceduralScene::addSphere(std::vector<TriangleGPU>& triangles,
+                                glm::vec3 center, float radius, uint32_t matId,
+                                int rings, int sectors) {
     float const R = 1.0f / static_cast<float>(rings - 1);
     float const S = 1.0f / static_cast<float>(sectors - 1);
     float const PI = 3.14159265358979323846f;
@@ -193,6 +193,12 @@ static void addSphere(std::vector<TriangleGPU>& triangles,
             }
         }
     }
+}
+
+static void addSphere(std::vector<TriangleGPU>& triangles,
+                      glm::vec3 center, float radius, uint32_t matId,
+                      int rings = 24, int sectors = 24) {
+    ProceduralScene::addSphere(triangles, center, radius, matId, rings, sectors);
 }
 
 static void addCylinder(std::vector<TriangleGPU>& triangles,
@@ -4945,44 +4951,11 @@ static inline bool intersectRayTriangle(const glm::vec3& orig, const glm::vec3& 
     return false;
 }
 
-static inline bool intersectRaySphere(const glm::vec3& orig, const glm::vec3& dir,
-                                     const glm::vec3& center, float radius, float& t) {
-    glm::vec3 oc = orig - center;
-    float b = glm::dot(oc, dir);
-    float c = glm::dot(oc, oc) - radius * radius;
-    float discriminant = b * b - c;
-    if (discriminant < 0.0f) return false;
-    float sqrtDisc = std::sqrt(discriminant);
-    float t0 = -b - sqrtDisc;
-    float t1 = -b + sqrtDisc;
-    if (t0 > 0.01f) {
-        t = t0;
-        return true;
-    }
-    if (t1 > 0.01f) {
-        t = t1;
-        return true;
-    }
-    return false;
-}
-
 bool SceneData::raycast(const glm::vec3& rayOrigin, const glm::vec3& rayDir, float maxDist,
                         float& outHitDist, glm::vec3& outHitPoint, std::string* outHitName) const {
     float closestT = maxDist;
     bool hit = false;
     std::string hitName = "";
-
-    // Test GPU spheres
-    for (size_t i = 0; i < spheres.size(); ++i) {
-        glm::vec3 center = glm::vec3(spheres[i].centerRadius);
-        float radius = spheres[i].centerRadius.w;
-        float t = 0.0f;
-        if (intersectRaySphere(rayOrigin, rayDir, center, radius, t) && t < closestT) {
-            closestT = t;
-            hit = true;
-            hitName = "Sphere_" + std::to_string(i);
-        }
-    }
 
     // Safe inverse direction avoiding division by 0
     glm::vec3 safeDir = rayDir;

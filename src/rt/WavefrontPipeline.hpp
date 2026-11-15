@@ -17,12 +17,10 @@ class Image;
 
 struct WavefrontSceneData {
     uint32_t numTriangles = 0;
-    uint32_t numSpheres = 0;
     uint32_t numMaterials = 0;
     uint32_t numLights = 0;
     uint32_t hasEnvMap = 0;
     float envMapIntensity = 1.0f;
-    uint32_t useHardwareRT = 1;
     uint32_t frameIndex = 0;
     uint32_t useMorton = 0;
     uint32_t accumulateHistory = 1;
@@ -70,10 +68,8 @@ public:
                       const std::vector<char>& shadowCode,
                       const std::vector<char>& shadeDiffuseCode = {},
                       const std::vector<char>& shadeDielectricCode = {},
-                      const std::vector<char>& shadeConductorCode = {},
                       const std::vector<char>& shadeComplexCode = {},
                       const std::vector<char>& shadeEmissiveCode = {},
-                      const std::vector<char>& shadePassthroughCode = {},
                       bool supportsExecutionSet = false,
                       const std::vector<char>& shadeDiffuseSecCode = {},
                       const std::vector<char>& shadeComplexSecCode = {},
@@ -90,7 +86,6 @@ public:
                                 VkImageView accumImageView,
                                 VkBuffer cameraUBO,
                                 VkBuffer triangleBuffer, VkDeviceSize triSize,
-                                VkBuffer sphereBuffer, VkDeviceSize sphereSize,
                                 VkBuffer matBuffer, VkDeviceSize matSize,
                                 VkBuffer lightBuffer, VkDeviceSize lightSize,
                                 VkAccelerationStructureKHR tlas,
@@ -121,7 +116,11 @@ public:
                                 VkBuffer giHistoryReservoirBuffer = VK_NULL_HANDLE,
                                 VkImageView prevNormalDepthImageView = VK_NULL_HANDLE,
                                 VkImageView mlSkipImageView = VK_NULL_HANDLE,
-                                VkImageView mlSpecAlbedoImageView = VK_NULL_HANDLE);
+                                VkImageView mlSpecAlbedoImageView = VK_NULL_HANDLE,
+                                VkImageView mlDirectDiffuseImageView = VK_NULL_HANDLE,
+                                VkImageView mlIndirectDiffuseImageView = VK_NULL_HANDLE,
+                                VkImageView mlDirectSpecularImageView = VK_NULL_HANDLE,
+                                VkImageView mlIndirectSpecularImageView = VK_NULL_HANDLE);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
@@ -205,10 +204,8 @@ private:
                          const std::vector<char>& shadowCode,
                          const std::vector<char>& shadeDiffuseCode,
                          const std::vector<char>& shadeDielectricCode,
-                         const std::vector<char>& shadeConductorCode,
                          const std::vector<char>& shadeComplexCode,
                          const std::vector<char>& shadeEmissiveCode,
-                         const std::vector<char>& shadePassthroughCode,
                          const std::vector<char>& shadeDiffuseSecCode = {},
                          const std::vector<char>& shadeComplexSecCode = {},
                          const std::vector<char>& tailMegakernelCode = {});
@@ -255,10 +252,8 @@ private:
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffusePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDielectricPipeline = VK_NULL_HANDLE;
-    VkPipeline m_shadeConductorPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
-    VkPipeline m_shadePassthroughPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;

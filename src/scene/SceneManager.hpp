@@ -78,7 +78,6 @@ public:
     [[nodiscard]] uint64_t getNumInstancedTriangles() const noexcept { return m_numInstancedTriangles; }
     [[nodiscard]] uint32_t getNumInstances() const noexcept { return m_numInstances; }
     [[nodiscard]] uint32_t getNumOpaqueTriangles() const noexcept { return m_numOpaqueTriangles; }
-    [[nodiscard]] uint32_t getNumSpheres() const noexcept { return m_numSpheres; }
     [[nodiscard]] uint32_t getNumMaterials() const noexcept { return m_numMaterials; }
     [[nodiscard]] uint32_t getNumLights() const noexcept { return m_numLights; }
     [[nodiscard]] bool hasNonOpaque() const noexcept { return m_sceneHasNonOpaque; }
@@ -90,7 +89,6 @@ public:
     // Accessors for Scene GPU Buffers
     [[nodiscard]] Buffer* getPositionBuffer() const noexcept { return m_positionBuffer.get(); }
     [[nodiscard]] Buffer* getTriangleBuffer() const noexcept { return m_triangleBuffer.get(); }
-    [[nodiscard]] Buffer* getSphereBuffer() const noexcept { return m_sphereBuffer.get(); }
     [[nodiscard]] Buffer* getMaterialBuffer() const noexcept { return m_materialBuffer.get(); }
     [[nodiscard]] Buffer* getMaterialArchetypeBuffer() const noexcept { return m_materialArchetypeBuffer.get(); }
     [[nodiscard]] Buffer* getShadeMaterialBuffer() const noexcept { return m_shadeMaterialBuffer.get(); }
@@ -147,7 +145,6 @@ private:
     uint64_t m_numInstancedTriangles = 0;
     uint32_t m_numInstances = 1;
     uint32_t m_numOpaqueTriangles = 0;
-    uint32_t m_numSpheres = 0;
     uint32_t m_numMaterials = 0;
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;
@@ -158,7 +155,6 @@ private:
     // Scene GPU Buffers
     std::unique_ptr<Buffer> m_positionBuffer;
     std::unique_ptr<Buffer> m_triangleBuffer;
-    std::unique_ptr<Buffer> m_sphereBuffer;
     std::unique_ptr<Buffer> m_materialBuffer;
     std::unique_ptr<Buffer> m_materialArchetypeBuffer;
     std::unique_ptr<Buffer> m_shadeMaterialBuffer;

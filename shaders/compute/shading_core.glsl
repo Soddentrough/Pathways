@@ -23,12 +23,9 @@ void traceClosestSceneHit(
     vec3 dir,
     float tMin,
     float tMax,
-    uint numSpheres,
     out float closestT,
     out int closestTri,
-    out int closestSphere,
     out vec2 closestBary,
-    out vec3 closestSphereNorm,
     out uint hitInstIdx,
     out uint hitInstMatOffset,
     out mat4x3 hitO2w,
@@ -36,9 +33,7 @@ void traceClosestSceneHit(
 ) {
     closestT = tMax;
     closestTri = -1;
-    closestSphere = -1;
     closestBary = vec2(0.0);
-    closestSphereNorm = vec3(0.0, 1.0, 0.0);
     hitInstIdx = 0u;
     hitInstMatOffset = 0u;
     hitO2w = mat4x3(1.0);
@@ -98,16 +93,6 @@ void traceClosestSceneHit(
         hitW2o = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
     }
 
-    for (uint i = 0u; i < numSpheres; ++i) {
-        float spT;
-        vec3 spNorm;
-        if (intersectSphere(origin, dir, spheres[i], tMin, closestT, spT, spNorm)) {
-            closestT = spT;
-            closestSphere = int(i);
-            closestTri = -1;
-            closestSphereNorm = spNorm;
-        }
-    }
 }
 #endif // SHADING_CORE_SKIP_SCENE_HIT
 

@@ -273,12 +273,6 @@ float getTriangleTangentSign(in Triangle tri) {
     return ((tri.tanSigns & 1u) != 0u) ? 1.0 : -1.0;
 }
 
-struct Sphere {
-    vec4 centerRadius; // xyz: center, w: radius
-    uint materialId;
-    uint padding[3];
-};
-
 struct InstanceGPU {
     uint firstTriangle;
     uint numOpaqueTriangles;
@@ -709,6 +703,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
     do { \
         if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
+            wfStoreIndirectSpecularHitDist(pCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
             vec4 smPrev_ = imageLoad(uMlSpecularMotionImage, pCoord_); if (smPrev_.z >= 0.0) { vec2 vSurf_ = smPrev_.xy; \
             float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
             vec3 toSurf_ = origin - ubo.position.xyz; \
@@ -741,16 +736,20 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
         } \
     } while(false)
 
-// Records normalized first-bounce diffuse indirect hit distance into uMlDiffuseImage.a for Upways 4.0.
+// Records normalized first-bounce diffuse indirect hit distance into uMlDiffuseImage.a for Upways 4.0
+// and raw world hit distance into uIndirectDiffuseImage.a for 4-signal Ray Regeneration.
 #define RECORD_DIFFUSE_HIT_DIST(pixelIdx, hitDist, isMiss) \
     do { \
         if (pc.currentBounce == 1u && !isSpecularPath && \
-            ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) && \
+            ((pc.captureMlData & (ML_CAPTURE_UPWAYS_V4_BIT | ML_CAPTURE_SPLIT_4SIG_BIT)) != 0u) && \
             pc.sppSampleIndex == 0u) { \
             ivec2 dCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
-            vec4 dPrev_ = imageLoad(uMlDiffuseImage, dCoord_); \
-            float normDist_ = (isMiss) ? 1.0 : clamp(float(hitDist) / (1.0 + max(float(hitDist), 0.0)), 0.0, 1.0); \
-            imageStore(uMlDiffuseImage, dCoord_, vec4(dPrev_.rgb, normDist_)); \
+            if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) { \
+                vec4 dPrev_ = imageLoad(uMlDiffuseImage, dCoord_); \
+                float normDist_ = (isMiss) ? 1.0 : clamp(float(hitDist) / (1.0 + max(float(hitDist), 0.0)), 0.0, 1.0); \
+                imageStore(uMlDiffuseImage, dCoord_, vec4(dPrev_.rgb, normDist_)); \
+            } \
+            wfStoreIndirectDiffuseHitDist(dCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
         } \
     } while(false)
 
@@ -1346,28 +1345,6 @@ float evalBSDFPdf(vec3 V, vec3 L, vec3 N, vec3 Nc, float alphaRoughness, float c
 }
 
 
-// Procedural sphere ray intersection
-bool intersectSphere(vec3 origin, vec3 dir, Sphere sphere, float tMin, float tMax, out float outT, out vec3 outNormal) {
-    vec3 oc = origin - sphere.centerRadius.xyz;
-    float radius = sphere.centerRadius.w;
-    float a = dot(dir, dir);
-    float halfB = dot(oc, dir);
-    float c = dot(oc, oc) - radius * radius;
-    float discriminant = halfB * halfB - a * c;
-
-    if (discriminant < 0.0) return false;
-    float sqrtd = sqrt(discriminant);
-
-    float root = (-halfB - sqrtd) / a;
-    if (root < tMin || root > tMax) {
-        root = (-halfB + sqrtd) / a;
-        if (root < tMin || root > tMax) return false;
-    }
-
-    outT = root;
-    outNormal = (origin + root * dir - sphere.centerRadius.xyz) / radius;
-    return true;
-}
 
 
 

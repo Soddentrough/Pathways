@@ -37,6 +37,7 @@ void RenderTargetManager::destroy() {
         vkDeviceWaitIdle(m_device);
     }
     destroyGBufferResources();
+    destroySplitSignalResources();
     for (auto& img : m_frameImages) img.reset();
     m_accumImage.reset();
     m_outputImage.reset();
@@ -54,6 +55,72 @@ void RenderTargetManager::destroyGBufferResources() {
     m_prevNormalDepthImage.reset();
 }
 
+void RenderTargetManager::ensureSplitSignalResources(uint32_t width, uint32_t height,
+                                                     const std::vector<uint32_t>& concurrentQueues,
+                                                     VkCommandBuffer cmd) {
+    if (width == 0 || height == 0) return;
+    if (hasSplitSignalResources() &&
+        m_mlDirectDiffuseImage->getWidth() == width &&
+        m_mlDirectDiffuseImage->getHeight() == height) {
+        return;
+    }
+
+    const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    m_mlDirectDiffuseImage = std::make_unique<Image>(
+        m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlIndirectDiffuseImage = std::make_unique<Image>(
+        m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlDirectSpecularImage = std::make_unique<Image>(
+        m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlIndirectSpecularImage = std::make_unique<Image>(
+        m_device, m_allocator, width, height, VK_FORMAT_R16G16B16A16_SFLOAT, usage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    auto trans = [&](Image* img) {
+        img->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+        );
+    };
+    trans(m_mlDirectDiffuseImage.get());
+    trans(m_mlIndirectDiffuseImage.get());
+    trans(m_mlDirectSpecularImage.get());
+    trans(m_mlIndirectSpecularImage.get());
+
+    vkEndCommandBuffer(cmd);
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+
+    Logger::info("4-signal split radiance targets allocated ({}x{}, RGBA16F).", width, height);
+}
+
+void RenderTargetManager::destroySplitSignalResources() {
+    m_mlDirectDiffuseImage.reset();
+    m_mlIndirectDiffuseImage.reset();
+    m_mlDirectSpecularImage.reset();
+    m_mlIndirectSpecularImage.reset();
+}
+
 void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -65,7 +132,7 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
             m_frameImages[i]->transitionLayout(
                 cmd, VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
             );
         }
@@ -93,7 +160,7 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
         m_motionVectorImage->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
@@ -145,6 +212,17 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
+    }
+    for (Image* splitImg : { m_mlDirectDiffuseImage.get(), m_mlIndirectDiffuseImage.get(),
+                             m_mlDirectSpecularImage.get(), m_mlIndirectSpecularImage.get() }) {
+        if (splitImg) {
+            splitImg->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
     }
 
     vkEndCommandBuffer(cmd);
@@ -252,6 +330,27 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
         concurrentQueues
     );
 
+    if (hasSplitSignalResources()) {
+        const VkImageUsageFlags splitUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        m_mlDirectDiffuseImage = std::make_unique<Image>(
+            m_device, m_allocator, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT, splitUsage,
+            VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlIndirectDiffuseImage = std::make_unique<Image>(
+            m_device, m_allocator, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT, splitUsage,
+            VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlDirectSpecularImage = std::make_unique<Image>(
+            m_device, m_allocator, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT, splitUsage,
+            VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlIndirectSpecularImage = std::make_unique<Image>(
+            m_device, m_allocator, rw, rh, VK_FORMAT_R16G16B16A16_SFLOAT, splitUsage,
+            VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+    }
+
     transitionAllToGeneral(cmd);
 }
 
@@ -285,7 +384,7 @@ void RenderTargetManager::recreateAccumImages(uint32_t width, uint32_t height, A
         m_frameImages[i]->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
@@ -413,6 +512,28 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         concurrentQueues
     );
 
+    const bool hadSplitSignals = hasSplitSignalResources();
+    if (hadSplitSignals) {
+        const VkImageUsageFlags splitUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        m_mlDirectDiffuseImage = std::make_unique<Image>(
+            m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT,
+            splitUsage, VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlIndirectDiffuseImage = std::make_unique<Image>(
+            m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT,
+            splitUsage, VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlDirectSpecularImage = std::make_unique<Image>(
+            m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT,
+            splitUsage, VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+        m_mlIndirectSpecularImage = std::make_unique<Image>(
+            m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R16G16B16A16_SFLOAT,
+            splitUsage, VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+        );
+    }
+
     m_normalDepthImage = std::make_unique<Image>(
         m_device, m_allocator, renderWidth, renderHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -436,7 +557,7 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
     m_motionVectorImage->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
     m_mlAlbedoRoughnessImage->transitionLayout(
@@ -487,6 +608,19 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
+    if (hadSplitSignals) {
+        for (Image* splitImg : { m_mlDirectDiffuseImage.get(), m_mlIndirectDiffuseImage.get(),
+                                 m_mlDirectSpecularImage.get(), m_mlIndirectSpecularImage.get() }) {
+            if (splitImg) {
+                splitImg->transitionLayout(
+                    cmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                );
+            }
+        }
+    }
 
     vkEndCommandBuffer(cmd);
     VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };

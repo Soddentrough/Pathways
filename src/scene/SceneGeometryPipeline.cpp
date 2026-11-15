@@ -174,16 +174,6 @@ void SceneGeometryPipeline::partitionSceneGeometry(SceneData& sceneData, uint32_
         }
     }
 
-    for (const auto& sph : sceneData.spheres) {
-        if (isDielectricMat(sph.materialId)) {
-            foundDielectric = true;
-            glm::vec3 center(sph.centerRadius.x, sph.centerRadius.y, sph.centerRadius.z);
-            float radius = sph.centerRadius.w;
-            dMin = glm::min(dMin, center - glm::vec3(radius));
-            dMax = glm::max(dMax, center + glm::vec3(radius));
-        }
-    }
-
     if (foundDielectric) {
         sceneData.hasDielectrics = true;
         sceneData.dielectricBoundsMin = dMin;

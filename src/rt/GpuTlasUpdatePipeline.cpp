@@ -271,7 +271,7 @@ void GpuTlasUpdatePipeline::recordGpuTlasUpdate(VkCommandBuffer cmd, uint32_t fr
         VkMemoryBarrier2 xferBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         xferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         xferBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        xferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        xferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         xferBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         VkDependencyInfo xferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         xferDep.memoryBarrierCount = 1;

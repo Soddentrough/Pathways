@@ -132,8 +132,7 @@ void TelemetryReporter::dumpOutputFiles() {
                m_engine->m_superResolution->getUpwaysPipeline() &&
                m_engine->m_superResolution->getUpwaysPipeline()->getOutputImage()) {
         hdrSourceImage = m_engine->m_superResolution->getUpwaysPipeline()->getOutputImage();
-    } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Svgf ||
-                m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+    } else if (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
                m_engine->m_denoiser && m_engine->m_denoiser->getDenoisedImage()) {
         hdrSourceImage = m_engine->m_denoiser->getDenoisedImage();
     }
@@ -499,16 +498,13 @@ FrameStats TelemetryReporter::getStats() const {
         stats.denoiser_profiler_stats.history_copy_ms = pt.resolveMs;
         stats.denoiser_profiler_stats.total_pass_ms = pt.totalMs;
         stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
-    } else if ((m_engine->m_config.denoiser_mode == DenoiserMode::Svgf ||
-                (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
-                 m_engine->m_denoiser && m_engine->m_denoiser->isUsingSdkProvider())) &&
-               m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
-        const bool isFfxRr = (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
-                              m_engine->m_denoiser->isUsingSdkProvider());
+    } else if (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
+               m_engine->m_denoiser && m_engine->m_denoiser->isUsingSdkProvider() &&
+               m_engine->m_denoiser->isInitialized()) {
         const auto& passMs = m_engine->m_denoiser->getPassTimingsMs();
-        stats.denoiser_mode_str = isFfxRr ? "FSR Ray Regeneration" : "SVGF";
+        stats.denoiser_mode_str = "FSR Ray Regeneration";
         stats.denoise_pass_names = {
-            "fusedTemporal", "atrousStep1", "atrousStep2", "atrousStep3", "coarseRemodulate"
+            "ffxRrPrep", "ffxRrDispatch", "ffxRrCompose", "unused0", "unused1"
         };
         double sumPass = 0.0;
         for (int p = 0; p < 5; ++p) {
@@ -516,7 +512,7 @@ FrameStats TelemetryReporter::getStats() const {
             sumPass += passMs[p];
         }
         stats.denoiser_profiler_stats.valid = (sumPass > 0.0001) || (stats.upways_time_ms > 0.0001);
-        stats.denoiser_profiler_stats.mode = isFfxRr ? "ffx_ray_regeneration" : "svgf";
+        stats.denoiser_profiler_stats.mode = "ffx_ray_regeneration";
         stats.denoiser_profiler_stats.temporal_ms = passMs[0];
         stats.denoiser_profiler_stats.total_pass_ms = sumPass;
         stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
@@ -526,7 +522,7 @@ FrameStats TelemetryReporter::getStats() const {
     stats.num_triangles = m_engine->m_numTriangles;
     stats.num_instanced_triangles = m_engine->m_numInstancedTriangles;
     stats.num_instances = m_engine->m_numInstances;
-    stats.num_spheres = m_engine->m_numSpheres;
+    stats.num_spheres = 0;
     stats.num_materials = m_engine->m_numMaterials;
     stats.num_lights = m_engine->m_numLights;
     stats.num_textures = static_cast<uint32_t>(m_engine->getSceneTextures().size());
@@ -691,8 +687,8 @@ FrameStats TelemetryReporter::getStats() const {
     stats.has_as = (m_engine->m_tlas != nullptr);
     stats.has_bda = m_engine->m_context->hasBufferDeviceAddress();
     stats.has_dho = m_engine->m_context->hasDeferredHostOps();
-    stats.has_rt_pipeline = (m_engine->m_rtpKhrPipeline != nullptr);
-    stats.has_dgc = (m_engine->m_rtpKhrPipeline && m_engine->m_rtpKhrPipeline->isIndirectSupported());
+    stats.has_rt_pipeline = false;
+    stats.has_dgc = m_engine->m_context->hasDGC();
     stats.dgc_preprocess = m_engine->isDgcPreprocessEnabled();
     stats.has_subgroup_control = m_engine->m_context->hasSubgroupSizeControl();
     stats.subgroup_size = m_engine->m_context->getSubgroupSize();
@@ -728,12 +724,6 @@ FrameStats TelemetryReporter::getStats() const {
     stats.supports_fsr_rc = (m_engine->m_nrcManager && m_engine->m_nrcManager->isUsingSdkProvider()) ||
                             FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::RadianceCache);
 
-    const auto& rtProps = m_engine->m_context->getRayTracingPipelineProperties();
-    stats.rt_handle_size = rtProps.shaderGroupHandleSize;
-    stats.rt_base_align = rtProps.shaderGroupBaseAlignment;
-    stats.rt_handle_align = rtProps.shaderGroupHandleAlignment;
-    stats.rt_max_recursion = rtProps.maxRayRecursionDepth;
-
     const auto& dgcProps = m_engine->m_context->getDgcProperties();
     stats.dgc_max_tokens = dgcProps.maxIndirectCommandsTokenCount;
     stats.dgc_max_sequences = dgcProps.maxIndirectSequenceCount;
@@ -743,7 +733,6 @@ FrameStats TelemetryReporter::getStats() const {
     stats.visualize_mgpu_split = m_engine->m_config.visualize_mgpu_split;
     switch (m_engine->m_config.denoiser_mode) {
         case DenoiserMode::Upways: stats.denoiser_mode_str = stats.has_cooperative_matrix ? "Upways" : "None"; break;
-        case DenoiserMode::Svgf: stats.denoiser_mode_str = "SVGF"; break;
         case DenoiserMode::FfxRayRegeneration:
             stats.denoiser_mode_str = stats.supports_fsr_rr ? "FFX Ray Regeneration" : "None";
             break;
@@ -847,11 +836,10 @@ FrameStats TelemetryReporter::getStats() const {
         s.target_achieved = tally.isTargetAchieved(m_engine->m_config.target_frame_time_ms);
 
         const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
-        const bool tallyIsSvgf = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::Svgf);
         const bool tallyIsFfxRr = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::FfxRayRegeneration);
 
         s.pipeline_stages.denoiser_upscale_ms = tally.getAvgDenoiserUpscaleMs();
-        s.pipeline_stages.denoiser_mode = tallyIsUpways ? "upways" : (tallyIsSvgf ? "svgf" : (tallyIsFfxRr ? "ffx_ray_regeneration" : "none"));
+        s.pipeline_stages.denoiser_mode = tallyIsUpways ? "upways" : (tallyIsFfxRr ? "ffx_ray_regeneration" : "none");
         for (size_t p = 0; p < 6; ++p) {
             s.pipeline_stages.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(p);
         }
@@ -879,8 +867,7 @@ FrameStats TelemetryReporter::getStats() const {
                     stats.denoise_pass_ms[0] + stats.denoise_pass_ms[1] + stats.denoise_pass_ms[2] + stats.denoise_pass_ms[3];
                 stats.denoiser_profiler_stats.outer_envelope_ms = tally.getAvgDenoiserUpscaleMs();
                 stats.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
-            } else if ((tallyIsSvgf || tallyIsFfxRr) &&
-                       (stats.denoiser_profiler_stats.mode == "svgf" || stats.denoiser_profiler_stats.mode == "ffx_ray_regeneration")) {
+            } else if (tallyIsFfxRr && stats.denoiser_profiler_stats.mode == "ffx_ray_regeneration") {
                 double sumPass = 0.0;
                 for (int p = 0; p < 5; ++p) {
                     stats.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(static_cast<size_t>(p));
@@ -1006,13 +993,13 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
                 denoiserUpscaleMs = pt.totalMs;
             }
         }
-    } else if ((key.denoiser == DenoiserMode::Svgf || key.denoiser == DenoiserMode::FfxRayRegeneration) &&
+    } else if (key.denoiser == DenoiserMode::FfxRayRegeneration &&
                m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
         const auto& pm = m_engine->m_denoiser->getPassTimingsMs();
         for (int p = 0; p < 5; ++p) {
             denoisePasses[p] = pm[p];
         }
-        numDenoisePasses = 5;
+        numDenoisePasses = 3;
     }
 
     auto updateAsMetrics = [this](ConfigStatsTally& t) {
@@ -1183,14 +1170,10 @@ void TelemetryReporter::printExecutionSummary() const {
                 Logger::info("      - Tail Megakernel (Bounce {}..{}): {:.3f} ms",
                              tally.tailMegakernelBounce, tally.key.max_bounces, tally.getAvgTailMegakernelMs());
             }
-        } else if (avgDenoiseSrMs > 0.0005) {
-            Logger::info("    Pipeline Stages:");
-            Logger::info("      - Hardware RTP Ray Tracing:  {:.3f} ms", tally.getAvgPrimaryRtMs());
         }
 
         const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
-        const bool tallyIsSvgf = !tallyIsUpways &&
-                                 (tally.key.denoiser == DenoiserMode::Svgf || tally.key.denoiser == DenoiserMode::FfxRayRegeneration);
+        const bool tallyIsFfxRr = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::FfxRayRegeneration);
 
         if (tallyIsUpways && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
             const double p1 = tally.getAvgDenoisePassMs(0);
@@ -1204,26 +1187,17 @@ void TelemetryReporter::printExecutionSummary() const {
             Logger::info("          * Pass 2 (3-Scale Recurrent WMMA U-Net Guide):     {:.3f} ms", p2);
             Logger::info("          * Pass 3 (Fused 2-Stage s=3+s=1 KPN & Resolve):    {:.3f} ms", p3);
             Logger::info("          * History Copy (Normal/Depth + Specular Motion):   {:.3f} ms", hc);
-        } else if (tallyIsSvgf && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+        } else if (tallyIsFfxRr && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
             const double p1 = tally.getAvgDenoisePassMs(0);
             const double p2 = tally.getAvgDenoisePassMs(1);
             const double p3 = tally.getAvgDenoisePassMs(2);
-            const double p4 = tally.getAvgDenoisePassMs(3);
-            const double p5 = tally.getAvgDenoisePassMs(4);
-            const double passSum = p1 + p2 + p3 + p4 + p5;
+            const double passSum = p1 + p2 + p3;
             const bool coupledWithFsr = (tally.key.upscaler == UpscalerMode::FSR && passSum > 0.0005);
-            const double svgfTotalMs = coupledWithFsr ? passSum : avgDenoiseSrMs;
-            if (tally.key.denoiser == DenoiserMode::FfxRayRegeneration) {
-                Logger::info("      - AMD FFX Ray Regeneration (1.2.1) Denoiser:     {:.3f} ms", svgfTotalMs);
-            } else {
-                Logger::info("      - E-SVGF Spatio-Temporal Denoiser:               {:.3f} ms", svgfTotalMs);
-            }
-            Logger::info("          * Pass 1 (Fused Temporal):                         {:.3f} ms", p1);
-            Logger::info("          * Pass 2 (A-Trous s=1):                            {:.3f} ms", p2);
-            Logger::info("          * Pass 3 (A-Trous s=2):                            {:.3f} ms", p3);
-            Logger::info("          * Pass 4 (A-Trous s=4):                            {:.3f} ms", p4);
-            Logger::info("          * Pass 5 (Coarse s={} + Remodulate):                {:.3f} ms",
-                         (p3 <= 0.0001 && p4 <= 0.0001) ? 3 : 8, p5);
+            const double rrTotalMs = coupledWithFsr ? passSum : avgDenoiseSrMs;
+            Logger::info("      - AMD FFX Ray Regeneration (1.2.1) Denoiser:     {:.3f} ms", rrTotalMs);
+            Logger::info("          * Pass 1 (4-Signal + Guide Prep):            {:.3f} ms", p1);
+            Logger::info("          * Pass 2 (FFX Denoiser 1.2.1):                 {:.3f} ms", p2);
+            Logger::info("          * Pass 3 (Signal Compose -> Accum):            {:.3f} ms", p3);
             if (coupledWithFsr) {
                 const double fsrMs = std::max(0.0, avgDenoiseSrMs - passSum);
                 Logger::info("      - AMD {} Super-Resolution Upscaler:       {:.3f} ms",

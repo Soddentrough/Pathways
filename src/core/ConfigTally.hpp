@@ -50,9 +50,9 @@ struct ConfigKey {
     }
 
     std::string getLabel() const {
-        std::string tailStr = (pipeline_type == PipelineType::Wavefront && enable_tail_megakernel)
+        std::string tailStr = enable_tail_megakernel
             ? std::format(" [Tail-MK b>={}]", tail_bounce) : "";
-        std::string pipeStr = (pipeline_type == PipelineType::Wavefront) ? ("Wavefront" + tailStr) : "RTP";
+        std::string pipeStr = "Wavefront" + tailStr;
         std::string modeStr;
         switch (mgpu_mode) {
             case MultiGpuMode::Off:
@@ -75,8 +75,6 @@ struct ConfigKey {
             denoiserStr = " [Pure MC]";
         } else if (denoiser == DenoiserMode::Upways) {
             denoiserStr = " [Upways]";
-        } else if (denoiser == DenoiserMode::Svgf) {
-            denoiserStr = " [E-SVGF]";
         } else if (denoiser == DenoiserMode::FfxRayRegeneration) {
             denoiserStr = " [FFX Ray Regeneration]";
         }

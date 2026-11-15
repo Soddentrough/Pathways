@@ -136,6 +136,15 @@ void NRCManager::initBuffers() {
     VkDeviceSize atomicAccumSize = static_cast<VkDeviceSize>(m_width) * m_height * 6ull * sizeof(uint32_t);
     m_atomicAccumBuffer = std::make_unique<Buffer>(m_allocator, atomicAccumSize, queueUsage,
                                                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+    // 7. 1x1 RGBA16F fallback storage image for optional resolve bindings 2..7
+    if (!m_dummyStorageImage) {
+        m_dummyStorageImage = std::make_unique<Image>(
+            m_device, m_allocator, 1, 1,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
 }
 
 void NRCManager::initWeights() {
@@ -209,12 +218,17 @@ void NRCManager::createDescriptorSetLayouts() {
         throw std::runtime_error("NRCManager: Failed to create training descriptor set layout!");
     }
 
-    // Resolve Layout: uAccumImage(0), AtomicBuffer(1), uMlDiffuseImage(2), uMlSpecularImage(3)
+    // Resolve Layout: uAccumImage(0), AtomicBuffer(1), uMlDiffuseImage(2), uMlSpecularImage(3),
+    // uMlAlbedoRoughnessImage(4), uMlSpecAlbedoImage(5), uIndirectDiffuseImage(6), uIndirectSpecularImage(7)
     std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
@@ -226,7 +240,7 @@ void NRCManager::createDescriptorSetLayouts() {
 
 void NRCManager::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 12 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -296,25 +310,52 @@ void NRCManager::allocateDescriptorSets() {
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(resolveBufWrites.size()), resolveBufWrites.data(), 0, nullptr);
 }
 
-void NRCManager::updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView, VkImageView mlSpecularImageView) {
-    updateDescriptors(0, accumImageView, mlDiffuseImageView, mlSpecularImageView);
-    updateDescriptors(1, accumImageView, mlDiffuseImageView, mlSpecularImageView);
+void NRCManager::updateDescriptors(VkImageView accumImageView,
+                                   VkImageView mlDiffuseImageView,
+                                   VkImageView mlSpecularImageView,
+                                   VkImageView mlAlbedoRoughnessView,
+                                   VkImageView mlSpecAlbedoView,
+                                   VkImageView mlIndirectDiffuseView,
+                                   VkImageView mlIndirectSpecularView) {
+    updateDescriptors(0, accumImageView, mlDiffuseImageView, mlSpecularImageView,
+                      mlAlbedoRoughnessView, mlSpecAlbedoView,
+                      mlIndirectDiffuseView, mlIndirectSpecularView);
+    updateDescriptors(1, accumImageView, mlDiffuseImageView, mlSpecularImageView,
+                      mlAlbedoRoughnessView, mlSpecAlbedoView,
+                      mlIndirectDiffuseView, mlIndirectSpecularView);
 }
 
-void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView, VkImageView mlSpecularImageView) {
+void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView,
+                                   VkImageView mlDiffuseImageView,
+                                   VkImageView mlSpecularImageView,
+                                   VkImageView mlAlbedoRoughnessView,
+                                   VkImageView mlSpecAlbedoView,
+                                   VkImageView mlIndirectDiffuseView,
+                                   VkImageView mlIndirectSpecularView) {
     if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer || slot >= m_resolveDescSets.size()) return;
-    VkImageView diffView = (mlDiffuseImageView != VK_NULL_HANDLE) ? mlDiffuseImageView : accumImageView;
-    VkImageView specView = (mlSpecularImageView != VK_NULL_HANDLE) ? mlSpecularImageView : diffView;
+    VkImageView dummyView = m_dummyStorageImage ? m_dummyStorageImage->getImageView() : VK_NULL_HANDLE;
+    auto orDummy = [dummyView](VkImageView view) {
+        return (view != VK_NULL_HANDLE) ? view : dummyView;
+    };
+
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mlDiffInfo{ VK_NULL_HANDLE, diffView, VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mlSpecInfo{ VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlDiffInfo{ VK_NULL_HANDLE, orDummy(mlDiffuseImageView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlSpecInfo{ VK_NULL_HANDLE, orDummy(mlSpecularImageView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlArInfo{ VK_NULL_HANDLE, orDummy(mlAlbedoRoughnessView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlSaInfo{ VK_NULL_HANDLE, orDummy(mlSpecAlbedoView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlIndDiffInfo{ VK_NULL_HANDLE, orDummy(mlIndirectDiffuseView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlIndSpecInfo{ VK_NULL_HANDLE, orDummy(mlIndirectSpecularView), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &imageInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlDiffInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecInfo, nullptr, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlArInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSaInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIndDiffInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIndSpecInfo, nullptr, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
@@ -477,6 +518,17 @@ void NRCManager::resetCounters(VkCommandBuffer cmd) {
         }
         vkCmdFillBuffer(cmd, m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
         m_needsGpuInit = false;
+    }
+
+    if (m_dummyStorageImage && m_dummyStorageImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+        m_dummyStorageImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+        VkClearColorValue zeroClear{};
+        VkImageSubresourceRange clrRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, m_dummyStorageImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &clrRange);
     }
 
     // Initialize NRCCountersBuffer + VkDispatchIndirectCommand at offset 8:

@@ -36,6 +36,15 @@ public:
                                 VkCommandBuffer cmd);
     void destroyGBufferResources();
 
+    void ensureSplitSignalResources(uint32_t width, uint32_t height,
+                                    const std::vector<uint32_t>& concurrentQueues,
+                                    VkCommandBuffer cmd);
+    void destroySplitSignalResources();
+    [[nodiscard]] bool hasSplitSignalResources() const noexcept {
+        return m_mlDirectDiffuseImage && m_mlIndirectDiffuseImage &&
+               m_mlDirectSpecularImage && m_mlIndirectSpecularImage;
+    }
+
     void resize(uint32_t width, uint32_t height, AccumFormat accumFormat,
                 bool isHdr, VkFormat swapchainFormat,
                 const std::vector<uint32_t>& concurrentQueues,
@@ -68,6 +77,10 @@ public:
     [[nodiscard]] Image* getMlSpecularImage() const { return m_mlSpecularImage.get(); }
     [[nodiscard]] Image* getMlSkipImage() const { return m_mlSkipImage.get(); }
     [[nodiscard]] Image* getMlSpecAlbedoImage() const { return m_mlSpecAlbedoImage.get(); }
+    [[nodiscard]] Image* getMlDirectDiffuseImage() const { return m_mlDirectDiffuseImage.get(); }
+    [[nodiscard]] Image* getMlIndirectDiffuseImage() const { return m_mlIndirectDiffuseImage.get(); }
+    [[nodiscard]] Image* getMlDirectSpecularImage() const { return m_mlDirectSpecularImage.get(); }
+    [[nodiscard]] Image* getMlIndirectSpecularImage() const { return m_mlIndirectSpecularImage.get(); }
 
 private:
     void transitionAllToGeneral(VkCommandBuffer cmd);
@@ -92,6 +105,10 @@ private:
     std::unique_ptr<Image> m_mlSpecularImage;
     std::unique_ptr<Image> m_mlSkipImage;
     std::unique_ptr<Image> m_mlSpecAlbedoImage;
+    std::unique_ptr<Image> m_mlDirectDiffuseImage;
+    std::unique_ptr<Image> m_mlIndirectDiffuseImage;
+    std::unique_ptr<Image> m_mlDirectSpecularImage;
+    std::unique_ptr<Image> m_mlIndirectSpecularImage;
 };
 
 } // namespace pathways

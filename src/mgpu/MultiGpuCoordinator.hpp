@@ -69,13 +69,11 @@ struct MultiGpuPlanParams {
     uint32_t renderW = 1280;
     uint32_t renderH = 720;
     uint32_t numTriangles = 0;
-    uint32_t numSpheres = 0;
     uint32_t numMaterials = 0;
     uint32_t numLights = 0;
     uint32_t numOpaqueTriangles = 0;
     uint32_t hasEnvMap = 0;
     float envIntensity = 1.0f;
-    uint32_t useHwRT = 1;
     bool temporalResetRequested = false;
     uint32_t accumulatedSamples = 1;
     WavefrontSortMode effectiveWavefrontSortMode = WavefrontSortMode::None;
@@ -121,10 +119,15 @@ public:
         Image* mlSpecularImage,
         Image* normalDepthImage,
         Image* prevNormalDepthImage,
-        VkDescriptorSet rtDescSet,
         CausticsPipeline* causticsPipeline,
         const SceneData& sceneData,
-        const std::function<void(VkCommandBuffer)>& onPreRecord
+        const std::function<void(VkCommandBuffer)>& onPreRecord,
+        Image* mlSkipImage = nullptr,
+        Image* mlSpecAlbedoImage = nullptr,
+        Image* mlDirectDiffuseImage = nullptr,
+        Image* mlIndirectDiffuseImage = nullptr,
+        Image* mlDirectSpecularImage = nullptr,
+        Image* mlIndirectSpecularImage = nullptr
     );
 
     /// Records merge compute pass, memory barriers, G-Buffer history update, and running avg into activeCmd.

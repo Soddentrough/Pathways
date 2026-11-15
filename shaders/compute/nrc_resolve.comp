@@ -1,10 +1,14 @@
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_shader_image_load_formatted : require
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) uniform image2D uAccumImage;
+#define ML_CAPTURE_UPWAYS_V4_BIT 4u
+#define ML_CAPTURE_SPLIT_4SIG_BIT 8u
+
+layout(set = 0, binding = 0) uniform image2D uAccumImage;
 
 layout(std430, set = 0, binding = 1) buffer AtomicAccumBuffer {
     uvec2 nrcAtomicPairs[];
@@ -12,6 +16,10 @@ layout(std430, set = 0, binding = 1) buffer AtomicAccumBuffer {
 
 layout(set = 0, binding = 2, rgba16f) uniform image2D uMlDiffuseImage;
 layout(set = 0, binding = 3, rgba16f) uniform image2D uMlSpecularImage;
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
+layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
+layout(set = 0, binding = 6, rgba16f) uniform image2D uIndirectDiffuseImage;
+layout(set = 0, binding = 7, rgba16f) uniform image2D uIndirectSpecularImage;
 
 layout(push_constant) uniform PushConstants {
     uint width;
@@ -32,6 +40,12 @@ float randFloat(inout uint seed) {
 
 vec3 randVec3(inout uint seed) {
     return vec3(randFloat(seed), randFloat(seed), randFloat(seed));
+}
+
+vec3 demodulateMlSafe(vec3 rad, vec3 demodFactor) {
+    bool valid = any(greaterThan(demodFactor, vec3(1e-4)));
+    vec3 safeDenom = valid ? max(demodFactor, vec3(0.02)) : vec3(1.0);
+    return min(rad / safeDenom, vec3(65000.0));
 }
 
 vec3 addFp16Stochastic(vec3 accum, vec3 val, inout uint seed) {
@@ -66,14 +80,30 @@ void main() {
             imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radTotal, seed), prev.a));
         }
 
-        if ((pc.captureMlData & 1u) != 0u) {
+        const bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+        const bool isSplit4 = (pc.captureMlData & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u;
+
+        if ((pc.captureMlData & 1u) != 0u && (isV4 || !isSplit4)) {
             if ((diffR | diffG | diffB) != 0u) {
+                vec3 contribDiff = isV4 ? demodulateMlSafe(radDiff, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb) : radDiff;
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, radDiff, seed), prevDiff.a));
+                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, contribDiff, seed), prevDiff.a));
             }
             if ((specR | specG | specB) != 0u) {
+                vec3 contribSpec = isV4 ? demodulateMlSafe(radSpec, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb) : radSpec;
                 vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, radSpec, seed), prevSpec.a));
+                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, contribSpec, seed), prevSpec.a));
+            }
+        }
+
+        if (isSplit4) {
+            if ((diffR | diffG | diffB) != 0u) {
+                vec4 prevIndDiff = imageLoad(uIndirectDiffuseImage, pixelCoord);
+                imageStore(uIndirectDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevIndDiff.rgb, radDiff, seed), prevIndDiff.a));
+            }
+            if ((specR | specG | specB) != 0u) {
+                vec4 prevIndSpec = imageLoad(uIndirectSpecularImage, pixelCoord);
+                imageStore(uIndirectSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevIndSpec.rgb, radSpec, seed), prevIndSpec.a));
             }
         }
 

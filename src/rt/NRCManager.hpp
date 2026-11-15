@@ -54,10 +54,20 @@ public:
     NRCManager& operator=(const NRCManager&) = delete;
 
     void resize(uint32_t width, uint32_t height);
-    void updateDescriptors(VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
-                           VkImageView mlSpecularImageView = VK_NULL_HANDLE);
-    void updateDescriptors(uint32_t slot, VkImageView accumImageView, VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
-                           VkImageView mlSpecularImageView = VK_NULL_HANDLE);
+    void updateDescriptors(VkImageView accumImageView,
+                           VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
+                           VkImageView mlSpecularImageView = VK_NULL_HANDLE,
+                           VkImageView mlAlbedoRoughnessView = VK_NULL_HANDLE,
+                           VkImageView mlSpecAlbedoView = VK_NULL_HANDLE,
+                           VkImageView mlIndirectDiffuseView = VK_NULL_HANDLE,
+                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE);
+    void updateDescriptors(uint32_t slot, VkImageView accumImageView,
+                           VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
+                           VkImageView mlSpecularImageView = VK_NULL_HANDLE,
+                           VkImageView mlAlbedoRoughnessView = VK_NULL_HANDLE,
+                           VkImageView mlSpecAlbedoView = VK_NULL_HANDLE,
+                           VkImageView mlIndirectDiffuseView = VK_NULL_HANDLE,
+                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE);
 
     void resetCounters(VkCommandBuffer cmd);
     void resetWeights() { initWeights(); }
@@ -121,6 +131,7 @@ private:
     std::unique_ptr<Buffer> m_trainQueue;
     std::unique_ptr<Buffer> m_counters;
     std::unique_ptr<Buffer> m_atomicAccumBuffer; // 32-bit fixed-point atomic accumulation buffer (CRIT-05)
+    std::unique_ptr<Image> m_dummyStorageImage;  // 1x1 RGBA16F fallback for unbound resolve storage images
 
     // Descriptors & Pipelines
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

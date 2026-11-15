@@ -127,13 +127,6 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
     return s;
 }
 
-struct SphereGPU {
-    glm::vec4 centerRadius; // xyz: center, w: radius
-    uint32_t materialId;
-    uint32_t padding[3];
-};
-static_assert(sizeof(SphereGPU) == 32, "SphereGPU must be exactly 32 bytes");
-
 struct TextureData {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -188,7 +181,6 @@ struct AnimatedInstance {
 
 struct SceneData {
     std::vector<TriangleGPU> triangles;
-    std::vector<SphereGPU> spheres;
     std::vector<MaterialGPU> materials;
     std::vector<LightGPU> lights;
     std::vector<LightTreeNodeGPU> lightTreeNodes;
@@ -259,6 +251,9 @@ struct SceneData {
 
 class ProceduralScene {
 public:
+    static void addSphere(std::vector<TriangleGPU>& triangles,
+                          glm::vec3 center, float radius, uint32_t matId,
+                          int rings = 25, int sectors = 25);
     static SceneData createCornellBox();
     static SceneData createManyLightsScene(uint32_t gridDim = 8);
     static SceneData createCyberCityScene();

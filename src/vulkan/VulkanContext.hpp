@@ -111,7 +111,6 @@ public:
     bool hasDGC() const { return m_hasDGC; }
     bool hasRayTracing() const { return m_hasRayTracing; }
     bool hasSubgroupSizeControl() const { return m_hasSubgroupSizeControl; }
-    bool hasRtSubgroupSizeControl() const { return m_hasRtSubgroupSizeControl; }
     bool hasExternalMemoryHost() const { return m_hasExternalMemoryHost; }
     bool hasExternalMemoryFd() const { return m_hasExternalMemoryFd; }
     bool hasExternalMemoryDmaBuf() const { return m_hasExternalMemoryDmaBuf; }
@@ -156,7 +155,6 @@ public:
     PFN_vkImportSemaphoreFdKHR pfnImportSemaphoreFdKHR = nullptr;
     PFN_vkGetMemoryFdKHR pfnGetMemoryFdKHR = nullptr;
     PFN_vkGetMemoryFdPropertiesKHR pfnGetMemoryFdPropertiesKHR = nullptr;
-    const VkPhysicalDeviceRayTracingPipelinePropertiesKHR& getRayTracingPipelineProperties() const { return m_rtPipelineProperties; }
     uint32_t getValidationErrors() const { return s_validationErrors; }
     const PciLinkInfo& getPciLinkInfo() const { return m_pciLinkInfo; }
     const std::string& getPciLinkString() const { return m_pciLinkInfo.formattedLink; }
@@ -198,13 +196,11 @@ private:
 
     VkPhysicalDeviceProperties m_deviceProperties{};
     VkPhysicalDeviceDriverProperties m_driverProperties{};
-    VkPhysicalDeviceRayTracingPipelinePropertiesKHR m_rtPipelineProperties{};
     std::string m_deviceName;
     GpuArchitecture m_architecture = GpuArchitecture::Generic;
     bool m_hasDGC = false;
     bool m_hasRayTracing = false;
     bool m_hasSubgroupSizeControl = false;
-    bool m_hasRtSubgroupSizeControl = false;
     bool m_hasExternalMemoryHost = false;
     bool m_hasExternalMemoryFd = false;
     bool m_hasExternalMemoryDmaBuf = false;
@@ -217,7 +213,6 @@ private:
     VkPhysicalDeviceVulkan12Features m_vk12Features{};
     VkPhysicalDeviceVulkan13Features m_vk13Features{};
     VkPhysicalDeviceVulkan14Features m_vk14Features{};
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR m_rtPipelineFeatures{};
     VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT m_dgcProperties{};
     uint32_t m_subgroupSize = 0;
     bool m_hasCooperativeMatrix = false;

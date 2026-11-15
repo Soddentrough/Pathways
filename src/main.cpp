@@ -291,9 +291,6 @@ int main(int argc, char* argv[]) {
             if (!stepAndVerify("4d. Switch FSR 3.1 -> Native 1.0x", 4, "None", "None")) return 1;
 
             // 5. Cycle through Denoisers at Native 1.0x
-            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
-            if (!stepAndVerify("5a. Native 1.0x + E-SVGF Denoiser", 4, "None", "SVGF")) return 1;
-
             cfg.denoiser_mode = pathways::DenoiserMode::FfxRayRegeneration;
             if (!stepAndVerify("5b. Native 1.0x + Ray Regen Request (Runtime Gating)", 4, "None", expectedRayRegen)) return 1;
 
@@ -309,8 +306,6 @@ int main(int argc, char* argv[]) {
             cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
-            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
-            if (!stepAndVerify("6a. FSR 3.1 (0.67x) + E-SVGF", 4, expectedFsr3, "SVGF")) return 1;
 
             if (initStats.has_cooperative_matrix) {
                 cfg.denoiser_mode = pathways::DenoiserMode::Upways;
@@ -320,9 +315,6 @@ int main(int argc, char* argv[]) {
                     cfg.fsr_version = pathways::FsrVersion::Fsr4;
                     cfg.denoiser_mode = pathways::DenoiserMode::Upways;
                     if (!stepAndVerify("6c. FSR 4.1 ML (0.67x) + Upways Denoiser", 4, expectedFsr4, "Upways")) return 1;
-
-                    cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
-                    if (!stepAndVerify("6d. FSR 4.1 ML (0.67x) + E-SVGF", 4, expectedFsr4, "SVGF")) return 1;
                 }
 
                 if (initStats.has_fp8_coop_matrix) {
@@ -344,18 +336,24 @@ int main(int argc, char* argv[]) {
             cfg.upscaler_mode = pathways::UpscalerMode::FSR;
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
-            cfg.denoiser_mode = pathways::DenoiserMode::Svgf;
+            cfg.denoiser_mode = pathways::DenoiserMode::None;
             cfg.enable_nrc = true;
             cfg.nrc_backend = pathways::NrcBackend::FfxRadianceCache;
-            if (!stepAndVerify("7a. Request FfxRadianceCache live (Runtime Gating)", 4, expectedFsr3, "SVGF")) return 1;
+            if (!stepAndVerify("7a. Request FfxRadianceCache live (Runtime Gating)", 4, expectedFsr3, "None")) return 1;
             if (!initStats.supports_fsr_rc && cfg.enable_nrc) {
                 pathways::Logger::error("[FAIL] Unsupported FfxRadianceCache did not disable enable_nrc!");
                 return 1;
             }
+            const pathways::DenoiserMode activeDenoiserMode =
+                initStats.has_cooperative_matrix ? pathways::DenoiserMode::Upways : pathways::DenoiserMode::None;
+            const std::string expectedActiveDenoiser =
+                initStats.has_cooperative_matrix ? "Upways" : "None";
+            cfg.denoiser_mode = activeDenoiserMode;
+
             if (initStats.has_cooperative_matrix) {
                 cfg.enable_nrc = true;
                 cfg.nrc_backend = pathways::NrcBackend::NativeWave32;
-                if (!stepAndVerify("7a-ii. Enable NativeWave32 NRC live", 4, expectedFsr3, "SVGF")) return 1;
+                if (!stepAndVerify("7a-ii. Enable NativeWave32 NRC live", 4, expectedFsr3, expectedActiveDenoiser)) return 1;
                 if (!cfg.enable_nrc) {
                     pathways::Logger::error("[FAIL] Supported NativeWave32 NRC failed to enable!");
                     return 1;
@@ -363,16 +361,19 @@ int main(int argc, char* argv[]) {
             }
 
             cfg.enable_restir = true;
-            if (!stepAndVerify("7b. Enable ReSTIR PT live", 4, expectedFsr3, "SVGF")) return 1;
+            if (!stepAndVerify("7b. Enable ReSTIR PT live", 4, expectedFsr3, expectedActiveDenoiser)) return 1;
 
             cfg.enable_caustics = true;
-            if (!stepAndVerify("7c. Enable Real-Time Caustics live", 4, expectedFsr3, "SVGF")) return 1;
+            if (!stepAndVerify("7c. Enable Real-Time Caustics live", 4, expectedFsr3, expectedActiveDenoiser)) return 1;
 
-            // 8. Disable GI options & return to clean FSR 3.1 + E-SVGF for final frame dump
+            // 8. Disable GI options & return to clean FSR 3.1 + active denoiser for final frame dump
             cfg.enable_caustics = false;
             cfg.enable_restir = false;
             cfg.enable_nrc = false;
-            if (!stepAndVerify("8. Return to FSR 3.1 (0.67x) + E-SVGF", 6, expectedFsr3, "SVGF")) return 1;
+            const std::string step8Label = initStats.has_cooperative_matrix
+                ? "8. Return to FSR 3.1 (0.67x) + Upways Denoiser"
+                : "8. Return to FSR 3.1 (0.67x) + Off";
+            if (!stepAndVerify(step8Label.c_str(), 6, expectedFsr3, expectedActiveDenoiser)) return 1;
 
             engine.dumpOutputFiles();
             engine.printExecutionSummary();

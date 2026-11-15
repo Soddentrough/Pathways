@@ -306,7 +306,7 @@ bool SceneManager::pollAsyncLoading(SceneData& outScene, std::string& outPath) {
 
 bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepath, const Config& config,
                                    SceneGeometryPipeline* geomPipeline) {
-    if (newScene.triangles.empty() && newScene.spheres.empty()) {
+    if (newScene.triangles.empty()) {
         Logger::warn("Loaded scene contains no renderable geometry! Falling back to procedural Cornell Box.");
         newScene = ProceduralScene::createCornellBox();
     }
@@ -319,7 +319,6 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
     }
 
     m_numTriangles = static_cast<uint32_t>(m_sceneData.triangles.size());
-    m_numSpheres = static_cast<uint32_t>(m_sceneData.spheres.size());
     m_numMaterials = static_cast<uint32_t>(m_sceneData.materials.size());
     m_numLights = static_cast<uint32_t>(m_sceneData.lights.size());
 
@@ -354,11 +353,11 @@ bool SceneManager::ingestSceneData(SceneData newScene, const std::string& filepa
     }
 
     if (m_numInstancedTriangles > m_numTriangles) {
-        Logger::info("Active Scene: {} Base Triangles ({} Instanced across {} Instances), {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
-                     m_numTriangles, m_numInstancedTriangles, m_numInstances, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+        Logger::info("Active Scene: {} Base Triangles ({} Instanced across {} Instances), {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numInstancedTriangles, m_numInstances, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
     } else {
-        Logger::info("Active Scene: {} Triangles, {} Spheres, {} Materials, {} Lights (Non-Opaque: {})",
-                     m_numTriangles, m_numSpheres, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
+        Logger::info("Active Scene: {} Triangles, {} Materials, {} Lights (Non-Opaque: {})",
+                     m_numTriangles, m_numMaterials, m_numLights, m_sceneHasNonOpaque ? "YES" : "NO");
     }
 
     m_currentSceneIndex = -1;
@@ -441,17 +440,6 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     );
     if (!shadeTriangles.empty() && geomPipeline) {
         geomPipeline->uploadToDeviceBuffer(*m_triangleBuffer, shadeTriangles.data(), sizeof(TriangleShadeGPU) * shadeTriangles.size());
-    }
-
-    VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * m_sceneData.spheres.size(), sizeof(SphereGPU));
-    m_sphereBuffer = std::make_unique<Buffer>(
-        m_allocator, sphereSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-    );
-    if (!m_sceneData.spheres.empty()) {
-        m_sphereBuffer->copyFrom(m_sceneData.spheres.data(), sizeof(SphereGPU) * m_sceneData.spheres.size());
     }
 
     VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * m_sceneData.materials.size(), sizeof(MaterialGPU));
@@ -596,7 +584,7 @@ void SceneManager::recordDynamicLightUpload(VkCommandBuffer cmd, uint32_t frameS
     VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     dep.memoryBarrierCount = 1;
@@ -706,7 +694,7 @@ SceneData SceneManager::reloadPreparedSceneData(const std::string& filepath, con
 
     std::string resolvedPath = resolveScenePath(filepath);
     SceneData prepared = loadRawSceneData(resolvedPath, usdOptions);
-    if (prepared.triangles.empty() && prepared.spheres.empty()) {
+    if (prepared.triangles.empty()) {
         prepared = ProceduralScene::createCornellBox();
     }
     if (config.enable_macro_blas && geomPipeline) {

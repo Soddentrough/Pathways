@@ -10,6 +10,7 @@
 #define WF_IN_QUEUE_IDX  0u
 #define WF_OUT_QUEUE_IDX 0u
 #include "wavefront_common.glsl"
+#include "wavefront_radiance_output.glsl"
 #include "restir_common.glsl"
 
 layout(std430, binding = 32) writeonly buffer ReSTIRCurrentReservoirsBuffer {
@@ -51,10 +52,6 @@ layout(binding = 1) uniform CameraUBO {
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
-};
-
-layout(std430, binding = 3) readonly buffer SpheresBuffer {
-    Sphere spheres[];
 };
 
 layout(std430, binding = 4) readonly buffer MaterialsBuffer {
@@ -191,16 +188,14 @@ void main() {
         float closestT = 1e4;
         int closestTri = -1;
         vec2 closestBary = vec2(0.0);
-        int closestSphere = -1;
-        vec3 closestSphereNorm = vec3(0.0, 1.0, 0.0);
         mat4x3 hitW2o = mat4x3(1.0);
         mat4x3 hitO2w = mat4x3(1.0);
         uint hitInstMatOffset = 0u;
         uint hitInstIdx = 0u;
 
         traceClosestSceneHit(
-            origin, direction, EPSILON, closestT, pc.numSpheres,
-            closestT, closestTri, closestSphere, closestBary, closestSphereNorm,
+            origin, direction, EPSILON, closestT,
+            closestT, closestTri, closestBary,
             hitInstIdx, hitInstMatOffset, hitO2w, hitW2o
         );
 
@@ -218,7 +213,7 @@ void main() {
             }
         }
 
-        if (closestTri < 0 && closestSphere < 0) {
+        if (closestTri < 0) {
             // Miss: Sky / ambient radiance (only store for local tiles)
             if (isLocalTile) {
                 vec3 skyColor;
@@ -237,7 +232,7 @@ void main() {
                     imageStore(uAccumImage, storeCoord, vec4(addFp16Stochastic(prev.rgb, skyColor, seed), outAlpha));
                 }
                 if (pc.captureMlData != 0u) {
-                    if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) {
+                    if ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) {
                         if (pc.sppSampleIndex == 0u) {
                             imageStore(uMlSkipImage, storeCoord, vec4(skyColor, 0.0));
                         } else {
@@ -270,42 +265,27 @@ void main() {
             vec3 tanDir = vec3(1.0, 0.0, 0.0);
             float tanSign = 1.0;
 
-            if (closestTri >= 0) {
-                Triangle tri = triangles[closestTri];
-                vec3 localNormal = getTriangleNormal(tri, closestBary);
-                hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-                hitUv = getTriangleUV(tri, closestBary);
-                matId = tri.materialId + hitInstMatOffset;
-                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
+            Triangle tri = triangles[closestTri];
+            vec3 localNormal = getTriangleNormal(tri, closestBary);
+            hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
+            hitUv = getTriangleUV(tri, closestBary);
+            matId = tri.materialId + hitInstMatOffset;
+            archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
 
-                if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
-                    tanDir = getTriangleTangent(tri, closestBary);
-                    tanDir = normalize(mat3(hitO2w) * tanDir);
-                    tanSign = getTriangleTangentSign(tri);
-                }
-
-                Hit hitAtom;
-                hitAtom.instanceId = hitInstIdx;
-                hitAtom.primitiveId = uint(closestTri);
-                hitAtom.baryPacked = packUnorm2x16(closestBary);
-                bool frontFace = dot(direction, hitNormal) < 0.0;
-                hitAtom.flags = (frontFace ? 2u : 0u) | (tri.tanSigns & 0xFFFF0000u);
-
-                hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
-            } else {
-                hitNormal = closestSphereNorm;
-                matId = spheres[closestSphere].materialId;
-
-                vec3 spPos = origin + closestT * direction;
-                Hit hitAtom;
-                hitAtom.instanceId = floatBitsToUint(spPos.x);
-                hitAtom.primitiveId = floatBitsToUint(spPos.y);
-                hitAtom.baryPacked = floatBitsToUint(spPos.z);
-                hitAtom.flags = 1u;
-
-                hit = packRayHit(closestT, matId, 1u, hitNormal, vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0, hitAtom);
-                archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
+            if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
+                tanDir = getTriangleTangent(tri, closestBary);
+                tanDir = normalize(mat3(hitO2w) * tanDir);
+                tanSign = getTriangleTangentSign(tri);
             }
+
+            Hit hitAtom;
+            hitAtom.instanceId = hitInstIdx;
+            hitAtom.primitiveId = uint(closestTri);
+            hitAtom.baryPacked = packUnorm2x16(closestBary);
+            bool frontFace = dot(direction, hitNormal) < 0.0;
+            hitAtom.flags = (frontFace ? 2u : 0u) | (tri.tanSigns & 0xFFFF0000u);
+
+            hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
 
             bool isSpecular = (archetype == MATERIAL_ARCHETYPE_DIELECTRIC);
             if (!isSpecular && matId < pc.numMaterials) {
@@ -338,11 +318,8 @@ void main() {
 
                 vec3 primaryHitPoint = origin + direction * closestT;
                 if (needMvStore || pc.captureMlData != 0u) {
-                    vec3 prevHitPoint = primaryHitPoint;
-                    if (closestTri >= 0) {
-                        vec3 localHitPos = hitW2o * vec4(primaryHitPoint, 1.0);
-                        prevHitPoint = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
-                    }
+                    vec3 localHitPos = hitW2o * vec4(primaryHitPoint, 1.0);
+                    vec3 prevHitPoint = (instances[hitInstIdx].invTransform * vec4(localHitPos, 1.0)).xyz;
                     vec4 currClip = ubo.unjitteredViewProj * vec4(primaryHitPoint, 1.0);
                     vec4 prevClip = ubo.prevViewProj * vec4(prevHitPoint, 1.0);
                     if (currClip.w > 1e-4) {
@@ -363,15 +340,14 @@ void main() {
                 }
 
                 vec2 quantUv = unpackHalf2x16(packHalf2x16(hitUv - floor(hitUv)));
-                float rayConeBaseLod = (closestTri >= 0)
-                    ? computeRayConeBaseLod(hit.hitData1.w >> 16u, closestT, direction, hitNormal,
-                                            2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
-                                            0u, 0u)
-                    : -16.0;
+                float rayConeBaseLod = computeRayConeBaseLod(
+                    hit.hitData1.w >> 16u, closestT, direction, hitNormal,
+                    2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
+                    0u, 0u);
 
                 vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                 if (needNormals) {
-                    if (matId < pc.numMaterials && closestTri >= 0) {
+                    if (matId < pc.numMaterials) {
                         Material mat = materials[matId];
                         if (mat.normalTex > 0u && mat.normalTex <= 512u) {
                             vec3 normalMap = SAMPLE_SCENE_TEXTURE_LOD(mat.normalTex, quantUv, rayConeBaseLod).rgb * 2.0 - 1.0;
@@ -414,7 +390,7 @@ void main() {
                         if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
                             emissiveVal *= SAMPLE_SCENE_TEXTURE_LOD(mat.emissiveTex, quantUv, rayConeBaseLod).rgb;
                         }
-                        if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) == 0u &&
+                        if ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u &&
                             archetype != MATERIAL_ARCHETYPE_EMISSIVE && mat.emissiveTex > 0u) {
                             albedoVal = clamp(albedoVal + emissiveVal, vec3(0.0), vec3(1.0));
                         }
@@ -465,6 +441,18 @@ void main() {
                         if (reactiveInit > 0.0) {
                             imageStore(uMlSpecularImage, storeCoord, vec4(0.0, 0.0, 0.0, reactiveInit));
                         }
+                    } else if ((pc.captureMlData & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u) {
+                        float rawDiffFactor = 1.0 - clampedMet;
+                        vec3 diffAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : clamp(albedoVal, vec3(0.0), vec3(1.0)) * rawDiffFactor;
+                        vec3 rawF0 = mix(vec3(0.04), clamp(albedoVal, vec3(0.0), vec3(1.0)), clampedMet);
+                        vec3 approxSpec = ffxApproximateBRDF(rawF0, physicalRoughness, shadingNormal, -direction);
+                        vec3 specAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : clamp(approxSpec, vec3(0.0), vec3(1.0));
+                        imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(diffAlbedo, physicalRoughness));
+                        imageStore(uMlSpecAlbedoImage, storeCoord, vec4(specAlbedo, 0.0));
+                        imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, (clampedTrans >= 0.5) ? -dSpec : dSpec, 0.0));
+                        if (pc.sppSampleIndex == 0u) {
+                            imageStore(uMlSkipImage, storeCoord, vec4(0.0, 0.0, 0.0, float(archetype) / 3.0));
+                        }
                     } else {
                         vec3 mlAlbedo = (isPrimaryEmissive > 0.0) ? vec3(0.0) : max(albedoVal, vec3(0.004));
                         imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(mlAlbedo, physicalRoughness));
@@ -475,7 +463,7 @@ void main() {
                 }
             }
         }
-        if (pc.sppSampleIndex == 0u && closestTri < 0 && closestSphere < 0) {
+        if (pc.sppSampleIndex == 0u && closestTri < 0) {
             bool needNdStore = (pc.pad0 == 0u) || ((pc.pad0 & 2u) != 0u) || (pc.captureMlData != 0u);
             bool needMvStore = (pc.pad0 == 0u) || ((pc.pad0 & 4u) != 0u) || (pc.captureMlData != 0u);
             vec2 vSurface = vec2(0.0);
@@ -502,7 +490,7 @@ void main() {
             if (pc.captureMlData != 0u) {
                 imageStore(uMlAlbedoRoughnessImage, storeCoord, vec4(0.0, 0.0, 0.0, 1.0));
                 imageStore(uMlSpecularMotionImage, storeCoord, vec4(vSurface, 0.0, 0.0));
-                if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) {
+                if ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) {
                     imageStore(uMlSpecAlbedoImage, storeCoord, vec4(0.0));
                 }
             }

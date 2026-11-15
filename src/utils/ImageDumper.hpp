@@ -96,7 +96,7 @@ struct FrameStats {
     bool supports_fsr_rc = false;
 
     // Engine Settings & Configuration
-    std::string pipeline_type_str = "rtp";
+    std::string pipeline_type_str = "wavefront";
     uint32_t width = 0;
     uint32_t height = 0;
     std::string denoiser_mode_str = "None";
@@ -186,11 +186,11 @@ struct FrameStats {
     // Per-dispatch denoiser GPU timings (ms):
     double denoise_pass_ms[5] = { 0.0, 0.0, 0.0, 0.0, 0.0 };
     std::array<std::string, 5> denoise_pass_names = {
-        "fusedTemporal", "atrousStep1", "atrousStep2", "atrousStep3", "coarseRemodulate"
+        "pass0", "pass1", "pass2", "pass3", "pass4"
     };
     struct DenoiserProfilerStats {
         bool valid = false;
-        std::string mode = "none"; // "upways", "gateway", or "svgf"
+        std::string mode = "none"; // "upways", "ffx_ray_regeneration", or "none"
         double temporal_ms = 0.0;
         double neural_guide_ms = 0.0;
         double atrous_step2_ms = 0.0;

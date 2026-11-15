@@ -402,6 +402,22 @@ int main(int argc, char** argv) {
         check_true(cRR.denoiser_mode == DenoiserMode::FfxRayRegeneration,
                    "--denoiser rayregen must select DenoiserMode::FfxRayRegeneration");
 
+        auto expectRejected = [](std::initializer_list<const char*> args, const std::string& label) {
+            std::vector<char*> argv;
+            for (const char* a : args) argv.push_back(const_cast<char*>(a));
+            bool threw = false;
+            try {
+                (void)Config::parse(static_cast<int>(argv.size()), argv.data());
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            check_true(threw, label);
+        };
+        expectRejected({ "pathways", "--svgf" }, "Removed --svgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--esvgf" }, "Removed --esvgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "svgf" }, "Removed --denoiser svgf must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "esvgf" }, "Removed --denoiser esvgf must throw std::runtime_error");
+
         const char* argvNrc[] = { "pathways", "--radiance-cache" };
         Config cNrc = Config::parse(2, const_cast<char**>(argvNrc));
         check_true(cNrc.enable_nrc, "--radiance-cache must enable NRC");
@@ -532,10 +548,6 @@ int main(int argc, char** argv) {
         hasDenoiserProvider ? "FFX Ray Regeneration (1.2.1)" : "Ray Regen (Gated -> Off)",
         "--upscaler none --denoiser rayregen --spp 1", &refPixels, refW, refH);
 
-    // 6b. Render In-House E-SVGF Denoiser (--denoiser svgf)
-    FeatureRunResult svgfRun = runFeatureConfig(
-        "05b_esvgf", "Denoiser: E-SVGF (Native 1.0x)", "--upscaler none --denoiser svgf --spp 1", &refPixels, refW, refH);
-
     // 7. Render Radiance Caching (--nrc)
     FeatureRunResult nrcRun = runFeatureConfig(
         "06_radiance_cache",
@@ -553,8 +565,6 @@ int main(int argc, char** argv) {
         "07c1_fsr3_upways_denoiser", "FSR 3.1 + Upways Denoiser", "--upscaler fsr3 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr4UpwaysDenRun = runFeatureConfig(
         "07c2_fsr4_upways_denoiser", "FSR 4.1 ML + Upways Denoiser", "--upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
-    FeatureRunResult fsr4SvgfDenRun = runFeatureConfig(
-        "07c3_fsr4_esvgf_denoiser", "FSR 4.1 ML + E-SVGF Denoiser", "--upscaler fsr4 --render-scale 0.67 --denoiser svgf --spp 1", &refPixels, refW, refH);
 
     // 10. Render ReSTIR PT & Real-Time Caustics
     FeatureRunResult restirRun = runFeatureConfig(
@@ -565,16 +575,16 @@ int main(int argc, char** argv) {
     // 11. Render Combined Stack: Supported Upscaler + Denoiser + Radiance Caching + ReSTIR + Caustics
     FeatureRunResult combinedRun = runFeatureConfig(
         "07_combined_ffx_stack",
-        hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + E-SVGF + GI",
+        hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + Upways + GI",
         hasDenoiserProvider
             ? "--upscaler fsr --render-scale 0.67 --denoiser rayregen --nrc --restir --caustics --spp 1"
-            : "--upscaler fsr --render-scale 0.67 --denoiser svgf --nrc --restir --caustics --spp 1",
+            : "--upscaler fsr --render-scale 0.67 --denoiser upways --nrc --restir --caustics --spp 1",
         &refPixels, refW, refH);
 
     std::vector<FeatureRunResult> allRuns = {
         raw1SppRun, baseMcRun, fsr3Run, fsr4Run, upwaysSrRun,
-        rayRegenRun, svgfRun, upwaysDenRun, fsr3UpwaysDenRun,
-        fsr4UpwaysDenRun, fsr4SvgfDenRun,
+        rayRegenRun, upwaysDenRun, fsr3UpwaysDenRun,
+        fsr4UpwaysDenRun,
         nrcRun, restirRun, causticsRun, combinedRun
     };
 
@@ -618,8 +628,6 @@ int main(int argc, char** argv) {
                    "FSR 4.1 ML run must report upscaler_mode == 'FSR 4.1 ML' without falling back to FSR 3.1, got '" + fsr4Run.reportedUpscaler + "'");
         check_true(fsr4UpwaysDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4UpwaysDenRun.reportedDenoiser == "Upways",
                    "FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'Upways'");
-        check_true(fsr4SvgfDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4SvgfDenRun.reportedDenoiser == "SVGF",
-                   "FSR 4.1 ML + E-SVGF Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'SVGF'");
         check_true(combinedRun.reportedUpscaler == "FSR 4.1 ML",
                    "Combined run must report upscaler_mode == 'FSR 4.1 ML'");
     } else {
@@ -635,10 +643,8 @@ int main(int argc, char** argv) {
                    "Ray Regeneration run must report FFX Ray Regeneration denoiser mode, got '" + rayRegenRun.reportedDenoiser + "'");
     } else {
         check_true(rayRegenRun.reportedDenoiser == "None",
-                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected (never fall back to SVGF) and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
+                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
     }
-    check_true(svgfRun.reportedDenoiser == "SVGF",
-               "E-SVGF run must report denoiser_mode == 'SVGF', got '" + svgfRun.reportedDenoiser + "'");
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
     check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
     check_true(upwaysDenRun.reportedDenoiser == "Upways", "Upways Denoiser run must report denoiser_mode == 'Upways'");
@@ -667,19 +673,19 @@ int main(int argc, char** argv) {
     }
 
     // Assertions: Surface-Guided & ML Edge Retention
-    check_true(upwaysDenRun.visual.edgeRetention >= 0.70 && svgfRun.visual.edgeRetention >= 0.70,
-               "Surface-guided native denoisers (Upways, E-SVGF) must retain >= 70% of strong geometric edge gradients");
+    check_true(upwaysDenRun.visual.edgeRetention >= 0.70,
+               "Upways native denoiser must retain >= 70% of strong geometric edge gradients");
     check_true(upwaysSrRun.visual.edgeRetention >= 0.70,
                "Upways SR must retain >= 70% of strong geometric edge gradients (got " + std::to_string(upwaysSrRun.visual.edgeRetention) + ")");
     if (expectsFsr4) {
         check_true(fsr4Run.visual.edgeRetention > fsr3Run.visual.edgeRetention + 0.25,
                    "FSR 4.1 ML must preserve significantly sharper structural edges than analytical FSR 3.1");
-        check_true(fsr4UpwaysDenRun.visual.edgeRetention >= 0.70 && fsr4SvgfDenRun.visual.edgeRetention >= 0.70,
-                   "Coupled FSR 4.1 ML + Upways/E-SVGF Denoiser must retain >= 70% of strong geometric edge gradients");
+        check_true(fsr4UpwaysDenRun.visual.edgeRetention >= 0.70,
+                   "Coupled FSR 4.1 ML + Upways Denoiser must retain >= 70% of strong geometric edge gradients");
     }
 
     // Assertions: Denoiser Visual Noise Reduction & Coupled Upscaler+Denoiser Assessment
-    const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : svgfRun;
+    const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : upwaysDenRun;
     check_true(activeDenoiserRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
                "Active denoiser must reduce 1-SPP high-frequency noise variance by >80%");
     check_true(upwaysDenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
@@ -689,8 +695,6 @@ int main(int argc, char** argv) {
     if (expectsFsr4) {
         check_true(fsr4UpwaysDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
                    "Coupling FSR 4.1 ML with Upways Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
-        check_true(fsr4SvgfDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
-                   "Coupling FSR 4.1 ML with E-SVGF Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
     }
 
     // Assertions: Performance Assessment
@@ -754,13 +758,11 @@ int main(int argc, char** argv) {
             "10c_motion_upways_sr", "Motion: Upways SR (0.67x)", "--camera-motion --upscaler upways --render-scale 0.67 --denoiser none --spp 1", &mRefPixels, mRefW, mRefH, 12);
         FeatureRunResult motionFsr4Upways = runFeatureConfig(
             "10d_motion_fsr4_upways", "Motion: FSR 4.1 ML + Upways", "--camera-motion --upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
-        FeatureRunResult motionFsr4Svgf = runFeatureConfig(
-            "10e_motion_fsr4_svgf", "Motion: FSR 4.1 ML + E-SVGF", "--camera-motion --upscaler fsr4 --render-scale 0.67 --denoiser svgf --spp 1", &mRefPixels, mRefW, mRefH, 12);
         FeatureRunResult motionUpwaysDen = runFeatureConfig(
             "10f_motion_upways_den", "Motion: Upways Denoiser (1.0x)", "--camera-motion --upscaler none --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
 
         std::vector<FeatureRunResult> motionRuns = {
-            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionFsr4Svgf, motionUpwaysDen
+            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionUpwaysDen
         };
         for (const auto& mr : motionRuns) {
             std::cout << "  -> " << std::left << std::setw(30) << mr.name

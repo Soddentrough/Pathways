@@ -436,7 +436,6 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 
     bool hasPciBusInfo = false;
     bool hasAccStruct = false;
-    bool hasRtPipeline = false;
     bool hasRayQuery = false;
     bool hasDeferredOps = false;
 
@@ -446,9 +445,6 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         }
         if (std::strcmp(ext.extensionName, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) == 0) {
             hasAccStruct = true;
-        }
-        if (std::strcmp(ext.extensionName, VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME) == 0) {
-            hasRtPipeline = true;
         }
         if (std::strcmp(ext.extensionName, VK_KHR_RAY_QUERY_EXTENSION_NAME) == 0) {
             hasRayQuery = true;
@@ -515,23 +511,20 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         }
 #endif
     }
-    m_hasRayTracing = hasAccStruct && hasRtPipeline && hasRayQuery && hasDeferredOps;
+    m_hasRayTracing = hasAccStruct && hasRayQuery && hasDeferredOps;
     m_hasRayQuery = hasRayQuery;
     m_hasDeferredOps = hasDeferredOps;
 
-    // Check Subgroup Size Control (Wave32 support), DGC Properties, and Ray Tracing Pipeline Properties
+    // Check Subgroup Size Control (Wave32 support) and DGC Properties
     VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps{};
     subgroupProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
     VkPhysicalDeviceDeviceGeneratedCommandsPropertiesEXT dgcProps{};
     dgcProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_PROPERTIES_EXT;
     subgroupProps.pNext = &dgcProps;
 
-    m_rtPipelineProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR;
-    dgcProps.pNext = &m_rtPipelineProperties;
-
     m_driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
     m_driverProperties.pNext = nullptr;
-    m_rtPipelineProperties.pNext = &m_driverProperties;
+    dgcProps.pNext = &m_driverProperties;
 
     VkPhysicalDevicePCIBusInfoPropertiesEXT pciBusProps{};
     pciBusProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT;
@@ -556,11 +549,6 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     vk13Features.pNext = &vk14Features;
     void** featQueryNext = &vk14Features.pNext;
 
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipeFeaturesQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
-    if (m_hasRayTracing) {
-        *featQueryNext = &rtPipeFeaturesQuery;
-        featQueryNext = &rtPipeFeaturesQuery.pNext;
-    }
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR posFetchQuery{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
     if (m_hasPositionFetch) {
         *featQueryNext = &posFetchQuery;
@@ -646,7 +634,6 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     m_vk12Features = vk12Features;
     m_vk13Features = vk13Features;
     m_vk14Features = vk14Features;
-    m_rtPipelineFeatures = rtPipeFeaturesQuery;
     m_dgcProperties = dgcProps;
 
     if (m_hasCooperativeMatrix) {
@@ -708,18 +695,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
     m_subgroupSize = (subgroupProps.minSubgroupSize <= 32 && subgroupProps.maxSubgroupSize >= 32)
                          ? 32
                          : subgroupProps.maxSubgroupSize;
-    if (m_hasSubgroupSizeControl &&
-        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_RAYGEN_BIT_KHR) &&
-        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR) &&
-        (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_MISS_BIT_KHR)) {
-        m_hasRtSubgroupSizeControl = true;
-    }
 
-    Logger::info("Device Capabilities -> DGC: {}, Hardware RT: {}, SubgroupSizeControl (Wave32 Compute: {}, RT: {})",
+    Logger::info("Device Capabilities -> DGC: {}, Hardware RT (Ray Query): {}, SubgroupSizeControl (Wave32 Compute): {}",
                  m_hasDGC ? "SUPPORTED" : "NOT FOUND",
                  m_hasRayTracing ? "SUPPORTED" : "NOT FOUND",
-                 m_hasSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)",
-                 m_hasRtSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)");
+                 m_hasSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)");
     Logger::info("ML / Cooperative Matrix Capabilities -> CoopMatrix: {}, Int8: {}, Float8: {}, WMMA Int8: {}, WMMA FP8: {}, MutableDescriptorType: {}",
                  m_hasCooperativeMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_vk12Features.shaderInt8 ? "SUPPORTED" : "NOT FOUND",
@@ -727,13 +707,6 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                  m_hasInt8CoopMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_hasFp8CoopMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_hasMutableDescriptorType ? "SUPPORTED" : "NOT FOUND");
-    if (m_hasRayTracing) {
-        Logger::info("RT Pipeline Properties -> HandleSize: {} B, BaseAlign: {} B, HandleAlign: {} B, MaxRecursion: {}",
-                     m_rtPipelineProperties.shaderGroupHandleSize,
-                     m_rtPipelineProperties.shaderGroupBaseAlignment,
-                     m_rtPipelineProperties.shaderGroupHandleAlignment,
-                     m_rtPipelineProperties.maxRayRecursionDepth);
-    }
     if (m_hasDGC) {
         if ((dgcProps.supportedIndirectCommandsShaderStagesPipelineBinding & VK_SHADER_STAGE_COMPUTE_BIT) ||
             (dgcProps.supportedIndirectCommandsShaderStagesShaderBinding & VK_SHADER_STAGE_COMPUTE_BIT)) {
@@ -752,7 +725,7 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     // 1. Mandatory Extension Verification
     std::vector<std::string> missingRequirements;
     if (!m_hasRayTracing) {
-        missingRequirements.push_back("Hardware Ray Tracing (VK_KHR_acceleration_structure, VK_KHR_ray_tracing_pipeline, VK_KHR_ray_query, VK_KHR_deferred_host_operations)");
+        missingRequirements.push_back("Hardware Ray Tracing (VK_KHR_acceleration_structure, VK_KHR_ray_query, VK_KHR_deferred_host_operations)");
     }
     if (!m_hasPositionFetch) {
         missingRequirements.push_back("Ray Tracing Position Fetch (VK_KHR_ray_tracing_position_fetch)");
@@ -766,7 +739,6 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     VkPhysicalDeviceVulkan13Features feat13{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
     VkPhysicalDeviceVulkan12Features feat12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
     VkPhysicalDeviceVulkan11Features feat11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR featRTP{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR };
     VkPhysicalDeviceAccelerationStructureFeaturesKHR featAS{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR };
     VkPhysicalDeviceRayQueryFeaturesKHR featRQ{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR };
     VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR featPosFetch{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR };
@@ -775,8 +747,7 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     feat14.pNext = &feat13;
     feat13.pNext = &feat12;
     feat12.pNext = &feat11;
-    feat11.pNext = &featRTP;
-    featRTP.pNext = &featAS;
+    feat11.pNext = &featAS;
     featAS.pNext = &featRQ;
     featRQ.pNext = &featPosFetch;
     featPosFetch.pNext = &featDGC;
@@ -830,12 +801,11 @@ void VulkanContext::verifyPhysicalDeviceRequirements() {
     requireFeat(feat2.features.shaderInt64, "Vulkan 1.0: shaderInt64");
     requireFeat(feat2.features.shaderStorageImageWriteWithoutFormat, "Vulkan 1.0: shaderStorageImageWriteWithoutFormat");
     requireFeat(feat2.features.shaderStorageImageReadWithoutFormat, "Vulkan 1.0: shaderStorageImageReadWithoutFormat");
-    // Required for VK_FORMAT_R8G8_UNORM dual-channel edge density storage images (E-SVGF)
+    // Required for VK_FORMAT_R8G8_UNORM dual-channel storage images
     requireFeat(feat2.features.shaderStorageImageExtendedFormats, "Vulkan 1.0: shaderStorageImageExtendedFormats");
 
     // Hardware Ray Tracing Features
     requireFeat(featAS.accelerationStructure, "Ray Tracing: accelerationStructure");
-    requireFeat(featRTP.rayTracingPipeline, "Ray Tracing: rayTracingPipeline");
     requireFeat(featRQ.rayQuery, "Ray Tracing: rayQuery");
     requireFeat(featPosFetch.rayTracingPositionFetch, "Ray Tracing: rayTracingPositionFetch");
 
@@ -1084,7 +1054,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     }
     if (m_hasRayTracing) {
         deviceExtensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
-        deviceExtensions.push_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
         deviceExtensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
         deviceExtensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
     }
@@ -1211,11 +1180,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     features11.variablePointers = VK_TRUE;
     features11.pNext = &features12;
 
-    VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeatures{};
-    rtPipelineFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-    rtPipelineFeatures.rayTracingPipeline = VK_TRUE;
-    rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect = m_rtPipelineFeatures.rayTracingPipelineTraceRaysIndirect;
-
     VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
     asFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
     asFeatures.accelerationStructure = VK_TRUE;
@@ -1246,7 +1210,6 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasRayTracing) {
         appendFeature(rayQueryFeatures);
         appendFeature(asFeatures);
-        appendFeature(rtPipelineFeatures);
     }
     if (m_hasPositionFetch) {
         featuresPositionFetch.rayTracingPositionFetch = VK_TRUE;
@@ -1399,8 +1362,8 @@ std::string VulkanContext::getRayAcceleratorName() const {
     // Derived from actually-queried extensions, not from the architecture table:
     // report exactly the ray-tracing surface this device/driver exposes.
     std::vector<const char*> features;
-    if (m_hasRayTracing) features.push_back("VK_KHR_ray_tracing_pipeline");
     if (m_hasRayQuery) features.push_back("VK_KHR_ray_query");
+    if (m_hasRayTracing) features.push_back("VK_KHR_acceleration_structure");
     if (m_hasPositionFetch) features.push_back("VK_KHR_ray_tracing_position_fetch");
     if (features.empty()) return "No Hardware Ray Tracing";
     std::string result = "Hardware Ray Tracing (";

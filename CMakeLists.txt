@@ -151,36 +151,26 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade.comp
     ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp
     ${SHADER_DIR}/compute/wavefront_shade_dielectric.comp
-    ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
     ${SHADER_DIR}/compute/wavefront_shade_complex.comp
     ${SHADER_DIR}/compute/wavefront_shade_emissive.comp
-    ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
     ${SHADER_DIR}/compute/wavefront_tail_megakernel.comp
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/compute/nrc_resolve.comp
-    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/upways_denoise_prep.comp
     ${SHADER_DIR}/compute/upways_denoiser_wmma.comp
     ${SHADER_DIR}/compute/upways_upscaler_wmma.comp
     ${SHADER_DIR}/compute/upways_upscale_resolve.comp
     ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
+    ${SHADER_DIR}/compute/ffx_rr_prep.comp
+    ${SHADER_DIR}/compute/ffx_rr_compose.comp
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
     ${SHADER_DIR}/compute/restir_debug_view.comp
-    ${SHADER_DIR}/compute/denoise_fused_temporal.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step1.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step2.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step3.comp
-    ${SHADER_DIR}/compute/denoise_atrous_coarse_remodulate.comp
-    ${SHADER_DIR}/rt/raytrace.rgen
-    ${SHADER_DIR}/rt/raytrace.rmiss
-    ${SHADER_DIR}/rt/shadow.rmiss
-    ${SHADER_DIR}/rt/raytrace.rchit
     ${SHADER_DIR}/ui/imgui_hdr.frag
 )
 
@@ -655,6 +645,9 @@ endif()
 
 # Pipeline Comparison, CLI Validation & Telemetry Unit Test Target
 add_executable(test_pipeline_comparison tests/test_pipeline_comparison.cpp)
+target_compile_definitions(test_pipeline_comparison PRIVATE
+    PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
+)
 target_link_libraries(test_pipeline_comparison PRIVATE pathways_engine_core)
 add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
 
@@ -677,14 +670,6 @@ add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 add_executable(test_upways_pipeline tests/test_upways_pipeline.cpp)
 target_link_libraries(test_upways_pipeline PRIVATE pathways_engine_core)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
-
-# Adaptive E-SVGF Denoiser Pipeline (5-Dispatch Dilated GPU Execution) Test Target
-add_executable(test_denoiser_pipeline tests/test_denoiser_pipeline.cpp)
-target_compile_definitions(test_denoiser_pipeline PRIVATE
-    PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
-)
-target_link_libraries(test_denoiser_pipeline PRIVATE pathways_engine_core)
-add_test(NAME DenoiserPipeline COMMAND test_denoiser_pipeline)
 
 # ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
 add_executable(test_restir_pt_math tests/test_restir_pt_math.cpp)

@@ -640,9 +640,11 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
     };
 
     PTTDHeader header;
-    header.version = (channels == 32u || channels == 12u || channels == 8u)
-        ? 4u
-        : ((channels >= 23u || jitterXY != nullptr) ? 3u : ((channels == 20u) ? 2u : 1u));
+    header.version = (channels >= 44u)
+        ? 5u
+        : ((channels == 32u || channels == 12u || channels == 8u)
+            ? 4u
+            : ((channels >= 23u || jitterXY != nullptr) ? 3u : ((channels == 20u) ? 2u : 1u)));
     header.width = width;
     header.height = height;
     header.channels = channels;

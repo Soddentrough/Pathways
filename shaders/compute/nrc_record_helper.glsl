@@ -19,7 +19,7 @@ void nrcEmitSelfTrainingRecord(
     uint nextPdfCode,
     inout uint seed
 ) {
-    if (!validBounce || pc.useHardwareRT != 1u) {
+    if (!validBounce) {
         return;
     }
 
@@ -46,24 +46,6 @@ void nrcEmitSelfTrainingRecord(
     bool hitTri = (rayQueryGetIntersectionTypeEXT(tailRq, true) == gl_RayQueryCommittedIntersectionTriangleEXT);
     if (hitTri) {
         bestT = rayQueryGetIntersectionTEXT(tailRq, true);
-    }
-
-    int hitSphereIdx = -1;
-    vec3 spHitNorm = vec3(0.0, 1.0, 0.0);
-    for (uint si = 0u; si < pc.numSpheres; ++si) {
-        ShadeMaterial spMat = shadeMaterials[spheres[si].materialId];
-        uint spType = smGetTypeFlags(spMat);
-        if ((spType & MATERIAL_TYPE_MASK) == 2u || smIsTransmissive(spMat)) {
-            continue;
-        }
-        float spT;
-        vec3 spN;
-        if (intersectSphere(nextOrigin, nextDirection, spheres[si], EPSILON, bestT, spT, spN)) {
-            bestT = spT;
-            spHitNorm = spN;
-            hitSphereIdx = int(si);
-            hitTri = false;
-        }
     }
 
     bool hitOpaqueSurface = false;
@@ -113,15 +95,6 @@ void nrcEmitSelfTrainingRecord(
         } else {
             tMisW = emitterHitMisWeight(0u, triIdx, instIdx, nextOrigin, nextDirection, bestT, nextPdfCode, pc.numLights);
         }
-        hitOpaqueSurface = true;
-    } else if (hitSphereIdx >= 0) {
-        uint sMatId = spheres[uint(hitSphereIdx)].materialId;
-        tMat = shadeMaterials[sMatId];
-        tType = smGetTypeFlags(tMat);
-        tailN = (dot(nextDirection, spHitNorm) > 0.0) ? -spHitNorm : spHitNorm;
-        tAlb = tMat.albedo.rgb;
-        tEmit = tMat.emissive_spec.rgb;
-        tMisW = 1.0;
         hitOpaqueSurface = true;
     }
 
@@ -214,7 +187,7 @@ void nrcEmitSelfTrainingRecord(
                         if ((ubo.flags & (1u << 4)) != 0u) {
                             vis = !traceShadowRayInline(
                                 offsetRayOrigin(tailPos, tailN), lDir, lDist,
-                                hasNonOpaque, pc.numSpheres, pc.numOpaqueTriangles
+                                hasNonOpaque, pc.numOpaqueTriangles
                             );
                         }
 #endif

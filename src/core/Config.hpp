@@ -27,7 +27,6 @@ enum class AccumFormat {
 };
 
 enum class PipelineType {
-    RTP,       // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
     Wavefront  // Wavefront Path Tracing with Ray Queues & DGC
 };
 
@@ -46,10 +45,9 @@ enum class SecondarySortMode {
 };
 
 enum class DenoiserMode {
-    None,               // Raw stochastic path traced output (unfiltered progressive)
-    Upways,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    Svgf,               // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
-    FfxRayRegeneration  // AMD FidelityFX Ray Regeneration (stub until native Vulkan provider is available)
+    None = 0,               // Raw stochastic path traced output (unfiltered progressive)
+    Upways = 1,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+    FfxRayRegeneration = 2  // AMD FidelityFX Ray Regeneration 1.2.1 (4-Signal)
 };
 
 enum class FsrVersion : uint32_t {
@@ -271,7 +269,7 @@ struct Config {
     uint32_t capture_input_spp = 1;
     uint32_t capture_reference_spp = 256;
     bool capture_normals = true;
-    uint32_t capture_channels = 24; // 16, 19, 20, 23, or 24 (PTTD v3 default)
+    uint32_t capture_channels = 24; // 16, 19, 20, 23, 24 (PTTD v3), 32 (v4), or 44 (PTTD v5)
     CaptureCameraMode capture_camera_mode = CaptureCameraMode::Gaming;
     uint32_t capture_input_width = 0;   // 0 = inherit config.width * render_scale
     uint32_t capture_input_height = 0;  // 0 = inherit config.height * render_scale

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "rt/WavefrontPipeline.hpp"
-#include "rt/RTPipeline.hpp"
 #include "rt/NRCManager.hpp"
 #include "rt/ReSTIRManager.hpp"
 #include "rt/CausticsPipeline.hpp"
@@ -58,17 +57,6 @@ public:
     RayTracingOrchestrator(const RayTracingOrchestrator&) = delete;
     RayTracingOrchestrator& operator=(const RayTracingOrchestrator&) = delete;
 
-    /// Initializes RTPipeline and its pipeline layout.
-    void initRTPipeline(
-        VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps,
-        VkDescriptorSetLayout rtDescLayout,
-        const std::vector<char>& rgenCode,
-        const std::vector<char>& rmissCode,
-        const std::vector<char>& shadowMissCode,
-        const std::vector<char>& rchitCode,
-        bool hasRtSubgroupSizeControl
-    );
-
     /// Initializes WavefrontPipeline with all shader modules and DGC settings.
     void initWavefrontPipeline(
         uint32_t width,
@@ -79,10 +67,8 @@ public:
         const std::vector<char>& shadowCode,
         const std::vector<char>& shadeDiffuseCode,
         const std::vector<char>& shadeDielectricCode,
-        const std::vector<char>& shadeConductorCode,
         const std::vector<char>& shadeComplexCode,
         const std::vector<char>& shadeEmissiveCode,
-        const std::vector<char>& shadePassthroughCode,
         bool hasDgcExecutionSet,
         const std::vector<char>& shadeDiffuseSecCode,
         const std::vector<char>& shadeComplexSecCode,
@@ -134,7 +120,7 @@ public:
     /// Resizes all ray tracing subsystems.
     void resize(uint32_t width, uint32_t height, const Config& config);
 
-    /// Records ray tracing dispatches (Wavefront or RTPipeline).
+    /// Records ray tracing dispatches (Wavefront).
     void recordRayTracing(
         VkCommandBuffer cmd,
         const RayTracingDispatchParams& params,
@@ -145,30 +131,29 @@ public:
         Image* normalDepthImage,
         Image* prevNormalDepthImage,
         Buffer* centerDepthBuffer,
-        VkDescriptorSet rtDescSet,
         CausticsPipeline* causticsPipeline,
         QualityGovernor* governor,
         Camera* camera,
         const SceneData& sceneData,
         uint32_t numTriangles,
-        uint32_t numSpheres,
         uint32_t numMaterials,
         uint32_t numLights,
         uint32_t numOpaqueTriangles,
         uint32_t hasEnvMap,
         float envIntensity,
-        uint32_t useHwRT,
         const Config& config,
         Image* mlSkipImage = nullptr,
-        Image* mlSpecAlbedoImage = nullptr
+        Image* mlSpecAlbedoImage = nullptr,
+        Image* mlDirectDiffuseImage = nullptr,
+        Image* mlIndirectDiffuseImage = nullptr,
+        Image* mlDirectSpecularImage = nullptr,
+        Image* mlIndirectSpecularImage = nullptr
     );
 
     // Getters
     [[nodiscard]] WavefrontPipeline* getWavefrontPipeline() const noexcept { return m_wavefrontPipeline.get(); }
-    [[nodiscard]] RTPipeline* getRtpPipeline() const noexcept { return m_rtpKhrPipeline.get(); }
     [[nodiscard]] NRCManager* getNrcManager() const noexcept { return m_nrcManager.get(); }
     [[nodiscard]] ReSTIRManager* getRestirManager() const noexcept { return m_restirManager.get(); }
-    [[nodiscard]] VkPipelineLayout getRtpPipelineLayout() const noexcept { return m_rtpPipelineLayout; }
     [[nodiscard]] uint32_t getCurrentBatchCount() const noexcept { return m_currentBatchCount; }
     [[nodiscard]] uint32_t getCurrentBatchPixels() const noexcept { return m_currentBatchPixels; }
     void setCurrentBatchParams(uint32_t count, uint32_t pixels) noexcept {
@@ -182,9 +167,6 @@ private:
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceType m_deviceType = VK_PHYSICAL_DEVICE_TYPE_OTHER;
 
-    VkPipelineLayout m_rtpPipelineLayout = VK_NULL_HANDLE;
-
-    std::unique_ptr<RTPipeline> m_rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
     std::unique_ptr<NRCManager> m_nrcManager;
     std::unique_ptr<ReSTIRManager> m_restirManager;

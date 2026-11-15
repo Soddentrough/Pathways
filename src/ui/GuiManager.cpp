@@ -726,8 +726,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             ImGui::BulletText("VK_KHR_acceleration_structure (BLAS + TLAS)");
             ImGui::BulletText("VK_KHR_buffer_device_address (64-bit BDA)");
             ImGui::BulletText("VK_KHR_deferred_host_operations (Host Build)");
-            ImGui::Text("Pipeline:           %s", (config.pipeline_type == PipelineType::Wavefront) ? "Wavefront Path Tracing (Ray Queues & DGC)" : "Hardware RTP (VK_KHR_ray_tracing_pipeline)");
-            if (config.pipeline_type == PipelineType::Wavefront) {
+            ImGui::Text("Pipeline:           Wavefront Path Tracing (Ray Queues & DGC)");
+            {
                 const char* wfSortStr = "Auto (Adaptive)";
                 if (config.wavefront_sort_mode == WavefrontSortMode::None) wfSortStr = "None (Monolithic)";
                 else if (config.wavefront_sort_mode == WavefrontSortMode::Archetype) wfSortStr = "Archetype (BSDF Buckets)";
@@ -755,11 +755,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         // 5. Scene Complexity Telemetry
         if (ImGui::CollapsingHeader("Scene Complexity", ImGuiTreeNodeFlags_None)) {
             if (stats.num_instanced_triangles > stats.num_triangles) {
-                ImGui::Text("Geometry:     %u Base Tris (%s Instanced across %u Instances), %u Spheres",
+                ImGui::Text("Geometry:     %u Base Tris (%s Instanced across %u Instances)",
                             stats.num_triangles, formatInstCount(stats.num_instanced_triangles).c_str(),
-                            stats.num_instances, stats.num_spheres);
+                            stats.num_instances);
             } else {
-                ImGui::Text("Geometry:     %u Triangles, %u Spheres", stats.num_triangles, stats.num_spheres);
+                ImGui::Text("Geometry:     %u Triangles", stats.num_triangles);
             }
             ImGui::Text("Shading:      %u Materials, %u Area Lights", stats.num_materials, stats.num_lights);
             ImGui::Text("Textures:     %u Texture Maps + HDRI Sky", stats.num_textures);
@@ -780,8 +780,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
             if (config.denoiser_mode == DenoiserMode::Upways) {
                 ImGui::Text("Denoising:    Upways 3.0 FP8 Neural Reconstructor");
-            } else if (config.denoiser_mode == DenoiserMode::Svgf) {
-                ImGui::Text("Denoising:    E-SVGF Spatio-Temporal Filter");
             } else if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::Text("Denoising:    AMD FSR Ray Regeneration (4-Signal)");
             } else {
@@ -1265,9 +1263,6 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen", stats.supports_fsr_rr,
                 stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)."
                                       : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active).");
-            ImGui::SameLine();
-            drawQuickDenoiserBtn(DenoiserMode::Svgf, "E-SVGF", true,
-                "Edge-Aware Spatio-Temporal Variance-Guided Wavelet Filter (61x61 receptive field).");
             ImGui::SameLine();
             drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
                 "Upways 3.0 RDNA 4 FP8 WMMA Spatiotemporal Backbone: runs standalone at render-res alongside FSR 3.1 / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
@@ -2011,8 +2006,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
         if (ImGui::CollapsingHeader("Post-Processing, Denoising & Super-Resolution")) {
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
-                "Upways 3.0 (RDNA 4 FP8 WMMA Spatiotemporal)",
-                "E-SVGF (Spatio-Temporal Wavelet)",
+                "Upways Neural Reconstructor (Wave32 WMMA)",
                 "AMD FSR Ray Regeneration (1.2.1 4-Signal)"
             };
             int denoiserIdx = static_cast<int>(config.denoiser_mode);
@@ -2049,9 +2043,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
-                                  "- Upways 3.0: Decoupled RDNA 4 FP8 WMMA multi-scale backbone + continuous subpixel resolve.\n"
-                                  "- E-SVGF: Variance-guided spatio-temporal A-Trous wavelet filter.\n"
-                                  "- AMD FSR Ray Regeneration (1.2.1): Vulkan SDK Denoiser provider slot (stub when absent).");
+                                  "- Upways: Decoupled RDNA 4 FP8 WMMA multi-scale backbone + continuous subpixel resolve.\n"
+                                  "- AMD FSR Ray Regeneration (1.2.1): 4-Signal AMD FidelityFX Denoiser provider.");
             }
             if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.95f, 0.55f, 1.0f));
@@ -2469,19 +2462,10 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
 
         // 7. Wavefront Engine & Ray Scheduling
         if (ImGui::CollapsingHeader("Wavefront Engine & Ray Scheduling")) {
-            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture:");
-            int pipeType = (config.pipeline_type == PipelineType::Wavefront) ? 0 : 1;
-            if (ImGui::RadioButton("Wavefront Path Tracing (Ray Queues & DGC)", &pipeType, 0)) {
-                config.pipeline_type = PipelineType::Wavefront;
-                settingsChanged = true;
-            }
-            if (ImGui::RadioButton("Dedicated RTP (VK_KHR_ray_tracing_pipeline) [Legacy / Benchmark]", &pipeType, 1)) {
-                config.pipeline_type = PipelineType::RTP;
-                settingsChanged = true;
-            }
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Pipeline Architecture: Wavefront Path Tracing (Ray Queues & DGC)");
             ImGui::TextDisabled("Ray Scheduling: %s (Wave%u)", stats.ray_accelerator_name.c_str(), stats.subgroup_size > 0 ? stats.subgroup_size : 32u);
 
-            if (config.pipeline_type == PipelineType::Wavefront) {
+            {
                 ImGui::Spacing();
                 ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Wavefront Material Sorting:");
                 const char* sortModes[] = {

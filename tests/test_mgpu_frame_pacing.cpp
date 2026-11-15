@@ -325,7 +325,7 @@ int main() {
 
         Config cfgOn = cfgOff;
         cfgOn.mgpu_mode = MultiGpuMode::CheckerboardTile;
-        cfgOn.denoiser_mode = DenoiserMode::Svgf;
+        cfgOn.denoiser_mode = DenoiserMode::Upways;
         check_true(mgpu.ensureSecondaryInitialized(cfgOn, cornellScene),
                    "ensureSecondaryInitialized must initialize GPU 1 on demand");
         check_true(mgpu.isSecondaryInitialized() && mgpu.isMultiGpuActive(),
