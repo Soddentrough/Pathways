@@ -126,8 +126,8 @@ Engine::Engine(const Config& config) : m_config(config) {
                 }
             }
         } else if (m_config.upscaler_mode == UpscalerMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+                   (!m_context || !m_context->supportsUpwaysWmma())) {
+            Logger::error("Upways Super-Resolution requires Wave32 VK_KHR_cooperative_matrix WMMA (FP8, INT8, or FP16); disabling upscaling.");
             m_config.upscaler_mode = UpscalerMode::None;
             m_config.render_scale = 1.0f;
             m_config.render_width = 0;
@@ -141,8 +141,8 @@ Engine::Engine(const Config& config) : m_config(config) {
                 m_config.denoiser_mode = DenoiserMode::None;
             }
         } else if (m_config.denoiser_mode == DenoiserMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Neural Denoiser requires VK_KHR_cooperative_matrix; disabling denoiser.");
+                   (!m_context || !m_context->supportsUpwaysWmma())) {
+            Logger::error("Upways Neural Denoiser requires Wave32 VK_KHR_cooperative_matrix WMMA (FP8, INT8, or FP16); disabling denoiser.");
             m_config.denoiser_mode = DenoiserMode::None;
         }
 
@@ -1112,7 +1112,8 @@ void Engine::initPipelines() {
     m_superResolution = std::make_unique<SuperResolutionManager>(
         device, m_context->getPhysicalDevice(), allocator,
         m_context->getGraphicsQueue(),
-        [this](const std::string& name) { return loadShaderSPIRV(name); }
+        [this](const std::string& name) { return loadShaderSPIRV(name); },
+        m_context->getInstance()
     );
     m_superResolution->init(m_config, m_postProcess.get(), m_commandBuffers[0]);
 
@@ -1782,8 +1783,8 @@ void Engine::renderFrame() {
                 }
             }
         } else if (m_config.upscaler_mode == UpscalerMode::Upways &&
-                   (!m_context || !m_context->hasCooperativeMatrix())) {
-            Logger::error("Upways Super-Resolution requires VK_KHR_cooperative_matrix; disabling upscaling.");
+                   (!m_context || !m_context->supportsUpwaysWmma())) {
+            Logger::error("Upways Super-Resolution requires Wave32 VK_KHR_cooperative_matrix WMMA (FP8, INT8, or FP16); disabling upscaling.");
             m_config.upscaler_mode = UpscalerMode::None;
             m_config.render_scale = 1.0f;
             m_config.render_width = 0;
@@ -1798,8 +1799,8 @@ void Engine::renderFrame() {
             m_config.denoiser_mode = DenoiserMode::None;
         }
     } else if (m_config.denoiser_mode == DenoiserMode::Upways &&
-               (!m_context || !m_context->hasCooperativeMatrix())) {
-        Logger::error("Upways Neural Denoiser requires VK_KHR_cooperative_matrix; disabling denoiser.");
+               (!m_context || !m_context->supportsUpwaysWmma())) {
+        Logger::error("Upways Neural Denoiser requires Wave32 VK_KHR_cooperative_matrix WMMA (FP8, INT8, or FP16); disabling denoiser.");
         m_config.denoiser_mode = DenoiserMode::None;
     }
     if (m_config.nrc_backend == NrcBackend::FfxRadianceCache) {
@@ -2041,7 +2042,8 @@ void Engine::renderFrame() {
                     m_config.upscaler_mode, m_config.denoiser_mode,
                     m_config.upways_superres, m_config.accum_format,
                     m_postProcess.get(), m_commandBuffers[0],
-                    m_config.fsr_version
+                    m_config.fsr_version,
+                    m_config.upways_precision
                 );
             }
         }
@@ -3305,7 +3307,8 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
                 m_config.upscaler_mode, m_config.denoiser_mode,
                 m_config.upways_superres, m_config.accum_format,
                 m_postProcess.get(), m_commandBuffers[0],
-                m_config.fsr_version
+                m_config.fsr_version,
+                m_config.upways_precision
             );
         }
     }

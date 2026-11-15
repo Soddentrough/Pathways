@@ -1,6 +1,7 @@
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/upways_weights.hpp"
 #include "rt/upways_default_weights.hpp"
+#include "rt/upways_default_int8_weights.hpp"
 #include "core/Config.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
@@ -224,24 +225,29 @@ int main() {
     check_true(sizeof(upways::DEFAULT_WEIGHTS) == 24064u, "sizeof(DEFAULT_WEIGHTS) == 24064");
     check_true(upways::EMBEDDED_WEIGHTS_SIZE == 24064u, "EMBEDDED_WEIGHTS_SIZE == 24064");
     check_true(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == 24064u, "sizeof(DEFAULT_UPWAYS_WEIGHTS) == 24064");
+    check_true(upways::EMBEDDED_INT8_WEIGHTS_SIZE == 24064u, "EMBEDDED_INT8_WEIGHTS_SIZE == 24064");
+    check_true(sizeof(upways::DEFAULT_UPWAYS_INT8_WEIGHTS) == 24064u, "sizeof(DEFAULT_UPWAYS_INT8_WEIGHTS) == 24064");
     {
         namespace fs = std::filesystem;
-        const std::vector<fs::path> weightCandidates = {
-            "data/models/upways_weights.bin",
-            "../data/models/upways_weights.bin",
-            "../../data/models/upways_weights.bin",
-            "../../../data/models/upways_weights.bin",
-        };
-        bool foundWeightFile = false;
-        for (const auto& wp : weightCandidates) {
-            if (fs::exists(wp)) {
-                foundWeightFile = true;
-                check_true(fs::file_size(wp) == upways::TOTAL_WEIGHT_BYTES,
-                           "On-disk upways_weights.bin must be exactly 24,064 bytes");
-                break;
+        auto checkWeightFile = [](const std::string& filename, const char* errMsg) {
+            const std::vector<fs::path> weightCandidates = {
+                fs::path("data/models") / filename,
+                fs::path("../data/models") / filename,
+                fs::path("../../data/models") / filename,
+                fs::path("../../../data/models") / filename,
+            };
+            bool foundWeightFile = false;
+            for (const auto& wp : weightCandidates) {
+                if (fs::exists(wp)) {
+                    foundWeightFile = true;
+                    check_true(fs::file_size(wp) == upways::TOTAL_WEIGHT_BYTES, errMsg);
+                    break;
+                }
             }
-        }
-        check_true(foundWeightFile, "upways_weights.bin found in expected data/models path");
+            check_true(foundWeightFile, (filename + " found in expected data/models path").c_str());
+        };
+        checkWeightFile("upways_weights.bin", "On-disk upways_weights.bin must be exactly 24,064 bytes");
+        checkWeightFile("upways_weights_int8.bin", "On-disk upways_weights_int8.bin must be exactly 24,064 bytes");
     }
 
     // 4. U-Net Pyramid Dimensions & 256-B Alignment
@@ -272,17 +278,17 @@ int main() {
     static_assert(UpwaysPipeline::NUM_DENOISER_STAGES == 4, "NUM_DENOISER_STAGES == 4");
     static_assert(UpwaysPipeline::BASE_ANCHOR_LAYERS == 4, "BASE_ANCHOR_LAYERS == 4");
     {
-        const uint32_t ldsPrep = 180u * (16u * 3u + 4u);          // s_diff, s_spec, s_nd, s_mat
-        const uint32_t ldsDenoiserFp8 = (5760u + 2304u) * 4u;     // s_buf + s_acc
-        const uint32_t ldsDenoiserFp16 = (6144u + 768u + 2304u) * 4u;
-        const uint32_t ldsUpscalerFp8 = 1024u * 8u + 1024u * 4u + 2304u * 4u;
-        const uint32_t ldsUpscalerFp16 = 1024u * 8u + 2048u * 4u + 256u * 4u + 2304u * 4u;
+        const uint32_t ldsPrep = 5u * 180u * 8u;                  // s_diff, s_spec, s_nrmDep, s_logDiff, s_logSpec
+        const uint32_t ldsDenoiser8Bit = (3072u + 1024u) * 4u;    // s_buf + s_acc (FP8 / INT8)
+        const uint32_t ldsDenoiserFp16 = (6144u + 1024u) * 4u;    // s_buf + s_acc (FP16)
+        const uint32_t ldsUpscaler8Bit = 1024u * 8u + 1024u * 4u + 2304u * 4u;
+        const uint32_t ldsUpscalerFp16 = 1024u * 8u + 2048u * 4u + 2304u * 4u;
 
-        check_true(ldsPrep == 9360u && ldsPrep <= 32768u, "denoise_prep LDS == 9,360 B <= 32 KiB");
-        check_true(ldsDenoiserFp8 == 32256u && ldsDenoiserFp8 <= 32768u, "denoiser_wmma FP8 LDS == 32,256 B <= 32 KiB");
-        check_true(ldsDenoiserFp16 == 36864u && ldsDenoiserFp16 <= 65536u, "denoiser_wmma FP16 LDS == 36,864 B <= 64 KiB");
-        check_true(ldsUpscalerFp8 == 21504u && ldsUpscalerFp8 <= 32768u, "upscaler_wmma FP8 LDS == 21,504 B <= 32 KiB");
-        check_true(ldsUpscalerFp16 == 26624u && ldsUpscalerFp16 <= 32768u, "upscaler_wmma FP16 LDS == 26,624 B <= 32 KiB");
+        check_true(ldsPrep == 7200u && ldsPrep <= 32768u, "denoise_prep LDS == 7,200 B <= 32 KiB");
+        check_true(ldsDenoiser8Bit == 16384u && ldsDenoiser8Bit <= 32768u, "denoiser_wmma 8-bit LDS == 16,384 B <= 32 KiB");
+        check_true(ldsDenoiserFp16 == 28672u && ldsDenoiserFp16 <= 32768u, "denoiser_wmma FP16 LDS == 28,672 B <= 32 KiB");
+        check_true(ldsUpscaler8Bit == 21504u && ldsUpscaler8Bit <= 32768u, "upscaler_wmma 8-bit LDS == 21,504 B <= 32 KiB");
+        check_true(ldsUpscalerFp16 == 25600u && ldsUpscalerFp16 <= 32768u, "upscaler_wmma FP16 LDS == 25,600 B <= 32 KiB");
     }
 
     // 6. Config CLI Parsing
@@ -291,29 +297,48 @@ int main() {
         Config defCfg;
         check_true(defCfg.capture_channels == 24u, "Default Config::capture_channels == 24 preserved");
         check_true(defCfg.denoiser_mode == DenoiserMode::None, "Default DenoiserMode == None");
+        check_true(defCfg.upways_precision == UpwaysPrecision::Auto, "Default UpwaysPrecision == Auto");
         check_true(!defCfg.upways_superres && !defCfg.upways_heuristic_fallback, "Default Upways SR/heuristic disabled");
 
-        const char* argv1[] = { "pathways", "--denoiser", "upways", "--capture-channels", "32" };
-        Config c1 = Config::parse(5, const_cast<char**>(argv1));
+        const char* argv1[] = { "pathways", "--denoiser", "upways", "--capture-channels", "32", "--upways-precision", "auto" };
+        Config c1 = Config::parse(7, const_cast<char**>(argv1));
         check_true(c1.denoiser_mode == DenoiserMode::Upways, "--denoiser upways selects Upways");
+        check_true(c1.upways_precision == UpwaysPrecision::Auto, "--upways-precision auto selects Auto");
         check_true(!c1.upways_superres, "--denoiser upways leaves upways_superres false");
         check_true(c1.capture_channels == 32u, "--capture-channels 32 accepted");
 
-        const char* argv2[] = { "pathways", "--scaler", "upways", "--upways-heuristic" };
-        Config c2 = Config::parse(4, const_cast<char**>(argv2));
+        const char* argv2[] = { "pathways", "--scaler", "upways", "--upways-heuristic", "--upways-precision", "fp8" };
+        Config c2 = Config::parse(6, const_cast<char**>(argv2));
         check_true(c2.denoiser_mode == DenoiserMode::Upways, "--scaler upways enables Upways denoiser");
         check_true(c2.upscaler_mode == UpscalerMode::Upways, "--scaler upways selects UpscalerMode::Upways");
         check_true(c2.upways_superres, "--scaler upways sets upways_superres true");
         check_true(c2.upways_heuristic_fallback, "--upways-heuristic enables fallback flag");
+        check_true(c2.upways_precision == UpwaysPrecision::Fp8, "--upways-precision fp8 selects Fp8");
+
+        const char* argv3[] = { "pathways", "--upways-precision", "int8" };
+        Config c3 = Config::parse(3, const_cast<char**>(argv3));
+        check_true(c3.upways_precision == UpwaysPrecision::Int8, "--upways-precision int8 selects Int8");
+
+        const char* argv4[] = { "pathways", "--upways-precision", "fp16" };
+        Config c4 = Config::parse(3, const_cast<char**>(argv4));
+        check_true(c4.upways_precision == UpwaysPrecision::Fp16, "--upways-precision fp16 selects Fp16");
+
+        const char* argv5[] = { "pathways", "--upways-precision=int8" };
+        Config c5 = Config::parse(2, const_cast<char**>(argv5));
+        check_true(c5.upways_precision == UpwaysPrecision::Int8, "--upways-precision=int8 selects Int8");
     }
 
-    // 7. SPIR-V Shader Validation (FP8 + FP16 Variants)
-    std::cout << "[TEST 7] SPIR-V Header Verification (8 Shaders)..." << std::endl;
+    // 7. SPIR-V Shader Validation (FP8 + INT8 + FP16 Variants)
+    std::cout << "[TEST 7] SPIR-V Header Verification (12 Shaders)..." << std::endl;
     const char* shaderNames[] = {
         "upways_denoise_prep.comp.spv",
         "upways_denoiser_wmma.comp.spv",
         "upways_upscaler_wmma.comp.spv",
         "upways_upscale_resolve.comp.spv",
+        "upways_denoise_prep.int8.comp.spv",
+        "upways_denoiser_wmma.int8.comp.spv",
+        "upways_upscaler_wmma.int8.comp.spv",
+        "upways_upscale_resolve.int8.comp.spv",
         "upways_denoise_prep.fp16.comp.spv",
         "upways_denoiser_wmma.fp16.comp.spv",
         "upways_upscaler_wmma.fp16.comp.spv",
@@ -362,14 +387,19 @@ int main() {
             VmaAllocator allocator = vkCtx.getAllocator();
             VkQueue queue = vkCtx.getGraphicsQueue();
 
-            const bool useFp8 = UpwaysPipeline::supportsFp8CoopMatrix(vkCtx.getPhysicalDevice());
-            const std::string suffix = useFp8 ? ".comp.spv" : ".fp16.comp.spv";
-            const auto prepSpv = loadSpv("upways_denoise_prep" + suffix);
-            const auto denSpv = loadSpv("upways_denoiser_wmma" + suffix);
-            const auto upSpv = loadSpv("upways_upscaler_wmma" + suffix);
-            const auto resSpv = loadSpv("upways_upscale_resolve" + suffix);
-            check_true(!prepSpv.empty() && !denSpv.empty() && !upSpv.empty() && !resSpv.empty(),
-                       "Upways 4.0 SPIR-V binaries loaded for live GPU test");
+            std::vector<UpwaysComputePrecision> supportedPrecisions;
+            if (UpwaysPipeline::supportsFp8CoopMatrix(vkCtx.getPhysicalDevice(), vkCtx.getInstance())) {
+                supportedPrecisions.push_back(UpwaysComputePrecision::Fp8);
+            }
+            if (UpwaysPipeline::supportsInt8CoopMatrix(vkCtx.getPhysicalDevice(), vkCtx.getInstance())) {
+                supportedPrecisions.push_back(UpwaysComputePrecision::Int8);
+            }
+            if (UpwaysPipeline::supportsFp16CoopMatrix(vkCtx.getPhysicalDevice(), vkCtx.getInstance())) {
+                supportedPrecisions.push_back(UpwaysComputePrecision::Fp16);
+            }
+            check_true(!supportedPrecisions.empty(),
+                       "At least one Upways WMMA precision tier (FP8/INT8/FP16) must be supported on hardware GPU");
+            check_true(vkCtx.supportsUpwaysWmma(), "VulkanContext::supportsUpwaysWmma() matches GPU WMMA capability");
 
             VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
             cpInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -463,14 +493,27 @@ int main() {
                     vkQueueWaitIdle(queue);
                 };
 
+            for (UpwaysComputePrecision prec : supportedPrecisions) {
+                const std::string suffix = (prec == UpwaysComputePrecision::Fp8)
+                    ? ".comp.spv"
+                    : (prec == UpwaysComputePrecision::Int8 ? ".int8.comp.spv" : ".fp16.comp.spv");
+                const auto prepSpv = loadSpv("upways_denoise_prep" + suffix);
+                const auto denSpv = loadSpv("upways_denoiser_wmma" + suffix);
+                const auto upSpv = loadSpv("upways_upscaler_wmma" + suffix);
+                const auto resSpv = loadSpv("upways_upscale_resolve" + suffix);
+                check_true(!prepSpv.empty() && !denSpv.empty() && !upSpv.empty() && !resSpv.empty(),
+                           "Upways 4.0 SPIR-V binaries loaded for live GPU test");
+
                 UpwaysPipeline upw(
                     device, vkCtx.getPhysicalDevice(), allocator,
                     64u, 64u, 128u, 128u,
                     prepSpv, denSpv, upSpv, resSpv,
-                    "", true, VK_FORMAT_R16G16B16A16_SFLOAT, useFp8
+                    "", true, VK_FORMAT_R16G16B16A16_SFLOAT, prec
                 );
                 check_true(upw.isInitialized(), "UpwaysPipeline 4.0 must initialize on GPU");
-                check_true(upw.usesFp8CoopMatrix() == useFp8, "usesFp8CoopMatrix reflects requested mode");
+                check_true(upw.getPrecision() == prec, "UpwaysPipeline::getPrecision matches requested tier");
+                check_true(upw.usesFp8CoopMatrix() == (prec == UpwaysComputePrecision::Fp8),
+                           "usesFp8CoopMatrix reflects active precision tier");
                 bindGbuf(upw, g64);
 
                 // Phase A: 2x Super-Resolution (64x64 -> 128x128), zero-residual + neural passes
@@ -543,12 +586,15 @@ int main() {
                     readbackBuf.unmap();
                     check_true(energyExact, "Native 1.0x zero-residual output matches remodulated 0.865 radiance");
                 }
+                    vkDeviceWaitIdle(device);
+                    std::cout << "    -> Verified precision=" << upwaysPrecisionName(prec) << " on live GPU." << std::endl;
+                }
             }
 
             vkDestroyCommandPool(device, cmdPool, nullptr);
             check_true(vkCtx.getValidationErrors() == 0u, "Zero Vulkan validation errors during Upways 4.0 GPU test");
-            std::cout << "  -> Live GPU Upways 4.0 + Lossless DRS + 1.0x verified (FP8=" << (useFp8 ? "true" : "false")
-                      << ", 0 validation errors)." << std::endl;
+            std::cout << "  -> Live GPU Upways 4.0 + Lossless DRS + 1.0x verified across "
+                      << supportedPrecisions.size() << " precision tier(s), 0 validation errors." << std::endl;
         } else {
             std::cout << "[TEST 8] Skipped (no Vulkan 1.4 hardware GPU available)." << std::endl;
         }

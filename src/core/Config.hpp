@@ -70,6 +70,13 @@ enum class UpscalerMode {
     FSR3 = FSR
 };
 
+enum class UpwaysPrecision : uint8_t {
+    Auto = 0, // Highest-speed supported tier: FP8 -> INT8 QAT -> FP16
+    Fp8  = 1, // RDNA 4 FP8 E4M3fn WMMA
+    Int8 = 2, // RDNA 3/3.5/4 INT8 QAT WMMA
+    Fp16 = 3  // IEEE FP16 WMMA fallback
+};
+
 // Post-mortem visualization overlays written directly over the output image
 // (bypass accumulation & tonemap). ReSTIR views require --restir.
 enum class DebugViewMode {
@@ -195,6 +202,7 @@ struct Config {
     bool upways_superres = false;         // Upways Continuous Super-Resolution (e.g. 1080p -> 4K)
     bool upways_heuristic_fallback = false; // Debug bypass: force analytical temporal/spatial heuristic instead of WMMA U-Net + KPN
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
+    UpwaysPrecision upways_precision = UpwaysPrecision::Auto; // WMMA precision tier: Auto (FP8->INT8->FP16), Fp8, Int8, Fp16
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
     FsrVersion fsr_version = FsrVersion::Auto;       // Target FSR version when UpscalerMode::FSR is active [Default: Auto]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]

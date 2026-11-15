@@ -1,14 +1,23 @@
 #version 460
 #extension GL_EXT_control_flow_attributes : enable
+#extension GL_KHR_cooperative_matrix : require
 #include "upways_common.glsl"
 
 layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 
 layout(constant_id = 0) const uint SPEC_STAGE_ID = 0u; // 0=ENC1_PW1, 1=ENC1_DWPW2, 2=BOT2, 3=DEC1
 
-layout(set = 0, binding = 0)  readonly  buffer WeightFp8Buf     { uint w8[]; }    g_w8;
+#if UPWAYS_IS_FP16
+layout(set = 0, binding = 0)  readonly  buffer WeightFp16Buf    { uint w16[]; }    g_w16;
+#else
+layout(set = 0, binding = 0)  readonly  buffer Weight8Buf       { uint w8[]; }     g_w8;
+#endif
 layout(set = 0, binding = 1)  readonly  buffer WeightFp32Buf    { vec4 w32v[]; }  g_w32;
-layout(set = 0, binding = 2)            buffer DenoiseActFp8Buf { uvec2 act2[]; } g_act;
+#if !UPWAYS_IS_FP16
+layout(set = 0, binding = 2)            buffer DenoiseActBuf    { uvec2 act2[]; } g_act;
+#else
+layout(set = 0, binding = 2)            buffer DenoiseActBuf    { uvec4 act4[]; } g_act;
+#endif
 layout(set = 0, binding = 3,  rgba16f)  readonly  uniform image2DArray tBaseAnchorLr;
 layout(set = 0, binding = 4,  rgba16f)  readonly  uniform image2D      uMlDiffuse;
 layout(set = 0, binding = 5,  rgba16f)  readonly  uniform image2D      uMlSpecular;
@@ -22,14 +31,35 @@ layout(set = 0, binding = 12, r32ui)    writeonly uniform uimage2D     uCurrHidd
 layout(set = 0, binding = 13, rgba16f)  writeonly uniform image2D      tCleanRadLr;
 layout(set = 0, binding = 14, rgba16f)  writeonly uniform image2D      uOutputColor;
 
-// Aliased LDS (16,384 B exact in FP8 mode: 3072 + 1024 = 4096 dwords -> 8 subgroups/SIMD on gfx1201)
-#ifndef UPWAYS_FP16_WMMA
+// Aliased LDS:
+// - FP8 / INT8: 3072 + 1024 = 4096 dwords = 16,384 B (8 subgroups/SIMD on gfx1100/gfx1201)
+// - FP16:       6144 + 1024 = 7168 dwords = 28,672 B (<= 32 KB; weights loaded directly from g_w16)
+#if !UPWAYS_IS_FP16
 shared uint s_buf[3072];
 #else
 shared uint s_buf[6144];
-shared uint s_w16[768];
 #endif
+#if UPWAYS_IS_INT8
+shared int s_acc[1024];
+#else
 shared float s_acc[1024];
+#endif
+
+void storeAccUint(uint idx, uint bits) {
+#if UPWAYS_IS_INT8
+    s_acc[idx] = int(bits);
+#else
+    s_acc[idx] = uintBitsToFloat(bits);
+#endif
+}
+
+uint loadAccUint(uint idx) {
+#if UPWAYS_IS_INT8
+    return uint(s_acc[idx]);
+#else
+    return floatBitsToUint(s_acc[idx]);
+#endif
+}
 
 void writeSB(uint px, uint vecIdx, uint vec4PerPx, vec4 v) {
     uint swizVec = vecIdx ^ (px & (vec4PerPx - 1u));
@@ -45,7 +75,7 @@ vec4 readSB(uint px, uint vecIdx, uint vec4PerPx) {
 }
 
 void writeSB2Lo(uint px, uint vecIdx, vec4 v) {
-#ifndef UPWAYS_FP16_WMMA
+#if !UPWAYS_IS_FP16
     uint swizVec     = vecIdx ^ ((px >> 3u) & 1u);
     uint base        = (px * 6u + swizVec) * 2u;
     s_buf[base + 0u] = packHalf2x16(v.xy);
@@ -56,7 +86,7 @@ void writeSB2Lo(uint px, uint vecIdx, vec4 v) {
 }
 
 vec4 readSB2Lo(uint px, uint vecIdx) {
-#ifndef UPWAYS_FP16_WMMA
+#if !UPWAYS_IS_FP16
     uint swizVec = vecIdx ^ ((px >> 3u) & 1u);
     uint base    = (px * 6u + swizVec) * 2u;
     return vec4(unpackHalf2x16(s_buf[base + 0u]), unpackHalf2x16(s_buf[base + 1u]));
@@ -66,61 +96,74 @@ vec4 readSB2Lo(uint px, uint vecIdx) {
 }
 
 void writeSB2Hi(uint px, uint c4_67, vec4 v) {
-#ifndef UPWAYS_FP16_WMMA
-    uint swizVec     = c4_67 ^ ((px >> 3u) & 1u);
-    uint base        = (px * 2u + swizVec) * 2u;
-    s_acc[base + 0u] = uintBitsToFloat(packHalf2x16(v.xy));
-    s_acc[base + 1u] = uintBitsToFloat(packHalf2x16(v.zw));
+#if !UPWAYS_IS_FP16
+    uint swizVec = c4_67 ^ ((px >> 3u) & 1u);
+    uint base    = (px * 2u + swizVec) * 2u;
+    storeAccUint(base + 0u, packHalf2x16(v.xy));
+    storeAccUint(base + 1u, packHalf2x16(v.zw));
 #else
     writeSB(px, 6u + c4_67, 8u, v);
 #endif
 }
 
 vec4 readSB2Hi(uint px, uint c4_67) {
-#ifndef UPWAYS_FP16_WMMA
+#if !UPWAYS_IS_FP16
     uint swizVec = c4_67 ^ ((px >> 3u) & 1u);
     uint base    = (px * 2u + swizVec) * 2u;
     return vec4(
-        unpackHalf2x16(floatBitsToUint(s_acc[base + 0u])),
-        unpackHalf2x16(floatBitsToUint(s_acc[base + 1u]))
+        unpackHalf2x16(loadAccUint(base + 0u)),
+        unpackHalf2x16(loadAccUint(base + 1u))
     );
 #else
     return readSB(px, 6u + c4_67, 8u);
 #endif
 }
 
-void writeSAFromGlobalU32(uint px, uint vecIdx, uint vec4PerPx, uint packedFp8) {
-#ifndef UPWAYS_FP16_WMMA
-    s_buf[px * vec4PerPx + vecIdx] = packedFp8;
+#if !UPWAYS_IS_FP16
+void writeSAU32(uint px, uint vecIdx, uint vec4PerPx, uint packed4) {
+    s_buf[px * vec4PerPx + vecIdx] = packed4;
+}
 #else
-    vec4 q = unpackFp8Vec4(packedFp8);
+void writeSAHalf(uint px, uint vecIdx, uint vec4PerPx, uvec2 h4) {
     uint base = (px * vec4PerPx + vecIdx) * 2u;
-    s_buf[base + 0u] = packHalf2x16(q.xy);
-    s_buf[base + 1u] = packHalf2x16(q.zw);
+    s_buf[base + 0u] = h4.x;
+    s_buf[base + 1u] = h4.y;
+}
+#endif
+
+void storeActFeatPair(uint idx2, vec4 v0, vec4 v1) {
+#if UPWAYS_IS_FP8
+    g_act.act2[idx2] = uvec2(packFp8Vec4(v0), packFp8Vec4(v1));
+#elif UPWAYS_IS_INT8
+    g_act.act2[idx2] = uvec2(
+        packInt8Vec4(v0, vec4(UPWAYS_INT8_ACT_MAX_FEAT)),
+        packInt8Vec4(v1, vec4(UPWAYS_INT8_ACT_MAX_FEAT))
+    );
+#else
+    g_act.act4[idx2] = uvec4(packHalf4(v0), packHalf4(v1));
 #endif
 }
 
-void writeSA(uint px, uint vecIdx, uint vec4PerPx, vec4 v) {
-    writeSAFromGlobalU32(px, vecIdx, vec4PerPx, packFp8Vec4(v));
+void loadActFeatPair(uint idx2, out vec4 v0, out vec4 v1) {
+#if UPWAYS_IS_FP8
+    uvec2 p = g_act.act2[idx2];
+    v0 = unpackFp8Vec4(p.x);
+    v1 = unpackFp8Vec4(p.y);
+#elif UPWAYS_IS_INT8
+    uvec2 p = g_act.act2[idx2];
+    v0 = unpackInt8Vec4(p.x, vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    v1 = unpackInt8Vec4(p.y, vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+#else
+    uvec4 p = g_act.act4[idx2];
+    v0 = unpackHalf4(p.xy);
+    v1 = unpackHalf4(p.zw);
+#endif
 }
 
 uvec2 packHeadHalf(vec4 v) {
     vec4 c = vec4(clamp(v.xyz, vec3(-8.0), vec3(8.0)), clamp(v.w, -4.0, 4.0));
     return uvec2(packHalf2x16(c.xy), packHalf2x16(c.zw));
 }
-
-#ifdef UPWAYS_FP16_WMMA
-void preloadWeightNTile(uint wBaseU32, uint ob, uint inTiles) {
-    uint t = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
-    for (uint ib = 0u; ib < inTiles; ++ib) {
-        uint tileBase = wBaseU32 + (ob * inTiles + ib) * 64u;
-        uint packed4  = g_w8.w8[tileBase + (t >> 1u)];
-        vec4 w = unpackFp8Vec4(packed4);
-        s_w16[ib * 128u + t] = packHalf2x16(((t & 1u) == 0u) ? w.xy : w.zw);
-    }
-    barrier();
-}
-#endif
 
 // Must be called subgroup-uniformly; reads s_buf[0..] as row-major input matrix A.
 void evalPwNTile(
@@ -130,12 +173,13 @@ void evalPwNTile(
     uint sOff,
     uint bOff,
     bool applyLrelu,
+    float actScale,
     out vec4 o0, out vec4 o1, out vec4 o2, out vec4 o3
 ) {
     uint sg   = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
 
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
     uint aStride = inTiles * 4u;
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
@@ -144,6 +188,25 @@ void evalPwNTile(
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_buf, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_buf, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#elif UPWAYS_IS_INT8
+    uint aStride = inTiles * 4u;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
 
     uint r0 = (sg * 32u) * aStride;
     uint r1 = (sg * 32u + 16u) * aStride;
@@ -169,7 +232,7 @@ void evalPwNTile(
     for (uint ib = 0u; ib < inTiles; ++ib) {
         coopMatLoad(matA0, s_buf, r0 + ib * 8u, aStride, gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(matA1, s_buf, r1 + ib * 8u, aStride, gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matB,  s_w16, ib * 128u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+        coopMatLoad(matB,  g_w16.w16, (wBaseU32 + (ob * inTiles + ib) * 64u) * 2u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
         acc0 = coopMatMulAdd(matA0, matB, acc0);
         acc1 = coopMatMulAdd(matA1, matB, acc1);
     }
@@ -209,6 +272,12 @@ void evalPwNTile(
     vec4 sc1 = g_w32.w32v[sIdx4 + 1u];
     vec4 sc2 = g_w32.w32v[sIdx4 + 2u];
     vec4 sc3 = g_w32.w32v[sIdx4 + 3u];
+#if UPWAYS_IS_INT8
+    sc0 *= actScale;
+    sc1 *= actScale;
+    sc2 *= actScale;
+    sc3 *= actScale;
+#endif
 
     vec4 bi0 = g_w32.w32v[bIdx4 + 0u];
     vec4 bi1 = g_w32.w32v[bIdx4 + 1u];
@@ -229,61 +298,180 @@ void evalPwNTile(
     subgroupBarrier();
 }
 
-uvec2 evalDw3x3L1Pair(uint baseAp, uint wTapStride4, uint c4Even, uint dwWOff, uint dwBOff) {
-    const uint kOff[9] = uint[9](0u, 1u, 2u, 18u, 19u, 20u, 36u, 37u, 38u);
+void evalDw3x3L1Pair(uint baseAp, uint wTapStride4, uint c4Even, uint dwWOff, uint dwBOff, out vec4 out0, out vec4 out1) {
     uint bIdx4  = (dwBOff >> 2u) + c4Even;
     vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
     vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
     uint wBase4 = (dwWOff >> 2u) + c4Even;
-    [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        uint apTap = baseAp + kOff[tap];
-        uint wIdx4 = wBase4 + tap * wTapStride4;
-        vec4 x0 = readSB(apTap, c4Even + 0u, 8u);
-        vec4 x1 = readSB(apTap, c4Even + 1u, 8u);
-        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
-        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
-        acc0 += x0 * w0;
-        acc1 += x1 * w1;
+    [[dont_unroll]] for (uint ky = 0u; ky < 3u; ++ky) {
+        [[unroll]] for (uint kx = 0u; kx < 3u; ++kx) {
+            uint tap = ky * 3u + kx;
+            uint apTap = baseAp + ky * 18u + kx;
+            uint wIdx4 = wBase4 + tap * wTapStride4;
+            vec4 x0 = readSB(apTap, c4Even + 0u, 8u);
+            vec4 x1 = readSB(apTap, c4Even + 1u, 8u);
+            vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+            vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+            acc0 += x0 * w0;
+            acc1 += x1 * w1;
+        }
     }
-    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
+    out0 = upwaysLrelu4(acc0);
+    out1 = upwaysLrelu4(acc1);
 }
 
-uvec2 evalDw3x3Stage2LoPair(uint baseAp, uint c4Even, uint dwWOff, uint dwBOff) {
-    const uint kOff[9] = uint[9](0u, 2u, 4u, 40u, 42u, 44u, 80u, 82u, 84u);
+void evalDw3x3Stage2LoPair(uint baseAp, uint c4Even, uint dwWOff, uint dwBOff, out vec4 out0, out vec4 out1) {
     uint bIdx4  = (dwBOff >> 2u) + c4Even;
     vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
     vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
     uint wBase4 = (dwWOff >> 2u) + c4Even;
-    [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        uint apTap = baseAp + kOff[tap];
-        uint wIdx4 = wBase4 + tap * 8u;
-        vec4 x0 = readSB2Lo(apTap, c4Even + 0u);
-        vec4 x1 = readSB2Lo(apTap, c4Even + 1u);
-        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
-        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
-        acc0 += x0 * w0;
-        acc1 += x1 * w1;
+    [[dont_unroll]] for (uint ky = 0u; ky < 3u; ++ky) {
+        [[unroll]] for (uint kx = 0u; kx < 3u; ++kx) {
+            uint tap = ky * 3u + kx;
+            uint apTap = baseAp + ky * 40u + kx * 2u;
+            uint wIdx4 = wBase4 + tap * 8u;
+            vec4 x0 = readSB2Lo(apTap, c4Even + 0u);
+            vec4 x1 = readSB2Lo(apTap, c4Even + 1u);
+            vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+            vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+            acc0 += x0 * w0;
+            acc1 += x1 * w1;
+        }
     }
-    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
+    out0 = upwaysLrelu4(acc0);
+    out1 = upwaysLrelu4(acc1);
 }
 
-uvec2 evalDw3x3Stage2HiPair(uint baseAp, uint dwWOff, uint dwBOff) {
-    const uint kOff[9] = uint[9](0u, 2u, 4u, 40u, 42u, 44u, 80u, 82u, 84u);
+void evalDw3x3Stage2HiPair(uint baseAp, uint dwWOff, uint dwBOff, out vec4 out0, out vec4 out1) {
     uint bIdx4  = (dwBOff >> 2u) + 6u;
     vec4 acc0   = g_w32.w32v[bIdx4 + 0u];
     vec4 acc1   = g_w32.w32v[bIdx4 + 1u];
     uint wBase4 = (dwWOff >> 2u) + 6u;
-    [[unroll]] for (uint tap = 0u; tap < 9u; ++tap) {
-        uint apTap = baseAp + kOff[tap];
-        uint wIdx4 = wBase4 + tap * 8u;
-        vec4 x0 = readSB2Hi(apTap, 0u);
-        vec4 x1 = readSB2Hi(apTap, 1u);
-        vec4 w0 = g_w32.w32v[wIdx4 + 0u];
-        vec4 w1 = g_w32.w32v[wIdx4 + 1u];
-        acc0 += x0 * w0;
-        acc1 += x1 * w1;
+    [[dont_unroll]] for (uint ky = 0u; ky < 3u; ++ky) {
+        [[unroll]] for (uint kx = 0u; kx < 3u; ++kx) {
+            uint tap = ky * 3u + kx;
+            uint apTap = baseAp + ky * 40u + kx * 2u;
+            uint wIdx4 = wBase4 + tap * 8u;
+            vec4 x0 = readSB2Hi(apTap, 0u);
+            vec4 x1 = readSB2Hi(apTap, 1u);
+            vec4 w0 = g_w32.w32v[wIdx4 + 0u];
+            vec4 w1 = g_w32.w32v[wIdx4 + 1u];
+            acc0 += x0 * w0;
+            acc1 += x1 * w1;
+        }
     }
-    return uvec2(packFp8Vec4(upwaysLrelu4(acc0)), packFp8Vec4(upwaysLrelu4(acc1)));
+    out0 = upwaysLrelu4(acc0);
+    out1 = upwaysLrelu4(acc1);
+}
+
+void writeSA8Vecs(uint px, vec4 v0, vec4 v1, vec4 v2, vec4 v3, vec4 v4, vec4 v5, vec4 v6, vec4 v7, out float actScale) {
+#if UPWAYS_IS_FP8
+    actScale = 1.0;
+    writeSAU32(px, 0u, 8u, packFp8Vec4(v0));
+    writeSAU32(px, 1u, 8u, packFp8Vec4(v1));
+    writeSAU32(px, 2u, 8u, packFp8Vec4(v2));
+    writeSAU32(px, 3u, 8u, packFp8Vec4(v3));
+    writeSAU32(px, 4u, 8u, packFp8Vec4(v4));
+    writeSAU32(px, 5u, 8u, packFp8Vec4(v5));
+    writeSAU32(px, 6u, 8u, packFp8Vec4(v6));
+    writeSAU32(px, 7u, 8u, packFp8Vec4(v7));
+#elif UPWAYS_IS_INT8
+    float m = max(max(max(dynInt8AbsMax4(v0), dynInt8AbsMax4(v1)), max(dynInt8AbsMax4(v2), dynInt8AbsMax4(v3))),
+                  max(max(dynInt8AbsMax4(v4), dynInt8AbsMax4(v5)), max(dynInt8AbsMax4(v6), dynInt8AbsMax4(v7))));
+    m = max(m, 1e-6);
+    actScale = m * (1.0 / 127.0);
+    vec4 invS = vec4(127.0 / m);
+    writeSAU32(px, 0u, 8u, packInt8Vec4Inv(v0, invS));
+    writeSAU32(px, 1u, 8u, packInt8Vec4Inv(v1, invS));
+    writeSAU32(px, 2u, 8u, packInt8Vec4Inv(v2, invS));
+    writeSAU32(px, 3u, 8u, packInt8Vec4Inv(v3, invS));
+    writeSAU32(px, 4u, 8u, packInt8Vec4Inv(v4, invS));
+    writeSAU32(px, 5u, 8u, packInt8Vec4Inv(v5, invS));
+    writeSAU32(px, 6u, 8u, packInt8Vec4Inv(v6, invS));
+    writeSAU32(px, 7u, 8u, packInt8Vec4Inv(v7, invS));
+#else
+    actScale = 1.0;
+    writeSAHalf(px, 0u, 8u, packHalf4(v0));
+    writeSAHalf(px, 1u, 8u, packHalf4(v1));
+    writeSAHalf(px, 2u, 8u, packHalf4(v2));
+    writeSAHalf(px, 3u, 8u, packHalf4(v3));
+    writeSAHalf(px, 4u, 8u, packHalf4(v4));
+    writeSAHalf(px, 5u, 8u, packHalf4(v5));
+    writeSAHalf(px, 6u, 8u, packHalf4(v6));
+    writeSAHalf(px, 7u, 8u, packHalf4(v7));
+#endif
+}
+
+float dynHalfAbsMax4(uvec2 h) {
+    vec4 v = unpackHalf4(h);
+    vec4 a = abs(v);
+    return max(max(a.x, a.y), max(a.z, a.w));
+}
+
+void writeSAHalf4Block(uint px, uint baseIdx, uint vec4PerPx, uvec2 h0, uvec2 h1, uvec2 h2, uvec2 h3, vec4 invS) {
+#if UPWAYS_IS_FP8
+    writeSAU32(px, baseIdx + 0u, vec4PerPx, packFp8Vec4(unpackHalf4(h0)));
+    writeSAU32(px, baseIdx + 1u, vec4PerPx, packFp8Vec4(unpackHalf4(h1)));
+    writeSAU32(px, baseIdx + 2u, vec4PerPx, packFp8Vec4(unpackHalf4(h2)));
+    writeSAU32(px, baseIdx + 3u, vec4PerPx, packFp8Vec4(unpackHalf4(h3)));
+#elif UPWAYS_IS_INT8
+    writeSAU32(px, baseIdx + 0u, vec4PerPx, packInt8Vec4Inv(unpackHalf4(h0), invS));
+    writeSAU32(px, baseIdx + 1u, vec4PerPx, packInt8Vec4Inv(unpackHalf4(h1), invS));
+    writeSAU32(px, baseIdx + 2u, vec4PerPx, packInt8Vec4Inv(unpackHalf4(h2), invS));
+    writeSAU32(px, baseIdx + 3u, vec4PerPx, packInt8Vec4Inv(unpackHalf4(h3), invS));
+#else
+    writeSAHalf(px, baseIdx + 0u, vec4PerPx, h0);
+    writeSAHalf(px, baseIdx + 1u, vec4PerPx, h1);
+    writeSAHalf(px, baseIdx + 2u, vec4PerPx, h2);
+    writeSAHalf(px, baseIdx + 3u, vec4PerPx, h3);
+#endif
+}
+
+void writeSA12HalfVecs(
+    uint px,
+    uvec2 h0, uvec2 h1, uvec2 h2, uvec2 h3,
+    uvec2 h4, uvec2 h5, uvec2 h6, uvec2 h7,
+    uvec2 h8, uvec2 h9, uvec2 h10, uvec2 h11,
+    out float actScale
+) {
+    vec4 invS = vec4(1.0);
+    actScale = 1.0;
+#if UPWAYS_IS_INT8
+    float m0 = max(max(dynHalfAbsMax4(h0), dynHalfAbsMax4(h1)), max(dynHalfAbsMax4(h2), dynHalfAbsMax4(h3)));
+    float m1 = max(max(dynHalfAbsMax4(h4), dynHalfAbsMax4(h5)), max(dynHalfAbsMax4(h6), dynHalfAbsMax4(h7)));
+    float m2 = max(max(dynHalfAbsMax4(h8), dynHalfAbsMax4(h9)), max(dynHalfAbsMax4(h10), dynHalfAbsMax4(h11)));
+    float m = max(max(m0, max(m1, m2)), 1e-6);
+    actScale = m * (1.0 / 127.0);
+    invS = vec4(127.0 / m);
+#endif
+    writeSAHalf4Block(px, 0u, 12u, h0, h1, h2, h3, invS);
+    writeSAHalf4Block(px, 4u, 12u, h4, h5, h6, h7, invS);
+    writeSAHalf4Block(px, 8u, 12u, h8, h9, h10, h11, invS);
+}
+
+void writeSA16HalfVecs(
+    uint px,
+    uvec2 h0,  uvec2 h1,  uvec2 h2,  uvec2 h3,
+    uvec2 h4,  uvec2 h5,  uvec2 h6,  uvec2 h7,
+    uvec2 h8,  uvec2 h9,  uvec2 h10, uvec2 h11,
+    uvec2 h12, uvec2 h13, uvec2 h14, uvec2 h15,
+    out float actScale
+) {
+    vec4 invS = vec4(1.0);
+    actScale = 1.0;
+#if UPWAYS_IS_INT8
+    float m0 = max(max(dynHalfAbsMax4(h0),  dynHalfAbsMax4(h1)),  max(dynHalfAbsMax4(h2),  dynHalfAbsMax4(h3)));
+    float m1 = max(max(dynHalfAbsMax4(h4),  dynHalfAbsMax4(h5)),  max(dynHalfAbsMax4(h6),  dynHalfAbsMax4(h7)));
+    float m2 = max(max(dynHalfAbsMax4(h8),  dynHalfAbsMax4(h9)),  max(dynHalfAbsMax4(h10), dynHalfAbsMax4(h11)));
+    float m3 = max(max(dynHalfAbsMax4(h12), dynHalfAbsMax4(h13)), max(dynHalfAbsMax4(h14), dynHalfAbsMax4(h15)));
+    float m = max(max(max(m0, m1), max(m2, m3)), 1e-6);
+    actScale = m * (1.0 / 127.0);
+    invS = vec4(127.0 / m);
+#endif
+    writeSAHalf4Block(px, 0u,  16u, h0,  h1,  h2,  h3,  invS);
+    writeSAHalf4Block(px, 4u,  16u, h4,  h5,  h6,  h7,  invS);
+    writeSAHalf4Block(px, 8u,  16u, h8,  h9,  h10, h11, invS);
+    writeSAHalf4Block(px, 12u, 16u, h12, h13, h14, h15, invS);
 }
 
 // Stage 0: ENC1_PW1 (L1: 96 -> 32, offX0 -> offHw0)
@@ -299,9 +487,15 @@ void runStage0Enc1Pw1() {
     ivec2 gp1   = clamp(ivec2(wgX + int(lx), wgY + int(ly)), ivec2(0), ivec2(W1 - 1, H1 - 1));
     uint xBase2 = (pc.offX0 >> 1u) + uint(gp1.y * W1 + gp1.x) * 12u;
     for (uint c2 = 0u; c2 < 12u; ++c2) {
+#if !UPWAYS_IS_FP16
         uvec2 v = g_act.act2[xBase2 + c2];
-        writeSAFromGlobalU32(t, c2 * 2u + 0u, 24u, v.x);
-        writeSAFromGlobalU32(t, c2 * 2u + 1u, 24u, v.y);
+        writeSAU32(t, c2 * 2u + 0u, 24u, v.x);
+        writeSAU32(t, c2 * 2u + 1u, 24u, v.y);
+#else
+        uvec4 v = g_act.act4[xBase2 + c2];
+        writeSAHalf(t, c2 * 2u + 0u, 24u, v.xy);
+        writeSAHalf(t, c2 * 2u + 1u, 24u, v.zw);
+#endif
     }
     barrier();
 
@@ -310,19 +504,19 @@ void runStage0Enc1Pw1() {
     bool inImg    = (gx < W1 && gy < H1);
     uint outBase2 = (pc.offHw0 >> 1u) + uint(gy * W1 + gx) * 4u;
 
-    [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-        preloadWeightNTile(U32_W_ENC1_PW1, ob, 6u);
-#endif
+    // In INT8 mode, X0 uses fixed static per-channel bounds folded into ENC1_PW1 weight scales (actScale = 1.0)
+    {
         vec4 o0, o1, o2, o3;
-        evalPwNTile(6u, U32_W_ENC1_PW1, ob, F32_S_ENC1_PW1, F32_B_ENC1_PW1, true, o0, o1, o2, o3);
+        evalPwNTile(6u, U32_W_ENC1_PW1, 0u, F32_S_ENC1_PW1, F32_B_ENC1_PW1, true, 1.0, o0, o1, o2, o3);
         if (inImg) {
-            g_act.act2[outBase2 + ob * 2u + 0u] = uvec2(packFp8Vec4(o0), packFp8Vec4(o1));
-            g_act.act2[outBase2 + ob * 2u + 1u] = uvec2(packFp8Vec4(o2), packFp8Vec4(o3));
+            storeActFeatPair(outBase2 + 0u, o0, o1);
+            storeActFeatPair(outBase2 + 1u, o2, o3);
         }
-#ifdef UPWAYS_FP16_WMMA
-        barrier();
-#endif
+        evalPwNTile(6u, U32_W_ENC1_PW1, 1u, F32_S_ENC1_PW1, F32_B_ENC1_PW1, true, 1.0, o0, o1, o2, o3);
+        if (inImg) {
+            storeActFeatPair(outBase2 + 2u, o0, o1);
+            storeActFeatPair(outBase2 + 3u, o2, o3);
+        }
     }
 }
 
@@ -336,7 +530,7 @@ void runStage1Enc1DwPw2() {
     int  wgX = int(gl_WorkGroupID.x * 16u);
     int  wgY = int(gl_WorkGroupID.y * 8u);
 
-    // Load 18x10 tile of f1 (32 ch = 8 u32/px) into s_b (180 * 8 * 2 = 2,880 uint32s)
+    // Load 18x10 tile of f1 (32 ch = 8 vec4/px) into s_b (180 * 8 * 2 = 2,880 uint32s)
     [[dont_unroll]] for (uint pass = 0u; pass < 2u; ++pass) {
         uint ap = pass * 128u + t;
         if (ap < 180u) {
@@ -345,23 +539,25 @@ void runStage1Enc1DwPw2() {
             int  ay  = int(ayU);
             ivec2 gp1 = clamp(ivec2(wgX + ax - 1, wgY + ay - 1), ivec2(0), ivec2(W1 - 1, H1 - 1));
             uint base2 = (pc.offHw0 >> 1u) + uint(gp1.y * W1 + gp1.x) * 4u;
-            uvec2 v0 = g_act.act2[base2 + 0u];
-            uvec2 v1 = g_act.act2[base2 + 1u];
-            uvec2 v2 = g_act.act2[base2 + 2u];
-            uvec2 v3 = g_act.act2[base2 + 3u];
-            writeSB(ap, 0u, 8u, unpackFp8Vec4(v0.x));
-            writeSB(ap, 1u, 8u, unpackFp8Vec4(v0.y));
-            writeSB(ap, 2u, 8u, unpackFp8Vec4(v1.x));
-            writeSB(ap, 3u, 8u, unpackFp8Vec4(v1.y));
-            writeSB(ap, 4u, 8u, unpackFp8Vec4(v2.x));
-            writeSB(ap, 5u, 8u, unpackFp8Vec4(v2.y));
-            writeSB(ap, 6u, 8u, unpackFp8Vec4(v3.x));
-            writeSB(ap, 7u, 8u, unpackFp8Vec4(v3.y));
+            vec4 v0, v1, v2, v3, v4, v5, v6, v7;
+            loadActFeatPair(base2 + 0u, v0, v1);
+            loadActFeatPair(base2 + 1u, v2, v3);
+            loadActFeatPair(base2 + 2u, v4, v5);
+            loadActFeatPair(base2 + 3u, v6, v7);
+            writeSB(ap, 0u, 8u, v0);
+            writeSB(ap, 1u, 8u, v1);
+            writeSB(ap, 2u, 8u, v2);
+            writeSB(ap, 3u, 8u, v3);
+            writeSB(ap, 4u, 8u, v4);
+            writeSB(ap, 5u, 8u, v5);
+            writeSB(ap, 6u, 8u, v6);
+            writeSB(ap, 7u, 8u, v7);
         }
     }
     barrier();
 
     uint coreApron = (ly + 1u) * 18u + (lx + 1u);
+#if UPWAYS_IS_FP8
     uint f1_0 = packFp8Vec4(readSB(coreApron, 0u, 8u));
     uint f1_1 = packFp8Vec4(readSB(coreApron, 1u, 8u));
     uint f1_2 = packFp8Vec4(readSB(coreApron, 2u, 8u));
@@ -370,25 +566,39 @@ void runStage1Enc1DwPw2() {
     uint f1_5 = packFp8Vec4(readSB(coreApron, 5u, 8u));
     uint f1_6 = packFp8Vec4(readSB(coreApron, 6u, 8u));
     uint f1_7 = packFp8Vec4(readSB(coreApron, 7u, 8u));
+#elif UPWAYS_IS_INT8
+    uint f1_0 = packInt8Vec4(readSB(coreApron, 0u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_1 = packInt8Vec4(readSB(coreApron, 1u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_2 = packInt8Vec4(readSB(coreApron, 2u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_3 = packInt8Vec4(readSB(coreApron, 3u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_4 = packInt8Vec4(readSB(coreApron, 4u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_5 = packInt8Vec4(readSB(coreApron, 5u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_6 = packInt8Vec4(readSB(coreApron, 6u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+    uint f1_7 = packInt8Vec4(readSB(coreApron, 7u, 8u), vec4(UPWAYS_INT8_ACT_MAX_FEAT));
+#else
+    uvec2 f1_0 = packHalf4(readSB(coreApron, 0u, 8u));
+    uvec2 f1_1 = packHalf4(readSB(coreApron, 1u, 8u));
+    uvec2 f1_2 = packHalf4(readSB(coreApron, 2u, 8u));
+    uvec2 f1_3 = packHalf4(readSB(coreApron, 3u, 8u));
+    uvec2 f1_4 = packHalf4(readSB(coreApron, 4u, 8u));
+    uvec2 f1_5 = packHalf4(readSB(coreApron, 5u, 8u));
+    uvec2 f1_6 = packHalf4(readSB(coreApron, 6u, 8u));
+    uvec2 f1_7 = packHalf4(readSB(coreApron, 7u, 8u));
+#endif
 
     uint baseAp1 = ly * 18u + lx;
-    uvec2 d01 = evalDw3x3L1Pair(baseAp1, 8u, 0u, F32_DW_ENC1_W, F32_DW_ENC1_B);
+    vec4 d0, d1, d2, d3, d4, d5, d6, d7;
+    evalDw3x3L1Pair(baseAp1, 8u, 0u, F32_DW_ENC1_W, F32_DW_ENC1_B, d0, d1);
     subgroupBarrier();
-    uvec2 d23 = evalDw3x3L1Pair(baseAp1, 8u, 2u, F32_DW_ENC1_W, F32_DW_ENC1_B);
+    evalDw3x3L1Pair(baseAp1, 8u, 2u, F32_DW_ENC1_W, F32_DW_ENC1_B, d2, d3);
     subgroupBarrier();
-    uvec2 d45 = evalDw3x3L1Pair(baseAp1, 8u, 4u, F32_DW_ENC1_W, F32_DW_ENC1_B);
+    evalDw3x3L1Pair(baseAp1, 8u, 4u, F32_DW_ENC1_W, F32_DW_ENC1_B, d4, d5);
     subgroupBarrier();
-    uvec2 d67 = evalDw3x3L1Pair(baseAp1, 8u, 6u, F32_DW_ENC1_W, F32_DW_ENC1_B);
+    evalDw3x3L1Pair(baseAp1, 8u, 6u, F32_DW_ENC1_W, F32_DW_ENC1_B, d6, d7);
     barrier();
 
-    writeSAFromGlobalU32(t, 0u, 8u, d01.x);
-    writeSAFromGlobalU32(t, 1u, 8u, d01.y);
-    writeSAFromGlobalU32(t, 2u, 8u, d23.x);
-    writeSAFromGlobalU32(t, 3u, 8u, d23.y);
-    writeSAFromGlobalU32(t, 4u, 8u, d45.x);
-    writeSAFromGlobalU32(t, 5u, 8u, d45.y);
-    writeSAFromGlobalU32(t, 6u, 8u, d67.x);
-    writeSAFromGlobalU32(t, 7u, 8u, d67.y);
+    float actScale = 1.0;
+    writeSA8Vecs(t, d0, d1, d2, d3, d4, d5, d6, d7, actScale);
     barrier();
 
     int  gx       = wgX + int(lx);
@@ -396,23 +606,51 @@ void runStage1Enc1DwPw2() {
     bool inImg    = (gx < W1 && gy < H1);
     uint outBase2 = (pc.offS0 >> 1u) + uint(gy * W1 + gx) * 4u;
 
-    [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-        preloadWeightNTile(U32_W_ENC1_PW2, ob, 2u);
-#endif
+    {
         vec4 o0, o1, o2, o3;
-        evalPwNTile(2u, U32_W_ENC1_PW2, ob, F32_S_ENC1_PW2, F32_B_ENC1_PW2, false, o0, o1, o2, o3);
-        o0 = upwaysLrelu4(o0 + unpackFp8Vec4((ob == 0u) ? f1_0 : f1_4));
-        o1 = upwaysLrelu4(o1 + unpackFp8Vec4((ob == 0u) ? f1_1 : f1_5));
-        o2 = upwaysLrelu4(o2 + unpackFp8Vec4((ob == 0u) ? f1_2 : f1_6));
-        o3 = upwaysLrelu4(o3 + unpackFp8Vec4((ob == 0u) ? f1_3 : f1_7));
-        if (inImg) {
-            g_act.act2[outBase2 + ob * 2u + 0u] = uvec2(packFp8Vec4(o0), packFp8Vec4(o1));
-            g_act.act2[outBase2 + ob * 2u + 1u] = uvec2(packFp8Vec4(o2), packFp8Vec4(o3));
-        }
-#ifdef UPWAYS_FP16_WMMA
-        barrier();
+        evalPwNTile(2u, U32_W_ENC1_PW2, 0u, F32_S_ENC1_PW2, F32_B_ENC1_PW2, false, actScale, o0, o1, o2, o3);
+#if UPWAYS_IS_FP8
+        o0 = upwaysLrelu4(o0 + unpackFp8Vec4(f1_0));
+        o1 = upwaysLrelu4(o1 + unpackFp8Vec4(f1_1));
+        o2 = upwaysLrelu4(o2 + unpackFp8Vec4(f1_2));
+        o3 = upwaysLrelu4(o3 + unpackFp8Vec4(f1_3));
+#elif UPWAYS_IS_INT8
+        o0 = upwaysLrelu4(o0 + unpackInt8Vec4(f1_0, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o1 = upwaysLrelu4(o1 + unpackInt8Vec4(f1_1, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o2 = upwaysLrelu4(o2 + unpackInt8Vec4(f1_2, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o3 = upwaysLrelu4(o3 + unpackInt8Vec4(f1_3, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+#else
+        o0 = upwaysLrelu4(o0 + unpackHalf4(f1_0));
+        o1 = upwaysLrelu4(o1 + unpackHalf4(f1_1));
+        o2 = upwaysLrelu4(o2 + unpackHalf4(f1_2));
+        o3 = upwaysLrelu4(o3 + unpackHalf4(f1_3));
 #endif
+        if (inImg) {
+            storeActFeatPair(outBase2 + 0u, o0, o1);
+            storeActFeatPair(outBase2 + 1u, o2, o3);
+        }
+
+        evalPwNTile(2u, U32_W_ENC1_PW2, 1u, F32_S_ENC1_PW2, F32_B_ENC1_PW2, false, actScale, o0, o1, o2, o3);
+#if UPWAYS_IS_FP8
+        o0 = upwaysLrelu4(o0 + unpackFp8Vec4(f1_4));
+        o1 = upwaysLrelu4(o1 + unpackFp8Vec4(f1_5));
+        o2 = upwaysLrelu4(o2 + unpackFp8Vec4(f1_6));
+        o3 = upwaysLrelu4(o3 + unpackFp8Vec4(f1_7));
+#elif UPWAYS_IS_INT8
+        o0 = upwaysLrelu4(o0 + unpackInt8Vec4(f1_4, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o1 = upwaysLrelu4(o1 + unpackInt8Vec4(f1_5, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o2 = upwaysLrelu4(o2 + unpackInt8Vec4(f1_6, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+        o3 = upwaysLrelu4(o3 + unpackInt8Vec4(f1_7, vec4(UPWAYS_INT8_ACT_MAX_FEAT)));
+#else
+        o0 = upwaysLrelu4(o0 + unpackHalf4(f1_4));
+        o1 = upwaysLrelu4(o1 + unpackHalf4(f1_5));
+        o2 = upwaysLrelu4(o2 + unpackHalf4(f1_6));
+        o3 = upwaysLrelu4(o3 + unpackHalf4(f1_7));
+#endif
+        if (inImg) {
+            storeActFeatPair(outBase2 + 2u, o0, o1);
+            storeActFeatPair(outBase2 + 3u, o2, o3);
+        }
     }
 }
 
@@ -445,92 +683,59 @@ void runStage2Bot2() {
             uint p01_2 = (pc.offS0 >> 1u) + uint(sy1 * W1 + sx0) * 4u;
             uint p11_2 = (pc.offS0 >> 1u) + uint(sy1 * W1 + sx1) * 4u;
 
-            uvec2 v00_0 = g_act.act2[p00_2 + 0u], v00_1 = g_act.act2[p00_2 + 1u], v00_2 = g_act.act2[p00_2 + 2u], v00_3 = g_act.act2[p00_2 + 3u];
-            uvec2 v10_0 = g_act.act2[p10_2 + 0u], v10_1 = g_act.act2[p10_2 + 1u], v10_2 = g_act.act2[p10_2 + 2u], v10_3 = g_act.act2[p10_2 + 3u];
-            uvec2 v01_0 = g_act.act2[p01_2 + 0u], v01_1 = g_act.act2[p01_2 + 1u], v01_2 = g_act.act2[p01_2 + 2u], v01_3 = g_act.act2[p01_2 + 3u];
-            uvec2 v11_0 = g_act.act2[p11_2 + 0u], v11_1 = g_act.act2[p11_2 + 1u], v11_2 = g_act.act2[p11_2 + 2u], v11_3 = g_act.act2[p11_2 + 3u];
-
-            writeSB2Lo(ap, 0u, 0.25 * (unpackFp8Vec4(v00_0.x) + unpackFp8Vec4(v10_0.x) + unpackFp8Vec4(v01_0.x) + unpackFp8Vec4(v11_0.x)));
-            writeSB2Lo(ap, 1u, 0.25 * (unpackFp8Vec4(v00_0.y) + unpackFp8Vec4(v10_0.y) + unpackFp8Vec4(v01_0.y) + unpackFp8Vec4(v11_0.y)));
-            writeSB2Lo(ap, 2u, 0.25 * (unpackFp8Vec4(v00_1.x) + unpackFp8Vec4(v10_1.x) + unpackFp8Vec4(v01_1.x) + unpackFp8Vec4(v11_1.x)));
-            writeSB2Lo(ap, 3u, 0.25 * (unpackFp8Vec4(v00_1.y) + unpackFp8Vec4(v10_1.y) + unpackFp8Vec4(v01_1.y) + unpackFp8Vec4(v11_1.y)));
-            writeSB2Lo(ap, 4u, 0.25 * (unpackFp8Vec4(v00_2.x) + unpackFp8Vec4(v10_2.x) + unpackFp8Vec4(v01_2.x) + unpackFp8Vec4(v11_2.x)));
-            writeSB2Lo(ap, 5u, 0.25 * (unpackFp8Vec4(v00_2.y) + unpackFp8Vec4(v10_2.y) + unpackFp8Vec4(v01_2.y) + unpackFp8Vec4(v11_2.y)));
-            writeSB2Hi(ap, 0u, 0.25 * (unpackFp8Vec4(v00_3.x) + unpackFp8Vec4(v10_3.x) + unpackFp8Vec4(v01_3.x) + unpackFp8Vec4(v11_3.x)));
-            writeSB2Hi(ap, 1u, 0.25 * (unpackFp8Vec4(v00_3.y) + unpackFp8Vec4(v10_3.y) + unpackFp8Vec4(v01_3.y) + unpackFp8Vec4(v11_3.y)));
+            for (uint c2 = 0u; c2 < 4u; ++c2) {
+                vec4 a00, a01, a10, a11, b00, b01, b10, b11;
+                loadActFeatPair(p00_2 + c2, a00, b00);
+                loadActFeatPair(p10_2 + c2, a10, b10);
+                loadActFeatPair(p01_2 + c2, a01, b01);
+                loadActFeatPair(p11_2 + c2, a11, b11);
+                vec4 avg0 = 0.25 * (a00 + a10 + a01 + a11);
+                vec4 avg1 = 0.25 * (b00 + b10 + b01 + b11);
+                if (c2 < 3u) {
+                    writeSB2Lo(ap, c2 * 2u + 0u, avg0);
+                    writeSB2Lo(ap, c2 * 2u + 1u, avg1);
+                } else {
+                    writeSB2Hi(ap, 0u, avg0);
+                    writeSB2Hi(ap, 1u, avg1);
+                }
+            }
         }
     }
     barrier();
 
+    float actScaleDw = 1.0;
     {
         uint baseAp2 = ly * 20u + lx;
-        uvec2 d01 = evalDw3x3Stage2LoPair(baseAp2, 0u, F32_DW_BOT2_W, F32_DW_BOT2_B);
+        vec4 d0, d1, d2, d3, d4, d5, d6, d7;
+        evalDw3x3Stage2LoPair(baseAp2, 0u, F32_DW_BOT2_W, F32_DW_BOT2_B, d0, d1);
         subgroupBarrier();
-        uvec2 d23 = evalDw3x3Stage2LoPair(baseAp2, 2u, F32_DW_BOT2_W, F32_DW_BOT2_B);
+        evalDw3x3Stage2LoPair(baseAp2, 2u, F32_DW_BOT2_W, F32_DW_BOT2_B, d2, d3);
         subgroupBarrier();
-        uvec2 d45 = evalDw3x3Stage2LoPair(baseAp2, 4u, F32_DW_BOT2_W, F32_DW_BOT2_B);
+        evalDw3x3Stage2LoPair(baseAp2, 4u, F32_DW_BOT2_W, F32_DW_BOT2_B, d4, d5);
         subgroupBarrier();
-        uvec2 d67 = evalDw3x3Stage2HiPair(baseAp2, F32_DW_BOT2_W, F32_DW_BOT2_B);
+        evalDw3x3Stage2HiPair(baseAp2, F32_DW_BOT2_W, F32_DW_BOT2_B, d6, d7);
         barrier();
 
-        writeSAFromGlobalU32(t, 0u, 8u, d01.x);
-        writeSAFromGlobalU32(t, 1u, 8u, d01.y);
-        writeSAFromGlobalU32(t, 2u, 8u, d23.x);
-        writeSAFromGlobalU32(t, 3u, 8u, d23.y);
-        writeSAFromGlobalU32(t, 4u, 8u, d45.x);
-        writeSAFromGlobalU32(t, 5u, 8u, d45.y);
-        writeSAFromGlobalU32(t, 6u, 8u, d67.x);
-        writeSAFromGlobalU32(t, 7u, 8u, d67.y);
+        writeSA8Vecs(t, d0, d1, d2, d3, d4, d5, d6, d7, actScaleDw);
     }
     barrier();
 
-    // BOT2_PW1: 32 -> 64 (inTiles=2, outTiles=4) -> hold FP8-packed directly in SSA scalars h2_0..h2_15
+    // BOT2_PW1: 32 -> 64 (inTiles=2, outTiles=4) -> pack into 16 scalar uvec2 VGPRs (half4)
+    float actScaleH2 = 1.0;
     {
-        uint h2_0  = 0u, h2_1  = 0u, h2_2  = 0u, h2_3  = 0u;
-        uint h2_4  = 0u, h2_5  = 0u, h2_6  = 0u, h2_7  = 0u;
-        uint h2_8  = 0u, h2_9  = 0u, h2_10 = 0u, h2_11 = 0u;
-        uint h2_12 = 0u, h2_13 = 0u, h2_14 = 0u, h2_15 = 0u;
-        [[unroll]] for (uint ob = 0u; ob < 4u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-            preloadWeightNTile(U32_W_BOT2_PW1, ob, 2u);
-#endif
-            vec4 o0, o1, o2, o3;
-            evalPwNTile(2u, U32_W_BOT2_PW1, ob, F32_S_BOT2_PW1, F32_B_BOT2_PW1, true, o0, o1, o2, o3);
-            uint p0 = packFp8Vec4(o0);
-            uint p1 = packFp8Vec4(o1);
-            uint p2 = packFp8Vec4(o2);
-            uint p3 = packFp8Vec4(o3);
-            if (ob == 0u) {
-                h2_0 = p0; h2_1 = p1; h2_2 = p2; h2_3 = p3;
-            } else if (ob == 1u) {
-                h2_4 = p0; h2_5 = p1; h2_6 = p2; h2_7 = p3;
-            } else if (ob == 2u) {
-                h2_8 = p0; h2_9 = p1; h2_10 = p2; h2_11 = p3;
-            } else {
-                h2_12 = p0; h2_13 = p1; h2_14 = p2; h2_15 = p3;
-            }
-#ifdef UPWAYS_FP16_WMMA
-            barrier();
-#endif
-        }
+        uvec2 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15;
+        vec4 o0, o1, o2, o3;
+        evalPwNTile(2u, U32_W_BOT2_PW1, 0u, F32_S_BOT2_PW1, F32_B_BOT2_PW1, true, actScaleDw, o0, o1, o2, o3);
+        h0 = packHalf4(o0); h1 = packHalf4(o1); h2 = packHalf4(o2); h3 = packHalf4(o3);
+        evalPwNTile(2u, U32_W_BOT2_PW1, 1u, F32_S_BOT2_PW1, F32_B_BOT2_PW1, true, actScaleDw, o0, o1, o2, o3);
+        h4 = packHalf4(o0); h5 = packHalf4(o1); h6 = packHalf4(o2); h7 = packHalf4(o3);
+        evalPwNTile(2u, U32_W_BOT2_PW1, 2u, F32_S_BOT2_PW1, F32_B_BOT2_PW1, true, actScaleDw, o0, o1, o2, o3);
+        h8 = packHalf4(o0); h9 = packHalf4(o1); h10 = packHalf4(o2); h11 = packHalf4(o3);
+        evalPwNTile(2u, U32_W_BOT2_PW1, 3u, F32_S_BOT2_PW1, F32_B_BOT2_PW1, true, actScaleDw, o0, o1, o2, o3);
+        h12 = packHalf4(o0); h13 = packHalf4(o1); h14 = packHalf4(o2); h15 = packHalf4(o3);
         barrier();
 
-        writeSAFromGlobalU32(t,  0u, 16u, h2_0);
-        writeSAFromGlobalU32(t,  1u, 16u, h2_1);
-        writeSAFromGlobalU32(t,  2u, 16u, h2_2);
-        writeSAFromGlobalU32(t,  3u, 16u, h2_3);
-        writeSAFromGlobalU32(t,  4u, 16u, h2_4);
-        writeSAFromGlobalU32(t,  5u, 16u, h2_5);
-        writeSAFromGlobalU32(t,  6u, 16u, h2_6);
-        writeSAFromGlobalU32(t,  7u, 16u, h2_7);
-        writeSAFromGlobalU32(t,  8u, 16u, h2_8);
-        writeSAFromGlobalU32(t,  9u, 16u, h2_9);
-        writeSAFromGlobalU32(t, 10u, 16u, h2_10);
-        writeSAFromGlobalU32(t, 11u, 16u, h2_11);
-        writeSAFromGlobalU32(t, 12u, 16u, h2_12);
-        writeSAFromGlobalU32(t, 13u, 16u, h2_13);
-        writeSAFromGlobalU32(t, 14u, 16u, h2_14);
-        writeSAFromGlobalU32(t, 15u, 16u, h2_15);
+        writeSA16HalfVecs(t, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, h12, h13, h14, h15, actScaleH2);
     }
     barrier();
 
@@ -540,19 +745,18 @@ void runStage2Bot2() {
     bool inImg    = (gx < W2 && gy < H2);
     uint outBase2 = (pc.offB2 >> 1u) + uint(gy * W2 + gx) * 4u;
 
-    [[unroll]] for (uint ob = 0u; ob < 2u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-        preloadWeightNTile(U32_W_BOT2_PW2, ob, 4u);
-#endif
+    {
         vec4 o0, o1, o2, o3;
-        evalPwNTile(4u, U32_W_BOT2_PW2, ob, F32_S_BOT2_PW2, F32_B_BOT2_PW2, true, o0, o1, o2, o3);
+        evalPwNTile(4u, U32_W_BOT2_PW2, 0u, F32_S_BOT2_PW2, F32_B_BOT2_PW2, true, actScaleH2, o0, o1, o2, o3);
         if (inImg) {
-            g_act.act2[outBase2 + ob * 2u + 0u] = uvec2(packFp8Vec4(o0), packFp8Vec4(o1));
-            g_act.act2[outBase2 + ob * 2u + 1u] = uvec2(packFp8Vec4(o2), packFp8Vec4(o3));
+            storeActFeatPair(outBase2 + 0u, o0, o1);
+            storeActFeatPair(outBase2 + 1u, o2, o3);
         }
-#ifdef UPWAYS_FP16_WMMA
-        barrier();
-#endif
+        evalPwNTile(4u, U32_W_BOT2_PW2, 1u, F32_S_BOT2_PW2, F32_B_BOT2_PW2, true, actScaleH2, o0, o1, o2, o3);
+        if (inImg) {
+            storeActFeatPair(outBase2 + 2u, o0, o1);
+            storeActFeatPair(outBase2 + 3u, o2, o3);
+        }
     }
 }
 
@@ -602,7 +806,7 @@ void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint qua
         decodeStage3NormalDepth(nd_0, nrm0, zD0);
         s_buf[s0 * 4u + 2u] = packHalf2x16(accS0.gb);
         s_buf[s0 * 4u + 3u] = packHalf2x16(vec2(nrm0.z, zD0));
-        s_acc[s0]           = uintBitsToFloat(packHalf2x16(nrm0.xy));
+        storeAccUint(s0, packHalf2x16(nrm0.xy));
     }
     bool  qSky0 = (a0_0.w < -0.5);
     float matC0 = qSky0 ? 0.0 : clamp(a0_0.w, 0.0, 1.0);
@@ -615,7 +819,7 @@ void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint qua
         decodeStage3NormalDepth(nd_1, nrm1, zD1);
         s_buf[s1 * 4u + 2u] = packHalf2x16(accS1.gb);
         s_buf[s1 * 4u + 3u] = packHalf2x16(vec2(nrm1.z, zD1));
-        s_acc[s1]           = uintBitsToFloat(packHalf2x16(nrm1.xy));
+        storeAccUint(s1, packHalf2x16(nrm1.xy));
     }
     bool  qSky1 = (a0_1.w < -0.5);
     float matC1 = qSky1 ? 0.0 : clamp(a0_1.w, 0.0, 1.0);
@@ -628,7 +832,7 @@ void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint qua
         decodeStage3NormalDepth(nd_2, nrm2, zD2);
         s_buf[s2 * 4u + 2u] = packHalf2x16(accS2.gb);
         s_buf[s2 * 4u + 3u] = packHalf2x16(vec2(nrm2.z, zD2));
-        s_acc[s2]           = uintBitsToFloat(packHalf2x16(nrm2.xy));
+        storeAccUint(s2, packHalf2x16(nrm2.xy));
     }
     bool  qSky2 = (a0_2.w < -0.5);
     float matC2 = qSky2 ? 0.0 : clamp(a0_2.w, 0.0, 1.0);
@@ -641,14 +845,14 @@ void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint qua
         decodeStage3NormalDepth(nd_3, nrm3, zD3);
         s_buf[s3 * 4u + 2u] = packHalf2x16(accS3.gb);
         s_buf[s3 * 4u + 3u] = packHalf2x16(vec2(nrm3.z, zD3));
-        s_acc[s3]           = uintBitsToFloat(packHalf2x16(nrm3.xy));
+        storeAccUint(s3, packHalf2x16(nrm3.xy));
     }
     bool  qSky3 = (a0_3.w < -0.5);
     float matC3 = qSky3 ? 0.0 : clamp(a0_3.w, 0.0, 1.0);
     float tErr3 = qSky3 ? 0.0 : clamp(a1_3.w, 0.0, 4.0);
 
-    uint packedSkyMat = packFp8Vec4(vec4(qSky0 ? -1.0 : matC0, qSky1 ? -1.0 : matC1, qSky2 ? -1.0 : matC2, qSky3 ? -1.0 : matC3));
-    vec4 decSkyMat    = unpackFp8Vec4(packedSkyMat);
+    uint packedSkyMat = packSkyMat4(vec4(qSky0 ? -1.0 : matC0, qSky1 ? -1.0 : matC1, qSky2 ? -1.0 : matC2, qSky3 ? -1.0 : matC3));
+    vec4 decSkyMat    = unpackSkyMat4(packedSkyMat);
     uint dielMask =
         (((decSkyMat.x >= -0.5) && (abs(decSkyMat.x - 0.6667) < 0.12)) ? 1u : 0u) |
         (((decSkyMat.y >= -0.5) && (abs(decSkyMat.y - 0.6667) < 0.12)) ? 2u : 0u) |
@@ -688,7 +892,7 @@ void loadStage3AnchorQuad(uint quadIdx, int l0WgX, int l0WgY, int halo, uint qua
     s_buf[s3 * 4u + 1u] = packHalf2x16(vec2(valA3.b, accS3.r));
 
     s_buf[2880u + quadIdx] = packedSkyMat;
-    s_acc[720u  + quadIdx] = uintBitsToFloat(packFp8Vec4(vec4(tErr0 * 16.0, tErr1 * 16.0, tErr2 * 16.0, tErr3 * 16.0)));
+    storeAccUint(720u + quadIdx, packTempErr4(vec4(tErr0, tErr1, tErr2, tErr3)));
 }
 
 void evalTapStage3(
@@ -752,10 +956,10 @@ void evalRingSlotsStage3(
     uvec4 b1 = uvec4(s_buf[s1 * 4u + 0u], s_buf[s1 * 4u + 1u], s_buf[s1 * 4u + 2u], s_buf[s1 * 4u + 3u]);
     uvec4 b2 = uvec4(s_buf[s2 * 4u + 0u], s_buf[s2 * 4u + 1u], s_buf[s2 * 4u + 2u], s_buf[s2 * 4u + 3u]);
     uvec4 b3 = uvec4(s_buf[s3 * 4u + 0u], s_buf[s3 * 4u + 1u], s_buf[s3 * 4u + 2u], s_buf[s3 * 4u + 3u]);
-    uint  n0 = floatBitsToUint(s_acc[s0]);
-    uint  n1 = floatBitsToUint(s_acc[s1]);
-    uint  n2 = floatBitsToUint(s_acc[s2]);
-    uint  n3 = floatBitsToUint(s_acc[s3]);
+    uint  n0 = loadAccUint(s0);
+    uint  n1 = loadAccUint(s1);
+    uint  n2 = loadAccUint(s2);
+    uint  n3 = loadAccUint(s3);
     evalTapStage3(b0, n0, m0, zPred4.x, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
     evalTapStage3(b1, n1, m1, zPred4.y, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
     evalTapStage3(b2, n2, m2, zPred4.z, kTapW, specRingW, invZTol_e2, viewNormal, absNz, matClass, matTol, matMismatchW, isDielMat, smoothSpec, cLog2LA, cLog2LB, invSigLA_e2, invSigLB_e2, sumA, sumWA, sumB, sumWB);
@@ -801,11 +1005,11 @@ void processStage3Corner(
     vec2  c1         = unpackHalf2x16(s_buf[cBase + 1u]);
     vec2  c2         = unpackHalf2x16(s_buf[cBase + 2u]);
     vec2  c3         = unpackHalf2x16(s_buf[cBase + 3u]);
-    vec2  cNxy       = unpackHalf2x16(floatBitsToUint(s_acc[cSlot]));
+    vec2  cNxy       = unpackHalf2x16(loadAccUint(cSlot));
     uint  smC        = s_buf[2880u + qC];
     vec3  viewNormal = vec3(cNxy, c3.x);
     float linDepth   = c3.y;
-    float cSkyOrMat  = decodeE4M3Byte(smC >> shiftC);
+    float cSkyOrMat  = unpackSkyMatByte(smC >> shiftC);
 
     vec3  cValA      = vec3(c0, c1.x);
     vec3  accSpec    = vec3(c1.y, c2);
@@ -840,12 +1044,12 @@ void processStage3Corner(
         uint  shiftV  = (subC ^ 2u) * 8u;
         uint  smH     = s_buf[2880u + qH];
         uint  smV     = s_buf[2880u + qV];
-        float mSameH  = decodeE4M3Byte(smC >> shiftH);
-        float mNbrH   = decodeE4M3Byte(smH >> shiftH);
+        float mSameH  = unpackSkyMatByte(smC >> shiftH);
+        float mNbrH   = unpackSkyMatByte(smH >> shiftH);
         float matL    = (bxC == 0u) ? mNbrH  : mSameH;
         float matR    = (bxC == 0u) ? mSameH : mNbrH;
-        float mSameV  = decodeE4M3Byte(smC >> shiftV);
-        float mNbrV   = decodeE4M3Byte(smV >> shiftV);
+        float mSameV  = unpackSkyMatByte(smC >> shiftV);
+        float mNbrV   = unpackSkyMatByte(smV >> shiftV);
         float matU    = (byC == 0u) ? mNbrV  : mSameV;
         float matD    = (byC == 0u) ? mSameV : mNbrV;
         bool  valL    = (matL >= -0.5);
@@ -876,16 +1080,16 @@ void processStage3Corner(
         bool  coR         = valR && (abs(matR - matClass) < 0.15) && (abs(zR    - linDepth) < zThrT);
         bool  coU         = valU && (abs(matU - matClass) < 0.15) && (abs(zU    - linDepth) < zThrT);
         bool  coD         = valD && (abs(matD - matClass) < 0.15) && (abs(zD_nb - linDepth) < zThrT);
-        uint  teQuC       = floatBitsToUint(s_acc[720u + qC]);
-        uint  teQuH       = floatBitsToUint(s_acc[720u + qH]);
-        uint  teQuV       = floatBitsToUint(s_acc[720u + qV]);
-        float teC         = decodeE4M3Byte(teQuC >> shiftC) * 0.0625;
-        float teSameH     = decodeE4M3Byte(teQuC >> shiftH) * 0.0625;
-        float teNbrH      = decodeE4M3Byte(teQuH >> shiftH) * 0.0625;
+        uint  teQuC       = loadAccUint(720u + qC);
+        uint  teQuH       = loadAccUint(720u + qH);
+        uint  teQuV       = loadAccUint(720u + qV);
+        float teC         = unpackTempErrByte(teQuC >> shiftC);
+        float teSameH     = unpackTempErrByte(teQuC >> shiftH);
+        float teNbrH      = unpackTempErrByte(teQuH >> shiftH);
         float teL         = (bxC == 0u) ? teNbrH  : teSameH;
         float teR         = (bxC == 0u) ? teSameH : teNbrH;
-        float teSameV     = decodeE4M3Byte(teQuC >> shiftV) * 0.0625;
-        float teNbrV      = decodeE4M3Byte(teQuV >> shiftV) * 0.0625;
+        float teSameV     = unpackTempErrByte(teQuC >> shiftV);
+        float teNbrV      = unpackTempErrByte(teQuV >> shiftV);
         float teU         = (byC == 0u) ? teNbrV  : teSameV;
         float teD         = (byC == 0u) ? teSameV : teNbrV;
         float wTeL        = coL ? 1.0 : 0.0;
@@ -990,10 +1194,10 @@ void processStage3Corner(
             uint  sm1       = (byC == 0u) ? smRowV_R : smRowC_R;
             uint  sm2       = (byC == 0u) ? smRowC_L : smRowV_L;
             uint  sm3       = (byC == 0u) ? smRowC_R : smRowV_R;
-            float rm0       = decodeE4M3Byte(sm0 >> shiftDiag);
-            float rm1       = decodeE4M3Byte(sm1 >> shiftDiag);
-            float rm2       = decodeE4M3Byte(sm2 >> shiftDiag);
-            float rm3       = decodeE4M3Byte(sm3 >> shiftDiag);
+            float rm0       = unpackSkyMatByte(sm0 >> shiftDiag);
+            float rm1       = unpackSkyMatByte(sm1 >> shiftDiag);
+            float rm2       = unpackSkyMatByte(sm2 >> shiftDiag);
+            float rm3       = unpackSkyMatByte(sm3 >> shiftDiag);
             evalRingSlotsStage3(
                 rs0, rs1, rs2, rs3,
                 rm0, rm1, rm2, rm3,
@@ -1016,10 +1220,10 @@ void processStage3Corner(
             uint  rs1     = cSlot + 4u;
             uint  rs2     = cSlot - rowStep;
             uint  rs3     = cSlot + rowStep;
-            float rm0     = decodeE4M3Byte(((bxC == 0u) ? smH  : smH2) >> shiftC);
-            float rm1     = decodeE4M3Byte(((bxC == 0u) ? smH2 : smH ) >> shiftC);
-            float rm2     = decodeE4M3Byte(((byC == 0u) ? smV  : smV2) >> shiftC);
-            float rm3     = decodeE4M3Byte(((byC == 0u) ? smV2 : smV ) >> shiftC);
+            float rm0     = unpackSkyMatByte(((bxC == 0u) ? smH  : smH2) >> shiftC);
+            float rm1     = unpackSkyMatByte(((bxC == 0u) ? smH2 : smH ) >> shiftC);
+            float rm2     = unpackSkyMatByte(((byC == 0u) ? smV  : smV2) >> shiftC);
+            float rm3     = unpackSkyMatByte(((byC == 0u) ? smV2 : smV ) >> shiftC);
             float rkTapW  = 1.10 * wideScale;
             evalRingSlotsStage3(
                 rs0, rs1, rs2, rs3,
@@ -1124,17 +1328,31 @@ void processStage3Corner(
         float outConf = isSky ? 1.0 : clamp(max(diffConf, (nDiff - 1.0) / 8.0), 0.0, 1.0);
         imageStore(tCleanRadLr, gp, vec4(cleanRad, outConf));
         uint srBase2 = (pc.offHw0 >> 1u) + uint(gp.y * W0 + gp.x) * 2u;
-        uint p0 = packFp8Vec4(vec4(safeLog1p(eDiffClean), viewNormal.x * 4.0));
-        uint p1 = packFp8Vec4(vec4(safeLog1p(eSpecClean), viewNormal.y * 4.0));
-        uint p2 = packFp8Vec4(vec4(aDiff * 4.0, viewNormal.z * 4.0));
-        uint p3 = packFp8Vec4(vec4(
+        vec4 s0 = vec4(safeLog1p(eDiffClean), viewNormal.x * 4.0);
+        vec4 s1 = vec4(safeLog1p(eSpecClean), viewNormal.y * 4.0);
+        vec4 s2 = vec4(aDiff * 4.0, viewNormal.z * 4.0);
+        vec4 s3 = vec4(
             safeLog1pF(linDepth),
             outConf * 4.0,
             clamp(pc.jitterX, -1.0, 1.0) * 4.0,
             clamp(pc.jitterY, -1.0, 1.0) * 4.0
-        ));
-        g_act.act2[srBase2 + 0u] = uvec2(p0, p1);
-        g_act.act2[srBase2 + 1u] = uvec2(p2, p3);
+        );
+#if UPWAYS_IS_FP8
+        g_act.act2[srBase2 + 0u] = uvec2(packFp8Vec4(s0), packFp8Vec4(s1));
+        g_act.act2[srBase2 + 1u] = uvec2(packFp8Vec4(s2), packFp8Vec4(s3));
+#elif UPWAYS_IS_INT8
+        g_act.act2[srBase2 + 0u] = uvec2(
+            packInt8Vec4(s0, UPWAYS_SRIN_INT8_MAX_0),
+            packInt8Vec4(s1, UPWAYS_SRIN_INT8_MAX_0)
+        );
+        g_act.act2[srBase2 + 1u] = uvec2(
+            packInt8Vec4(s2, UPWAYS_SRIN_INT8_MAX_2),
+            packInt8Vec4(s3, UPWAYS_SRIN_INT8_MAX_3)
+        );
+#else
+        g_act.act4[srBase2 + 0u] = uvec4(packHalf4(s0), packHalf4(s1));
+        g_act.act4[srBase2 + 1u] = uvec4(packHalf4(s2), packHalf4(s3));
+#endif
     } else if (gp.x < int(pc.hrWidth) && gp.y < int(pc.hrHeight)) {
         imageStore(uOutputColor, gp, vec4(cleanRad, 1.0));
     }
@@ -1157,7 +1375,9 @@ void runStage3Dec1() {
     vec2 upScale = vec2(float(W2), float(H2)) / vec2(float(W1), float(H1));
 
     // Split DEC1_DW(64) into two 2,880-dword passes so all LDS fits inside 3,072 + 1,024 dwords (16 KB)
+    float actScaleD3 = 1.0;
     {
+        uvec2 d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15;
         [[dont_unroll]] for (uint pass = 0u; pass < 2u; ++pass) {
             uint ap = pass * 128u + t;
             if (ap < 180u) {
@@ -1172,31 +1392,36 @@ void runStage3Dec1() {
                 uint b01 = (pc.offB2 >> 1u) + uint(bt.i01.y * W2 + bt.i01.x) * 4u;
                 uint b11 = (pc.offB2 >> 1u) + uint(bt.i11.y * W2 + bt.i11.x) * 4u;
 
-                uvec2 v00_0 = g_act.act2[b00 + 0u], v00_1 = g_act.act2[b00 + 1u], v00_2 = g_act.act2[b00 + 2u], v00_3 = g_act.act2[b00 + 3u];
-                uvec2 v10_0 = g_act.act2[b10 + 0u], v10_1 = g_act.act2[b10 + 1u], v10_2 = g_act.act2[b10 + 2u], v10_3 = g_act.act2[b10 + 3u];
-                uvec2 v01_0 = g_act.act2[b01 + 0u], v01_1 = g_act.act2[b01 + 1u], v01_2 = g_act.act2[b01 + 2u], v01_3 = g_act.act2[b01 + 3u];
-                uvec2 v11_0 = g_act.act2[b11 + 0u], v11_1 = g_act.act2[b11 + 1u], v11_2 = g_act.act2[b11 + 2u], v11_3 = g_act.act2[b11 + 3u];
-
-                writeSB(ap, 0u, 8u, bt.w.x * unpackFp8Vec4(v00_0.x) + bt.w.y * unpackFp8Vec4(v10_0.x) + bt.w.z * unpackFp8Vec4(v01_0.x) + bt.w.w * unpackFp8Vec4(v11_0.x));
-                writeSB(ap, 1u, 8u, bt.w.x * unpackFp8Vec4(v00_0.y) + bt.w.y * unpackFp8Vec4(v10_0.y) + bt.w.z * unpackFp8Vec4(v01_0.y) + bt.w.w * unpackFp8Vec4(v11_0.y));
-                writeSB(ap, 2u, 8u, bt.w.x * unpackFp8Vec4(v00_1.x) + bt.w.y * unpackFp8Vec4(v10_1.x) + bt.w.z * unpackFp8Vec4(v01_1.x) + bt.w.w * unpackFp8Vec4(v11_1.x));
-                writeSB(ap, 3u, 8u, bt.w.x * unpackFp8Vec4(v00_1.y) + bt.w.y * unpackFp8Vec4(v10_1.y) + bt.w.z * unpackFp8Vec4(v01_1.y) + bt.w.w * unpackFp8Vec4(v11_1.y));
-                writeSB(ap, 4u, 8u, bt.w.x * unpackFp8Vec4(v00_2.x) + bt.w.y * unpackFp8Vec4(v10_2.x) + bt.w.z * unpackFp8Vec4(v01_2.x) + bt.w.w * unpackFp8Vec4(v11_2.x));
-                writeSB(ap, 5u, 8u, bt.w.x * unpackFp8Vec4(v00_2.y) + bt.w.y * unpackFp8Vec4(v10_2.y) + bt.w.z * unpackFp8Vec4(v01_2.y) + bt.w.w * unpackFp8Vec4(v11_2.y));
-                writeSB(ap, 6u, 8u, bt.w.x * unpackFp8Vec4(v00_3.x) + bt.w.y * unpackFp8Vec4(v10_3.x) + bt.w.z * unpackFp8Vec4(v01_3.x) + bt.w.w * unpackFp8Vec4(v11_3.x));
-                writeSB(ap, 7u, 8u, bt.w.x * unpackFp8Vec4(v00_3.y) + bt.w.y * unpackFp8Vec4(v10_3.y) + bt.w.z * unpackFp8Vec4(v01_3.y) + bt.w.w * unpackFp8Vec4(v11_3.y));
+                for (uint c2 = 0u; c2 < 4u; ++c2) {
+                    vec4 a00, b00v, a10, b10v, a01, b01v, a11, b11v;
+                    loadActFeatPair(b00 + c2, a00, b00v);
+                    loadActFeatPair(b10 + c2, a10, b10v);
+                    loadActFeatPair(b01 + c2, a01, b01v);
+                    loadActFeatPair(b11 + c2, a11, b11v);
+                    writeSB(ap, c2 * 2u + 0u, 8u, bt.w.x * a00  + bt.w.y * a10  + bt.w.z * a01  + bt.w.w * a11);
+                    writeSB(ap, c2 * 2u + 1u, 8u, bt.w.x * b00v + bt.w.y * b10v + bt.w.z * b01v + bt.w.w * b11v);
+                }
             }
         }
         barrier();
 
         uint baseAp3 = ly * 18u + lx;
-        uvec2 dLo01 = evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W, F32_DW_DEC1_B);
+        vec4 t0, t1;
+        evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W, F32_DW_DEC1_B, t0, t1);
+        uvec2 p0 = packHalf4(t0); uvec2 p1 = packHalf4(t1);
+        storeAccUint(t * 8u + 0u, p0.x); storeAccUint(t * 8u + 1u, p0.y);
+        storeAccUint(t * 8u + 2u, p1.x); storeAccUint(t * 8u + 3u, p1.y);
         subgroupBarrier();
-        uvec2 dLo23 = evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W, F32_DW_DEC1_B);
+        evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W, F32_DW_DEC1_B, t0, t1);
+        p0 = packHalf4(t0); p1 = packHalf4(t1);
+        storeAccUint(t * 8u + 4u, p0.x); storeAccUint(t * 8u + 5u, p0.y);
+        storeAccUint(t * 8u + 6u, p1.x); storeAccUint(t * 8u + 7u, p1.y);
         subgroupBarrier();
-        uvec2 dLo45 = evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W, F32_DW_DEC1_B);
+        evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W, F32_DW_DEC1_B, t0, t1);
+        d4 = packHalf4(t0); d5 = packHalf4(t1);
         subgroupBarrier();
-        uvec2 dLo67 = evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W, F32_DW_DEC1_B);
+        evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W, F32_DW_DEC1_B, t0, t1);
+        d6 = packHalf4(t0); d7 = packHalf4(t1);
         barrier();
 
         [[dont_unroll]] for (uint pass = 0u; pass < 2u; ++pass) {
@@ -1207,122 +1432,77 @@ void runStage3Dec1() {
                 int  ay  = int(ayU);
                 ivec2 gp1 = clamp(ivec2(wgX + ax - 1, wgY + ay - 1), ivec2(0), ivec2(W1 - 1, H1 - 1));
                 uint sBase2 = (pc.offS0 >> 1u) + uint(gp1.y * W1 + gp1.x) * 4u;
-                uvec2 v0 = g_act.act2[sBase2 + 0u];
-                uvec2 v1 = g_act.act2[sBase2 + 1u];
-                uvec2 v2 = g_act.act2[sBase2 + 2u];
-                uvec2 v3 = g_act.act2[sBase2 + 3u];
-                writeSB(ap, 0u, 8u, unpackFp8Vec4(v0.x));
-                writeSB(ap, 1u, 8u, unpackFp8Vec4(v0.y));
-                writeSB(ap, 2u, 8u, unpackFp8Vec4(v1.x));
-                writeSB(ap, 3u, 8u, unpackFp8Vec4(v1.y));
-                writeSB(ap, 4u, 8u, unpackFp8Vec4(v2.x));
-                writeSB(ap, 5u, 8u, unpackFp8Vec4(v2.y));
-                writeSB(ap, 6u, 8u, unpackFp8Vec4(v3.x));
-                writeSB(ap, 7u, 8u, unpackFp8Vec4(v3.y));
+                for (uint c2 = 0u; c2 < 4u; ++c2) {
+                    vec4 v0, v1;
+                    loadActFeatPair(sBase2 + c2, v0, v1);
+                    writeSB(ap, c2 * 2u + 0u, 8u, v0);
+                    writeSB(ap, c2 * 2u + 1u, 8u, v1);
+                }
             }
         }
         barrier();
 
-        uvec2 dHi01 = evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
+        evalDw3x3L1Pair(baseAp3, 16u, 0u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u, t0, t1);
+        d8 = packHalf4(t0); d9 = packHalf4(t1);
         subgroupBarrier();
-        uvec2 dHi23 = evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
+        evalDw3x3L1Pair(baseAp3, 16u, 2u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u, t0, t1);
+        d10 = packHalf4(t0); d11 = packHalf4(t1);
         subgroupBarrier();
-        uvec2 dHi45 = evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
+        evalDw3x3L1Pair(baseAp3, 16u, 4u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u, t0, t1);
+        d12 = packHalf4(t0); d13 = packHalf4(t1);
         subgroupBarrier();
-        uvec2 dHi67 = evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u);
+        evalDw3x3L1Pair(baseAp3, 16u, 6u, F32_DW_DEC1_W + 32u, F32_DW_DEC1_B + 32u, t0, t1);
+        d14 = packHalf4(t0); d15 = packHalf4(t1);
         barrier();
 
-        writeSAFromGlobalU32(t,  0u, 16u, dLo01.x);
-        writeSAFromGlobalU32(t,  1u, 16u, dLo01.y);
-        writeSAFromGlobalU32(t,  2u, 16u, dLo23.x);
-        writeSAFromGlobalU32(t,  3u, 16u, dLo23.y);
-        writeSAFromGlobalU32(t,  4u, 16u, dLo45.x);
-        writeSAFromGlobalU32(t,  5u, 16u, dLo45.y);
-        writeSAFromGlobalU32(t,  6u, 16u, dLo67.x);
-        writeSAFromGlobalU32(t,  7u, 16u, dLo67.y);
-        writeSAFromGlobalU32(t,  8u, 16u, dHi01.x);
-        writeSAFromGlobalU32(t,  9u, 16u, dHi01.y);
-        writeSAFromGlobalU32(t, 10u, 16u, dHi23.x);
-        writeSAFromGlobalU32(t, 11u, 16u, dHi23.y);
-        writeSAFromGlobalU32(t, 12u, 16u, dHi45.x);
-        writeSAFromGlobalU32(t, 13u, 16u, dHi45.y);
-        writeSAFromGlobalU32(t, 14u, 16u, dHi67.x);
-        writeSAFromGlobalU32(t, 15u, 16u, dHi67.y);
+        uvec2 d0 = uvec2(loadAccUint(t * 8u + 0u), loadAccUint(t * 8u + 1u));
+        uvec2 d1 = uvec2(loadAccUint(t * 8u + 2u), loadAccUint(t * 8u + 3u));
+        uvec2 d2 = uvec2(loadAccUint(t * 8u + 4u), loadAccUint(t * 8u + 5u));
+        uvec2 d3 = uvec2(loadAccUint(t * 8u + 6u), loadAccUint(t * 8u + 7u));
+        writeSA16HalfVecs(t, d0, d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11, d12, d13, d14, d15, actScaleD3);
     }
     barrier();
 
-    // DEC1_PW1: 64 -> 48 (inTiles=4, outTiles=3) -> FP8-packed SSA scalars h3_0..h3_11
+    // DEC1_PW1: 64 -> 48 (inTiles=4, outTiles=3) -> pack into 12 scalar uvec2 VGPRs (half4)
+    float actScaleH3 = 1.0;
     {
-        uint h3_0 = 0u, h3_1 = 0u, h3_2 = 0u, h3_3  = 0u;
-        uint h3_4 = 0u, h3_5 = 0u, h3_6 = 0u, h3_7  = 0u;
-        uint h3_8 = 0u, h3_9 = 0u, h3_10 = 0u, h3_11 = 0u;
-        [[unroll]] for (uint ob = 0u; ob < 3u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-            preloadWeightNTile(U32_W_DEC1_PW1, ob, 4u);
-#endif
-            vec4 o0, o1, o2, o3;
-            evalPwNTile(4u, U32_W_DEC1_PW1, ob, F32_S_DEC1_PW1, F32_B_DEC1_PW1, true, o0, o1, o2, o3);
-            uint p0 = packFp8Vec4(o0);
-            uint p1 = packFp8Vec4(o1);
-            uint p2 = packFp8Vec4(o2);
-            uint p3 = packFp8Vec4(o3);
-            if (ob == 0u) {
-                h3_0 = p0; h3_1 = p1; h3_2 = p2; h3_3 = p3;
-            } else if (ob == 1u) {
-                h3_4 = p0; h3_5 = p1; h3_6 = p2; h3_7 = p3;
-            } else {
-                h3_8 = p0; h3_9 = p1; h3_10 = p2; h3_11 = p3;
-            }
-#ifdef UPWAYS_FP16_WMMA
-            barrier();
-#endif
-        }
+        uvec2 h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11;
+        vec4 o0, o1, o2, o3;
+        evalPwNTile(4u, U32_W_DEC1_PW1, 0u, F32_S_DEC1_PW1, F32_B_DEC1_PW1, true, actScaleD3, o0, o1, o2, o3);
+        h0 = packHalf4(o0); h1 = packHalf4(o1); h2 = packHalf4(o2); h3 = packHalf4(o3);
+        evalPwNTile(4u, U32_W_DEC1_PW1, 1u, F32_S_DEC1_PW1, F32_B_DEC1_PW1, true, actScaleD3, o0, o1, o2, o3);
+        h4 = packHalf4(o0); h5 = packHalf4(o1); h6 = packHalf4(o2); h7 = packHalf4(o3);
+        evalPwNTile(4u, U32_W_DEC1_PW1, 2u, F32_S_DEC1_PW1, F32_B_DEC1_PW1, true, actScaleD3, o0, o1, o2, o3);
+        h8 = packHalf4(o0); h9 = packHalf4(o1); h10 = packHalf4(o2); h11 = packHalf4(o3);
         barrier();
 
-        writeSAFromGlobalU32(t,  0u, 12u, h3_0);
-        writeSAFromGlobalU32(t,  1u, 12u, h3_1);
-        writeSAFromGlobalU32(t,  2u, 12u, h3_2);
-        writeSAFromGlobalU32(t,  3u, 12u, h3_3);
-        writeSAFromGlobalU32(t,  4u, 12u, h3_4);
-        writeSAFromGlobalU32(t,  5u, 12u, h3_5);
-        writeSAFromGlobalU32(t,  6u, 12u, h3_6);
-        writeSAFromGlobalU32(t,  7u, 12u, h3_7);
-        writeSAFromGlobalU32(t,  8u, 12u, h3_8);
-        writeSAFromGlobalU32(t,  9u, 12u, h3_9);
-        writeSAFromGlobalU32(t, 10u, 12u, h3_10);
-        writeSAFromGlobalU32(t, 11u, 12u, h3_11);
+        writeSA12HalfVecs(t, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9, h10, h11, actScaleH3);
     }
     barrier();
 
-    // DEN_HEAD: 48 -> 48 (inTiles=3, outTiles=3) -> packed into 20 scalar uint VGPRs across preload
+    // DEN_HEAD: 48 -> 48 (inTiles=3, outTiles=3) -> packed into 20 scalar uint VGPRs
     uint  hNextP0 = 0u, hNextP1 = 0u, hNextP2 = 0u, hNextP3 = 0u;
     uvec2 hd0 = uvec2(0u), hd1 = uvec2(0u), hd2 = uvec2(0u), hd3 = uvec2(0u);
     uvec2 hs0 = uvec2(0u), hs1 = uvec2(0u), hs2 = uvec2(0u), hs3 = uvec2(0u);
-    [[unroll]] for (uint ob = 0u; ob < 3u; ++ob) {
-#ifdef UPWAYS_FP16_WMMA
-        preloadWeightNTile(U32_W_DEN_HEAD, ob, 3u);
-#endif
+    {
         vec4 o0, o1, o2, o3;
-        evalPwNTile(3u, U32_W_DEN_HEAD, ob, F32_S_DEN_HEAD, F32_B_DEN_HEAD, false, o0, o1, o2, o3);
-        if (ob == 0u) {
-            hNextP0 = packFp8Vec4(clamp(o0, vec4(-4.0), vec4(4.0)));
-            hd0     = packHeadHalf(o1);
-            hs0     = packHeadHalf(o2);
-            hNextP1 = packFp8Vec4(clamp(o3, vec4(-4.0), vec4(4.0)));
-        } else if (ob == 1u) {
-            hd1     = packHeadHalf(o0);
-            hs1     = packHeadHalf(o1);
-            hNextP2 = packFp8Vec4(clamp(o2, vec4(-4.0), vec4(4.0)));
-            hd2     = packHeadHalf(o3);
-        } else {
-            hs2     = packHeadHalf(o0);
-            hNextP3 = packFp8Vec4(clamp(o1, vec4(-4.0), vec4(4.0)));
-            hd3     = packHeadHalf(o2);
-            hs3     = packHeadHalf(o3);
-        }
-#ifdef UPWAYS_FP16_WMMA
-        barrier();
-#endif
+        evalPwNTile(3u, U32_W_DEN_HEAD, 0u, F32_S_DEN_HEAD, F32_B_DEN_HEAD, false, actScaleH3, o0, o1, o2, o3);
+        hNextP0 = packHiddenVec4(clamp(o0, vec4(-4.0), vec4(4.0)));
+        hd0     = packHeadHalf(o1);
+        hs0     = packHeadHalf(o2);
+        hNextP1 = packHiddenVec4(clamp(o3, vec4(-4.0), vec4(4.0)));
+
+        evalPwNTile(3u, U32_W_DEN_HEAD, 1u, F32_S_DEN_HEAD, F32_B_DEN_HEAD, false, actScaleH3, o0, o1, o2, o3);
+        hd1     = packHeadHalf(o0);
+        hs1     = packHeadHalf(o1);
+        hNextP2 = packHiddenVec4(clamp(o2, vec4(-4.0), vec4(4.0)));
+        hd2     = packHeadHalf(o3);
+
+        evalPwNTile(3u, U32_W_DEN_HEAD, 2u, F32_S_DEN_HEAD, F32_B_DEN_HEAD, false, actScaleH3, o0, o1, o2, o3);
+        hs2     = packHeadHalf(o0);
+        hNextP3 = packHiddenVec4(clamp(o1, vec4(-4.0), vec4(4.0)));
+        hd3     = packHeadHalf(o2);
+        hs3     = packHeadHalf(o3);
     }
 
     barrier();

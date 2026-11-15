@@ -649,12 +649,24 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                 }
                 if (pfnGetCoopMatProps(m_physicalDevice, &propCount, coopProps.data()) == VK_SUCCESS) {
                     for (const auto& cp : coopProps) {
-                        if (cp.scope != VK_SCOPE_SUBGROUP_KHR) continue;
-                        if (cp.AType == VK_COMPONENT_TYPE_SINT8_KHR || cp.AType == VK_COMPONENT_TYPE_UINT8_KHR) {
+                        if (cp.scope != VK_SCOPE_SUBGROUP_KHR ||
+                            cp.MSize != 16u || cp.NSize != 16u || cp.KSize != 16u) {
+                            continue;
+                        }
+                        if (cp.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            cp.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            cp.ResultType == VK_COMPONENT_TYPE_SINT32_KHR) {
                             m_hasInt8CoopMatrix = true;
                         }
+                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            cp.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                            m_hasFp16CoopMatrix = true;
+                        }
 #ifdef VK_EXT_shader_float8
-                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT || cp.AType == VK_COMPONENT_TYPE_FLOAT8_E5M2_EXT) {
+                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                            cp.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
                             m_hasFp8CoopMatrix = true;
                         }
 #endif
@@ -700,10 +712,11 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
                  m_hasDGC ? "SUPPORTED" : "NOT FOUND",
                  m_hasRayTracing ? "SUPPORTED" : "NOT FOUND",
                  m_hasSubgroupSizeControl ? "SUPPORTED" : "NATIVE (e.g. Wave64)");
-    Logger::info("ML / Cooperative Matrix Capabilities -> CoopMatrix: {}, Int8: {}, Float8: {}, WMMA Int8: {}, WMMA FP8: {}, MutableDescriptorType: {}",
+    Logger::info("ML / Cooperative Matrix Capabilities -> CoopMatrix: {}, Int8: {}, Float8: {}, WMMA FP16: {}, WMMA Int8: {}, WMMA FP8: {}, MutableDescriptorType: {}",
                  m_hasCooperativeMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_vk12Features.shaderInt8 ? "SUPPORTED" : "NOT FOUND",
                  m_hasShaderFloat8 ? "SUPPORTED" : "NOT FOUND",
+                 m_hasFp16CoopMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_hasInt8CoopMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_hasFp8CoopMatrix ? "SUPPORTED" : "NOT FOUND",
                  m_hasMutableDescriptorType ? "SUPPORTED" : "NOT FOUND");

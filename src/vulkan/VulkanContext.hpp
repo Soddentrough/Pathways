@@ -135,7 +135,19 @@ public:
     bool hasShaderFloat8() const { return m_hasShaderFloat8; }
     bool hasFp8CooperativeMatrix() const { return m_hasFp8CoopMatrix; }
     bool hasInt8CooperativeMatrix() const { return m_hasInt8CoopMatrix; }
+    bool hasFp16CooperativeMatrix() const { return m_hasFp16CoopMatrix; }
     bool hasMutableDescriptorType() const { return m_hasMutableDescriptorType; }
+    bool supportsUpwaysWmma() const {
+        const bool hasFp8 = m_hasShaderFloat8 && m_hasShaderFloat8CoopMatrix && m_hasFp8CoopMatrix;
+        const bool hasInt8 = (m_vk12Features.shaderInt8 == VK_TRUE) &&
+                             (m_vk12Features.storageBuffer8BitAccess == VK_TRUE) &&
+                             (m_vk12Features.shaderFloat16 == VK_TRUE) &&
+                             m_hasInt8CoopMatrix;
+        const bool hasFp16 = (m_vk12Features.shaderFloat16 == VK_TRUE) &&
+                             (m_vk11Features.storageBuffer16BitAccess == VK_TRUE) &&
+                             m_hasFp16CoopMatrix;
+        return m_hasCooperativeMatrix && m_hasSubgroupSizeControl && (hasFp8 || hasInt8 || hasFp16);
+    }
     bool supportsFsr4() const {
         const bool hasFp8Ml = m_hasShaderFloat8 && m_hasShaderFloat8CoopMatrix && m_hasFp8CoopMatrix;
         const bool hasInt8Ml = (m_vk12Features.shaderInt8 == VK_TRUE) &&
@@ -220,6 +232,7 @@ private:
     bool m_hasShaderFloat8CoopMatrix = false;
     bool m_hasFp8CoopMatrix = false;
     bool m_hasInt8CoopMatrix = false;
+    bool m_hasFp16CoopMatrix = false;
     bool m_hasMutableDescriptorType = false;
     bool m_hasHdrMetadata = false;
     bool m_hasFullScreenExclusive = false;

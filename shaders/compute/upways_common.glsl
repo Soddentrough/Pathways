@@ -1,13 +1,24 @@
 // Upways 4.0 shared GLSL definitions, layout constants, FP8/FP16 helpers, and explicit bilinear warps.
 // Must remain strictly identical between Upways and Pathways repositories.
 
+#ifndef UPWAYS_PRECISION_MODE
+#ifdef UPWAYS_FP16_WMMA
+#define UPWAYS_PRECISION_MODE 2
+#else
+#define UPWAYS_PRECISION_MODE 0
+#endif
+#endif
+
+#define UPWAYS_IS_FP8  (UPWAYS_PRECISION_MODE == 0)
+#define UPWAYS_IS_INT8 (UPWAYS_PRECISION_MODE == 1)
+#define UPWAYS_IS_FP16 (UPWAYS_PRECISION_MODE == 2)
+
 #extension GL_KHR_memory_scope_semantics : require
-#extension GL_KHR_cooperative_matrix : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
 #extension GL_EXT_float_e4m3 : require
 #endif
 
@@ -134,7 +145,7 @@ bool isSkyOrEmissiveOnly(float linearDepth, float matClass, vec3 aDiff, vec3 aSp
 // Software / Hardware OCP E4M3fn Pack & Unpack (bit-exact with floate4m3_t)
 // -----------------------------------------------------------------------------
 uint encodeE4M3Byte(float x) {
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
     float xc = clamp(x, -448.0, 448.0);
     return uint(uint8_t(floate4m3BitsToIntEXT(floate4m3_t(xc))));
 #else
@@ -173,7 +184,7 @@ uint encodeE4M3Byte(float x) {
 }
 
 float decodeE4M3Byte(uint b) {
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
     return float(intBitsToFloate4m3EXT(int8_t(uint8_t(b & 0xFFu))));
 #else
     uint u = b & 0xFFu;
@@ -191,7 +202,7 @@ float decodeE4M3Byte(uint b) {
 }
 
 uint packFp8Vec4(vec4 v) {
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
     vec4 vc = clamp(v, vec4(-448.0), vec4(448.0));
     return pack32(floate4m3BitsToUintEXT(fe4m3vec4(vc)));
 #else
@@ -203,7 +214,7 @@ uint packFp8Vec4(vec4 v) {
 }
 
 vec4 unpackFp8Vec4(uint u) {
-#ifndef UPWAYS_FP16_WMMA
+#if UPWAYS_IS_FP8
     return vec4(uintBitsToFloate4m3EXT(unpack8(u)));
 #else
     return vec4(
@@ -217,6 +228,118 @@ vec4 unpackFp8Vec4(uint u) {
 
 vec4 quantFp8Sim4(vec4 v) {
     return unpackFp8Vec4(packFp8Vec4(v));
+}
+
+// Fixed symmetric INT8 static bounds for pre-serialized g_act slots & temporal state
+const float UPWAYS_INT8_ACT_MAX_FEAT   = 12.0;
+const float UPWAYS_INT8_ACT_MAX_HIDDEN = 4.0;
+const float UPWAYS_INT8_ACT_MAX_SKYMAT = 1.0;
+const float UPWAYS_INT8_ACT_MAX_TERR   = 4.0;
+
+const vec4 UPWAYS_X0_INT8_MAX_0   = vec4(12.0, 12.0, 12.0, 4.0);
+const vec4 UPWAYS_X0_INT8_MAX_4   = vec4(4.0,  4.0,  12.0, 4.0);
+const vec4 UPWAYS_X0_INT8_MAX_5   = vec4(4.0,  4.0,  4.0,  4.0);
+
+const vec4 UPWAYS_SRIN_INT8_MAX_0 = vec4(12.0, 12.0, 12.0, 4.0);
+const vec4 UPWAYS_SRIN_INT8_MAX_2 = vec4(4.0,  4.0,  4.0,  4.0);
+const vec4 UPWAYS_SRIN_INT8_MAX_3 = vec4(12.0, 4.0,  4.0,  4.0);
+
+uint packInt8Vec4Inv(vec4 v, vec4 invScale) {
+    ivec4 q = clamp(ivec4(roundEven(v * invScale)), ivec4(-127), ivec4(127));
+    uvec4 u = uvec4(q) & uvec4(0xFFu);
+    return u.x | (u.y << 8u) | (u.z << 16u) | (u.w << 24u);
+}
+
+uint packInt8Vec4(vec4 v, vec4 maxAbs) {
+    return packInt8Vec4Inv(v, vec4(127.0) / maxAbs);
+}
+
+vec4 unpackInt8Vec4Scale(uint u, vec4 scale) {
+    ivec4 q = ivec4(
+        bitfieldExtract(int(u), 0, 8),
+        bitfieldExtract(int(u), 8, 8),
+        bitfieldExtract(int(u), 16, 8),
+        bitfieldExtract(int(u), 24, 8)
+    );
+    return vec4(q) * scale;
+}
+
+vec4 unpackInt8Vec4(uint u, vec4 maxAbs) {
+    return unpackInt8Vec4Scale(u, maxAbs * (1.0 / 127.0));
+}
+
+float unpackInt8Byte(uint shifted, float maxAbs) {
+    int q = bitfieldExtract(int(shifted), 0, 8);
+    return float(q) * (maxAbs * (1.0 / 127.0));
+}
+
+uint packHiddenVec4(vec4 v) {
+#if UPWAYS_IS_FP8
+    return packFp8Vec4(v);
+#else
+    return packInt8Vec4(v, vec4(UPWAYS_INT8_ACT_MAX_HIDDEN));
+#endif
+}
+
+vec4 unpackHiddenVec4(uint u) {
+#if UPWAYS_IS_FP8
+    return unpackFp8Vec4(u);
+#else
+    return unpackInt8Vec4(u, vec4(UPWAYS_INT8_ACT_MAX_HIDDEN));
+#endif
+}
+
+uint packSkyMat4(vec4 v) {
+#if UPWAYS_IS_FP8
+    return packFp8Vec4(v);
+#else
+    return packInt8Vec4(v, vec4(UPWAYS_INT8_ACT_MAX_SKYMAT));
+#endif
+}
+
+vec4 unpackSkyMat4(uint u) {
+#if UPWAYS_IS_FP8
+    return unpackFp8Vec4(u);
+#else
+    return unpackInt8Vec4(u, vec4(UPWAYS_INT8_ACT_MAX_SKYMAT));
+#endif
+}
+
+float unpackSkyMatByte(uint shifted) {
+#if UPWAYS_IS_FP8
+    return decodeE4M3Byte(shifted);
+#else
+    return unpackInt8Byte(shifted, UPWAYS_INT8_ACT_MAX_SKYMAT);
+#endif
+}
+
+uint packTempErr4(vec4 tErr4) {
+#if UPWAYS_IS_FP8
+    return packFp8Vec4(tErr4 * 16.0);
+#else
+    return packInt8Vec4(tErr4, vec4(UPWAYS_INT8_ACT_MAX_TERR));
+#endif
+}
+
+float unpackTempErrByte(uint shifted) {
+#if UPWAYS_IS_FP8
+    return decodeE4M3Byte(shifted) * 0.0625;
+#else
+    return unpackInt8Byte(shifted, UPWAYS_INT8_ACT_MAX_TERR);
+#endif
+}
+
+float dynInt8AbsMax4(vec4 v) {
+    vec4 a = abs(v);
+    return max(max(a.x, a.y), max(a.z, a.w));
+}
+
+uvec2 packHalf4(vec4 v) {
+    return uvec2(packHalf2x16(v.xy), packHalf2x16(v.zw));
+}
+
+vec4 unpackHalf4(uvec2 u) {
+    return vec4(unpackHalf2x16(u.x), unpackHalf2x16(u.y));
 }
 
 // Bilinear tap computation matching PyTorch & HLSL integer imageLoad

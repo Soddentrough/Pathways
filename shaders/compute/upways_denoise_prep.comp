@@ -18,7 +18,11 @@ layout(set = 0, binding = 10, rgba16f)  readonly  uniform image2D      uPrevGeom
 layout(set = 0, binding = 11, r32ui)    readonly  uniform uimage2D     uPrevHiddenLr;
 layout(set = 0, binding = 12, rgba16f)  writeonly uniform image2DArray tBaseAnchorLr;
 layout(set = 0, binding = 13, rgba16f)  writeonly uniform image2D      uCurrGeomLr;
-layout(set = 0, binding = 14)           writeonly buffer  DenoiseActFp8Buf { uvec2 act2[]; } g_act;
+#if !UPWAYS_IS_FP16
+layout(set = 0, binding = 14)           writeonly buffer  DenoiseActBuf { uvec2 act2[]; } g_act;
+#else
+layout(set = 0, binding = 14)           writeonly buffer  DenoiseActBuf { uvec4 act4[]; } g_act;
+#endif
 
 // 18x10 cooperative G-buffer tile: 180 * 40 B = 7,200 B (< 8 KB -> 16 waves/SIMD)
 shared uvec2 s_diff[180];       // packHalf2x16(eD.rg), packHalf2x16(vec2(eD.b, dHD))
@@ -27,12 +31,21 @@ shared uvec2 s_nrmDep[180];     // packHalf2x16(nrm.xy), packHalf2x16(vec2(nrm.z
 shared uvec2 s_logDiff[180];    // packHalf2x16(safeLog1p(eD).rg), packHalf2x16(vec2(safeLog1p(eD).b, 0.0))
 shared uvec2 s_logSpec[180];    // packHalf2x16(safeLog1p(eS).rg), packHalf2x16(vec2(safeLog1p(eS).b, 0.0))
 
+#if !UPWAYS_IS_FP16
 void writeQuadSlot(int qx, int qy, int corner, int W1, uint f0, uint f1, uint f2, uint f3, uint f4, uint f5) {
     uint base2 = (pc.offX0 >> 1u) + uint(qy * W1 + qx) * 12u + uint(corner) * 3u;
     g_act.act2[base2 + 0u] = uvec2(f0, f1);
     g_act.act2[base2 + 1u] = uvec2(f2, f3);
     g_act.act2[base2 + 2u] = uvec2(f4, f5);
 }
+#else
+void writeQuadSlot(int qx, int qy, int corner, int W1, uvec2 f0, uvec2 f1, uvec2 f2, uvec2 f3, uvec2 f4, uvec2 f5) {
+    uint base2 = (pc.offX0 >> 1u) + uint(qy * W1 + qx) * 12u + uint(corner) * 3u;
+    g_act.act4[base2 + 0u] = uvec4(f0, f1);
+    g_act.act4[base2 + 1u] = uvec4(f2, f3);
+    g_act.act4[base2 + 2u] = uvec4(f4, f5);
+}
+#endif
 
 void evalWarpGeomTap(
     vec4 pg, bool inOk, float bw, float linDepth, vec3 viewNormal,
@@ -68,17 +81,17 @@ void accumPrevDiffHidden4(
                     + wD1 * clamp(pd1.a, 0.0, 64.0)
                     + wD2 * clamp(pd2.a, 0.0, 64.0)
                     + wD3 * clamp(pd3.a, 0.0, 64.0);
-    vec4 accPrevH = wD0 * unpackFp8Vec4(ph0)
-                  + wD1 * unpackFp8Vec4(ph1)
-                  + wD2 * unpackFp8Vec4(ph2)
-                  + wD3 * unpackFp8Vec4(ph3);
+    vec4 accPrevH = wD0 * unpackHiddenVec4(ph0)
+                  + wD1 * unpackHiddenVec4(ph1)
+                  + wD2 * unpackHiddenVec4(ph2)
+                  + wD3 * unpackHiddenVec4(ph3);
 
     float invSumW = 1.0 / sumTapW;
     diffConf    = clamp(sumTapW, 0.0, 1.0);
     yDiffPrev   = accPrevD * invSumW;
     prevNDiff   = accPrevND * invSumW;
     vec4 hAcc   = accPrevH * invSumW;
-    hWarpPacked = packFp8Vec4(clamp(hAcc, vec4(-4.0), vec4(4.0)) * diffConf);
+    hWarpPacked = packHiddenVec4(clamp(hAcc, vec4(-4.0), vec4(4.0)) * diffConf);
 }
 
 void accumPrevSpec4(
@@ -604,12 +617,28 @@ void main() {
     vec3  guideDiff  = mix(accDiff, muDiffCurr, currBlendD);
     vec3  guideSpec  = mix(accSpec, muSpecCurr, currBlendS);
 
+#if UPWAYS_IS_FP8
     uint f0 = packFp8Vec4(vec4(safeLog1p(accDiff), diffHitDist * 4.0));
     uint f1 = packFp8Vec4(vec4(safeLog1p(guideDiff), log2(nDiff) * (4.0 / 6.0)));
     uint f2 = packFp8Vec4(vec4(safeLog1p(accSpec), log2(nSpec) * (4.0 / 6.0)));
     uint f3 = packFp8Vec4(vec4(safeLog1p(guideSpec), roughness * 4.0));
     uint f4 = packFp8Vec4(vec4(viewNormal.x * 4.0, viewNormal.y * 4.0, safeLog1pF(linDepth), reactiveMask * 4.0));
     uint f5 = hWarpPacked;
+#elif UPWAYS_IS_INT8
+    uint f0 = packInt8Vec4(vec4(safeLog1p(accDiff), diffHitDist * 4.0), UPWAYS_X0_INT8_MAX_0);
+    uint f1 = packInt8Vec4(vec4(safeLog1p(guideDiff), log2(nDiff) * (4.0 / 6.0)), UPWAYS_X0_INT8_MAX_0);
+    uint f2 = packInt8Vec4(vec4(safeLog1p(accSpec), log2(nSpec) * (4.0 / 6.0)), UPWAYS_X0_INT8_MAX_0);
+    uint f3 = packInt8Vec4(vec4(safeLog1p(guideSpec), roughness * 4.0), UPWAYS_X0_INT8_MAX_0);
+    uint f4 = packInt8Vec4(vec4(viewNormal.x * 4.0, viewNormal.y * 4.0, safeLog1pF(linDepth), reactiveMask * 4.0), UPWAYS_X0_INT8_MAX_4);
+    uint f5 = hWarpPacked;
+#else
+    uvec2 f0 = packHalf4(vec4(safeLog1p(accDiff), diffHitDist * 4.0));
+    uvec2 f1 = packHalf4(vec4(safeLog1p(guideDiff), log2(nDiff) * (4.0 / 6.0)));
+    uvec2 f2 = packHalf4(vec4(safeLog1p(accSpec), log2(nSpec) * (4.0 / 6.0)));
+    uvec2 f3 = packHalf4(vec4(safeLog1p(guideSpec), roughness * 4.0));
+    uvec2 f4 = packHalf4(vec4(viewNormal.x * 4.0, viewNormal.y * 4.0, safeLog1pF(linDepth), reactiveMask * 4.0));
+    uvec2 f5 = packHalf4(unpackHiddenVec4(hWarpPacked));
+#endif
 
     int W1     = (W + 1) >> 1;
     int qx     = p.x >> 1;

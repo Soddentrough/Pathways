@@ -307,7 +307,7 @@ int main(int argc, char* argv[]) {
             cfg.fsr_version = pathways::FsrVersion::Fsr3;
             cfg.render_scale = 0.6666667f;
 
-            if (initStats.has_cooperative_matrix) {
+            if (initStats.supports_upways_wmma) {
                 cfg.denoiser_mode = pathways::DenoiserMode::Upways;
                 if (!stepAndVerify("6b. FSR 3.1 (0.67x) + Upways Denoiser", 4, expectedFsr3, "Upways")) return 1;
 
@@ -317,7 +317,7 @@ int main(int argc, char* argv[]) {
                     if (!stepAndVerify("6c. FSR 4.1 ML (0.67x) + Upways Denoiser", 4, expectedFsr4, "Upways")) return 1;
                 }
 
-                if (initStats.has_fp8_coop_matrix) {
+                if (initStats.supports_upways_wmma) {
                     // Verify live transition -> Upways SR (0.67x) -> Native Upways Denoiser (1.0x)
                     cfg.upscaler_mode = pathways::UpscalerMode::Upways;
                     cfg.upways_superres = true;
@@ -345,9 +345,9 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             const pathways::DenoiserMode activeDenoiserMode =
-                initStats.has_cooperative_matrix ? pathways::DenoiserMode::Upways : pathways::DenoiserMode::None;
+                initStats.supports_upways_wmma ? pathways::DenoiserMode::Upways : pathways::DenoiserMode::None;
             const std::string expectedActiveDenoiser =
-                initStats.has_cooperative_matrix ? "Upways" : "None";
+                initStats.supports_upways_wmma ? "Upways" : "None";
             cfg.denoiser_mode = activeDenoiserMode;
 
             if (initStats.has_cooperative_matrix) {

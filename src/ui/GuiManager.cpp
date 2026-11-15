@@ -742,10 +742,12 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Distance Clamping:  %s", config.distance_clamping ? "Scene-Scale Invariant (D_scene * 1.25)" : "Disabled (10,000m)");
             }
             ImGui::Text("Ray Scheduling:     %s (Wave%u)", stats.ray_accelerator_name.c_str(), stats.subgroup_size > 0 ? stats.subgroup_size : 32u);
-            ImGui::Text("ML CoopMatrix:      %s (FP8: %s, INT8: %s, FSR4 ML: %s)",
+            ImGui::Text("ML CoopMatrix:      %s (FP8: %s, INT8: %s, FP16: %s, Upways WMMA: %s, FSR4 ML: %s)",
                         stats.has_cooperative_matrix ? "SUPPORTED" : "NO",
                         stats.has_fp8_coop_matrix ? "YES" : "NO",
                         stats.has_int8_coop_matrix ? "YES" : "NO",
+                        stats.has_fp16_coop_matrix ? "YES" : "NO",
+                        stats.supports_upways_wmma ? "YES" : "NO",
                         stats.supports_fsr4 ? "SUPPORTED" : "UNSUPPORTED");
             ImGui::Text("Command Execution:  %s", stats.has_dgc ? "GPU-Driven Indirect (VK_EXT_dgc)" : "Host Recorded Dispatch");
             ImGui::Text("Ray Throughput:     %.2f GigaRays/sec", stats.rays_per_second * 1e-9);
@@ -779,7 +781,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Lighting:     Fallback Synthetic Sun (0 lights in asset)");
             }
             if (config.denoiser_mode == DenoiserMode::Upways) {
-                ImGui::Text("Denoising:    Upways 3.0 FP8 Neural Reconstructor");
+                ImGui::Text("Denoising:    Upways 4.0 WMMA (%s)", stats.upways_precision_str.c_str());
             } else if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::Text("Denoising:    AMD FSR Ray Regeneration (4-Signal)");
             } else {
@@ -788,7 +790,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (config.upscaler_mode == UpscalerMode::FSR) {
                 ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", stats.upscaler_mode_str.c_str(), config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
-                ImGui::Text("Upscaling:    Upways 3.0 Continuous Subpixel SR (%.2fx)", config.render_scale);
+                ImGui::Text("Upscaling:    Upways 4.0 WMMA SR (%s, %.2fx)", stats.upways_precision_str.c_str(), config.render_scale);
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -1154,8 +1156,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     if (config.render_scale >= 0.999f) config.render_scale = 0.6666667f;
                 });
             ImGui::SameLine();
-            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix && stats.has_fp8_coop_matrix, false,
-                "Upways 3.0 RDNA 4 FP8 WMMA Spatiotemporal Backbone + Continuous Subpixel Resolve (requires VK_EXT_shader_float8 + VK_KHR_cooperative_matrix).", [&]() {
+            drawQuickUpscalerBtn("Upways SR", config.upscaler_mode == UpscalerMode::Upways, stats.supports_upways_wmma, false,
+                "Upways 4.0 WMMA Spatiotemporal Backbone + Continuous Subpixel Resolve (FP8 E4M3 / INT8 QAT / FP16 via VK_KHR_cooperative_matrix).", [&]() {
                     m_fsr4StubSelected = false;
                     config.upscaler_mode = UpscalerMode::Upways;
                     config.denoiser_mode = DenoiserMode::Upways;
@@ -1194,7 +1196,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 const char* activeUpscalerDesc =
                     (hwMl && isFsr4Selected) ? "AMD FSR 4.1.2 ML" :
                     isFsr3Selected ? "AMD FSR 3.1.6" :
-                    (config.upscaler_mode == UpscalerMode::Upways) ? "Upways 3.0 FP8 Neural SR" : "Disabled";
+                    (config.upscaler_mode == UpscalerMode::Upways) ? "Upways 4.0 WMMA Neural SR" : "Disabled";
                 ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
                                    "Active: %s  |  %ux%u -> %ux%u (%.0f%% Scale)",
                                    activeUpscalerDesc, rW, rH, config.width, config.height, config.render_scale * 100.0f);
@@ -1264,24 +1266,24 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)."
                                       : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active).");
             ImGui::SameLine();
-            drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
-                "Upways 3.0 RDNA 4 FP8 WMMA Spatiotemporal Backbone: runs standalone at render-res alongside FSR 3.1 / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
+            drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.supports_upways_wmma,
+                "Upways 4.0 WMMA Spatiotemporal Backbone (FP8 E4M3 / INT8 QAT / FP16): runs standalone at render-res alongside FSR 3.1 / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
 
             if (config.denoiser_mode != DenoiserMode::None || config.upscaler_mode == UpscalerMode::Upways) {
                 uint32_t rW = config.getRenderWidth();
                 uint32_t rH = config.getRenderHeight();
                 if (config.upscaler_mode == UpscalerMode::Upways) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 3.0 FP8 Coupled Neural SR + Denoiser (%ux%u -> %ux%u)",
-                                       rW, rH, config.width, config.height);
+                                       "Active Denoiser: Upways 4.0 WMMA [%s] Coupled Neural SR + Denoiser (%ux%u -> %ux%u)",
+                                       stats.upways_precision_str.c_str(), rW, rH, config.width, config.height);
                 } else if (config.denoiser_mode == DenoiserMode::Upways && config.upscaler_mode == UpscalerMode::FSR) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 3.0 FP8 Neural Denoiser (%ux%u, Jitter-Preserving -> %s)",
-                                       rW, rH, isFsr4Selected ? "FSR 4.1.2 ML" : "FSR 3.1.6");
+                                       "Active Denoiser: Upways 4.0 WMMA [%s] Neural Denoiser (%ux%u, Jitter-Preserving -> %s)",
+                                       stats.upways_precision_str.c_str(), rW, rH, isFsr4Selected ? "FSR 4.1.2 ML" : "FSR 3.1.6");
                 } else if (config.denoiser_mode == DenoiserMode::Upways) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 3.0 FP8 Neural Denoiser (Native %ux%u)",
-                                       rW, rH);
+                                       "Active Denoiser: Upways 4.0 WMMA [%s] Neural Denoiser (Native %ux%u)",
+                                       stats.upways_precision_str.c_str(), rW, rH);
                 }
             }
 
@@ -2019,7 +2021,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     const DenoiserMode candMode = static_cast<DenoiserMode>(n);
                     const bool needsCoop = (candMode == DenoiserMode::Upways);
                     const bool needsFfxRr = (candMode == DenoiserMode::FfxRayRegeneration);
-                    const bool itemDisabled = (needsCoop && !(stats.has_cooperative_matrix && stats.has_fp8_coop_matrix)) || (needsFfxRr && !stats.supports_fsr_rr);
+                    const bool itemDisabled = (needsCoop && !stats.supports_upways_wmma) || (needsFfxRr && !stats.supports_fsr_rr);
                     if (itemDisabled) ImGui::BeginDisabled(true);
                     const bool isSelected = (denoiserIdx == n);
                     if (ImGui::Selectable(denoiserModeLabels[n], isSelected)) {
@@ -2034,7 +2036,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
                             ImGui::SetTooltip("%s", needsFfxRr
                                 ? "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active)."
-                                : "Unavailable: Requires VK_EXT_shader_float8 + VK_KHR_cooperative_matrix support.");
+                                : "Unavailable: Requires VK_KHR_cooperative_matrix 16x16 WMMA support (FP8, INT8, or FP16).");
                         }
                     }
                 }
@@ -2043,7 +2045,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
-                                  "- Upways: Decoupled RDNA 4 FP8 WMMA multi-scale backbone + continuous subpixel resolve.\n"
+                                  "- Upways: Decoupled WMMA multi-scale backbone (FP8 E4M3 / INT8 QAT / FP16) + continuous subpixel resolve.\n"
                                   "- AMD FSR Ray Regeneration (1.2.1): 4-Signal AMD FidelityFX Denoiser provider.");
             }
             if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
@@ -2083,9 +2085,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 { UpscalerChoiceId::Fsr3, "AMD FSR 3.1 (SDK Super-Resolution)",
                   isFsr3ComboSelected, stats.supports_fsr3,
                   "Unavailable: Requires AMD FidelityFX Upscaler Vulkan provider (amd_fidelityfx_upscaler_vk)." },
-                { UpscalerChoiceId::UpwaysSr, "Upways 3.0 SR (FP8 Neural Subpixel Super-Resolution)",
-                  config.upscaler_mode == UpscalerMode::Upways, stats.has_cooperative_matrix && stats.has_fp8_coop_matrix,
-                  "Unavailable: Requires VK_EXT_shader_float8 + VK_KHR_cooperative_matrix support." }
+                { UpscalerChoiceId::UpwaysSr, "Upways 4.0 SR (WMMA Neural Subpixel Super-Resolution)",
+                  config.upscaler_mode == UpscalerMode::Upways, stats.supports_upways_wmma,
+                  "Unavailable: Requires VK_KHR_cooperative_matrix 16x16 WMMA support (FP8, INT8, or FP16)." }
             };
             const char* curUpscalerLabel = upscalerItems[0].label;
             for (const auto& item : upscalerItems) {
@@ -2248,6 +2250,52 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 drawScalePreset(0.3333333f, "UltraPerf (0.33x)");
                 ImGui::NewLine();
                 ImGui::PopID();
+            }
+
+            if (config.denoiser_mode == DenoiserMode::Upways || config.upscaler_mode == UpscalerMode::Upways) {
+                struct PrecisionOption {
+                    UpwaysPrecision mode;
+                    const char* label;
+                    bool supported;
+                    const char* tooltip;
+                };
+                const PrecisionOption options[] = {
+                    { UpwaysPrecision::Auto, "Auto (FP8 -> INT8 -> FP16)", stats.supports_upways_wmma,
+                      "Automatically selects the best supported WMMA tier: FP8 E4M3 -> INT8 QAT -> FP16." },
+                    { UpwaysPrecision::Fp8, "FP8 E4M3fn", stats.has_fp8_coop_matrix,
+                      "Native FP8 E4M3 cooperative matrix WMMA (RDNA 4 / gfx12+)." },
+                    { UpwaysPrecision::Int8, "INT8 QAT", stats.has_int8_coop_matrix,
+                      "Dedicated QAT-trained INT8 cooperative matrix WMMA (primary RDNA 3/3.5 & RDNA 4 tier)." },
+                    { UpwaysPrecision::Fp16, "FP16", stats.has_fp16_coop_matrix,
+                      "FP16 cooperative matrix WMMA fallback with host-expanded weights." },
+                };
+                const char* previewLabel = options[0].label;
+                for (const auto& opt : options) {
+                    if (opt.mode == config.upways_precision) {
+                        previewLabel = opt.label;
+                        break;
+                    }
+                }
+                if (ImGui::BeginCombo("Upways WMMA Precision", previewLabel)) {
+                    for (const auto& opt : options) {
+                        const bool isSelected = (config.upways_precision == opt.mode);
+                        if (!opt.supported) ImGui::BeginDisabled(true);
+                        if (ImGui::Selectable(opt.label, isSelected)) {
+                            config.upways_precision = opt.mode;
+                        }
+                        if (isSelected) ImGui::SetItemDefaultFocus();
+                        if (!opt.supported) {
+                            ImGui::EndDisabled();
+                            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                                ImGui::SetTooltip("Unavailable on this GPU.");
+                            }
+                        } else if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%s", opt.tooltip);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::TextDisabled("Active WMMA tier: %s", stats.upways_precision_str.c_str());
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {

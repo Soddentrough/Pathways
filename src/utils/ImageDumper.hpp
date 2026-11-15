@@ -89,6 +89,8 @@ struct FrameStats {
     bool has_shader_float8 = false;
     bool has_int8_coop_matrix = false;
     bool has_fp8_coop_matrix = false;
+    bool has_fp16_coop_matrix = false;
+    bool supports_upways_wmma = false;
     bool has_mutable_descriptor_type = false;
     bool supports_fsr3 = false;
     bool supports_fsr4 = false;
@@ -102,6 +104,7 @@ struct FrameStats {
     std::string denoiser_mode_str = "None";
     bool enable_nrc = false;
     std::string upscaler_mode_str = "None";
+    std::string upways_precision_str = "none";
     float render_scale = 1.0f;
     uint32_t spp = 0;
     uint32_t max_bounces = 0;

@@ -700,7 +700,23 @@ FrameStats TelemetryReporter::getStats() const {
     stats.has_shader_float8 = m_engine->m_context->hasShaderFloat8();
     stats.has_int8_coop_matrix = m_engine->m_context->hasInt8CooperativeMatrix();
     stats.has_fp8_coop_matrix = m_engine->m_context->hasFp8CooperativeMatrix();
+    stats.has_fp16_coop_matrix = m_engine->m_context->hasFp16CooperativeMatrix();
+    stats.supports_upways_wmma = m_engine->m_context->supportsUpwaysWmma();
     stats.has_mutable_descriptor_type = m_engine->m_context->hasMutableDescriptorType();
+    if (stats.supports_upways_wmma &&
+        (m_engine->m_config.denoiser_mode == DenoiserMode::Upways ||
+         m_engine->m_config.upscaler_mode == UpscalerMode::Upways)) {
+        if (const UpwaysPipeline* upw = m_engine->getUpwaysPipeline(); upw && upw->isInitialized()) {
+            stats.upways_precision_str = upwaysPrecisionName(upw->getPrecision());
+        } else {
+            stats.upways_precision_str = upwaysPrecisionName(UpwaysPipeline::selectPrecision(
+                m_engine->m_context->getPhysicalDevice(),
+                m_engine->m_config.upways_precision,
+                m_engine->m_context->getInstance()));
+        }
+    } else {
+        stats.upways_precision_str = "none";
+    }
     {
         static VkDevice s_cachedDevice = VK_NULL_HANDLE;
         static bool s_cachedFsr3 = false;
@@ -732,7 +748,7 @@ FrameStats TelemetryReporter::getStats() const {
     // 5. Engine Settings & State
     stats.visualize_mgpu_split = m_engine->m_config.visualize_mgpu_split;
     switch (m_engine->m_config.denoiser_mode) {
-        case DenoiserMode::Upways: stats.denoiser_mode_str = stats.has_cooperative_matrix ? "Upways" : "None"; break;
+        case DenoiserMode::Upways: stats.denoiser_mode_str = stats.supports_upways_wmma ? "Upways" : "None"; break;
         case DenoiserMode::FfxRayRegeneration:
             stats.denoiser_mode_str = stats.supports_fsr_rr ? "FFX Ray Regeneration" : "None";
             break;
@@ -757,7 +773,7 @@ FrameStats TelemetryReporter::getStats() const {
             }
             break;
         }
-        case UpscalerMode::Upways: stats.upscaler_mode_str = stats.has_cooperative_matrix ? "Upways" : "None"; break;
+        case UpscalerMode::Upways: stats.upscaler_mode_str = stats.supports_upways_wmma ? "Upways" : "None"; break;
         case UpscalerMode::None: default: stats.upscaler_mode_str = "None"; break;
     }
     stats.render_scale = m_engine->m_config.render_scale;

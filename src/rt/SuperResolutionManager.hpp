@@ -26,7 +26,8 @@ public:
                            VkPhysicalDevice physicalDevice,
                            VmaAllocator allocator,
                            VkQueue queue,
-                           ShaderLoaderFunc shaderLoader);
+                           ShaderLoaderFunc shaderLoader,
+                           VkInstance instance = VK_NULL_HANDLE);
     ~SuperResolutionManager();
 
     SuperResolutionManager(const SuperResolutionManager&) = delete;
@@ -45,7 +46,8 @@ public:
                 UpscalerMode upscalerMode, DenoiserMode denoiserMode,
                 bool upwaysSuperres, AccumFormat accumFormat,
                 PostProcessPipeline* postProcess, VkCommandBuffer cmd,
-                FsrVersion fsrVersion = FsrVersion::Auto);
+                FsrVersion fsrVersion = FsrVersion::Auto,
+                UpwaysPrecision upwaysPrecision = UpwaysPrecision::Auto);
 
     void updateDescriptors(PostProcessPipeline* postProcess,
                            Image* accumImage, Image* outputImage,
@@ -128,6 +130,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
     ShaderLoaderFunc m_shaderLoader;
+    VkInstance m_instance = VK_NULL_HANDLE;
 
     VkDescriptorPool m_postProcessDescPool = VK_NULL_HANDLE;
 

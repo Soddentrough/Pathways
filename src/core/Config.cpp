@@ -334,7 +334,8 @@ void Config::printUsage(const char* progName) {
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
               << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
               << "  --upways                Shortcut to enable Upways real-time denoiser\n"
-              << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n\n"
+              << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n"
+              << "  --upways-precision <m>  Upways WMMA compute precision: 'auto' [default] (fp8->int8->fp16), 'fp8', 'int8', or 'fp16'\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -1017,6 +1018,24 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
+            continue;
+        }
+        auto parseUpwaysPrecision = [](const std::string& raw) -> UpwaysPrecision {
+            std::string v = raw;
+            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (v == "fp8") return UpwaysPrecision::Fp8;
+            if (v == "int8") return UpwaysPrecision::Int8;
+            if (v == "fp16") return UpwaysPrecision::Fp16;
+            return UpwaysPrecision::Auto;
+        };
+        if (arg == "--upways-precision" && i + 1 < argc) {
+            cfg.upways_precision = parseUpwaysPrecision(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--upways-precision=")) {
+            cfg.upways_precision = parseUpwaysPrecision(arg.substr(arg.find('=') + 1));
             continue;
         }
         if (arg == "--light-tree") {
