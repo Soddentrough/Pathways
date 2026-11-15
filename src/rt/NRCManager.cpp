@@ -61,7 +61,7 @@ const char* NRCManager::getActiveBackendName() const {
     if (m_backend == NrcBackend::FfxRadianceCache) {
         return "Stub (No Native Vulkan Radiance Cache Provider)";
     }
-    return "Native Wave32 WMMA Positional MLP";
+    return "Native Wave32 WMMA Hash-Grid MLP";
 }
 
 void NRCManager::initFfxRadianceCacheContext() {
@@ -126,16 +126,28 @@ void NRCManager::initBuffers() {
     VkDeviceSize weightsSize = 19200;
     m_weights = std::make_unique<Buffer>(m_allocator, weightsSize, queueUsage,
                                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_inferWeights = std::make_unique<Buffer>(m_allocator, weightsSize, queueUsage,
+                                              VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
     // 5. Adam Momentum + FP32 Master Weights buffer: 3 * 9360 * sizeof(float) = 112,320 bytes (Device-Local VRAM)
     VkDeviceSize momentumSize = 3ull * 9360ull * sizeof(float);
     m_weightMomentum = std::make_unique<Buffer>(m_allocator, momentumSize, queueUsage,
                                                 VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
 
+    // 5b. Multi-Resolution Hash Grid (262,144 x f16vec2 = 1 MiB) + FP32 Adam State (m, v, master = 6 MiB)
+    constexpr VkDeviceSize kHashEntries = 262144ull;
+    m_hashGrid = std::make_unique<Buffer>(m_allocator, kHashEntries * 4ull, queueUsage,
+                                          VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_inferHashGrid = std::make_unique<Buffer>(m_allocator, kHashEntries * 4ull, queueUsage,
+                                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_hashGridState = std::make_unique<Buffer>(m_allocator, 3ull * kHashEntries * 8ull, queueUsage,
+                                               VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
     // 6. Atomic Accumulation Buffer: 6 channels (diffuse RGB + specular RGB) * width * height * sizeof(uint32_t) bytes in Device-Local VRAM
     VkDeviceSize atomicAccumSize = static_cast<VkDeviceSize>(m_width) * m_height * 6ull * sizeof(uint32_t);
     m_atomicAccumBuffer = std::make_unique<Buffer>(m_allocator, atomicAccumSize, queueUsage,
                                                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    m_atomicAccumNeedsClear = true;
 
     // 7. 1x1 RGBA16F fallback storage image for optional resolve bindings 2..7
     if (!m_dummyStorageImage) {
@@ -181,21 +193,23 @@ void NRCManager::initWeights() {
     for (size_t i = 0; i < 1024; ++i) {
         setParam(8320 + i, weightDist(rng) * 0.02f);
     }
-    // Layer 2: 16 biases
+    // Layer 2: 16 biases (small positive RGB prior accelerates warm-start convergence)
     for (size_t i = 0; i < 16; ++i) {
-        setParam(9344 + i, 0.0f);
+        setParam(9344 + i, (i < 3) ? 0.02f : 0.0f);
     }
 
     m_needsGpuInit = true;
+    m_inferSnapshotDirty = false;
 }
 
 void NRCManager::createDescriptorSetLayouts() {
-    // Inference Layout: AtomicBuffer(0), QueryQueue(1), Weights(2), Counters(3)
+    // Inference Layout: AtomicBuffer(0), QueryQueue(1), Weights(2), Counters(3), HashGrid(4)
     std::vector<VkDescriptorSetLayoutBinding> inferBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo inferLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     inferLayoutInfo.bindingCount = static_cast<uint32_t>(inferBindings.size());
@@ -204,12 +218,14 @@ void NRCManager::createDescriptorSetLayouts() {
         throw std::runtime_error("NRCManager: Failed to create inference descriptor set layout!");
     }
 
-    // Training Layout: TrainQueue(0), Weights(1), Momentum(2), Counters(3)
+    // Training Layout: TrainQueue(0), Weights(1), Momentum(2), Counters(3), HashGrid(4), HashGridState(5)
     std::vector<VkDescriptorSetLayoutBinding> trainBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo trainLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     trainLayoutInfo.bindingCount = static_cast<uint32_t>(trainBindings.size());
@@ -276,17 +292,22 @@ void NRCManager::allocateDescriptorSets() {
         throw std::runtime_error("NRCManager: Failed to allocate resolve descriptor sets!");
     }
 
-    // Write persistent buffer bindings for inference descriptor set (0: AtomicBuffer)
+    // Write persistent buffer bindings for inference descriptor set (0: AtomicBuffer, 2: inferWeights, 4: inferHashGrid)
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo inferWeightsInfo{ m_inferWeights->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo hashGridInfo{ m_hashGrid->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo inferHashGridInfo{ m_inferHashGrid->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo hashStateInfo{ m_hashGridState->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> inferWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inferWeightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inferHashGridInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(inferWrites.size()), inferWrites.data(), 0, nullptr);
 
@@ -298,7 +319,9 @@ void NRCManager::allocateDescriptorSets() {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashGridInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashStateInfo, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(trainWrites.size()), trainWrites.data(), 0, nullptr);
 
@@ -308,6 +331,10 @@ void NRCManager::allocateDescriptorSets() {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
     }};
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(resolveBufWrites.size()), resolveBufWrites.data(), 0, nullptr);
+
+    if (m_dummyStorageImage) {
+        updateDescriptors(m_dummyStorageImage->getImageView());
+    }
 }
 
 void NRCManager::updateDescriptors(VkImageView accumImageView,
@@ -377,10 +404,11 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
     pcRange.offset = 0;
     pcRange.size = sizeof(uint32_t) * 4 + sizeof(float) * 8; // 48 bytes
 
-    // Inference Pipeline
+    // Inference Pipeline (set 0 = infer descriptors, set 1 = direct-resolve storage images)
+    std::array<VkDescriptorSetLayout, 2> inferSetLayouts = { m_inferDescLayout, m_resolveDescLayout };
     VkPipelineLayoutCreateInfo inferLayoutInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-    inferLayoutInfo.setLayoutCount = 1;
-    inferLayoutInfo.pSetLayouts = &m_inferDescLayout;
+    inferLayoutInfo.setLayoutCount = static_cast<uint32_t>(inferSetLayouts.size());
+    inferLayoutInfo.pSetLayouts = inferSetLayouts.data();
     inferLayoutInfo.pushConstantRangeCount = 1;
     inferLayoutInfo.pPushConstantRanges = &pcRange;
     if (vkCreatePipelineLayout(m_device, &inferLayoutInfo, nullptr, &m_inferPipelineLayout) != VK_SUCCESS) {
@@ -481,20 +509,27 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo queryQueueInfo{ m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo weightsInfo{ m_weights->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo inferWeightsInfo{ m_inferWeights->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo countersInfo{ m_counters->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo trainQueueInfo{ m_trainQueue->getBuffer(), 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo momInfo{ m_weightMomentum->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo hashGridInfo{ m_hashGrid->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo inferHashGridInfo{ m_inferHashGrid->getBuffer(), 0, VK_WHOLE_SIZE };
+    VkDescriptorBufferInfo hashStateInfo{ m_hashGridState->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &queryQueueInfo, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inferWeightsInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_inferDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &inferHashGridInfo, nullptr },
 
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &trainQueueInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &weightsInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &momInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &countersInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashGridInfo, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_trainDescSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hashStateInfo, nullptr },
 
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[0], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[1], 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &atomicAccumInfo, nullptr }
@@ -502,10 +537,61 @@ void NRCManager::resize(uint32_t width, uint32_t height) {
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
+static void ensureAtomicAccumCleared(VkCommandBuffer cmd, Buffer* atomicAccumBuffer, bool& needsClear) {
+    if (!needsClear || !atomicAccumBuffer) return;
+    vkCmdFillBuffer(cmd, atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+    VkBufferMemoryBarrier2 clearBar{
+        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+        atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
+    };
+    VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    clearDep.bufferMemoryBarrierCount = 1;
+    clearDep.pBufferMemoryBarriers = &clearBar;
+    vkCmdPipelineBarrier2(cmd, &clearDep);
+    needsClear = false;
+}
+
+void NRCManager::syncInferenceSnapshot(VkCommandBuffer cmd) {
+    if (!m_inferSnapshotDirty || !m_weights || !m_inferWeights || !m_hashGrid || !m_inferHashGrid) return;
+    VkBufferCopy wCopy{ 0, 0, 19200 };
+    vkCmdCopyBuffer(cmd, m_weights->getBuffer(), m_inferWeights->getBuffer(), 1, &wCopy);
+    VkBufferCopy hCopy{ 0, 0, 262144ull * 4ull };
+    vkCmdCopyBuffer(cmd, m_hashGrid->getBuffer(), m_inferHashGrid->getBuffer(), 1, &hCopy);
+
+    std::array<VkBufferMemoryBarrier2, 2> copyBars = {
+        VkBufferMemoryBarrier2{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_inferWeights->getBuffer(), 0, VK_WHOLE_SIZE
+        },
+        VkBufferMemoryBarrier2{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_inferHashGrid->getBuffer(), 0, VK_WHOLE_SIZE
+        }
+    };
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.bufferMemoryBarrierCount = static_cast<uint32_t>(copyBars.size());
+    dep.pBufferMemoryBarriers = copyBars.data();
+    vkCmdPipelineBarrier2(cmd, &dep);
+    m_inferSnapshotDirty = false;
+}
+
 void NRCManager::resetCounters(VkCommandBuffer cmd) {
     if (m_needsGpuInit) {
         if (!m_initialWeights.empty()) {
             vkCmdUpdateBuffer(cmd, m_weights->getBuffer(), 0,
+                              m_initialWeights.size() * sizeof(uint16_t),
+                              m_initialWeights.data());
+            vkCmdUpdateBuffer(cmd, m_inferWeights->getBuffer(), 0,
                               m_initialWeights.size() * sizeof(uint16_t),
                               m_initialWeights.data());
         }
@@ -516,8 +602,17 @@ void NRCManager::resetCounters(VkCommandBuffer cmd) {
                               m_initialMasterWeights.size() * sizeof(float),
                               m_initialMasterWeights.data());
         }
-        vkCmdFillBuffer(cmd, m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, m_hashGrid->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, m_inferHashGrid->getBuffer(), 0, VK_WHOLE_SIZE, 0);
+        vkCmdFillBuffer(cmd, m_hashGridState->getBuffer(), 0, VK_WHOLE_SIZE, 0);
         m_needsGpuInit = false;
+        m_inferSnapshotDirty = false;
+    } else if (m_inferSnapshotDirty) {
+        VkBufferCopy wCopy{ 0, 0, 19200 };
+        vkCmdCopyBuffer(cmd, m_weights->getBuffer(), m_inferWeights->getBuffer(), 1, &wCopy);
+        VkBufferCopy hCopy{ 0, 0, 262144ull * 4ull };
+        vkCmdCopyBuffer(cmd, m_hashGrid->getBuffer(), m_inferHashGrid->getBuffer(), 1, &hCopy);
+        m_inferSnapshotDirty = false;
     }
 
     if (m_dummyStorageImage && m_dummyStorageImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
@@ -537,7 +632,7 @@ void NRCManager::resetCounters(VkCommandBuffer cmd) {
     vkCmdUpdateBuffer(cmd, m_counters->getBuffer(), 0, sizeof(initCounters), initCounters);
 
     VkMemoryBarrier2 transferBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
-    transferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    transferBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
     transferBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     transferBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
     transferBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
@@ -555,6 +650,9 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
                                 uint32_t frameSlot, uint32_t captureMlData, float maxRadiance)
 {
     if (!m_initialized || m_inferPipeline == VK_NULL_HANDLE) return;
+
+    syncInferenceSnapshot(cmd);
+    ensureAtomicAccumCleared(cmd, m_atomicAccumBuffer.get(), m_atomicAccumNeedsClear);
 
     // Buffer memory barrier: Wavefront writes query queue & indirect dispatch count -> Inference reads
     std::array<VkBufferMemoryBarrier2, 2> inBarriers = {
@@ -580,7 +678,9 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
     vkCmdPipelineBarrier2(cmd, &inDep);
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipelineLayout, 0, 1, &m_inferDescSet, 0, nullptr);
+    std::array<VkDescriptorSet, 2> inferSets = { m_inferDescSet, m_resolveDescSets[frameSlot % 2u] };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipelineLayout, 0,
+                            static_cast<uint32_t>(inferSets.size()), inferSets.data(), 0, nullptr);
 
     glm::vec3 extent = worldMax - worldMin;
     glm::vec3 invExtent = glm::vec3(
@@ -603,7 +703,7 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
     pc.height = height;
     pc.queryCount = queryCount;
     pc.maxRadiance = (maxRadiance > 0.0f) ? maxRadiance : 10.0f;
-    pc.worldMin = glm::vec4(worldMin, 0.0f);
+    pc.worldMin = glm::vec4(worldMin, (captureMlData != 0u) ? 1.0f : 0.0f);
     pc.invWorldExtent = glm::vec4(invExtent, 0.0f);
 
     vkCmdPushConstants(cmd, m_inferPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -647,11 +747,13 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
     }
 
     // Barrier: Resolve writes uAccumImage / uMlDiffuseImage -> downstream tonemapping / denoiser reads
+    // Also orders m_inferWeights/m_inferHashGrid reads before any subsequent snapshot copy.
     VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                               VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
     VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     outDep.memoryBarrierCount = 1;
     outDep.pMemoryBarriers = &outBarrier;
@@ -666,7 +768,7 @@ void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
 
     // Buffer memory barrier: Wavefront writes train records -> Training reads train records,
     // and prior Inference reads weights -> Training updates weights (WAR + WAW syncval).
-    std::array<VkBufferMemoryBarrier2, 3> inBarriers = {
+    std::array<VkBufferMemoryBarrier2, 4> inBarriers = {
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -689,6 +791,15 @@ void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
             VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
             m_weights->getBuffer(), 0, VK_WHOLE_SIZE
+        },
+        VkBufferMemoryBarrier2{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_hashGrid->getBuffer(), 0, VK_WHOLE_SIZE
         }
     };
     VkDependencyInfo inDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -738,19 +849,31 @@ void NRCManager::recordTraining(VkCommandBuffer cmd, uint32_t frameIndex,
     if (dispatchCount > 0) {
         vkCmdDispatch(cmd, dispatchCount, 1, 1);
         m_adamStep += numSteps;
+        m_inferSnapshotDirty = true;
     }
 
-    // Barrier: Training updates weights -> next frame inference reads weights
-    VkBufferMemoryBarrier2 weightBarrier{
-        VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-        m_weights->getBuffer(), 0, VK_WHOLE_SIZE
+    // Barrier: Training updates weights & hash grid -> next frame inference snapshot copy or direct read
+    std::array<VkBufferMemoryBarrier2, 2> outBarriers = {
+        VkBufferMemoryBarrier2{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_weights->getBuffer(), 0, VK_WHOLE_SIZE
+        },
+        VkBufferMemoryBarrier2{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_hashGrid->getBuffer(), 0, VK_WHOLE_SIZE
+        }
     };
     VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    outDep.bufferMemoryBarrierCount = 1;
-    outDep.pBufferMemoryBarriers = &weightBarrier;
+    outDep.bufferMemoryBarrierCount = static_cast<uint32_t>(outBarriers.size());
+    outDep.pBufferMemoryBarriers = outBarriers.data();
     vkCmdPipelineBarrier2(cmd, &outDep);
 }
 
@@ -759,73 +882,25 @@ void NRCManager::recordInferenceAndTraining(VkCommandBuffer cmd, uint32_t width,
                                             uint32_t queryCountOverride, uint32_t frameSlot,
                                             uint32_t captureMlData, float maxRadiance,
                                             uint32_t frameIndex, float learningRate,
-                                            uint32_t batchSize)
+                                            uint32_t batchSize, bool singleQueryPerPixel)
 {
     if (!m_initialized || m_inferPipeline == VK_NULL_HANDLE) return;
 
-    std::array<VkBufferMemoryBarrier2, 2> preInferBarriers = {
+    syncInferenceSnapshot(cmd);
+
+    const bool useDirectResolve = singleQueryPerPixel && (queryCountOverride == 0u);
+    if (!useDirectResolve) {
+        ensureAtomicAccumCleared(cmd, m_atomicAccumBuffer.get(), m_atomicAccumNeedsClear);
+    }
+
+    // Wait for Wavefront shader writes to queryQueue, trainQueue, and counters.
+    std::array<VkBufferMemoryBarrier2, 3> preNrcBarriers = {
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
             m_queryQueue->getBuffer(), 0, VK_WHOLE_SIZE
-        },
-        VkBufferMemoryBarrier2{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_counters->getBuffer(), 0, 256
-        }
-    };
-    VkDependencyInfo preInferDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    preInferDep.bufferMemoryBarrierCount = static_cast<uint32_t>(preInferBarriers.size());
-    preInferDep.pBufferMemoryBarriers = preInferBarriers.data();
-    vkCmdPipelineBarrier2(cmd, &preInferDep);
-
-    glm::vec3 extent = worldMax - worldMin;
-    glm::vec3 invExtent = glm::vec3(
-        extent.x > 1e-4f ? 1.0f / extent.x : 1.0f,
-        extent.y > 1e-4f ? 1.0f / extent.y : 1.0f,
-        extent.z > 1e-4f ? 1.0f / extent.z : 1.0f
-    );
-
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipelineLayout, 0, 1, &m_inferDescSet, 0, nullptr);
-
-    struct InferPushConstants {
-        uint32_t width;
-        uint32_t height;
-        uint32_t queryCount;
-        float maxRadiance;
-        glm::vec4 worldMin;
-        glm::vec4 invWorldExtent;
-    } ipc;
-    ipc.width = width;
-    ipc.height = height;
-    ipc.queryCount = queryCountOverride > 0 ? queryCountOverride : m_maxQueries;
-    ipc.maxRadiance = (maxRadiance > 0.0f) ? maxRadiance : 10.0f;
-    ipc.worldMin = glm::vec4(worldMin, 0.0f);
-    ipc.invWorldExtent = glm::vec4(invExtent, 0.0f);
-    vkCmdPushConstants(cmd, m_inferPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
-
-    if (queryCountOverride > 0) {
-        uint32_t dispatchCount = (queryCountOverride + 63u) / 64u;
-        vkCmdDispatch(cmd, dispatchCount, 1, 1);
-    } else {
-        vkCmdDispatchIndirect(cmd, m_counters->getBuffer(), 8);
-    }
-
-    // Combined post-infer barrier covering Resolve (atomicAccumBuffer) and Train (trainQueue, counters, weights WAR+WAW)
-    std::array<VkBufferMemoryBarrier2, 4> midBarriers = {
-        VkBufferMemoryBarrier2{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
         },
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
@@ -837,26 +912,26 @@ void NRCManager::recordInferenceAndTraining(VkCommandBuffer cmd, uint32_t width,
         VkBufferMemoryBarrier2{
             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
             VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
             m_counters->getBuffer(), 0, 256
-        },
-        VkBufferMemoryBarrier2{
-            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
-            m_weights->getBuffer(), 0, VK_WHOLE_SIZE
         }
     };
-    VkDependencyInfo midDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
-    midDep.bufferMemoryBarrierCount = static_cast<uint32_t>(midBarriers.size());
-    midDep.pBufferMemoryBarriers = midBarriers.data();
-    vkCmdPipelineBarrier2(cmd, &midDep);
+    VkDependencyInfo preNrcDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    preNrcDep.bufferMemoryBarrierCount = static_cast<uint32_t>(preNrcBarriers.size());
+    preNrcDep.pBufferMemoryBarriers = preNrcBarriers.data();
+    vkCmdPipelineBarrier2(cmd, &preNrcDep);
 
-    // Dispatch 1-WG Training immediately before Resolve (disjoint resources -> no barrier between)
+    glm::vec3 extent = worldMax - worldMin;
+    glm::vec3 invExtent = glm::vec3(
+        extent.x > 1e-4f ? 1.0f / extent.x : 1.0f,
+        extent.y > 1e-4f ? 1.0f / extent.y : 1.0f,
+        extent.z > 1e-4f ? 1.0f / extent.z : 1.0f
+    );
+
+    // 1. Dispatch 1-WG Training FIRST so CU 0 starts training concurrently alongside full-GPU inference
+    //    (m_inferPipeline reads frozen snapshot m_inferWeights / m_inferHashGrid; zero WAR hazard).
     const uint32_t numSteps = (batchSize > 0u) ? std::clamp((batchSize + 31u) / 32u, 1u, 16u) : 0u;
     if (m_trainPipeline != VK_NULL_HANDLE && numSteps > 0u && m_maxTrainRecords > 0u) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_trainPipeline);
@@ -888,28 +963,79 @@ void NRCManager::recordInferenceAndTraining(VkCommandBuffer cmd, uint32_t width,
 
         vkCmdDispatch(cmd, 1, 1, 1);
         m_adamStep += numSteps;
+        m_inferSnapshotDirty = true;
     }
 
-    if (m_resolvePipeline != VK_NULL_HANDLE) {
-        uint32_t slot = frameSlot % 2u;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSets[slot], 0, nullptr);
+    // 2. Immediately (NO barrier) dispatch Inference across remaining CUs
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipeline);
+    std::array<VkDescriptorSet, 2> inferSets = { m_inferDescSet, m_resolveDescSets[frameSlot % 2u] };
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipelineLayout, 0,
+                            static_cast<uint32_t>(inferSets.size()), inferSets.data(), 0, nullptr);
 
-        struct ResolvePushConstants {
-            uint32_t width;
-            uint32_t height;
-            uint32_t captureMlData;
-            uint32_t pad;
-        } rpc{ width, height, captureMlData, 0u };
-        vkCmdPushConstants(cmd, m_resolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
-        vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1);
+    uint32_t resolveFlags = useDirectResolve ? (0x80000000u | (captureMlData & 0xFFu)) : 0u;
+    float resolveFlagsFloat = 0.0f;
+    std::memcpy(&resolveFlagsFloat, &resolveFlags, sizeof(resolveFlagsFloat));
+
+    struct InferPushConstants {
+        uint32_t width;
+        uint32_t height;
+        uint32_t queryCount;
+        float maxRadiance;
+        glm::vec4 worldMin;
+        glm::vec4 invWorldExtent;
+    } ipc;
+    ipc.width = width;
+    ipc.height = height;
+    ipc.queryCount = queryCountOverride > 0 ? queryCountOverride : m_maxQueries;
+    ipc.maxRadiance = (maxRadiance > 0.0f) ? maxRadiance : 10.0f;
+    ipc.worldMin = glm::vec4(worldMin, (captureMlData != 0u) ? 1.0f : 0.0f);
+    ipc.invWorldExtent = glm::vec4(invExtent, resolveFlagsFloat);
+    vkCmdPushConstants(cmd, m_inferPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(ipc), &ipc);
+
+    if (queryCountOverride > 0) {
+        uint32_t dispatchCount = (queryCountOverride + 63u) / 64u;
+        vkCmdDispatch(cmd, dispatchCount, 1, 1);
+    } else {
+        vkCmdDispatchIndirect(cmd, m_counters->getBuffer(), 8);
     }
 
+    if (!useDirectResolve) {
+        VkBufferMemoryBarrier2 inferToResolveBarrier{
+            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
+            m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE
+        };
+        VkDependencyInfo inferToResolveDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        inferToResolveDep.bufferMemoryBarrierCount = 1;
+        inferToResolveDep.pBufferMemoryBarriers = &inferToResolveBarrier;
+        vkCmdPipelineBarrier2(cmd, &inferToResolveDep);
+
+        if (m_resolvePipeline != VK_NULL_HANDLE) {
+            uint32_t slot = frameSlot % 2u;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipelineLayout, 0, 1, &m_resolveDescSets[slot], 0, nullptr);
+
+            struct ResolvePushConstants {
+                uint32_t width;
+                uint32_t height;
+                uint32_t captureMlData;
+                uint32_t pad;
+            } rpc{ width, height, captureMlData, 0u };
+            vkCmdPushConstants(cmd, m_resolvePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(rpc), &rpc);
+            vkCmdDispatch(cmd, (width + 15u) / 16u, (height + 15u) / 16u, 1);
+        }
+    }
+
+    // Unified post-NRC barrier: makes direct/resolved image writes visible to tonemap/denoiser
+    // and orders train writes & infer snapshot reads before next frame's snapshot copy.
     VkMemoryBarrier2 outBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     outBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    outBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    outBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                               VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
     VkDependencyInfo outDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
     outDep.memoryBarrierCount = 1;
     outDep.pMemoryBarriers = &outBarrier;

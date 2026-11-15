@@ -11,7 +11,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform image2D uAccumImage;
 
 layout(std430, set = 0, binding = 1) buffer AtomicAccumBuffer {
-    uvec2 nrcAtomicPairs[];
+    uint nrcAtomicUints[];
 };
 
 layout(set = 0, binding = 2, rgba16f) uniform image2D uMlDiffuseImage;
@@ -58,17 +58,31 @@ void main() {
     if (pixelCoord.x >= int(pc.width) || pixelCoord.y >= int(pc.height)) return;
 
     uint pixelIdx = uint(pixelCoord.y * int(pc.width) + pixelCoord.x);
-    uint pairBase = pixelIdx * 3u;
 
-    uvec2 p0 = nrcAtomicPairs[pairBase + 0u];
-    uvec2 p1 = nrcAtomicPairs[pairBase + 1u];
-    uvec2 p2 = nrcAtomicPairs[pairBase + 2u];
-    uint diffR = p0.x;
-    uint diffG = p0.y;
-    uint diffB = p1.x;
-    uint specR = p1.y;
-    uint specG = p2.x;
-    uint specB = p2.y;
+    if (pc.captureMlData == 0u) {
+        uint base3 = pixelIdx * 3u;
+        uint r = nrcAtomicUints[base3 + 0u];
+        uint g = nrcAtomicUints[base3 + 1u];
+        uint b = nrcAtomicUints[base3 + 2u];
+        if ((r | g | b) != 0u) {
+            vec3 radTotal = vec3(float(r), float(g), float(b)) * (1.0 / 65536.0);
+            uint seed = (pixelIdx * 1973u) | 1u;
+            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radTotal, seed), prev.a));
+            if (r != 0u) nrcAtomicUints[base3 + 0u] = 0u;
+            if (g != 0u) nrcAtomicUints[base3 + 1u] = 0u;
+            if (b != 0u) nrcAtomicUints[base3 + 2u] = 0u;
+        }
+        return;
+    }
+
+    uint base6 = pixelIdx * 6u;
+    uint diffR = nrcAtomicUints[base6 + 0u];
+    uint diffG = nrcAtomicUints[base6 + 1u];
+    uint diffB = nrcAtomicUints[base6 + 2u];
+    uint specR = nrcAtomicUints[base6 + 3u];
+    uint specG = nrcAtomicUints[base6 + 4u];
+    uint specB = nrcAtomicUints[base6 + 5u];
 
     if ((diffR | diffG | diffB | specR | specG | specB) != 0u) {
         vec3 radDiff = vec3(float(diffR), float(diffG), float(diffB)) / 65536.0;
@@ -107,9 +121,12 @@ void main() {
             }
         }
 
-        // Reset non-zero accumulator pairs back to zero for the next frame
-        if ((p0.x | p0.y) != 0u) nrcAtomicPairs[pairBase + 0u] = uvec2(0u);
-        if ((p1.x | p1.y) != 0u) nrcAtomicPairs[pairBase + 1u] = uvec2(0u);
-        if ((p2.x | p2.y) != 0u) nrcAtomicPairs[pairBase + 2u] = uvec2(0u);
+        // Reset non-zero accumulators back to zero for the next frame
+        if (diffR != 0u) nrcAtomicUints[base6 + 0u] = 0u;
+        if (diffG != 0u) nrcAtomicUints[base6 + 1u] = 0u;
+        if (diffB != 0u) nrcAtomicUints[base6 + 2u] = 0u;
+        if (specR != 0u) nrcAtomicUints[base6 + 3u] = 0u;
+        if (specG != 0u) nrcAtomicUints[base6 + 4u] = 0u;
+        if (specB != 0u) nrcAtomicUints[base6 + 5u] = 0u;
     }
 }

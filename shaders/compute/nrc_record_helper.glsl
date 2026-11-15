@@ -10,7 +10,8 @@ void nrcEmitSelfTrainingRecord(
     vec3 hitNormal,
     vec3 V,
     uint pixelIndex,
-    vec3 diffuseAlbedo,
+    vec3 nrcQueryRefl,
+    float nrcQuerySpecRatio,
     float nrcRoughness,
     bool validBounce,
     vec3 nextOrigin,
@@ -23,14 +24,15 @@ void nrcEmitSelfTrainingRecord(
         return;
     }
 
-    vec3 clampedBsdfW = min(nrcBsdfWeight, vec3(2.0));
+    vec3 demodW = nrcDemodulateWeight(nrcBsdfWeight, nrcQueryRefl);
+    float nrcCap = (pc.indirectClamp > 0.0) ? min(pc.indirectClamp, 35.0) : 35.0;
     vec3 localRad = vec3(0.0);
     vec3 tailWeight = vec3(0.0);
     float hasTail = 0.0;
     vec3 tailPos = hitPoint;
     float tailRough = 1.0;
     vec3 tailN = hitNormal;
-    vec3 tailAlbedo = vec3(0.0);
+    float tailSpecRatio = 0.0;
 
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
     rayQueryEXT tailRq;
@@ -106,9 +108,8 @@ void nrcEmitSelfTrainingRecord(
         }
         bool isDeltaOrTransTail = ((tType & MATERIAL_TYPE_MASK) == 2u) || smIsTransmissive(tMat) || (tMet >= 0.9 && tRough < 0.20);
         if (!isDeltaOrTransTail) {
-            float nrcCap = min(pc.indirectClamp, 24.0);
             if (length(tEmit) > 1e-3 && tMisW > 0.0) {
-                localRad += clampedBsdfW * clampIndirectRadiance(tEmit * tMisW, nrcCap);
+                localRad += demodW * clampIndirectRadiance(tEmit * tMisW, nrcCap);
             }
 
             if ((tType & MATERIAL_TYPE_MASK) != 3u) {
@@ -192,16 +193,17 @@ void nrcEmitSelfTrainingRecord(
                         }
 #endif
                         if (vis) {
-                            localRad += clampedBsdfW * tailDirect;
+                            localRad += demodW * tailDirect;
                         }
                     }
                 }
             }
 
-                tailRough = max(tRough, 0.20);
-                tailAlbedo = max(mix(tDiff, tF0, tMet), vec3(0.04));
-                float horizonScale = (pc.maxBounces == 4u) ? 0.84 : 0.90;
-                tailWeight = clamp(clampedBsdfW * horizonScale, vec3(0.0), vec3(0.85));
+                vec3 tailExactRefl = vec3(0.0);
+                nrcSurfaceReflectance(tDiff, tF0, tRough, 0.0, 1.0, clamp(dot(tailN, -nextDirection), 0.0, 1.0),
+                                      tailExactRefl, tailSpecRatio);
+                tailRough = clamp(tRough, 0.04, 1.0);
+                tailWeight = nrcClampChromaticity(demodW * tailExactRefl, 0.95);
                 hasTail = 1.0;
             }
         }
@@ -213,7 +215,7 @@ void nrcEmitSelfTrainingRecord(
             float st = 0.5 * (nextDirection.y + 1.0);
             tailSky = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), st);
         }
-        localRad += clampedBsdfW * clampIndirectRadiance(tailSky, min(pc.indirectClamp, 24.0));
+        localRad += demodW * clampIndirectRadiance(tailSky, nrcCap);
     }
 
     uvec4 trainBallot = subgroupBallot(true);
@@ -229,18 +231,18 @@ void nrcEmitSelfTrainingRecord(
         return;
     }
 
-    vec3 normLocal = clampIndirectRadiance(localRad, min(pc.indirectClamp, 24.0));
+    vec3 normLocal = clampIndirectRadiance(localRad, nrcCap);
     nrcTrainRecords[trainIdx].pos_roughness = vec4(hitPoint, nrcRoughness);
     nrcTrainRecords[trainIdx].normal_flags = vec4(hitNormal, 1.0);
     nrcTrainRecords[trainIdx].dir_pixelIndex = vec4(V, uintBitsToFloat(pixelIndex));
-    nrcTrainRecords[trainIdx].albedo_pad = vec4(diffuseAlbedo, 0.0);
+    nrcTrainRecords[trainIdx].albedo_pad = vec4(nrcQuerySpecRatio, 0.0, 0.0, 0.0);
     nrcTrainRecords[trainIdx].throughput = vec4(tailWeight, hasTail);
     nrcTrainRecords[trainIdx].targetRadiance = vec4(normLocal, 0.0);
     nrcTrainRecords[trainIdx].tailPos_roughness = vec4(tailPos, tailRough);
     nrcTrainRecords[trainIdx].tailPacked = vec4(
         uintBitsToFloat(nrcPackUnitVec3(tailN)),
         uintBitsToFloat(nrcPackUnitVec3(-nextDirection)),
-        uintBitsToFloat(packUnorm4x8(vec4(clamp(tailAlbedo, 0.0, 1.0), 0.0))),
+        uintBitsToFloat(packUnorm4x8(vec4(clamp(tailSpecRatio, 0.0, 1.0), 0.0, 0.0, 0.0))),
         0.0
     );
 }

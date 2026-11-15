@@ -134,7 +134,10 @@ float restirDiMisLightScale(uint numLights) {
 uint restirDiFreshM(uint numLights, uint captureMlData) {
     if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return max(min(numLights, 8u), 1u);
     if (numLights <= 1u) return 1u;
-    if (numLights > 4096u) return (captureMlData == 0u) ? 6u : 4u;
+    if (numLights > 4096u) {
+        bool noHistory = (ubo.frameIndex == 0u) || ((ubo.flags & (1u << 23)) != 0u);
+        return noHistory ? 4u : 2u;
+    }
     return min(numLights, 16u);
 }
 
@@ -154,7 +157,7 @@ uint restirSecondaryFreshM(uint bounce, uint numLights, bool isSpecularPath, uin
     bool rawRestirMode = (captureMlData == 0u);
     if (numLights > 4096u) {
         if (bounce == 1u) {
-            return isSpecularPath ? 2u : (rawRestirMode ? 2u : 1u);
+            return isSpecularPath ? 2u : 1u;
         }
         return 1u;
     }

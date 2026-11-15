@@ -46,7 +46,7 @@ struct DiReservoir {
     float targetPdf;   // p̂ of the selected sample at the storing pixel
     uint  flags;       // [7:0] age, [8] valid, [9] transmission lobe, [25:10] oct16(x1 normal)
     float hitDist;     // x1 -> light-sample distance (1e4 for directional lights)
-    uint  lightPacked; // [15:0] oct16(light normal), [31:16] reserved
+    uint  lightPacked; // [15:0] oct16(light normal), [31:16] bf16(selectPdf)
     uint  x1Misc;      // [15:0] fp16 cos(theta at light, stored config), [31:16] fp16 primary hit distance
     uint  lightUv16;   // packUnorm2x16(luv) — full 16-bit area-light sample UV
 };
@@ -95,6 +95,16 @@ vec3 restirUnpackOct16(uint p) {
     float u = float(p & 0xFFu) / 255.0;
     float v = float((p >> 8u) & 0xFFu) / 255.0;
     return octDecode(vec2(u, v) * 2.0 - 1.0);
+}
+
+uint restirPackLightNormalAndSelectPdf(vec3 lightNormal, float selectPdf) {
+    uint bf16Bits = floatBitsToUint(max(selectPdf, 0.0)) & 0xFFFF0000u;
+    return bf16Bits | (restirPackOct16(lightNormal) & 0xFFFFu);
+}
+
+float restirUnpackSelectPdf(uint lightPacked) {
+    uint bf16Bits = lightPacked & 0xFFFF0000u;
+    return (bf16Bits != 0u) ? uintBitsToFloat(bf16Bits) : -1.0;
 }
 
 uint restirPackFlags(uint age, bool valid, bool trans, vec3 x1Normal) {
@@ -399,7 +409,7 @@ void restirDiFreshStream(
         r.wSum = totalWeightSum;
         r.targetPdf = sel.target;
         r.hitDist = sel.dist;
-        r.lightPacked = restirPackOct16(lights[sel.lightIdx].normal.xyz);
+        r.lightPacked = restirPackLightNormalAndSelectPdf(lights[sel.lightIdx].normal.xyz, sel.selectPdf);
         r.flags = restirPackFlags(0u, true, sel.isTrans, hitNormal);
         r.x1Misc = restirPackF16Pair(sel.cosLight, min(hitT, 60000.0));
         r.lightUv16 = packUnorm2x16(sel.luv);
@@ -582,13 +592,14 @@ bool restirDiApplyTapEx(
         weight = 0.0;
     }
 
+    float cachedSelectPdf = restirUnpackSelectPdf(src.lightPacked);
     if (weight > 0.0) {
         outEval.weightOverPHat = wFactor * float(mTap);
         outEval.tapSample.lightIdx = srcLightIdx;
         outEval.tapSample.dir = reconDir;
         outEval.tapSample.dist = reconDist;
         outEval.tapSample.emission = reconEmission;
-        outEval.tapSample.selectPdf = -1.0;
+        outEval.tapSample.selectPdf = cachedSelectPdf;
         outEval.tapSample.cosLight = cosLightNew;
         outEval.tapSample.ndotL = NdotL;
         outEval.tapSample.target = pHat;
@@ -605,8 +616,7 @@ bool restirDiApplyTapEx(
         sel.dir = reconDir;
         sel.dist = reconDist;
         sel.emission = reconEmission;
-        // Deferred: evaluate LightTree MIS selectPdf only for the final visible winner.
-        sel.selectPdf = -1.0;
+        sel.selectPdf = cachedSelectPdf;
         sel.cosLight = cosLightNew;
         sel.ndotL = NdotL;
         sel.target = pHat;
@@ -617,7 +627,7 @@ bool restirDiApplyTapEx(
         r.idxM = restirPackIdxM(srcLightIdx, combinedM);
         r.targetPdf = pHat;
         r.hitDist = reconDist;
-        r.lightPacked = restirPackOct16(srcLight.normal.xyz);
+        r.lightPacked = restirPackLightNormalAndSelectPdf(srcLight.normal.xyz, cachedSelectPdf);
         // x1 context is re-stamped with the CURRENT surface: the reservoir
         // describes this pixel for the next frame's taps.
         r.flags = restirPackFlags(ageNew, true, isTrans, hitNormal);

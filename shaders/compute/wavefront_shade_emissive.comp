@@ -174,7 +174,7 @@ void main() {
                     restirGiRunReuse(
                         pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
                         pc.restirMCap, pc.captureMlData, pc.indirectClamp,
-                        true, pc.numOpaqueTriangles,
+                        false, pc.numOpaqueTriangles,
                         giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
                         giReuseSeed, hasGiShadowRay, giShadowCandidate
                     );

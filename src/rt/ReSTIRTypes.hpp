@@ -14,7 +14,7 @@ struct DiReservoirGPU {
     float    targetPdf;   // p-hat of the selected sample at the storing pixel
     uint32_t flags;       // [7:0] age, [8] valid, [9] trans lobe, [25:10] oct16(x1 normal)
     float    hitDist;     // x1 -> light-sample distance
-    uint32_t lightPacked; // [15:0] oct16(light normal), [31:16] reserved
+    uint32_t lightPacked; // [15:0] oct16(light normal), [31:16] bf16(selectPdf)
     uint32_t x1Misc;      // [15:0] fp16 cos(theta at light), [31:16] fp16 primary hit distance
     uint32_t lightUv16;   // packUnorm2x16(luv) — full 16-bit area-light sample UV
 };

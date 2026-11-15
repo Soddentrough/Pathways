@@ -522,17 +522,18 @@ void RayTracingOrchestrator::recordRayTracing(
             m_nrcManager->setBackend(config.nrc_backend);
             uint32_t nrcW = params.isMultiGpu ? params.fullWidth : params.dispatchWidth;
             uint32_t nrcH = params.isMultiGpu ? params.fullHeight : params.dispatchHeight;
-            const bool nrcWarmStart = (params.frameIndex < 4u || params.accumReset);
-            const bool nrcSteady = (!nrcWarmStart && params.frameIndex >= 8u);
-            float nrcLr = (nrcWarmStart
-                ? 2.0e-3f
-                : ((!params.cameraMovedLastFrame && config.progressive_accumulation) ? 5e-4f : 8e-4f))
-                * (nrcSteady ? 1.25f : 1.0f);
-            uint32_t nrcBatch = nrcWarmStart ? 128u : (nrcSteady ? 32u : 64u);
+            const uint32_t adamStep = m_nrcManager->getAdamStep();
+            const bool nrcWarmBatch = (adamStep < 20u);
+            const bool nrcWarmLr = (adamStep < 20u);
+            float nrcLr = nrcWarmLr
+                ? 5.8e-3f
+                : ((!params.cameraMovedLastFrame && config.progressive_accumulation) ? 2.3e-3f : 2.8e-3f);
+            uint32_t nrcBatch = nrcWarmBatch ? 64u : 32u;
             m_nrcManager->recordInferenceAndTraining(cmd, nrcW, nrcH, nrcBMin, nrcBMax,
                                                      0, params.frameSlot, wfSceneData.captureMlData,
-                                                     std::min(config.indirect_clamp, 24.0f),
-                                                     params.frameIndex, nrcLr, nrcBatch);
+                                                     std::min(config.indirect_clamp, 35.0f),
+                                                     params.frameIndex, nrcLr, nrcBatch,
+                                                     activeDispatchSpp == 1u);
         }
 
         const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile);

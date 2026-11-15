@@ -82,7 +82,8 @@ public:
                                     uint32_t queryCountOverride = 0, uint32_t frameSlot = 0,
                                     uint32_t captureMlData = 0, float maxRadiance = 10.0f,
                                     uint32_t frameIndex = 0, float learningRate = 1e-3f,
-                                    uint32_t batchSize = 8192);
+                                    uint32_t batchSize = 8192,
+                                    bool singleQueryPerPixel = false);
 
     Buffer* getQueryQueue() const { return m_queryQueue.get(); }
     Buffer* getTrainQueue() const { return m_trainQueue.get(); }
@@ -92,6 +93,7 @@ public:
 
     uint32_t getMaxQueries() const { return m_maxQueries; }
     uint32_t getMaxTrainRecords() const { return m_maxTrainRecords; }
+    uint32_t getAdamStep() const { return m_adamStep; }
 
     bool isInitialized() const { return m_initialized; }
     NrcBackend getBackend() const { return m_backend; }
@@ -107,6 +109,7 @@ private:
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
     void createPipelines(const std::vector<char>& inferSpv, const std::vector<char>& trainSpv, const std::vector<char>& resolveSpv);
+    void syncInferenceSnapshot(VkCommandBuffer cmd);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
@@ -119,6 +122,8 @@ private:
     uint32_t m_adamStep = 0;
     bool m_initialized = false;
     bool m_needsGpuInit = true;
+    bool m_atomicAccumNeedsClear = true;
+    bool m_inferSnapshotDirty = false;
     NrcBackend m_backend = NrcBackend::Auto;
     void* m_ffxRcContext = nullptr;
     std::vector<uint16_t> m_initialWeights;
@@ -126,7 +131,11 @@ private:
 
     // GPU Buffers
     std::unique_ptr<Buffer> m_weights;
+    std::unique_ptr<Buffer> m_inferWeights;
     std::unique_ptr<Buffer> m_weightMomentum;
+    std::unique_ptr<Buffer> m_hashGrid;
+    std::unique_ptr<Buffer> m_inferHashGrid;
+    std::unique_ptr<Buffer> m_hashGridState;
     std::unique_ptr<Buffer> m_queryQueue;
     std::unique_ptr<Buffer> m_trainQueue;
     std::unique_ptr<Buffer> m_counters;

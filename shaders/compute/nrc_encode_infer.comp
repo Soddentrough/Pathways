@@ -3,21 +3,20 @@
 #extension GL_KHR_memory_scope_semantics : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_image_load_formatted : require
 #extension GL_GOOGLE_include_directive : enable
 
 #include "nrc_common.glsl"
 
 layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 
-// Quad-subgroup shared memory buffers for 4 independent Wave32 batches (64 queries total)
-shared float16_t s_layer0[4 * 16 * 64];
-shared float16_t s_layer1[4 * 16 * 64];
-shared float16_t s_output[4 * 16 * 16];
+#define ML_CAPTURE_UPWAYS_V4_BIT 4u
+#define ML_CAPTURE_SPLIT_4SIG_BIT 8u
 
+// Quad-subgroup shared memory buffers reusing s_layer0 in-place (~9.25 KiB LDS -> 16/16 Wave32 occupancy)
+shared float16_t s_layer0[4 * 16 * 64];
 shared vec3 s_throughput[64];
-shared uint s_pixelIndex[64];
-shared bool s_valid[64];
-shared bool s_isSpec[64];
+shared uint s_pixelMeta[64]; // 0xFFFFFFFFu = invalid; bit 31 = isSpec, bits 0..30 = pixelIdx
 
 layout(std430, set = 0, binding = 0) buffer AtomicAccumBuffer {
     uint nrcAtomicBuffer[];
@@ -35,6 +34,18 @@ layout(std430, set = 0, binding = 3) readonly buffer InCounters {
     NRCCountersBuffer counters;
 };
 
+layout(std430, set = 0, binding = 4) readonly buffer InHashGrid {
+    uint hashGrid[];
+};
+
+layout(set = 1, binding = 0) uniform image2D uAccumImage;
+layout(set = 1, binding = 2, rgba16f) uniform image2D uMlDiffuseImage;
+layout(set = 1, binding = 3, rgba16f) uniform image2D uMlSpecularImage;
+layout(set = 1, binding = 4, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
+layout(set = 1, binding = 5, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
+layout(set = 1, binding = 6, rgba16f) uniform image2D uIndirectDiffuseImage;
+layout(set = 1, binding = 7, rgba16f) uniform image2D uIndirectSpecularImage;
+
 layout(push_constant) uniform PushConstants {
     uint width;
     uint height;
@@ -44,6 +55,11 @@ layout(push_constant) uniform PushConstants {
     vec4 invWorldExtent;
 } pc;
 
+vec3 demodulateMlSafe(vec3 rad, vec3 demodFactor) {
+    bool valid = any(greaterThan(demodFactor, vec3(1e-4)));
+    vec3 safeDenom = valid ? max(demodFactor, vec3(0.02)) : vec3(1.0);
+    return min(rad / safeDenom, vec3(65000.0));
+}
 
 void main() {
     uint sg = gl_SubgroupID;
@@ -54,11 +70,10 @@ void main() {
     if (queryBase >= actualCount) return;
 
     uint sgLayerOff = sg * 1024u;
-    uint sgOutOff = sg * 256u;
     uint sgMetaOff = sg * 16u;
 
     // 1. Wave32 parallel multi-frequency encoding (2 lanes per query: 16 queries x 64 features per subgroup)
-    //    Out-of-range trailing slots are zero-padded so workgroup-uniform barrier() covers all 4 subgroups.
+    //    Out-of-range trailing slots are zero-padded so subgroupBarrier() covers the whole subgroup cleanly.
     uint qSlot = tid >> 1u;
     uint halfLane = tid & 1u;
     uint metaSlot = sgMetaOff + qSlot;
@@ -66,85 +81,123 @@ void main() {
     uint rowBase = sgLayerOff + qSlot * 64u;
 
     if (qIdx < actualCount) {
-        NRCQuery q = queries[qIdx];
-        vec3 normPos = clamp((q.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
+        vec4 qPosRough = queries[qIdx].pos_roughness;
+        vec4 qNormFlags = queries[qIdx].normal_flags;
+        vec4 qDirPix = queries[qIdx].dir_pixelIndex;
+        vec3 normPos = clamp((qPosRough.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0));
         const float PI = 3.14159265359;
 
-        if (halfLane == 0u) {
-            s_throughput[metaSlot] = q.throughput.xyz;
-            s_pixelIndex[metaSlot] = floatBitsToUint(q.dir_pixelIndex.w);
-            s_isSpec[metaSlot] = (q.normal_flags.w > 0.5);
-            s_valid[metaSlot] = true;
+        float nLen = length(qNormFlags.xyz);
+        vec3 N = (nLen > 1e-6) ? (qNormFlags.xyz / nLen) : vec3(0.0, 1.0, 0.0);
+        float vLen = length(qDirPix.xyz);
+        vec3 V = (vLen > 1e-6) ? (qDirPix.xyz / vLen) : vec3(0.0, 0.0, 1.0);
 
-            // 28 features (channels 0..27): axes X & Y x 7 octaves via double-angle recurrence
+        // Channels 0..15: 8-level multi-resolution spatial hash grid (4-corner 3D simplex interpolation)
+        for (uint lStep = 0u; lStep < 4u; ++lStep) {
+            uint l = halfLane * 4u + lStep;
+            ivec3 c0, d1, d2;
+            vec4 w4;
+            nrcSimplexCorners(normPos * NRC_ACTIVE_SCALES[l], c0, d1, d2, w4);
+            vec2 feat = w4.x * unpackHalf2x16(hashGrid[nrcHashCorner(c0, l)])
+                      + w4.y * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + d1, l)])
+                      + w4.z * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + d2, l)])
+                      + w4.w * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + ivec3(1), l)]);
+            s_layer0[rowBase + l * 2u + 0u] = float16_t(feat.x);
+            s_layer0[rowBase + l * 2u + 1u] = float16_t(feat.y);
+        }
+
+        if (halfLane == 0u) {
+            s_throughput[metaSlot] = queries[qIdx].throughput.xyz;
+            uint pix = floatBitsToUint(qDirPix.w);
+            bool isSpec = (qNormFlags.w > 0.5);
+            s_pixelMeta[metaSlot] = (pix < pc.width * pc.height) ? (pix | (isSpec ? 0x80000000u : 0u)) : 0xFFFFFFFFu;
+
+            // Channels 16..23: Linear identity coordinate & direction skip-encoding
+            s_layer0[rowBase + 16u] = float16_t(normPos.x);
+            s_layer0[rowBase + 17u] = float16_t(normPos.y);
+            s_layer0[rowBase + 18u] = float16_t(normPos.z);
+            s_layer0[rowBase + 19u] = float16_t(N.x);
+            s_layer0[rowBase + 20u] = float16_t(N.y);
+            s_layer0[rowBase + 21u] = float16_t(N.z);
+            s_layer0[rowBase + 22u] = float16_t(V.x);
+            s_layer0[rowBase + 23u] = float16_t(V.y);
+
+            // Channels 24..35: Coarse Fourier frequency encoding axes 0..1 (balanced SFU sin/cos)
             for (uint axis = 0u; axis < 2u; ++axis) {
                 float th = normPos[axis] * PI;
                 float s = sin(th);
                 float c = cos(th);
                 float amp = 1.0;
-                uint axisBase = rowBase + axis * 14u;
-                for (uint l = 0u; l < 7u; ++l) {
-                    s_layer0[axisBase + l * 2u + 0u] = float16_t(s * amp);
-                    s_layer0[axisBase + l * 2u + 1u] = float16_t(c * amp);
-                    if (l < 6u) {
+                uint axisBase = rowBase + 24u + axis * 6u;
+                for (uint o = 0u; o < 3u; ++o) {
+                    s_layer0[axisBase + o * 2u + 0u] = float16_t(s * amp);
+                    s_layer0[axisBase + o * 2u + 1u] = float16_t(c * amp);
+                    if (o < 2u) {
                         float s2 = 2.0 * s * c;
                         float c2 = c * c - s * s;
                         s = s2;
                         c = c2;
-                        amp *= 0.75;
+                        amp *= 0.5;
+                    }
+                }
+            }
+        } else {
+            // Channels 36..41: Coarse Fourier frequency encoding axis 2
+            {
+                float th = normPos[2u] * PI;
+                float s = sin(th);
+                float c = cos(th);
+                float amp = 1.0;
+                uint axisBase = rowBase + 36u;
+                for (uint o = 0u; o < 3u; ++o) {
+                    s_layer0[axisBase + o * 2u + 0u] = float16_t(s * amp);
+                    s_layer0[axisBase + o * 2u + 1u] = float16_t(c * amp);
+                    if (o < 2u) {
+                        float s2 = 2.0 * s * c;
+                        float c2 = c * c - s * s;
+                        s = s2;
+                        c = c2;
+                        amp *= 0.5;
                     }
                 }
             }
 
-            // Normal (channels 54..56), View Direction (57..59), Roughness (60), Reflectance (61..63)
-            s_layer0[rowBase + 54u] = float16_t(q.normal_flags.x);
-            s_layer0[rowBase + 55u] = float16_t(q.normal_flags.y);
-            s_layer0[rowBase + 56u] = float16_t(q.normal_flags.z);
-            s_layer0[rowBase + 57u] = float16_t(q.dir_pixelIndex.x);
-            s_layer0[rowBase + 58u] = float16_t(q.dir_pixelIndex.y);
-            s_layer0[rowBase + 59u] = float16_t(q.dir_pixelIndex.z);
-            s_layer0[rowBase + 60u] = float16_t(q.pos_roughness.w);
-            s_layer0[rowBase + 61u] = float16_t(q.albedo_pad.x);
-            s_layer0[rowBase + 62u] = float16_t(q.albedo_pad.y);
-            s_layer0[rowBase + 63u] = float16_t(q.albedo_pad.z);
-        } else {
-            // 14 features (channels 28..41): axis Z x 7 octaves via double-angle recurrence
-            float th = normPos.z * PI;
-            float s = sin(th);
-            float c = cos(th);
-            float amp = 1.0;
-            uint axisBase = rowBase + 28u;
-            for (uint l = 0u; l < 7u; ++l) {
-                s_layer0[axisBase + l * 2u + 0u] = float16_t(s * amp);
-                s_layer0[axisBase + l * 2u + 1u] = float16_t(c * amp);
-                if (l < 6u) {
-                    float s2 = 2.0 * s * c;
-                    float c2 = c * c - s * s;
-                    s = s2;
-                    c = c2;
-                    amp *= 0.75;
-                }
-            }
+            vec3 R = reflect(-V, N);
+            float ndotv = clamp(dot(N, V), 0.0, 1.0);
+            float rough = clamp(qPosRough.w, 0.04, 1.0);
+            float specRatio = clamp(queries[qIdx].albedo_pad.x, 0.0, 1.0);
 
-            // 12 features (channels 42..53): 6 3D cross-axis diagonals x 2 (sin/cos)
-            float diagCoords[6] = float[6](
-                0.5 * (normPos.x + normPos.y),
-                0.5 * (normPos.y + normPos.z),
-                0.5 * (normPos.z + normPos.x),
-                0.5 * (normPos.x - normPos.y) + 0.5,
-                0.5 * (normPos.y - normPos.z) + 0.5,
-                0.5 * (normPos.z - normPos.x) + 0.5
-            );
-            for (uint d = 0u; d < 6u; ++d) {
-                float ang = diagCoords[d] * (6.0 * PI);
-                s_layer0[rowBase + 42u + d * 2u + 0u] = float16_t(sin(ang) * 0.5);
-                s_layer0[rowBase + 42u + d * 2u + 1u] = float16_t(cos(ang) * 0.5);
-            }
+            // Channels 42..50: Order-2 real Spherical Harmonics of surface normal
+            s_layer0[rowBase + 42u] = float16_t(0.282095);
+            s_layer0[rowBase + 43u] = float16_t(0.488603 * N.y);
+            s_layer0[rowBase + 44u] = float16_t(0.488603 * N.z);
+            s_layer0[rowBase + 45u] = float16_t(0.488603 * N.x);
+            s_layer0[rowBase + 46u] = float16_t(1.092548 * N.x * N.y);
+            s_layer0[rowBase + 47u] = float16_t(1.092548 * N.y * N.z);
+            s_layer0[rowBase + 48u] = float16_t(0.315392 * (3.0 * N.z * N.z - 1.0));
+            s_layer0[rowBase + 49u] = float16_t(1.092548 * N.x * N.z);
+            s_layer0[rowBase + 50u] = float16_t(0.546274 * (N.x * N.x - N.y * N.y));
+
+            // Channels 51..63: View, Reflection, NdotV, Roughness, Specular Ratio, Fresnel, Bias
+            float omc = 1.0 - ndotv;
+            float omc2 = omc * omc;
+            s_layer0[rowBase + 51u] = float16_t(V.x);
+            s_layer0[rowBase + 52u] = float16_t(V.y);
+            s_layer0[rowBase + 53u] = float16_t(V.z);
+            s_layer0[rowBase + 54u] = float16_t(R.x);
+            s_layer0[rowBase + 55u] = float16_t(R.y);
+            s_layer0[rowBase + 56u] = float16_t(R.z);
+            s_layer0[rowBase + 57u] = float16_t(ndotv);
+            s_layer0[rowBase + 58u] = float16_t(rough);
+            s_layer0[rowBase + 59u] = float16_t(rough * rough);
+            s_layer0[rowBase + 60u] = float16_t(specRatio);
+            s_layer0[rowBase + 61u] = float16_t(1.0 - specRatio);
+            s_layer0[rowBase + 62u] = float16_t(omc2 * omc2 * omc);
+            s_layer0[rowBase + 63u] = float16_t(1.0);
         }
     } else {
         if (halfLane == 0u) {
-            s_valid[metaSlot] = false;
-            s_isSpec[metaSlot] = false;
+            s_pixelMeta[metaSlot] = 0xFFFFFFFFu;
         }
         uint colStart = halfLane * 32u;
         for (uint c = 0u; c < 32u; ++c) {
@@ -155,12 +208,13 @@ void main() {
     subgroupBarrier();
 
     // ==========================================
-    // 3. LAYER 0: 64 -> 64 WMMA
+    // 3. LAYER 0: 64 -> 64 WMMA (in-place s_layer0)
     // ==========================================
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles0[4];
     for (uint k = 0u; k < 4u; ++k) {
         coopMatLoad(aTiles0[k], s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
+    subgroupBarrier();
     for (uint col = 0u; col < 4u; ++col) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
         c0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
@@ -172,7 +226,7 @@ void main() {
             c0 = coopMatMulAdd(aTiles0[k], bTile, c0);
         }
 
-        coopMatStore(c0, s_layer1, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c0, s_layer0, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
@@ -181,22 +235,23 @@ void main() {
         float16_t b0_hi = weights[NRC_B0_OFFSET + tid + 32u];
         for (uint r = 0u; r < 16u; ++r) {
             uint rowOff = sgLayerOff + r * 64u;
-            float16_t v0 = s_layer1[rowOff + tid] + b0_lo;
-            s_layer1[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
-            float16_t v1 = s_layer1[rowOff + tid + 32u] + b0_hi;
-            s_layer1[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
+            float16_t v0 = s_layer0[rowOff + tid] + b0_lo;
+            s_layer0[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
+            float16_t v1 = s_layer0[rowOff + tid + 32u] + b0_hi;
+            s_layer0[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
         }
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
     // ==========================================
-    // 4. LAYER 1: 64 -> 64 WMMA
+    // 4. LAYER 1: 64 -> 64 WMMA (in-place s_layer0)
     // ==========================================
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles1[4];
     for (uint k = 0u; k < 4u; ++k) {
-        coopMatLoad(aTiles1[k], s_layer1, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(aTiles1[k], s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
     }
+    subgroupBarrier();
     for (uint col = 0u; col < 4u; ++col) {
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
         c1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
@@ -227,7 +282,7 @@ void main() {
     subgroupBarrier();
 
     // ==========================================
-    // 5. LAYER 2: 64 -> 16 WMMA (Output layer)
+    // 5. LAYER 2: 64 -> 16 WMMA (Output layer in-place s_layer0)
     // ==========================================
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2;
     c2 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
@@ -242,36 +297,81 @@ void main() {
 
         c2 = coopMatMulAdd(aTile, bTile, c2);
     }
+    subgroupBarrier();
 
-    // Store linear output to s_output
-    coopMatStore(c2, s_output, sgOutOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c2, s_layer0, sgLayerOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
-    // 6. Write final predicted radiance to 32-bit fixed-point atomic buffer (CRIT-05)
+    // 6. Direct image resolve (1-SPP unique-pixel fast path) or Q16.16 atomic accumulation fallback
     if (tid < 16u) {
         uint slot = sgMetaOff + tid;
-        if (s_valid[slot]) {
-            uint outRow = sgOutOff + tid * 16u;
+        uint meta = s_pixelMeta[slot];
+        if (meta != 0xFFFFFFFFu) {
+            uint pixelIdx = meta & 0x7FFFFFFFu;
+            bool isSpec = (meta & 0x80000000u) != 0u;
+            uint outRow = sgLayerOff + tid * 16u;
             vec3 rawPred = vec3(
-                float(s_output[outRow + 0u] + weights[NRC_B2_OFFSET + 0u]),
-                float(s_output[outRow + 1u] + weights[NRC_B2_OFFSET + 1u]),
-                float(s_output[outRow + 2u] + weights[NRC_B2_OFFSET + 2u])
+                float(s_layer0[outRow + 0u] + weights[NRC_B2_OFFSET + 0u]),
+                float(s_layer0[outRow + 1u] + weights[NRC_B2_OFFSET + 1u]),
+                float(s_layer0[outRow + 2u] + weights[NRC_B2_OFFSET + 2u])
             );
             if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
             if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
             if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
             float maxRad = (pc.maxRadiance > 0.0) ? pc.maxRadiance : 10.0;
-            vec3 predRadiance = clamp(rawPred, vec3(0.0), vec3(maxRad));
-            vec3 radiance = clamp(s_throughput[slot] * predRadiance, vec3(0.0), vec3(maxRad));
+            vec3 predRadiance = nrcClampChromaticity(rawPred, maxRad);
+            vec3 radiance = nrcClampChromaticity(s_throughput[slot] * predRadiance, maxRad);
 
             if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
             if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;
             if (isnan(radiance.z) || isinf(radiance.z)) radiance.z = 0.0;
 
-            uint pixelIdx = s_pixelIndex[slot];
-            if (pixelIdx < pc.width * pc.height) {
-                uint base = pixelIdx * 6u + (s_isSpec[slot] ? 3u : 0u);
+            uint resolveFlags = floatBitsToUint(pc.invWorldExtent.w);
+            if ((resolveFlags & 0x80000000u) != 0u) {
+                vec3 radPos = max(radiance, vec3(0.0));
+                if (dot(radPos, vec3(1.0)) > 0.0) {
+                    ivec2 pixelCoord = ivec2(int(pixelIdx % pc.width), int(pixelIdx / pc.width));
+                    uint capMl = resolveFlags & 0xFFu;
+                    if (capMl == 0u) {
+                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                        imageStore(uAccumImage, pixelCoord, vec4(prev.rgb + radPos, prev.a));
+                    } else {
+                        if ((capMl & 1u) == 0u || (capMl & 2u) != 0u) {
+                            vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                            imageStore(uAccumImage, pixelCoord, vec4(prev.rgb + radPos, prev.a));
+                        }
+                        bool isV4 = (capMl & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                        bool isSplit4 = (capMl & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u;
+                        if ((capMl & 1u) != 0u && (isV4 || !isSplit4)) {
+                            if (!isSpec) {
+                                vec3 contribDiff = isV4
+                                    ? demodulateMlSafe(radPos, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                    : radPos;
+                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                imageStore(uMlDiffuseImage, pixelCoord, vec4(prevDiff.rgb + contribDiff, prevDiff.a));
+                            } else {
+                                vec3 contribSpec = isV4
+                                    ? demodulateMlSafe(radPos, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                    : radPos;
+                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                imageStore(uMlSpecularImage, pixelCoord, vec4(prevSpec.rgb + contribSpec, prevSpec.a));
+                            }
+                        }
+                        if (isSplit4) {
+                            if (!isSpec) {
+                                vec4 prevIndDiff = imageLoad(uIndirectDiffuseImage, pixelCoord);
+                                imageStore(uIndirectDiffuseImage, pixelCoord, vec4(prevIndDiff.rgb + radPos, prevIndDiff.a));
+                            } else {
+                                vec4 prevIndSpec = imageLoad(uIndirectSpecularImage, pixelCoord);
+                                imageStore(uIndirectSpecularImage, pixelCoord, vec4(prevIndSpec.rgb + radPos, prevIndSpec.a));
+                            }
+                        }
+                    }
+                }
+            } else {
+                bool splitSpec = (pc.worldMin.w > 0.5);
+                uint base = splitSpec ? (pixelIdx * 6u + (isSpec ? 3u : 0u)) : (pixelIdx * 3u);
                 // Q16.16 fixed-point scaling (65536.0)
                 uvec3 fixedRad = uvec3(clamp(radiance, vec3(0.0), vec3(65535.0)) * 65536.0 + 0.5);
                 if (fixedRad.x > 0u) atomicAdd(nrcAtomicBuffer[base + 0u], fixedRad.x);
