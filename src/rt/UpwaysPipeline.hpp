@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/Config.hpp"
+
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
 
@@ -126,12 +128,36 @@ struct UpwaysPassTimings {
     bool   valid = false;
 };
 
+enum class UpwaysComputePrecision : uint8_t {
+    Fp8  = 0,
+    Int8 = 1,
+    Fp16 = 2
+};
+
+inline constexpr const char* upwaysPrecisionName(UpwaysComputePrecision precision) noexcept {
+    switch (precision) {
+        case UpwaysComputePrecision::Fp8:  return "fp8";
+        case UpwaysComputePrecision::Int8: return "int8";
+        case UpwaysComputePrecision::Fp16: return "fp16";
+    }
+    return "fp8";
+}
+
+inline constexpr const char* upwaysPrecisionDisplayName(UpwaysComputePrecision precision) noexcept {
+    switch (precision) {
+        case UpwaysComputePrecision::Fp8:  return "FP8 E4M3fn";
+        case UpwaysComputePrecision::Int8: return "INT8 QAT";
+        case UpwaysComputePrecision::Fp16: return "FP16";
+    }
+    return "FP8 E4M3fn";
+}
+
 /**
- * Upways 4.0 RDNA 4 FP8 E4M3fn WMMA Two-Module Spatiotemporal Denoiser & Super-Resolution Pipeline.
+ * Upways 4.0 Wave32 Cooperative Matrix WMMA (FP8 E4M3fn / INT8 QAT / FP16) Two-Module Spatiotemporal Denoiser & SR Pipeline.
  *
  * Module A (UpwaysDenoiser):
- *   Pass 1: upways_denoise_prep.comp    -> temporal reprojection, disocclusion, FP8 X0 packing
- *   Pass 2: upways_denoiser_wmma.comp   -> 4-stage L1/L2 FP8 WMMA hourglass + clean diffuse/specular/radiance
+ *   Pass 1: upways_denoise_prep.comp    -> temporal reprojection, disocclusion, X0 packing
+ *   Pass 2: upways_denoiser_wmma.comp   -> 4-stage L1/L2 WMMA hourglass + clean diffuse/specular/radiance
  * Module B (UpwaysUpscaler):
  *   Pass 3: upways_upscaler_wmma.comp   -> 16 -> 32 -> 32 -> 16 subpixel delta & blend logit prediction
  *   Pass 4: upways_upscale_resolve.comp -> bicubic LR base + neural residual + HR temporal TAAU
@@ -143,7 +169,14 @@ public:
     static constexpr uint32_t NUM_DENOISER_STAGES = 4;
     static constexpr uint32_t BASE_ANCHOR_LAYERS = 4;
 
-    static bool supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice);
+    static bool supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
+    static bool supportsInt8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
+    static bool supportsFp16CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
+    static UpwaysComputePrecision selectPrecision(
+        VkPhysicalDevice physicalDevice,
+        UpwaysPrecision requested = UpwaysPrecision::Auto,
+        VkInstance instance = VK_NULL_HANDLE
+    );
 
     UpwaysPipeline(
         VkDevice device,
@@ -160,7 +193,7 @@ public:
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
-        bool useFp8CoopMatrix = true
+        UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8
     );
     ~UpwaysPipeline();
 
@@ -206,7 +239,8 @@ public:
     [[nodiscard]] uint32_t getOutputHeight() const { return m_outputHeight; }
     [[nodiscard]] bool isSuperResEnabled() const { return m_enableSuperRes; }
     [[nodiscard]] bool isHistoryValid() const { return m_historyValid; }
-    [[nodiscard]] bool usesFp8CoopMatrix() const { return m_useFp8CoopMatrix; }
+    [[nodiscard]] UpwaysComputePrecision getPrecision() const { return m_precision; }
+    [[nodiscard]] bool usesFp8CoopMatrix() const { return m_precision == UpwaysComputePrecision::Fp8; }
     [[nodiscard]] bool isInitialized() const {
         return m_prepPipeline != VK_NULL_HANDLE &&
                m_resolvePipeline != VK_NULL_HANDLE &&
@@ -261,10 +295,11 @@ private:
     uint32_t         m_inputWidth = 0;
     uint32_t         m_inputHeight = 0;
     uint32_t         m_outputWidth = 0;
-    uint32_t         m_outputHeight = 0;
-    bool             m_enableSuperRes = false;
-    bool             m_useFp8CoopMatrix = true;
-    VkFormat         m_imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
+    uint32_t               m_outputHeight = 0;
+    bool                   m_enableSuperRes = false;
+    UpwaysComputePrecision m_precision = UpwaysComputePrecision::Fp8;
+    VkDeviceSize           m_weightQuantBytes = 15616u;
+    VkFormat               m_imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT;
     UpwaysPyramidDims m_pyramidDims{};
 
     bool             m_hasSubgroupSizeControl = false;

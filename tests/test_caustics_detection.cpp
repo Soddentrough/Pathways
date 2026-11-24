@@ -148,10 +148,7 @@ int main() {
         mat.type = MATERIAL_DIELECTRIC;
         scene.materials.push_back(mat);
 
-        SphereGPU sph{};
-        sph.centerRadius = glm::vec4(5.0f, 5.0f, 5.0f, 2.0f);
-        sph.materialId = 0;
-        scene.spheres.push_back(sph);
+        ProceduralScene::addSphere(scene.triangles, glm::vec3(5.0f, 5.0f, 5.0f), 2.0f, 0u, 25, 25);
 
         uint32_t numOpaque = 0;
         geomPipeline.partitionSceneGeometry(scene, numOpaque);

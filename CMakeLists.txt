@@ -151,36 +151,26 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/wavefront_shade.comp
     ${SHADER_DIR}/compute/wavefront_shade_diffuse.comp
     ${SHADER_DIR}/compute/wavefront_shade_dielectric.comp
-    ${SHADER_DIR}/compute/wavefront_shade_conductor.comp
     ${SHADER_DIR}/compute/wavefront_shade_complex.comp
     ${SHADER_DIR}/compute/wavefront_shade_emissive.comp
-    ${SHADER_DIR}/compute/wavefront_shade_passthrough.comp
     ${SHADER_DIR}/compute/wavefront_shadow.comp
     ${SHADER_DIR}/compute/wavefront_tail_megakernel.comp
     ${SHADER_DIR}/compute/update_tlas_instances.comp
     ${SHADER_DIR}/compute/nrc_encode_infer.comp
     ${SHADER_DIR}/compute/nrc_train.comp
     ${SHADER_DIR}/compute/nrc_resolve.comp
-    ${SHADER_DIR}/compute/wavefront_resolve.comp
     ${SHADER_DIR}/compute/upways_denoise_prep.comp
     ${SHADER_DIR}/compute/upways_denoiser_wmma.comp
     ${SHADER_DIR}/compute/upways_upscaler_wmma.comp
     ${SHADER_DIR}/compute/upways_upscale_resolve.comp
     ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
+    ${SHADER_DIR}/compute/ffx_rr_prep.comp
+    ${SHADER_DIR}/compute/ffx_rr_compose.comp
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
     ${SHADER_DIR}/compute/restir_debug_view.comp
-    ${SHADER_DIR}/compute/denoise_fused_temporal.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step1.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step2.comp
-    ${SHADER_DIR}/compute/denoise_atrous_step3.comp
-    ${SHADER_DIR}/compute/denoise_atrous_coarse_remodulate.comp
-    ${SHADER_DIR}/rt/raytrace.rgen
-    ${SHADER_DIR}/rt/raytrace.rmiss
-    ${SHADER_DIR}/rt/shadow.rmiss
-    ${SHADER_DIR}/rt/raytrace.rchit
     ${SHADER_DIR}/ui/imgui_hdr.frag
 )
 
@@ -261,11 +251,16 @@ add_specialized_wf_shader(wavefront_shade_complex_sec_restir.comp wavefront_shad
 add_specialized_wf_shader(wavefront_shade_dielectric_restir.comp wavefront_shade_dielectric.comp -DENABLE_RESTIR_PT=1)
 add_specialized_wf_shader(wavefront_shade_emissive_restir.comp wavefront_shade_emissive.comp -DENABLE_RESTIR_PT=1)
 
-# Upways 4.0 FP16 WMMA software-E4M3 fallback variants
-add_specialized_wf_shader(upways_denoise_prep.fp16.comp upways_denoise_prep.comp -DUPWAYS_FP16_WMMA=1)
-add_specialized_wf_shader(upways_denoiser_wmma.fp16.comp upways_denoiser_wmma.comp -DUPWAYS_FP16_WMMA=1)
-add_specialized_wf_shader(upways_upscaler_wmma.fp16.comp upways_upscaler_wmma.comp -DUPWAYS_FP16_WMMA=1)
-add_specialized_wf_shader(upways_upscale_resolve.fp16.comp upways_upscale_resolve.comp -DUPWAYS_FP16_WMMA=1)
+# Upways 4.0 INT8 QAT & FP16 WMMA variants
+add_specialized_wf_shader(upways_denoise_prep.int8.comp upways_denoise_prep.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_denoiser_wmma.int8.comp upways_denoiser_wmma.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_upscaler_wmma.int8.comp upways_upscaler_wmma.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_upscale_resolve.int8.comp upways_upscale_resolve.comp -DUPWAYS_PRECISION_MODE=1)
+
+add_specialized_wf_shader(upways_denoise_prep.fp16.comp upways_denoise_prep.comp -DUPWAYS_PRECISION_MODE=2)
+add_specialized_wf_shader(upways_denoiser_wmma.fp16.comp upways_denoiser_wmma.comp -DUPWAYS_PRECISION_MODE=2)
+add_specialized_wf_shader(upways_upscaler_wmma.fp16.comp upways_upscaler_wmma.comp -DUPWAYS_PRECISION_MODE=2)
+add_specialized_wf_shader(upways_upscale_resolve.fp16.comp upways_upscale_resolve.comp -DUPWAYS_PRECISION_MODE=2)
 
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 
@@ -579,15 +574,25 @@ add_custom_target(package_upways_weights
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
         "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin/data/models"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
         "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights_int8.bin"
     BYPRODUCTS
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_weights.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_int8_weights.hpp"
         "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
         "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights_int8.bin"
     COMMENT "Checking and packaging updated Upways neural weights"
 )
 
@@ -612,7 +617,28 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
             "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights.bin"
-        COMMENT "Deploying Upways neural weights to build tree"
+        COMMENT "Deploying Upways FP8 neural weights to build tree"
+    )
+endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin")
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
+    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
+    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
+    endif()
+    add_custom_command(TARGET pathways POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+            "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
+            "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights_int8.bin"
+        COMMENT "Deploying Upways INT8 QAT neural weights to build tree"
     )
 endif()
 
@@ -655,6 +681,9 @@ endif()
 
 # Pipeline Comparison, CLI Validation & Telemetry Unit Test Target
 add_executable(test_pipeline_comparison tests/test_pipeline_comparison.cpp)
+target_compile_definitions(test_pipeline_comparison PRIVATE
+    PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
+)
 target_link_libraries(test_pipeline_comparison PRIVATE pathways_engine_core)
 add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
 
@@ -677,14 +706,6 @@ add_test(NAME NrcWmma COMMAND test_nrc_wmma)
 add_executable(test_upways_pipeline tests/test_upways_pipeline.cpp)
 target_link_libraries(test_upways_pipeline PRIVATE pathways_engine_core)
 add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
-
-# Adaptive E-SVGF Denoiser Pipeline (5-Dispatch Dilated GPU Execution) Test Target
-add_executable(test_denoiser_pipeline tests/test_denoiser_pipeline.cpp)
-target_compile_definitions(test_denoiser_pipeline PRIVATE
-    PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
-)
-target_link_libraries(test_denoiser_pipeline PRIVATE pathways_engine_core)
-add_test(NAME DenoiserPipeline COMMAND test_denoiser_pipeline)
 
 # ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
 add_executable(test_restir_pt_math tests/test_restir_pt_math.cpp)
@@ -820,6 +841,9 @@ if(WIN32)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION data/models)
     endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin" DESTINATION data/models)
+    endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/pathways.ico" DESTINATION ${CMAKE_INSTALL_BINDIR})
     endif()
@@ -884,6 +908,9 @@ else()
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
         install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin")
+        install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin" DESTINATION ${CMAKE_INSTALL_DATADIR}/pathways/data/models)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
         install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/pathways)

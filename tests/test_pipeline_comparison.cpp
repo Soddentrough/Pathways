@@ -1,13 +1,49 @@
 #include "core/Config.hpp"
 #include "utils/ImageDumper.hpp"
+#include "rt/DenoiserPipeline.hpp"
+#include "vulkan/VulkanContext.hpp"
+#include "vulkan/Buffer.hpp"
+#include "vulkan/Image.hpp"
+
+#include <glm/glm.hpp>
+#include <glm/gtc/packing.hpp>
 #include <iostream>
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <vector>
 #include <fstream>
 #include <filesystem>
 
 using namespace pathways;
+
+namespace {
+
+bool parseRejected(std::initializer_list<const char*> args) {
+    std::vector<char*> argv;
+    for (const char* a : args) argv.push_back(const_cast<char*>(a));
+    try {
+        (void)Config::parse(static_cast<int>(argv.size()), argv.data());
+        return false;
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+}
+
+std::vector<char> loadSpvFile(const std::string& filename) {
+    std::filesystem::path spvPath = std::filesystem::path(PATHWAYS_SPV_DIR) / filename;
+    std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return {};
+    }
+    const size_t size = static_cast<size_t>(file.tellg());
+    std::vector<char> buf(size);
+    file.seekg(0, std::ios::beg);
+    file.read(buf.data(), static_cast<std::streamsize>(size));
+    return buf;
+}
+
+} // namespace
 
 static void assert_near(float a, float b, float eps = 0.001f, const char* msg = "") {
     if (std::abs(a - b) > eps) {
@@ -39,10 +75,9 @@ int main() {
         check_true(cfgDef.pipeline_type == PipelineType::Wavefront, "Default pipeline is Wavefront");
         check_true(cfgDef.wavefront_sort_mode == WavefrontSortMode::Auto, "Default sort mode is Auto");
 
-        // Explicit --pipeline rtp
-        const char* argv1[] = { "pathways", "--pipeline", "rtp" };
-        Config c1 = Config::parse(3, const_cast<char**>(argv1));
-        check_true(c1.pipeline_type == PipelineType::RTP, "--pipeline rtp sets RTP");
+        // Removed legacy --pipeline rtp must be rejected
+        check_true(parseRejected({ "pathways", "--pipeline", "rtp" }),
+                   "Removed --pipeline rtp must throw std::runtime_error");
 
         // Explicit --pipeline wavefront
         const char* argv2[] = { "pathways", "--pipeline", "wavefront" };
@@ -144,30 +179,33 @@ int main() {
         Config cDbgView = Config::parse(3, const_cast<char**>(argvDbgView));
         check_true(cDbgView.debug_view == DebugViewMode::RestirM, "--debug-view restir-m sets DebugViewMode::RestirM");
 
-        const char* argvDenoiser[] = { "pathways", "--svgf" };
-        Config cDenoiser = Config::parse(2, const_cast<char**>(argvDenoiser));
-        check_true(cDenoiser.denoiser_mode == DenoiserMode::Svgf, "--svgf sets DenoiserMode::Svgf");
+        const char* argvDenoiserRR[] = { "pathways", "--ray-regeneration" };
+        Config cDenoiserRR = Config::parse(2, const_cast<char**>(argvDenoiserRR));
+        check_true(cDenoiserRR.denoiser_mode == DenoiserMode::FfxRayRegeneration,
+                   "--ray-regeneration sets DenoiserMode::FfxRayRegeneration");
 
-        const char* argvDenoiserEsvgf[] = { "pathways", "--denoiser", "esvgf" };
-        Config cDenoiserEsvgf = Config::parse(3, const_cast<char**>(argvDenoiserEsvgf));
-        check_true(cDenoiserEsvgf.denoiser_mode == DenoiserMode::Svgf, "--denoiser esvgf sets DenoiserMode::Svgf");
+        const char* argvDenoiserFfxRr[] = { "pathways", "--ffx-rr" };
+        Config cDenoiserFfxRr = Config::parse(2, const_cast<char**>(argvDenoiserFfxRr));
+        check_true(cDenoiserFfxRr.denoiser_mode == DenoiserMode::FfxRayRegeneration,
+                   "--ffx-rr sets DenoiserMode::FfxRayRegeneration");
+
+        const char* argvDenoiserModeFfxRr[] = { "pathways", "--denoiser", "ffx-rr" };
+        Config cDenoiserModeFfxRr = Config::parse(3, const_cast<char**>(argvDenoiserModeFfxRr));
+        check_true(cDenoiserModeFfxRr.denoiser_mode == DenoiserMode::FfxRayRegeneration,
+                   "--denoiser ffx-rr sets DenoiserMode::FfxRayRegeneration");
 
         const char* argvDenoiserUpways[] = { "pathways", "--denoiser", "upways" };
         Config cDenoiserUpways = Config::parse(3, const_cast<char**>(argvDenoiserUpways));
         check_true(cDenoiserUpways.denoiser_mode == DenoiserMode::Upways, "--denoiser upways sets DenoiserMode::Upways");
 
-        // Verify removed vaporware/alias flags are strictly rejected
+        // Verify removed vaporware/legacy flags are strictly rejected
         auto expectRejected = [](std::initializer_list<const char*> args, const char* label) {
-            std::vector<char*> argv;
-            for (const char* a : args) argv.push_back(const_cast<char*>(a));
-            bool rejected = false;
-            try {
-                (void)Config::parse(static_cast<int>(argv.size()), argv.data());
-            } catch (const std::runtime_error&) {
-                rejected = true;
-            }
-            check_true(rejected, label);
+            check_true(parseRejected(args), label);
         };
+        expectRejected({ "pathways", "--svgf" }, "Removed --svgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--esvgf" }, "Removed --esvgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "svgf" }, "Removed --denoiser svgf must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "esvgf" }, "Removed --denoiser esvgf must throw std::runtime_error");
         expectRejected({ "pathways", "--relax" }, "Removed --relax flag must throw std::runtime_error");
         expectRejected({ "pathways", "--asvgf" }, "Removed --asvgf flag must throw std::runtime_error");
         expectRejected({ "pathways", "--denoiser", "relax" }, "Removed --denoiser relax must throw std::runtime_error");
@@ -346,6 +384,300 @@ int main() {
         check_true(std::filesystem::exists(exrPath) && std::filesystem::file_size(exrPath) > 64, "EXR file must be non-empty");
         std::filesystem::remove(exrPath, ec);
         std::cout << "  -> Uncapped HDR OpenEXR serialization verified." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Test 44-Channel PTTD v5 Header & Payload Serialization
+    // -------------------------------------------------------------------------
+    {
+        std::cout << "[TEST 5] 44-Channel PTTD v5 Serialization..." << std::endl;
+        const uint32_t w = 4, h = 4, ch = 44;
+        const size_t numFloats = static_cast<size_t>(w) * h * ch;
+        std::vector<uint16_t> payload(numFloats, glm::packHalf1x16(0.25f));
+        const std::string pttdPath = "screenshots/pw_pttd_v5_test.pttd";
+        const float camPos[3] = { 1.0f, 2.0f, 3.0f };
+        const float jitter[2] = { 0.25f, -0.25f };
+        check_true(ImageDumper::savePTTD(pttdPath, w, h, ch, /*dataType=*/0, /*frameIndex=*/7, /*spp=*/1,
+                                         payload.data(), payload.size() * sizeof(uint16_t),
+                                         45.0f, 16.0f / 9.0f, camPos, jitter),
+                   "ImageDumper::savePTTD(44ch) must succeed");
+
+        std::ifstream in(pttdPath, std::ios::binary);
+        check_true(in.is_open(), "Saved 44ch PTTD file must open");
+        struct HeaderRead {
+            char magic[4];
+            uint32_t version;
+            uint32_t width;
+            uint32_t height;
+            uint32_t channels;
+            uint32_t data_type;
+            uint32_t frame_index;
+            uint32_t spp;
+            uint64_t payload_byte_size;
+            float fov_deg;
+            float aspect_ratio;
+            float cam_pos[3];
+            char padding[4];
+        } hdr{};
+        static_assert(sizeof(HeaderRead) == 64, "PTTD header size mismatch");
+        in.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+        check_true(in.good(), "Must read 64-byte PTTD v5 header");
+        check_true(std::memcmp(hdr.magic, "PTTD", 4) == 0, "PTTD magic must be 'PTTD'");
+        check_true(hdr.version == 5u, "44-channel PTTD must serialize version == 5");
+        check_true(hdr.width == w && hdr.height == h && hdr.channels == 44u,
+                   "PTTD v5 dimensions and channel count must match (4x4x44)");
+        check_true(hdr.payload_byte_size == payload.size() * sizeof(uint16_t),
+                   "PTTD v5 payload_byte_size must match");
+        in.close();
+        std::error_code ec;
+        std::filesystem::remove(pttdPath, ec);
+        std::cout << "  -> 44-channel PTTD v5 header & payload verified." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. Test 3-Stage DenoiserPipeline (ffx_rr_prep -> passthrough/SDK -> ffx_rr_compose)
+    // -------------------------------------------------------------------------
+    {
+        uint32_t hwGpuCount = 0;
+        VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+        appInfo.pApplicationName = "PathwaysDenoiserProbe";
+        appInfo.apiVersion = VK_API_VERSION_1_4;
+        VkInstanceCreateInfo instInfo{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+        instInfo.pApplicationInfo = &appInfo;
+        VkInstance probeInst = VK_NULL_HANDLE;
+        if (vkCreateInstance(&instInfo, nullptr, &probeInst) == VK_SUCCESS) {
+            uint32_t devCount = 0;
+            vkEnumeratePhysicalDevices(probeInst, &devCount, nullptr);
+            std::vector<VkPhysicalDevice> devs(devCount);
+            vkEnumeratePhysicalDevices(probeInst, &devCount, devs.data());
+            for (VkPhysicalDevice pd : devs) {
+                VkPhysicalDeviceProperties props{};
+                vkGetPhysicalDeviceProperties(pd, &props);
+                if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+                    ++hwGpuCount;
+                }
+            }
+            vkDestroyInstance(probeInst, nullptr);
+        }
+
+        if (hwGpuCount == 0) {
+            std::cout << "[SKIP] No hardware Vulkan 1.4 GPU available for live DenoiserPipeline test." << std::endl;
+        } else {
+            std::cout << "[TEST 6] GPU 3-Stage DenoiserPipeline Energy Conservation..." << std::endl;
+            Config cfg;
+            cfg.headless = true;
+            cfg.validation_layers = true;
+            cfg.gpu_index = (hwGpuCount >= 2) ? 1u : 0u;
+
+            VulkanContext vkCtx(cfg, VK_NULL_HANDLE, "DenoiserPipeline 3-Stage Test");
+            VkDevice device = vkCtx.getDevice();
+            VmaAllocator allocator = vkCtx.getAllocator();
+            VkQueue queue = vkCtx.getGraphicsQueue();
+
+            DenoiserPipeline denoiser(
+                device, vkCtx.getPhysicalDevice(), allocator, queue,
+                [](const std::string& spv) {
+                    auto bytes = loadSpvFile(spv);
+                    if (bytes.empty()) {
+                        throw std::runtime_error("Missing SPIR-V: " + spv);
+                    }
+                    return bytes;
+                },
+                vkCtx.hasSubgroupSizeControl()
+            );
+
+            const uint32_t w = 16, h = 16;
+            denoiser.resize(w, h, AccumFormat::RGBA16_SFLOAT);
+            check_true(denoiser.isInitialized(), "DenoiserPipeline must be initialized after resize");
+
+            constexpr VkImageUsageFlags kImgUsage =
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+            auto makeInput = [&]() {
+                return std::make_unique<Image>(device, allocator, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, kImgUsage);
+            };
+            auto imgND    = makeInput();
+            auto imgMV    = makeInput();
+            auto imgAR    = makeInput();
+            auto imgSA    = makeInput();
+            auto imgSkip  = makeInput();
+            auto imgDD    = makeInput();
+            auto imgID    = makeInput();
+            auto imgDS    = makeInput();
+            auto imgIS    = makeInput();
+
+            const size_t numPx = static_cast<size_t>(w) * h;
+            const VkDeviceSize rgba16Bytes = numPx * 4 * sizeof(uint16_t);
+            std::vector<uint16_t> stageData(numPx * 4 * 9, 0);
+            auto packPx = [&](size_t imgIdx, size_t px, const glm::vec4& v) {
+                const size_t base = imgIdx * (numPx * 4) + px * 4;
+                stageData[base + 0] = glm::packHalf1x16(v.x);
+                stageData[base + 1] = glm::packHalf1x16(v.y);
+                stageData[base + 2] = glm::packHalf1x16(v.z);
+                stageData[base + 3] = glm::packHalf1x16(v.w);
+            };
+
+            // Pixel groups test normal albedo, zero-albedo black diffuse/spec, clamped low albedo (0.005), and sky miss
+            for (size_t px = 0; px < numPx; ++px) {
+                const size_t mode = denoiser.isUsingSdkProvider() ? 0 : (px % 4);
+                if (mode == 0) {
+                    packPx(0, px, glm::vec4(0.0f, 0.0f, 1.0f, 10.0f));
+                    packPx(1, px, glm::vec4(0.0f, 0.0f, 0.0f, 0.0f));
+                    packPx(2, px, glm::vec4(0.50f, 0.25f, 0.80f, 0.40f));
+                    packPx(3, px, glm::vec4(0.40f, 0.40f, 0.40f, 0.0f));
+                    packPx(4, px, glm::vec4(0.10f, 0.05f, 0.02f, 0.0f));
+                    packPx(5, px, glm::vec4(1.50f, 0.50f, 0.40f, 0.0f));
+                    packPx(6, px, glm::vec4(0.50f, 0.25f, 0.80f, 3.0f));
+                    packPx(7, px, glm::vec4(0.80f, 0.40f, 0.20f, 0.0f));
+                    packPx(8, px, glm::vec4(0.20f, 0.20f, 0.60f, 5.0f));
+                } else if (mode == 1) {
+                    // Zero diffuse + zero spec albedo must still recover 100% energy via effAlb = 1.0
+                    packPx(0, px, glm::vec4(0.0f, 1.0f, 0.0f, 4.0f));
+                    packPx(1, px, glm::vec4(0.0f));
+                    packPx(2, px, glm::vec4(0.0f, 0.0f, 0.0f, 0.2f));
+                    packPx(3, px, glm::vec4(0.0f));
+                    packPx(4, px, glm::vec4(0.0f));
+                    packPx(5, px, glm::vec4(0.6f, 0.3f, 0.1f, 0.0f));
+                    packPx(6, px, glm::vec4(0.2f, 0.4f, 0.5f, 2.0f));
+                    packPx(7, px, glm::vec4(0.1f, 0.2f, 0.3f, 0.0f));
+                    packPx(8, px, glm::vec4(0.3f, 0.1f, 0.2f, 1.0f));
+                } else if (mode == 2) {
+                    // Low albedo clamped at 0.02 symmetrically in prep and compose
+                    packPx(0, px, glm::vec4(1.0f, 0.0f, 0.0f, 6.0f));
+                    packPx(1, px, glm::vec4(0.0f));
+                    packPx(2, px, glm::vec4(0.005f, 0.0f, 0.0f, 0.8f));
+                    packPx(3, px, glm::vec4(0.005f, 0.005f, 0.005f, 0.0f));
+                    packPx(4, px, glm::vec4(0.05f, 0.05f, 0.05f, 0.0f));
+                    packPx(5, px, glm::vec4(0.04f, 0.0f, 0.0f, 0.0f));
+                    packPx(6, px, glm::vec4(0.02f, 0.0f, 0.0f, 1.5f));
+                    packPx(7, px, glm::vec4(0.01f, 0.02f, 0.03f, 0.0f));
+                    packPx(8, px, glm::vec4(0.01f, 0.01f, 0.01f, 2.5f));
+                } else {
+                    // Sky / miss pixel: skip radiance only
+                    packPx(0, px, glm::vec4(0.0f));
+                    packPx(1, px, glm::vec4(0.0f));
+                    packPx(2, px, glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    packPx(3, px, glm::vec4(0.0f));
+                    packPx(4, px, glm::vec4(0.2f, 0.4f, 0.9f, 0.0f));
+                    packPx(5, px, glm::vec4(0.0f));
+                    packPx(6, px, glm::vec4(0.0f));
+                    packPx(7, px, glm::vec4(0.0f));
+                    packPx(8, px, glm::vec4(0.0f));
+                }
+            }
+
+            Buffer uploadBuf(allocator, rgba16Bytes * 9, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                             VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            uploadBuf.copyFrom(stageData.data(), rgba16Bytes * 9);
+            Buffer readbackBuf(allocator, rgba16Bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VMA_MEMORY_USAGE_AUTO, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+
+            VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+            cpInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            cpInfo.queueFamilyIndex = vkCtx.getGraphicsQueueFamily();
+            VkCommandPool cmdPool = VK_NULL_HANDLE;
+            check_true(vkCreateCommandPool(device, &cpInfo, nullptr, &cmdPool) == VK_SUCCESS, "Create test cmdPool");
+
+            VkCommandBufferAllocateInfo cbInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            cbInfo.commandPool = cmdPool;
+            cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbInfo.commandBufferCount = 1;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            check_true(vkAllocateCommandBuffers(device, &cbInfo, &cmd) == VK_SUCCESS, "Allocate test cmd");
+
+            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            check_true(vkBeginCommandBuffer(cmd, &beginInfo) == VK_SUCCESS, "Begin denoiser test cmd");
+
+            const std::array<Image*, 9> inImgs = {
+                imgND.get(), imgMV.get(), imgAR.get(), imgSA.get(),
+                imgSkip.get(), imgDD.get(), imgID.get(), imgDS.get(), imgIS.get()
+            };
+            for (size_t i = 0; i < 9; ++i) {
+                inImgs[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_NONE, 0,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                VkBufferImageCopy reg{};
+                reg.bufferOffset = i * rgba16Bytes;
+                reg.bufferRowLength = w;
+                reg.bufferImageHeight = h;
+                reg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                reg.imageExtent = { w, h, 1 };
+                vkCmdCopyBufferToImage(cmd, uploadBuf.getBuffer(), inImgs[i]->getImage(),
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reg);
+                inImgs[i]->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+            }
+
+            DenoiserPipeline::CameraMatrices cm{};
+            cm.view = glm::mat4(1.0f);
+            cm.prevView = glm::mat4(1.0f);
+            cm.viewInverse = glm::mat4(1.0f);
+            cm.projection = glm::perspective(glm::radians(45.0f), 1.0f, 0.1f, 1000.0f);
+            cm.nearZ = 0.1f;
+            cm.farZ = 1000.0f;
+
+            // Dispatch twice to verify frame-to-frame layout restoration and descriptor reuse
+            for (uint32_t f = 0; f < 2; ++f) {
+                denoiser.recordDenoise(
+                    cmd, f, (f == 0),
+                    imgND.get(), imgMV.get(), imgAR.get(), imgSA.get(),
+                    imgSkip.get(), imgDD.get(), imgID.get(), imgDS.get(), imgIS.get(),
+                    cm
+                );
+            }
+
+            Image* outImg = denoiser.getDenoisedImage();
+            check_true(outImg != nullptr, "Denoiser output image must exist");
+            outImg->transitionLayout(cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+            VkBufferImageCopy outReg{};
+            outReg.bufferRowLength = w;
+            outReg.bufferImageHeight = h;
+            outReg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            outReg.imageExtent = { w, h, 1 };
+            vkCmdCopyImageToBuffer(cmd, outImg->getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   readbackBuf.getBuffer(), 1, &outReg);
+            check_true(vkEndCommandBuffer(cmd) == VK_SUCCESS, "End denoiser test cmd");
+
+            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            submitInfo.commandBufferCount = 1;
+            submitInfo.pCommandBuffers = &cmd;
+            check_true(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) == VK_SUCCESS, "Submit denoiser test");
+            vkQueueWaitIdle(queue);
+
+            std::vector<uint16_t> outHalf(numPx * 4);
+            readbackBuf.invalidate(0, rgba16Bytes);
+            void* mappedOut = readbackBuf.map();
+            check_true(mappedOut != nullptr, "Map readback buffer");
+            std::memcpy(outHalf.data(), mappedOut, rgba16Bytes);
+            readbackBuf.unmap();
+            for (size_t px = 0; px < numPx; ++px) {
+                const float r = glm::unpackHalf1x16(outHalf[px * 4 + 0]);
+                const float g = glm::unpackHalf1x16(outHalf[px * 4 + 1]);
+                const float b = glm::unpackHalf1x16(outHalf[px * 4 + 2]);
+                check_true(std::isfinite(r) && std::isfinite(g) && std::isfinite(b),
+                           "DenoiserPipeline output must be finite");
+                const size_t mode = denoiser.isUsingSdkProvider() ? 0 : (px % 4);
+                glm::vec3 expected(0.0f);
+                if (mode == 0)      expected = glm::vec3(3.10f, 1.40f, 2.02f);
+                else if (mode == 1) expected = glm::vec3(1.20f, 1.00f, 1.10f);
+                else if (mode == 2) expected = glm::vec3(0.13f, 0.08f, 0.09f);
+                else                expected = glm::vec3(0.20f, 0.40f, 0.90f);
+                const float tol = denoiser.isUsingSdkProvider() ? 0.10f : 0.02f;
+                assert_near(r, expected.x, tol, "DenoiserPipeline composed R");
+                assert_near(g, expected.y, tol, "DenoiserPipeline composed G");
+                assert_near(b, expected.z, tol, "DenoiserPipeline composed B");
+            }
+
+            vkDestroyCommandPool(device, cmdPool, nullptr);
+            std::cout << "  -> 3-stage DenoiserPipeline (" << (denoiser.isUsingSdkProvider() ? "FFX SDK" : "Passthrough Fallback")
+                      << ") multi-frame & energy conservation verified." << std::endl;
+        }
     }
 
     std::cout << "==========================================================" << std::endl;

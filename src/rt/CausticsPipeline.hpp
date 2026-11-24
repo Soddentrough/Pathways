@@ -41,7 +41,6 @@ public:
 
     void updateDescriptors(
         Buffer* triangleBuffer,
-        Buffer* sphereBuffer,
         Buffer* materialBuffer,
         Buffer* lightBuffer,
         VkAccelerationStructureKHR tlasHandle,
@@ -60,7 +59,6 @@ public:
         VkCommandBuffer cmd,
         uint32_t frameSlot,
         uint32_t numTriangles,
-        uint32_t numSpheres,
         uint32_t numMaterials,
         uint32_t numLights,
         uint32_t numOpaqueTriangles,
@@ -76,26 +74,6 @@ public:
         Image* normalDepthImage,
         float cameraFov,
         uint32_t frameIndex,
-        bool progressiveAccumulation,
-        bool cameraMovedLastFrame,
-        bool hasDielectrics,
-        const glm::vec3& dielectricBoundsMin,
-        const glm::vec3& dielectricBoundsMax,
-        uint32_t fullScreenWidth = 0,
-        uint32_t checkerboardTileSize = 0
-    );
-
-    void recordFullPass(
-        VkCommandBuffer cmd,
-        uint32_t frameSlot,
-        uint32_t numTriangles,
-        uint32_t numSpheres,
-        uint32_t numMaterials,
-        uint32_t numLights,
-        uint32_t numOpaqueTriangles,
-        uint32_t frameIndex,
-        Image* normalDepthImage,
-        float cameraFov,
         bool progressiveAccumulation,
         bool cameraMovedLastFrame,
         bool hasDielectrics,

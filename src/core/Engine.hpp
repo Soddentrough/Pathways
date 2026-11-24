@@ -13,7 +13,6 @@
 #include "utils/ImageDumper.hpp"
 #include "rt/AccelerationStructure.hpp"
 #include "rt/DGCManager.hpp"
-#include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/NRCManager.hpp"
 #include "rt/ReSTIRManager.hpp"
@@ -171,7 +170,6 @@ private:
 
     // GPU Buffers (Observing pointers to resources owned by SceneManager)
     Buffer* m_triangleBuffer = nullptr;
-    Buffer* m_sphereBuffer = nullptr;
     Buffer* m_materialBuffer = nullptr;
     Buffer* m_materialArchetypeBuffer = nullptr;
     Buffer* m_shadeMaterialBuffer = nullptr;
@@ -218,16 +216,12 @@ private:
     friend class EngineDescriptorManager;
     std::unique_ptr<EngineDescriptorManager> m_descriptorManager;
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_rtDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     Buffer* m_secTransferBuffer = nullptr;
     void syncDescriptorPointers();
 
-    // Ray Tracing Pipeline Subsystem (Wavefront, RTPipeline, NRC, ReSTIR)
+    // Ray Tracing Pipeline Subsystem (Wavefront, NRC, ReSTIR)
     friend class RayTracingOrchestrator;
     std::unique_ptr<RayTracingOrchestrator> m_rtOrchestrator;
-    VkPipelineLayout m_rtpPipelineLayout = VK_NULL_HANDLE;
-    RTPipeline* m_rtpKhrPipeline = nullptr;
     WavefrontPipeline* m_wavefrontPipeline = nullptr;
     NRCManager* m_nrcManager = nullptr;
     void syncRayTracingPointers();
@@ -295,8 +289,14 @@ private:
     Image* m_mlSpecularImage = nullptr;
     Image* m_mlSkipImage = nullptr;
     Image* m_mlSpecAlbedoImage = nullptr;
+    Image* m_mlDirectDiffuseImage = nullptr;
+    Image* m_mlIndirectDiffuseImage = nullptr;
+    Image* m_mlDirectSpecularImage = nullptr;
+    Image* m_mlIndirectSpecularImage = nullptr;
     void createGBufferResources();
     void destroyGBufferResources();
+    void ensureSplitSignalResources();
+    void destroySplitSignalResources();
     void syncRenderTargetPointers();
     [[nodiscard]] uint32_t getEffectiveGbufferWidth() const noexcept {
         return m_config.capture_training_data_dir.empty()
@@ -381,7 +381,6 @@ private:
     uint64_t m_numInstancedTriangles = 0;
     uint32_t m_numInstances = 1;
     uint32_t m_numOpaqueTriangles = 0;
-    uint32_t m_numSpheres = 0;
     uint32_t m_numMaterials = 0;
     uint32_t m_numLights = 0;
     bool m_sceneHasNonOpaque = false;

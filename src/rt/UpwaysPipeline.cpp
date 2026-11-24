@@ -1,10 +1,13 @@
 #include "UpwaysPipeline.hpp"
 
 #include "core/Logger.hpp"
+#include "rt/upways_default_int8_weights.hpp"
 #include "rt/upways_default_weights.hpp"
 #include "rt/upways_weights.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
+
+#include <glm/gtc/packing.hpp>
 
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
@@ -21,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -72,34 +76,219 @@ std::filesystem::path getExecutableDirectory() {
 #endif
 }
 
-} // namespace
+struct CoopMatrixSupport {
+    bool fp8 = false;
+    bool int8 = false;
+    bool fp16 = false;
+};
 
-bool UpwaysPipeline::supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice) {
+float decodeE4M3ToFloat(uint8_t b) noexcept {
+    const uint32_t u = static_cast<uint32_t>(b);
+    const float s = ((u & 0x80u) != 0u) ? -1.0f : 1.0f;
+    const uint32_t e = (u >> 3u) & 0xFu;
+    const uint32_t m = u & 0x7u;
+    if (e == 0u) {
+        return s * (static_cast<float>(m) / 512.0f);
+    }
+    if (e == 15u && m == 7u) {
+        return 0.0f;
+    }
+    return s * std::exp2(static_cast<float>(static_cast<int32_t>(e) - 7))
+             * (1.0f + static_cast<float>(m) / 8.0f);
+}
+
+std::vector<uint8_t> expandFp8WeightsToFp16(const std::vector<uint8_t>& blob24k) {
+    if (blob24k.size() != upways::TOTAL_WEIGHT_BYTES) {
+        throw std::runtime_error("UpwaysPipeline: Expected 24,064-byte weights blob for FP16 expansion");
+    }
+    constexpr size_t kFp16WeightBytes = upways::FP8_WEIGHT_SECTION_BYTES * 2u;
+    std::vector<uint8_t> expanded(kFp16WeightBytes + upways::FP32_WEIGHT_SECTION_BYTES);
+    for (size_t i = 0; i < upways::FP8_WEIGHT_SECTION_BYTES; ++i) {
+        const uint16_t h = glm::packHalf1x16(decodeE4M3ToFloat(blob24k[i]));
+        std::memcpy(expanded.data() + i * sizeof(uint16_t), &h, sizeof(uint16_t));
+    }
+    std::memcpy(
+        expanded.data() + kFp16WeightBytes,
+        blob24k.data() + upways::FP8_WEIGHT_SECTION_OFFSET + upways::FP8_WEIGHT_SECTION_BYTES,
+        upways::FP32_WEIGHT_SECTION_BYTES
+    );
+    return expanded;
+}
+
+CoopMatrixSupport queryCoopMatrixSupport(VkPhysicalDevice physicalDevice, VkInstance instance) {
+    CoopMatrixSupport sup{};
     if (physicalDevice == VK_NULL_HANDLE) {
-        return false;
+        return sup;
     }
 
-    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT
+    uint32_t extCount = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, nullptr);
+    std::vector<VkExtensionProperties> exts(extCount);
+    if (extCount > 0) {
+        vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extCount, exts.data());
+    }
+    auto hasExt = [&](const char* name) {
+        for (const auto& ext : exts) {
+            if (std::strcmp(ext.extensionName, name) == 0) {
+                return true;
+            }
+        }
+        return false;
     };
+    const bool hasCoopExt = hasExt(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+#ifdef VK_EXT_shader_float8
+    const bool hasFloat8Ext = hasExt(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME);
+#else
+    const bool hasFloat8Ext = false;
+#endif
+    if (!hasCoopExt) {
+        return sup;
+    }
+
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR
     };
     VkPhysicalDeviceVulkan13Features vk13Features{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES
     };
+    VkPhysicalDeviceVulkan12Features vk12Features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES
+    };
+    VkPhysicalDeviceVulkan11Features vk11Features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES
+    };
 
+    vk11Features.pNext = &vk12Features;
+    vk12Features.pNext = &vk13Features;
     vk13Features.pNext = &coopFeatures;
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT
+    };
     coopFeatures.pNext = &float8Features;
+#endif
 
     VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
-    features2.pNext = &vk13Features;
+    features2.pNext = &vk11Features;
     vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
 
-    return (vk13Features.subgroupSizeControl == VK_TRUE) &&
-           (coopFeatures.cooperativeMatrix == VK_TRUE) &&
-           (float8Features.shaderFloat8 == VK_TRUE) &&
-           (float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
+    if (vk13Features.subgroupSizeControl != VK_TRUE || coopFeatures.cooperativeMatrix != VK_TRUE) {
+        return sup;
+    }
+
+#ifdef VK_EXT_shader_float8
+    const bool featFp8 = hasFloat8Ext &&
+                         (float8Features.shaderFloat8 == VK_TRUE) &&
+                         (float8Features.shaderFloat8CooperativeMatrix == VK_TRUE);
+#else
+    const bool featFp8 = false;
+    (void)hasFloat8Ext;
+#endif
+    const bool featInt8 = (vk12Features.shaderInt8 == VK_TRUE) &&
+                          (vk12Features.storageBuffer8BitAccess == VK_TRUE) &&
+                          (vk12Features.shaderFloat16 == VK_TRUE);
+    const bool featFp16 = (vk12Features.shaderFloat16 == VK_TRUE) &&
+                          (vk11Features.storageBuffer16BitAccess == VK_TRUE);
+
+    bool propFp8 = featFp8;
+    bool propInt8 = featInt8;
+    bool propFp16 = featFp16;
+
+    if (instance != VK_NULL_HANDLE) {
+        auto pfnGetCoopProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (pfnGetCoopProps != nullptr) {
+            uint32_t propCount = 0;
+            if (pfnGetCoopProps(physicalDevice, &propCount, nullptr) == VK_SUCCESS && propCount > 0) {
+                std::vector<VkCooperativeMatrixPropertiesKHR> coopProps(propCount);
+                for (auto& cp : coopProps) {
+                    cp = {};
+                    cp.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+                }
+                if (pfnGetCoopProps(physicalDevice, &propCount, coopProps.data()) == VK_SUCCESS) {
+                    propFp8 = false;
+                    propInt8 = false;
+                    propFp16 = false;
+                    for (const auto& cp : coopProps) {
+                        if (cp.scope != VK_SCOPE_SUBGROUP_KHR ||
+                            cp.MSize != 16u || cp.NSize != 16u || cp.KSize != 16u) {
+                            continue;
+                        }
+#ifdef VK_EXT_shader_float8
+                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                            cp.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+                            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                            propFp8 = true;
+                        }
+#endif
+                        if (cp.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            cp.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                            cp.ResultType == VK_COMPONENT_TYPE_SINT32_KHR) {
+                            propInt8 = true;
+                        }
+                        if (cp.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            cp.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+                            propFp16 = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sup.fp8 = featFp8 && propFp8;
+    sup.int8 = featInt8 && propInt8;
+    sup.fp16 = featFp16 && propFp16;
+    return sup;
+}
+
+} // namespace
+
+bool UpwaysPipeline::supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance) {
+    return queryCoopMatrixSupport(physicalDevice, instance).fp8;
+}
+
+bool UpwaysPipeline::supportsInt8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance) {
+    return queryCoopMatrixSupport(physicalDevice, instance).int8;
+}
+
+bool UpwaysPipeline::supportsFp16CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance) {
+    return queryCoopMatrixSupport(physicalDevice, instance).fp16;
+}
+
+UpwaysComputePrecision UpwaysPipeline::selectPrecision(
+    VkPhysicalDevice physicalDevice,
+    UpwaysPrecision requested,
+    VkInstance instance
+) {
+    const CoopMatrixSupport sup = queryCoopMatrixSupport(physicalDevice, instance);
+    auto pickAuto = [&]() -> UpwaysComputePrecision {
+        if (sup.fp8) return UpwaysComputePrecision::Fp8;
+        if (sup.int8) return UpwaysComputePrecision::Int8;
+        if (sup.fp16) return UpwaysComputePrecision::Fp16;
+        throw std::runtime_error(
+            "UpwaysPipeline: GPU lacks Wave32 16x16x16 VK_KHR_cooperative_matrix WMMA support for FP8, INT8, and FP16."
+        );
+    };
+
+    switch (requested) {
+        case UpwaysPrecision::Fp8:
+            if (sup.fp8) return UpwaysComputePrecision::Fp8;
+            Logger::warn("UpwaysPipeline: Requested precision 'fp8' is unsupported on this GPU; falling back automatically.");
+            return pickAuto();
+        case UpwaysPrecision::Int8:
+            if (sup.int8) return UpwaysComputePrecision::Int8;
+            Logger::warn("UpwaysPipeline: Requested precision 'int8' is unsupported on this GPU; falling back automatically.");
+            return pickAuto();
+        case UpwaysPrecision::Fp16:
+            if (sup.fp16) return UpwaysComputePrecision::Fp16;
+            Logger::warn("UpwaysPipeline: Requested precision 'fp16' is unsupported on this GPU; falling back automatically.");
+            return pickAuto();
+        case UpwaysPrecision::Auto:
+        default:
+            return pickAuto();
+    }
 }
 
 UpwaysPipeline::UpwaysPipeline(
@@ -117,7 +306,7 @@ UpwaysPipeline::UpwaysPipeline(
     const std::string& weightsPath,
     bool enableSuperRes,
     VkFormat imageFormat,
-    bool useFp8CoopMatrix
+    UpwaysComputePrecision precision
 )
     : m_device(device)
     , m_physDevice(physicalDevice)
@@ -127,7 +316,8 @@ UpwaysPipeline::UpwaysPipeline(
     , m_outputWidth(std::max(1u, outputWidth))
     , m_outputHeight(std::max(1u, outputHeight))
     , m_enableSuperRes(enableSuperRes)
-    , m_useFp8CoopMatrix(useFp8CoopMatrix)
+    , m_precision(precision)
+    , m_weightQuantBytes((precision == UpwaysComputePrecision::Fp16) ? (upways::FP8_WEIGHT_SECTION_BYTES * 2u) : upways::FP8_WEIGHT_SECTION_BYTES)
     , m_imageFormat(VK_FORMAT_R16G16B16A16_SFLOAT)
     , m_pyramidDims(computeUpwaysPyramidDims(m_inputWidth, m_inputHeight))
 {
@@ -150,7 +340,7 @@ UpwaysPipeline::UpwaysPipeline(
 
     Logger::info(
         "UpwaysPipeline 4.0 ({} WMMA) initializing: LR {}x{} -> HR {}x{} (SuperRes: {}, L1 {}x{}, L2 {}x{}).",
-        m_useFp8CoopMatrix ? "FP8 E4M3fn" : "FP16 fallback",
+        upwaysPrecisionDisplayName(m_precision),
         m_inputWidth, m_inputHeight,
         m_outputWidth, m_outputHeight,
         m_enableSuperRes ? "ON" : "OFF",
@@ -175,9 +365,10 @@ UpwaysPipeline::UpwaysPipeline(
     createPipelines(denoisePrepSpv, denoiserWmmaSpv, upscalerWmmaSpv, upscaleResolveSpv);
 
     Logger::info(
-        "UpwaysPipeline 4.0 initialized ({} active params, {} B verbatim FP8+FP32 weights).",
+        "UpwaysPipeline 4.0 initialized ({} active params, {} B uploaded {} weights).",
         upways::ACTIVE_PARAMETER_COUNT,
-        upways::TOTAL_WEIGHT_BYTES
+        m_weightBuffer->getSize(),
+        upwaysPrecisionDisplayName(m_precision)
     );
 }
 
@@ -245,8 +436,13 @@ UpwaysPipeline::~UpwaysPipeline() {
 void UpwaysPipeline::initWeights(const std::string& weightsPath) {
     static_assert(sizeof(upways::DEFAULT_UPWAYS_WEIGHTS) == upways::TOTAL_WEIGHT_BYTES,
                   "EMBEDDED DEFAULT_UPWAYS_WEIGHTS size must equal 24,064 B");
+    static_assert(sizeof(upways::DEFAULT_UPWAYS_INT8_WEIGHTS) == upways::TOTAL_WEIGHT_BYTES,
+                  "EMBEDDED DEFAULT_UPWAYS_INT8_WEIGHTS size must equal 24,064 B");
     static_assert(sizeof(upways::DEFAULT_WEIGHTS) == upways::TOTAL_WEIGHT_BYTES,
                   "Header upways::DEFAULT_WEIGHTS size must equal 24,064 B");
+
+    const bool isInt8 = (m_precision == UpwaysComputePrecision::Int8);
+    const char* binName = isInt8 ? "upways_weights_int8.bin" : "upways_weights.bin";
 
     std::vector<uint8_t> rawWeights;
     std::vector<std::string> candidates;
@@ -254,17 +450,17 @@ void UpwaysPipeline::initWeights(const std::string& weightsPath) {
         candidates.push_back(weightsPath);
     }
     if (std::filesystem::path exeDir = getExecutableDirectory(); !exeDir.empty()) {
-        candidates.push_back((exeDir / "data" / "models" / "upways_weights.bin").string());
-        candidates.push_back((exeDir / "upways_weights.bin").string());
-        candidates.push_back((exeDir / ".." / "share" / "pathways" / "data" / "models" / "upways_weights.bin").string());
+        candidates.push_back((exeDir / "data" / "models" / binName).string());
+        candidates.push_back((exeDir / binName).string());
+        candidates.push_back((exeDir / ".." / "share" / "pathways" / "data" / "models" / binName).string());
     }
-    candidates.push_back("data/models/upways_weights.bin");
-    candidates.push_back("../data/models/upways_weights.bin");
-    candidates.push_back("../../data/models/upways_weights.bin");
-    candidates.push_back("../../../data/models/upways_weights.bin");
-    candidates.push_back("/usr/share/pathways/data/models/upways_weights.bin");
-    candidates.push_back("/usr/local/share/pathways/data/models/upways_weights.bin");
-    candidates.push_back("upways_weights.bin");
+    candidates.push_back(std::string("data/models/") + binName);
+    candidates.push_back(std::string("../data/models/") + binName);
+    candidates.push_back(std::string("../../data/models/") + binName);
+    candidates.push_back(std::string("../../../data/models/") + binName);
+    candidates.push_back(std::string("/usr/share/pathways/data/models/") + binName);
+    candidates.push_back(std::string("/usr/local/share/pathways/data/models/") + binName);
+    candidates.push_back(binName);
 
     std::string loadedFrom;
     for (const auto& candidate : candidates) {
@@ -293,24 +489,34 @@ void UpwaysPipeline::initWeights(const std::string& weightsPath) {
     }
 
     if (rawWeights.empty()) {
-        rawWeights.assign(
-            upways::DEFAULT_UPWAYS_WEIGHTS,
-            upways::DEFAULT_UPWAYS_WEIGHTS + sizeof(upways::DEFAULT_UPWAYS_WEIGHTS)
+        const uint8_t* embedded = isInt8 ? upways::DEFAULT_UPWAYS_INT8_WEIGHTS : upways::DEFAULT_UPWAYS_WEIGHTS;
+        rawWeights.assign(embedded, embedded + upways::TOTAL_WEIGHT_BYTES);
+        Logger::info(
+            "UpwaysPipeline using embedded {} ({} B).",
+            isInt8 ? "DEFAULT_UPWAYS_INT8_WEIGHTS" : "DEFAULT_UPWAYS_WEIGHTS",
+            rawWeights.size()
         );
-        Logger::info("UpwaysPipeline using embedded DEFAULT_UPWAYS_WEIGHTS ({} B).", rawWeights.size());
     } else {
-        Logger::info("UpwaysPipeline loaded {} B verbatim weights from '{}'.", rawWeights.size(), loadedFrom);
+        Logger::info("UpwaysPipeline loaded {} B {} weights from '{}'.",
+                     rawWeights.size(), upwaysPrecisionDisplayName(m_precision), loadedFrom);
     }
 
-    // Upload 24,064 B verbatim with zero CPU transpose (already exported in column-major 16x16 KxN WMMA tiles)
+    const std::vector<uint8_t> uploadWeights =
+        (m_precision == UpwaysComputePrecision::Fp16)
+            ? expandFp8WeightsToFp16(rawWeights)
+            : std::move(rawWeights);
+    m_weightQuantBytes = (m_precision == UpwaysComputePrecision::Fp16)
+        ? (upways::FP8_WEIGHT_SECTION_BYTES * 2u)
+        : upways::FP8_WEIGHT_SECTION_BYTES;
+
     m_weightBuffer = std::make_unique<Buffer>(
         m_allocator,
-        upways::TOTAL_WEIGHT_BYTES,
+        uploadWeights.size(),
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
     );
-    m_weightBuffer->copyFrom(rawWeights.data(), upways::TOTAL_WEIGHT_BYTES);
+    m_weightBuffer->copyFrom(uploadWeights.data(), uploadWeights.size());
 }
 
 void UpwaysPipeline::createArrayImage(ArrayImage2D& outImg, uint32_t width, uint32_t height, uint32_t layers) {
@@ -410,9 +616,12 @@ void UpwaysPipeline::initRenderResources(uint32_t slotMask) {
         m_device, m_allocator, m_inputWidth, m_inputHeight, VK_FORMAT_R16G16B16A16_SFLOAT, kStorageUsage
     );
 
+    const VkDeviceSize actBytes = (m_precision == UpwaysComputePrecision::Fp16)
+        ? (m_pyramidDims.totalBytes * 2ULL)
+        : m_pyramidDims.totalBytes;
     m_actBuffer = std::make_unique<Buffer>(
         m_allocator,
-        m_pyramidDims.totalBytes,
+        actBytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
     );
@@ -745,12 +954,12 @@ void UpwaysPipeline::refreshDescriptors() {
 
     const VkDescriptorBufferInfo w8Bi{
         m_weightBuffer->getBuffer(),
-        upways::FP8_WEIGHT_SECTION_OFFSET,
-        upways::FP8_WEIGHT_SECTION_BYTES
+        0u,
+        m_weightQuantBytes
     };
     const VkDescriptorBufferInfo w32Bi{
         m_weightBuffer->getBuffer(),
-        upways::FP32_WEIGHT_SECTION_OFFSET,
+        m_weightQuantBytes,
         upways::FP32_WEIGHT_SECTION_BYTES
     };
     const VkDescriptorBufferInfo actBi{ m_actBuffer->getBuffer(), 0u, m_actBuffer->getSize() };
@@ -959,7 +1168,7 @@ void UpwaysPipeline::createPipelines(
                 "upways_v4_vk_pipeline_cache_{:04x}_{:04x}_{}.bin",
                 props.vendorID,
                 props.deviceID,
-                m_useFp8CoopMatrix ? "fp8" : "fp16"
+                upwaysPrecisionName(m_precision)
             );
         }
     }

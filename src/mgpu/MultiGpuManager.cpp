@@ -370,11 +370,9 @@ GpuDeviceNode::~GpuDeviceNode() {
 
     causticsPipeline.reset();
     tlasUpdatePipeline.reset();
-    rtpKhrPipeline.reset();
     wavefrontPipeline.reset();
     restirManager.reset();
     nrcManager.reset();
-    if (rtpPipelineLayout) vkDestroyPipelineLayout(device, rtpPipelineLayout, nullptr);
     for (uint32_t i = 0; i < NUM_IN_FLIGHT; ++i) {
         if (queryPools[i]) vkDestroyQueryPool(device, queryPools[i], nullptr);
         if (renderFences[i]) vkDestroyFence(device, renderFences[i], nullptr);
@@ -385,7 +383,6 @@ GpuDeviceNode::~GpuDeviceNode() {
         videoStagingBuffers[i].reset();
     }
     if (secTimelineSemaphore) vkDestroySemaphore(device, secTimelineSemaphore, nullptr);
-    if (rtDescLayout) vkDestroyDescriptorSetLayout(device, rtDescLayout, nullptr);
     if (descriptorPool) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
     if (commandPool) vkDestroyCommandPool(device, commandPool, nullptr);
 
@@ -393,7 +390,6 @@ GpuDeviceNode::~GpuDeviceNode() {
         accumTargets[i].reset();
     }
     triangleBuffer.reset();
-    sphereBuffer.reset();
     materialBuffer.reset();
     materialArchetypeBuffer.reset();
     shadeMaterialBuffer.reset();
@@ -1166,7 +1162,6 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
     const bool isSampleBlendFsr =
         (m_config.upscaler_mode == UpscalerMode::FSR &&
          m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
-         m_config.denoiser_mode != DenoiserMode::Svgf &&
          m_config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
     if (isSampleBlendFsr) {
         return align64k(static_cast<VkDeviceSize>(width) * height * 8);
@@ -1486,17 +1481,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         uploadToDeviceBufferSec(*secNode, *secNode->triangleBuffer, shadeTriangles.data(), sizeof(TriangleShadeGPU) * shadeTriangles.size());
     }
 
-    VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * scene.spheres.size(), sizeof(SphereGPU));
-    secNode->sphereBuffer = std::make_unique<Buffer>(
-        secAlloc, sphereSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-    );
-    if (!scene.spheres.empty()) {
-        secNode->sphereBuffer->copyFrom(scene.spheres.data(), sizeof(SphereGPU) * scene.spheres.size());
-    }
-
     VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * scene.materials.size(), sizeof(MaterialGPU));
     secNode->materialBuffer = std::make_unique<Buffer>(
         secAlloc, matSize,
@@ -1634,44 +1618,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     descPoolInfo.maxSets = 32;
     vkCreateDescriptorPool(secDevice, &descPoolInfo, nullptr, &secNode->descriptorPool);
 
-    VkShaderStageFlags rtStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-
-    std::vector<VkDescriptorSetLayoutBinding> rtBindings = {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, rtStages, nullptr },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, rtStages, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 8, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_SCENE_TEXTURES, rtStages, nullptr },
-        { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 13, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, rtStages, nullptr },
-        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr },
-        { 26, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 27, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 28, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 29, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, rtStages, nullptr },
-        { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, rtStages, nullptr }
-    };
-
-    VkDescriptorSetLayoutCreateInfo rtLayoutInfo{};
-    rtLayoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    rtLayoutInfo.bindingCount = static_cast<uint32_t>(rtBindings.size());
-    rtLayoutInfo.pBindings = rtBindings.data();
-    vkCreateDescriptorSetLayout(secDevice, &rtLayoutInfo, nullptr, &secNode->rtDescLayout);
-
-    std::vector<VkDescriptorSetLayout> descLayouts(GpuDeviceNode::NUM_IN_FLIGHT, secNode->rtDescLayout);
-    VkDescriptorSetAllocateInfo descAllocInfo{};
-    descAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    descAllocInfo.descriptorPool = secNode->descriptorPool;
-    descAllocInfo.descriptorSetCount = GpuDeviceNode::NUM_IN_FLIGHT;
-    descAllocInfo.pSetLayouts = descLayouts.data();
-    vkAllocateDescriptorSets(secDevice, &descAllocInfo, secNode->rtDescSets.data());
-
     // Allocate secondary G-Buffer & scratch images
     secNode->normalDepthImage = std::make_unique<Image>(secDevice, secAlloc, secWidth, secHeight,
         VK_FORMAT_R16G16B16A16_SFLOAT,
@@ -1689,97 +1635,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
-    VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-
-    VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
-    VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
-    VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
-    VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
-    Buffer* secLightTree = secNode->lightTreeBuffer ? secNode->lightTreeBuffer.get() : secNode->lightBuffer.get();
-    Buffer* secInstances = secNode->instanceBuffer ? secNode->instanceBuffer.get() : secNode->triangleBuffer.get();
-    VkDescriptorBufferInfo lightTreeInfo{ secLightTree->getBuffer(), 0, secLightTree->getSize() };
-    VkDescriptorBufferInfo instanceInfo{ secInstances->getBuffer(), 0, secInstances->getSize() };
-
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
-    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asInfo.accelerationStructureCount = 1;
-    VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
-    asInfo.pAccelerationStructures = &tlasHandle;
-
-    VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
-    VkDescriptorImageInfo blueNoiseInfo = secNode->blueNoiseTexture ? secNode->blueNoiseTexture->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
-
-    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
-    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
-        if (i < secNode->sceneTextures.size() && secNode->sceneTextures[i]) {
-            texInfos[i] = secNode->sceneTextures[i]->getDescriptorInfo();
-        } else {
-            texInfos[i] = secNode->dummyWhite->getDescriptorInfo();
-        }
-    }
-
-    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-        VkDescriptorImageInfo accumImageInfo{};
-        accumImageInfo.imageView = secNode->accumTargets[slot]->getImageView();
-        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
-        std::vector<VkWriteDescriptorSet> writes = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr }
-        };
-        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    }
-
-    // 6. Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) on Secondary GPU
-    VkPushConstantRange rtpPushConstant{};
-    rtpPushConstant.stageFlags = rtStages;
-    rtpPushConstant.offset = 0;
-    rtpPushConstant.size = sizeof(uint32_t) * 16;
-
-    VkPipelineLayoutCreateInfo rtpPipeLayoutInfo{};
-    rtpPipeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    rtpPipeLayoutInfo.setLayoutCount = 1;
-    rtpPipeLayoutInfo.pSetLayouts = &secNode->rtDescLayout;
-    rtpPipeLayoutInfo.pushConstantRangeCount = 1;
-    rtpPipeLayoutInfo.pPushConstantRanges = &rtpPushConstant;
-    vkCreatePipelineLayout(secDevice, &rtpPipeLayoutInfo, nullptr, &secNode->rtpPipelineLayout);
-
-    auto rgenCode = loadShaderSPIRV("raytrace.rgen.spv");
-    auto rmissCode = loadShaderSPIRV("raytrace.rmiss.spv");
-    auto shadowMissCode = loadShaderSPIRV("shadow.rmiss.spv");
-    auto rchitCode = loadShaderSPIRV("raytrace.rchit.spv");
-
-    secNode->rtpKhrPipeline = std::make_unique<RTPipeline>(
-        secDevice, secAlloc,
-        secNode->context->getRayTracingPipelineProperties(),
-        secNode->rtpPipelineLayout,
-        rgenCode, rmissCode, shadowMissCode, rchitCode,
-        secNode->context->hasRtSubgroupSizeControl()
-    );
-    Logger::info("Secondary GPU: Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline) initialized.");
-
     // Wavefront Path Tracing Pipeline on secondary device
-    if (config.pipeline_type == PipelineType::Wavefront) {
+    {
         try {
             auto wfClassifyCode = loadShaderSPIRV("wavefront_classify.comp.spv");
             auto wfIntersectCode = loadShaderSPIRV("wavefront_intersect.comp.spv");
@@ -1787,10 +1644,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadowCode = loadShaderSPIRV("wavefront_shadow.comp.spv");
             auto wfShadeDiffuseCode = loadShaderSPIRV("wavefront_shade_diffuse.comp.spv");
             auto wfShadeDielectricCode = loadShaderSPIRV("wavefront_shade_dielectric.comp.spv");
-            auto wfShadeConductorCode = loadShaderSPIRV("wavefront_shade_conductor.comp.spv");
             auto wfShadeComplexCode = loadShaderSPIRV("wavefront_shade_complex.comp.spv");
             auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
-            auto wfShadePassthroughCode = loadShaderSPIRV("wavefront_shade_passthrough.comp.spv");
             auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
             auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
@@ -1801,8 +1656,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 secDevice, secAlloc,
                 secWidth, secHeight,
                 wfClassifyCode, wfIntersectCode, wfShadeCode, wfShadowCode,
-                wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeConductorCode, wfShadeComplexCode,
-                wfShadeEmissiveCode, wfShadePassthroughCode,
+                wfShadeDiffuseCode, wfShadeDielectricCode, wfShadeComplexCode,
+                wfShadeEmissiveCode,
                 enableSecExecSet,
                 wfShadeDiffuseSecCode, wfShadeComplexSecCode,
                 config.dgc_preprocess && secNode->context->supportsDgcPreprocess(),
@@ -1847,7 +1702,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             }
             Logger::info("Secondary GPU: Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
         } catch (const std::exception& e) {
-            Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}. Falling back to RTP.", e.what());
+            Logger::warn("Failed to initialize secondary GPU Wavefront pipeline: {}", e.what());
             secNode->wavefrontPipeline.reset();
         }
     }
@@ -1887,7 +1742,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->motionVectorImage->transitionLayout(
         secNode->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
 
@@ -1951,7 +1806,6 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
 bool MultiGpuManager::needSecondaryMlGuides() const {
     return (m_config.upscaler_mode == UpscalerMode::Upways ||
             m_config.denoiser_mode == DenoiserMode::Upways ||
-            m_config.denoiser_mode == DenoiserMode::Svgf ||
             m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
             m_config.upways_superres ||
             !m_config.capture_training_data_dir.empty());
@@ -1976,22 +1830,14 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
             secNode->mlSkipImage.reset();
             secNode->mlSpecAlbedoImage.reset();
 
-            VkDescriptorImageInfo fallbackInfo{ VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-            for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-                VkWriteDescriptorSet writes[4] = {
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr },
-                    { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackInfo, nullptr, nullptr }
-                };
-                vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
-            }
             if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
                 VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
                 VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+                VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+                VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
                 for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
                     if (secNode->accumTargets[slot]) {
-                        secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+                        secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
                     }
                 }
             }
@@ -2043,7 +1889,7 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
         img->transitionLayout(
             initCmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
         vkCmdClearColorImage(initCmd, img->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClr, 1, &clearRng);
@@ -2059,25 +1905,14 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
     vkFreeCommandBuffers(secDevice, secNode->commandPool, 1, &initCmd);
 
-    VkDescriptorImageInfo albInfo{ VK_NULL_HANDLE, secNode->mlAlbedoRoughnessImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo smvInfo{ VK_NULL_HANDLE, secNode->mlSpecularMotionImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo diffInfo{ VK_NULL_HANDLE, secNode->mlDiffuseImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    VkDescriptorImageInfo specInfo{ VK_NULL_HANDLE, secNode->mlSpecularImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-        VkWriteDescriptorSet writes[4] = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr }
-        };
-        vkUpdateDescriptorSets(secDevice, 4, writes, 0, nullptr);
-    }
     if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
         VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
         VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
             if (secNode->accumTargets[slot]) {
-                secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+                secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
             }
         }
     }
@@ -2095,14 +1930,6 @@ void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
         if (secNode->causticsPipeline) {
             vkDeviceWaitIdle(secDevice);
             secNode->causticsPipeline.reset();
-            VkDescriptorImageInfo fallbackCaustic{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-            for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-                VkWriteDescriptorSet write{
-                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot],
-                    15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &fallbackCaustic, nullptr, nullptr
-                };
-                vkUpdateDescriptorSets(secDevice, 1, &write, 0, nullptr);
-            }
             updateSecondaryWavefrontDescriptors(secNode);
         }
         return;
@@ -2161,7 +1988,6 @@ void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
         VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
         secNode->causticsPipeline->updateDescriptors(
             secNode->triangleBuffer.get(),
-            secNode->sphereBuffer.get(),
             secNode->materialBuffer.get(),
             secNode->lightBuffer.get(),
             tlasHandle,
@@ -2174,19 +2000,6 @@ void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
             secNode->prevNormalDepthImage.get()
         );
 
-        Image* filteredCaustic = secNode->causticsPipeline->getFilteredCausticImage();
-        VkDescriptorImageInfo causticInfo{
-            VK_NULL_HANDLE,
-            filteredCaustic ? filteredCaustic->getImageView() : secNode->causticImage->getImageView(),
-            VK_IMAGE_LAYOUT_GENERAL
-        };
-        for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-            VkWriteDescriptorSet write{
-                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot],
-                15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr
-            };
-            vkUpdateDescriptorSets(secDevice, 1, &write, 0, nullptr);
-        }
         updateSecondaryWavefrontDescriptors(secNode);
     } catch (const std::exception& e) {
         Logger::warn("Failed to initialize secondary GPU Caustics pipeline: {}", e.what());
@@ -2230,9 +2043,11 @@ void MultiGpuManager::ensureSecondaryNrc(GpuDeviceNode* secNode) {
 
     VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
     VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
         if (secNode->accumTargets[slot]) {
-            secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+            secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
         }
     }
     updateSecondaryWavefrontDescriptors(secNode);
@@ -2276,7 +2091,6 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             secNode->accumTargets[slot]->getImageView(),
             secNode->cameraUBOs[slot]->getBuffer(),
             secNode->triangleBuffer->getBuffer(), secNode->triangleBuffer->getSize(),
-            secNode->sphereBuffer->getBuffer(), secNode->sphereBuffer->getSize(),
             secNode->materialBuffer->getBuffer(), secNode->materialBuffer->getSize(),
             secNode->lightBuffer->getBuffer(), secNode->lightBuffer->getSize(),
             tlasHandle,
@@ -2307,7 +2121,11 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             giPrevBuf ? giPrevBuf->getBuffer() : VK_NULL_HANDLE,
             secNode->prevNormalDepthImage ? secNode->prevNormalDepthImage->getImageView() : VK_NULL_HANDLE,
             secNode->mlSkipImage ? secNode->mlSkipImage->getImageView() : VK_NULL_HANDLE,
-            secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE
+            secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE,
+            VK_NULL_HANDLE,
+            VK_NULL_HANDLE,
+            VK_NULL_HANDLE,
+            VK_NULL_HANDLE
         );
     }
 }
@@ -2440,9 +2258,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     // 2. Update Camera UBO for this slot
     CameraUniform uboSecCopy = packet.cameraUniform;
     uint32_t secSppLoop = packet.cameraUniform.spp;
-    if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline && node->wavefrontPipeline->getWarmupSppOverride() > 0u) {
+    if (node->wavefrontPipeline && node->wavefrontPipeline->getWarmupSppOverride() > 0u) {
         uboSecCopy.spp = node->wavefrontPipeline->getWarmupSppOverride();
-    } else if (m_config.pipeline_type == PipelineType::Wavefront && packet.totalCompositeSpp > 0u) {
+    } else if (packet.totalCompositeSpp > 0u) {
         uboSecCopy.spp = packet.totalCompositeSpp;
     }
     node->cameraUBOs[slot]->copyFrom(&uboSecCopy, sizeof(CameraUniform));
@@ -2500,7 +2318,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         VkMemoryBarrier2 lightBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
         lightBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         lightBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        lightBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         lightBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
         VkDependencyInfo lightDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
         lightDep.memoryBarrierCount = 1;
@@ -2520,21 +2338,6 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         }
         node->sceneTextures[0]->updatePixelsAsync(cmd, *node->videoStagingBuffers[slot], localVideoPixels.data(), localVideoPixels.size());
     }
-
-    uint32_t envBits = std::bit_cast<uint32_t>(packet.envMapIntensity);
-    uint32_t fracBits = std::bit_cast<uint32_t>(packet.fractionalSpp);
-    const uint32_t rtpAccumFlags = (packet.accumulateHistory & 1u) | (needMl ? 2u : 0u);
-    uint32_t rtPushConstants[16] = {
-        packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
-        packet.tileOffsetX, packet.tileOffsetY, packet.tileWidth, packet.tileHeight,
-        packet.useHardwareRT,
-        packet.hasEnvMap,
-        envBits,
-        rtpAccumFlags,
-        fracBits,
-        packet.totalCompositeSpp,
-        packet.numOpaqueTriangles, std::bit_cast<uint32_t>(m_config.indirect_clamp)
-    };
 
     uint32_t dispatchWidth = packet.tileWidth;
     uint32_t dispatchHeight = packet.tileHeight;
@@ -2574,7 +2377,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     bool packDepthInAlpha = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMvDepth && !copyMvImage);
     bool earlyGbufferCopy = false;
 
-    if (m_config.pipeline_type == PipelineType::Wavefront && node->wavefrontPipeline) {
+    if (node->wavefrontPipeline) {
         VkClearColorValue clearVal = { { 0.0f, 0.0f, 0.0f, 0.0f } };
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         std::vector<VkImageMemoryBarrier2> clearBarriers;
@@ -2617,12 +2420,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         WavefrontSceneData wfSceneData{};
         wfSceneData.numTriangles = packet.numTriangles;
-        wfSceneData.numSpheres = packet.numSpheres;
         wfSceneData.numMaterials = packet.numMaterials;
         wfSceneData.numLights = packet.numLights;
         wfSceneData.hasEnvMap = packet.hasEnvMap;
         wfSceneData.envMapIntensity = packet.envMapIntensity;
-        wfSceneData.useHardwareRT = packet.useHardwareRT;
         wfSceneData.frameIndex = packet.cameraUniform.frameIndex;
         wfSceneData.useMorton = m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = packet.accumulateHistory;
@@ -2665,7 +2466,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
             node->causticsPipeline->recordTrace(
                 cmd, slot,
-                packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
+                packet.numTriangles, packet.numMaterials, packet.numLights,
                 packet.numOpaqueTriangles, packet.frameIndex,
                 m_hasDielectrics, m_dielectricBoundsMin, m_dielectricBoundsMax
             );
@@ -2691,28 +2492,6 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                                               0, slot, wfSceneData.captureMlData,
                                               std::min(m_config.indirect_clamp, 8.0f));
         }
-    } else {
-        if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
-            node->causticsPipeline->recordFullPass(
-                cmd, slot,
-                packet.numTriangles, packet.numSpheres, packet.numMaterials, packet.numLights,
-                packet.numOpaqueTriangles, packet.frameIndex,
-                node->normalDepthImage.get(),
-                node->currentCameraFov,
-                false,
-                node->currentCameraMoved,
-                m_hasDielectrics, m_dielectricBoundsMin, m_dielectricBoundsMax,
-                node->currentFullScreenWidth,
-                node->currentCbTileSize
-            );
-        }
-        // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpKhrPipeline->getPipeline());
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, node->rtpPipelineLayout, 0, 1, &node->rtDescSets[slot], 0, nullptr);
-        VkShaderStageFlags rtpStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR;
-        vkCmdPushConstants(cmd, node->rtpPipelineLayout, rtpStages, 0, sizeof(rtPushConstants), rtPushConstants);
-
-        node->rtpKhrPipeline->traceRays(cmd, dispatchWidth, dispatchHeight, 1);
     }
 
 
@@ -2766,7 +2545,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         // Transition upscaler output to TRANSFER_SRC_OPTIMAL
         node->upscaler->getOutputImage()->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT
         );
 
@@ -2818,7 +2597,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         auto makeToTransferBarrier = [&](VkImage img) {
             VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-            b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            b.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             b.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -2950,7 +2729,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             VkImageMemoryBarrier2 b{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
             b.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             b.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-            b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            b.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
             b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2999,7 +2778,7 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         VkImageSubresourceRange ndRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         VkImageMemoryBarrier2 preCopyBarriers[2]{};
         preCopyBarriers[0] = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
-        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        preCopyBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         preCopyBarriers[0].srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
         preCopyBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
         preCopyBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -3074,9 +2853,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          uint32_t bufferSlot,
                                          uint32_t tileOffsetX, uint32_t tileOffsetY,
                                          uint32_t tileWidth, uint32_t tileHeight,
-                                         uint32_t numTriangles, uint32_t numSpheres,
+                                         uint32_t numTriangles,
                                          uint32_t numMaterials, uint32_t numLights,
-                                         uint32_t useHardwareRT,
                                          uint32_t hasEnvMap,
                                          float envMapIntensity,
                                          uint32_t accumulateHistory,
@@ -3111,10 +2889,8 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.tileWidth = tileWidth;
         m_pendingWork.tileHeight = tileHeight;
         m_pendingWork.numTriangles = numTriangles;
-        m_pendingWork.numSpheres = numSpheres;
         m_pendingWork.numMaterials = numMaterials;
         m_pendingWork.numLights = numLights;
-        m_pendingWork.useHardwareRT = useHardwareRT;
         m_pendingWork.hasEnvMap = hasEnvMap;
         m_pendingWork.envMapIntensity = envMapIntensity;
         m_pendingWork.accumulateHistory = accumulateHistory;
@@ -3257,7 +3033,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             node->accumTargets[i]->transitionLayout(
                 node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
                 VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                 VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
             );
         }
@@ -3265,7 +3041,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->normalDepthImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
         node->prevNormalDepthImage->transitionLayout(
@@ -3278,7 +3054,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->motionVectorImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
@@ -3294,7 +3070,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
         node->causticImage->transitionLayout(
             node->commandBuffers[0], VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
         vkCmdClearColorImage(node->commandBuffers[0], node->causticImage->getImage(),
@@ -3327,50 +3103,7 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             node->mlSpecAlbedoImage.reset();
         }
 
-        VkDescriptorImageInfo normDepthInfo{ VK_NULL_HANDLE, node->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo mvInfo{ VK_NULL_HANDLE, node->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorImageInfo causticInfo{ VK_NULL_HANDLE, node->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-        const bool hasValidMlGuides = (node->mlDiffuseImage && node->mlSpecularImage &&
-                                       node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage &&
-                                       node->mlSkipImage && node->mlSpecAlbedoImage);
-        VkDescriptorImageInfo albInfo{
-            VK_NULL_HANDLE,
-            hasValidMlGuides ? node->mlAlbedoRoughnessImage->getImageView() : node->normalDepthImage->getImageView(),
-            VK_IMAGE_LAYOUT_GENERAL
-        };
-        VkDescriptorImageInfo smvInfo{
-            VK_NULL_HANDLE,
-            hasValidMlGuides ? node->mlSpecularMotionImage->getImageView() : node->normalDepthImage->getImageView(),
-            VK_IMAGE_LAYOUT_GENERAL
-        };
-        VkDescriptorImageInfo diffInfo{
-            VK_NULL_HANDLE,
-            hasValidMlGuides ? node->mlDiffuseImage->getImageView() : node->normalDepthImage->getImageView(),
-            VK_IMAGE_LAYOUT_GENERAL
-        };
-        VkDescriptorImageInfo specInfo{
-            VK_NULL_HANDLE,
-            hasValidMlGuides ? node->mlSpecularImage->getImageView() : node->normalDepthImage->getImageView(),
-            VK_IMAGE_LAYOUT_GENERAL
-        };
-
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-            VkDescriptorImageInfo accumImageInfo{};
-            accumImageInfo.imageView = node->accumTargets[slot]->getImageView();
-            accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-            std::vector<VkWriteDescriptorSet> writes = {
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr },
-                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, node->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr }
-            };
-            vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-
             node->slotHasExecuted[slot] = false;
             node->slotFdReady[slot] = false;
             if (node->exportedFd[slot] >= 0) {
@@ -3391,9 +3124,11 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                     node->nrcManager->resize(std::max(renderW, secWidth), std::max(renderH, secHeight));
                     VkImageView mlDiffView = node->mlDiffuseImage ? node->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
                     VkImageView mlSpecView = node->mlSpecularImage ? node->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+                    VkImageView mlArView = node->mlAlbedoRoughnessImage ? node->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+                    VkImageView mlSaView = node->mlSpecAlbedoImage ? node->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
                     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
                         if (node->accumTargets[slot]) {
-                            node->nrcManager->updateDescriptors(slot, node->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView);
+                            node->nrcManager->updateDescriptors(slot, node->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
                         }
                     }
                 } else {
@@ -3600,17 +3335,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         uploadToDeviceBufferSec(*secNode, *secNode->triangleBuffer, shadeTriangles.data(), sizeof(TriangleShadeGPU) * shadeTriangles.size());
     }
 
-    VkDeviceSize sphereSize = std::max(sizeof(SphereGPU) * scene.spheres.size(), sizeof(SphereGPU));
-    secNode->sphereBuffer = std::make_unique<Buffer>(
-        secAlloc, sphereSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-    );
-    if (!scene.spheres.empty()) {
-        secNode->sphereBuffer->copyFrom(scene.spheres.data(), sizeof(SphereGPU) * scene.spheres.size());
-    }
-
     VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * scene.materials.size(), sizeof(MaterialGPU));
     secNode->materialBuffer = std::make_unique<Buffer>(
         secAlloc, matSize,
@@ -3722,93 +3446,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         m_config.hdri_path, m_config.scene_path, scene.domeLightHdriPath
     );
 
-    // 4. Update secondary descriptors
-    VkDescriptorBufferInfo triInfo{ secNode->triangleBuffer->getBuffer(), 0, secNode->triangleBuffer->getSize() };
-    VkDescriptorBufferInfo sphereInfo{ secNode->sphereBuffer->getBuffer(), 0, secNode->sphereBuffer->getSize() };
-    VkDescriptorBufferInfo matInfo{ secNode->materialBuffer->getBuffer(), 0, secNode->materialBuffer->getSize() };
-    VkDescriptorBufferInfo lightInfo{ secNode->lightBuffer->getBuffer(), 0, secNode->lightBuffer->getSize() };
-    Buffer* secLightTree = secNode->lightTreeBuffer ? secNode->lightTreeBuffer.get() : secNode->lightBuffer.get();
-    Buffer* secInstances = secNode->instanceBuffer ? secNode->instanceBuffer.get() : secNode->triangleBuffer.get();
-    VkDescriptorBufferInfo lightTreeInfo{ secLightTree->getBuffer(), 0, secLightTree->getSize() };
-    VkDescriptorBufferInfo instanceInfo{ secInstances->getBuffer(), 0, secInstances->getSize() };
-
-    VkWriteDescriptorSetAccelerationStructureKHR asInfo{};
-    asInfo.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
-    asInfo.accelerationStructureCount = 1;
-    VkAccelerationStructureKHR tlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
-    asInfo.pAccelerationStructures = &tlasHandle;
-
-    VkDescriptorImageInfo envInfo = secNode->environmentMap ? secNode->environmentMap->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
-
-    std::vector<VkDescriptorImageInfo> texInfos(MAX_SCENE_TEXTURES);
-    for (size_t i = 0; i < MAX_SCENE_TEXTURES; ++i) {
-        if (i < secNode->sceneTextures.size() && secNode->sceneTextures[i]) {
-            texInfos[i] = secNode->sceneTextures[i]->getDescriptorInfo();
-        } else {
-            texInfos[i] = secNode->dummyWhite->getDescriptorInfo();
-        }
-    }
-
-    VkDescriptorImageInfo normDepthInfo{};
-    VkDescriptorImageInfo mvInfo{};
-    if (secNode->normalDepthImage) {
-        normDepthInfo = { VK_NULL_HANDLE, secNode->normalDepthImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    }
-    if (secNode->motionVectorImage) {
-        mvInfo = { VK_NULL_HANDLE, secNode->motionVectorImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-    }
-    VkDescriptorImageInfo blueNoiseInfo = secNode->blueNoiseTexture ? secNode->blueNoiseTexture->getDescriptorInfo() : secNode->dummyWhite->getDescriptorInfo();
-
-    for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-        VkDescriptorImageInfo accumImageInfo{};
-        accumImageInfo.imageView = secNode->accumTargets[slot]->getImageView();
-        accumImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-        VkDescriptorBufferInfo uboInfo{ secNode->cameraUBOs[slot]->getBuffer(), 0, sizeof(CameraUniform) };
-        std::vector<VkWriteDescriptorSet> writes = {
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, &asInfo, secNode->rtDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, nullptr, nullptr, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &envInfo, nullptr, nullptr },
-            VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 8, 0, MAX_SCENE_TEXTURES, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texInfos.data(), nullptr, nullptr }
-        };
-        if (secNode->normalDepthImage) {
-            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &normDepthInfo, nullptr, nullptr });
-        }
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &blueNoiseInfo, nullptr, nullptr });
-        if (secNode->motionVectorImage) {
-            writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mvInfo, nullptr, nullptr });
-        }
-        VkDescriptorImageInfo causticInfo = (secNode->causticsPipeline && secNode->causticsPipeline->getFilteredCausticImage())
-            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->causticsPipeline->getFilteredCausticImage()->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-            : (secNode->causticImage
-                ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->causticImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-                : normDepthInfo);
-        VkDescriptorImageInfo albInfo = secNode->mlAlbedoRoughnessImage
-            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlAlbedoRoughnessImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-            : normDepthInfo;
-        VkDescriptorImageInfo smvInfo = secNode->mlSpecularMotionImage
-            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlSpecularMotionImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-            : normDepthInfo;
-        VkDescriptorImageInfo diffInfo = secNode->mlDiffuseImage
-            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlDiffuseImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-            : normDepthInfo;
-        VkDescriptorImageInfo specInfo = secNode->mlSpecularImage
-            ? VkDescriptorImageInfo{ VK_NULL_HANDLE, secNode->mlSpecularImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL }
-            : normDepthInfo;
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 15, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &causticInfo, nullptr, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 25, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightTreeInfo, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 26, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &albInfo, nullptr, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 27, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &smvInfo, nullptr, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 28, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &diffInfo, nullptr, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 29, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specInfo, nullptr, nullptr });
-        writes.push_back(VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, secNode->rtDescSets[slot], 30, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &instanceInfo, nullptr });
-        vkUpdateDescriptorSets(secDevice, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    }
     if (secNode->causticsPipeline) {
         secNode->causticsPipeline->resetHistory();
         if (!m_hasDielectrics) {
@@ -3817,7 +3454,6 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
             VkAccelerationStructureKHR secTlasHandle = secNode->tlas ? secNode->tlas->getHandle() : VK_NULL_HANDLE;
             secNode->causticsPipeline->updateDescriptors(
                 secNode->triangleBuffer.get(),
-                secNode->sphereBuffer.get(),
                 secNode->materialBuffer.get(),
                 secNode->lightBuffer.get(),
                 secTlasHandle,

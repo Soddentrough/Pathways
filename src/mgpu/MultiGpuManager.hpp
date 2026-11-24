@@ -7,7 +7,6 @@
 #include "scene/Camera.hpp"
 #include "core/Config.hpp"
 #include "rt/AccelerationStructure.hpp"
-#include "rt/RTPipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/FsrUpscaler.hpp"
 #include "rt/ReSTIRManager.hpp"
@@ -55,7 +54,6 @@ struct GpuDeviceNode {
 
     // Secondary scene buffers
     std::unique_ptr<Buffer> triangleBuffer;
-    std::unique_ptr<Buffer> sphereBuffer;
     std::unique_ptr<Buffer> materialBuffer;
     std::unique_ptr<Buffer> materialArchetypeBuffer;
     std::unique_ptr<Buffer> shadeMaterialBuffer;
@@ -79,12 +77,8 @@ struct GpuDeviceNode {
     std::vector<std::unique_ptr<Texture>> sceneTextures;
     std::unique_ptr<Texture> blueNoiseTexture;
 
-    // Secondary hardware ray tracing pipeline & descriptors (VK_KHR_ray_tracing_pipeline)
+    // Secondary hardware ray tracing pipeline & descriptors (VK_KHR_ray_query Wavefront)
     VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout rtDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, NUM_IN_FLIGHT> rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkPipelineLayout rtpPipelineLayout = VK_NULL_HANDLE;
-    std::unique_ptr<RTPipeline> rtpKhrPipeline;
     std::unique_ptr<WavefrontPipeline> wavefrontPipeline;
 
     // G-Buffer Resources (used by ray tracer, ReSTIR temporal validation, and FSR / Upways)
@@ -95,7 +89,7 @@ struct GpuDeviceNode {
     std::unique_ptr<Image> motionVectorImage;
     std::unique_ptr<Image> causticImage;
 
-    // Lazy Demodulated ML & Denoiser Guide Images (allocated only when E-SVGF / Upways / training capture is active)
+    // Lazy Demodulated ML & Denoiser Guide Images (allocated only when FFX RR / Upways / training capture is active)
     std::unique_ptr<Image> mlDiffuseImage;
     std::unique_ptr<Image> mlSpecularImage;
     std::unique_ptr<Image> mlAlbedoRoughnessImage;
@@ -170,9 +164,8 @@ public:
                              uint32_t bufferSlot,
                              uint32_t tileOffsetX, uint32_t tileOffsetY,
                              uint32_t tileWidth, uint32_t tileHeight,
-                             uint32_t numTriangles, uint32_t numSpheres,
+                             uint32_t numTriangles,
                              uint32_t numMaterials, uint32_t numLights,
-                             uint32_t useHardwareRT = 0,
                              uint32_t hasEnvMap = 0,
                              float envMapIntensity = 1.0f,
                              uint32_t accumulateHistory = 1,
@@ -265,10 +258,8 @@ private:
         uint32_t tileWidth = 0;
         uint32_t tileHeight = 0;
         uint32_t numTriangles = 0;
-        uint32_t numSpheres = 0;
         uint32_t numMaterials = 0;
         uint32_t numLights = 0;
-        uint32_t useHardwareRT = 0;
         uint32_t hasEnvMap = 0;
         float envMapIntensity = 1.0f;
         uint32_t accumulateHistory = 1;

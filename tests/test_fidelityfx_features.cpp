@@ -9,6 +9,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -19,6 +20,107 @@
 #include <vector>
 
 using namespace pathways;
+
+static bool querySupportsUpwaysWmma(VkInstance instance, VkPhysicalDevice physDevice) {
+    if (instance == VK_NULL_HANDLE || physDevice == VK_NULL_HANDLE) return false;
+    uint32_t extCount = 0;
+    if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, nullptr) != VK_SUCCESS || extCount == 0) {
+        return false;
+    }
+    std::vector<VkExtensionProperties> exts(extCount);
+    if (vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &extCount, exts.data()) != VK_SUCCESS) {
+        return false;
+    }
+    bool hasCoopMatrixExt = false;
+    bool hasFloat8Ext = false;
+    for (const auto& ext : exts) {
+        if (std::strcmp(ext.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) hasCoopMatrixExt = true;
+#ifdef VK_EXT_shader_float8
+        if (std::strcmp(ext.extensionName, VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) == 0) hasFloat8Ext = true;
+#endif
+    }
+    if (!hasCoopMatrixExt) return false;
+
+    VkPhysicalDeviceVulkan11Features vk11Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES };
+    VkPhysicalDeviceVulkan12Features vk12Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+    VkPhysicalDeviceVulkan13Features vk13Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+    vk11Features.pNext = &vk12Features;
+    vk12Features.pNext = &vk13Features;
+    vk13Features.pNext = &coopFeatures;
+#ifdef VK_EXT_shader_float8
+    VkPhysicalDeviceShaderFloat8FeaturesEXT float8Features{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT };
+    if (hasFloat8Ext) {
+        coopFeatures.pNext = &float8Features;
+    }
+#endif
+    VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    feat2.pNext = &vk11Features;
+    vkGetPhysicalDeviceFeatures2(physDevice, &feat2);
+
+    VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES };
+    VkPhysicalDeviceProperties2 props2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    props2.pNext = &subgroupProps;
+    vkGetPhysicalDeviceProperties2(physDevice, &props2);
+
+    const bool hasSubgroup32Compute = (vk13Features.subgroupSizeControl == VK_TRUE) &&
+                                      (subgroupProps.minSubgroupSize <= 32 && subgroupProps.maxSubgroupSize >= 32) &&
+                                      ((subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0);
+    if (coopFeatures.cooperativeMatrix != VK_TRUE || !hasSubgroup32Compute) {
+        return false;
+    }
+
+    auto pfnGetCoopMatProps = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+    if (!pfnGetCoopMatProps) return false;
+
+    uint32_t propCount = 0;
+    if (pfnGetCoopMatProps(physDevice, &propCount, nullptr) != VK_SUCCESS || propCount == 0) return false;
+    std::vector<VkCooperativeMatrixPropertiesKHR> coopProps(propCount);
+    for (auto& cp : coopProps) {
+        cp = {};
+        cp.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    }
+    if (pfnGetCoopMatProps(physDevice, &propCount, coopProps.data()) != VK_SUCCESS) return false;
+
+    bool hasFp8Mat = false;
+    bool hasInt8Mat = false;
+    bool hasFp16Mat = false;
+    for (const auto& cp : coopProps) {
+        if (cp.scope != VK_SCOPE_SUBGROUP_KHR || cp.MSize != 16u || cp.NSize != 16u || cp.KSize != 16u) {
+            continue;
+        }
+        if (cp.AType == VK_COMPONENT_TYPE_SINT8_KHR && cp.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+            cp.ResultType == VK_COMPONENT_TYPE_SINT32_KHR) {
+            hasInt8Mat = true;
+        }
+        if (cp.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && cp.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+            hasFp16Mat = true;
+        }
+#ifdef VK_EXT_shader_float8
+        if (cp.AType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT && cp.BType == VK_COMPONENT_TYPE_FLOAT8_E4M3_EXT &&
+            cp.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR) {
+            hasFp8Mat = true;
+        }
+#endif
+    }
+
+#ifdef VK_EXT_shader_float8
+    const bool hasFp8 = hasFloat8Ext && (float8Features.shaderFloat8 == VK_TRUE) &&
+                        (float8Features.shaderFloat8CooperativeMatrix == VK_TRUE) && hasFp8Mat;
+#else
+    const bool hasFp8 = false;
+#endif
+    const bool hasInt8 = (vk12Features.shaderInt8 == VK_TRUE) &&
+                         (vk12Features.storageBuffer8BitAccess == VK_TRUE) &&
+                         (vk12Features.shaderFloat16 == VK_TRUE) &&
+                         hasInt8Mat;
+    const bool hasFp16 = (vk12Features.shaderFloat16 == VK_TRUE) &&
+                         (vk11Features.storageBuffer16BitAccess == VK_TRUE) &&
+                         hasFp16Mat;
+    return hasFp8 || hasInt8 || hasFp16;
+}
 
 static void check_true(bool cond, const std::string& msg) {
     if (!cond) {
@@ -320,8 +422,10 @@ int main(int argc, char** argv) {
     VkPhysicalDevice targetPhys = discreteIndices.empty() ? physDevices[0] : physDevices[discreteIndices[std::min<size_t>(targetGpuIdx, discreteIndices.size() - 1)]];
 
     bool hwMl = FfxSdkRuntime::supportsHardwareMl(targetPhys);
+    const bool supportsUpways = querySupportsUpwaysWmma(instance, targetPhys);
     std::cout << "  -> Selected GPU index " << targetGpuIdx << " | API Hardware ML Support (CoopMatrix + 8-bit + MutableDesc): "
-              << (hwMl ? "YES" : "NO") << std::endl;
+              << (hwMl ? "YES" : "NO") << " | Upways Wave32 WMMA (FP8/INT8/FP16): "
+              << (supportsUpways ? "YES" : "NO") << std::endl;
 
     // -------------------------------------------------------------------------
     // TEST 2: FidelityFX SDK 2.4.0 Effect Version Queries & Bitfield Extraction
@@ -333,7 +437,6 @@ int main(int argc, char** argv) {
 #if defined(PATHWAYS_HAS_FFX_SDK)
     const bool hasUpscalerProvider = FfxSdkRuntime::instance().hasNativeProvider(FfxEffectModule::Upscaler);
     const bool expectsFsr4 = hasUpscalerProvider && FfxSdkRuntime::instance().isUpscalerVersionSupported(targetPhys, VK_NULL_HANDLE, 4u);
-    const bool supportsUpways = FfxSdkRuntime::supportsHardwareFloat8(targetPhys);
     auto upscaleVersions = FfxSdkRuntime::instance().queryEffectVersions(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE, targetPhys);
     if (hasUpscalerProvider) {
         check_true(!upscaleVersions.empty(), "Upscale effect versions must not be empty when Upscaler Vulkan provider is loaded");
@@ -402,6 +505,22 @@ int main(int argc, char** argv) {
         Config cRR = Config::parse(3, const_cast<char**>(argvRR));
         check_true(cRR.denoiser_mode == DenoiserMode::FfxRayRegeneration,
                    "--denoiser rayregen must select DenoiserMode::FfxRayRegeneration");
+
+        auto expectRejected = [](std::initializer_list<const char*> args, const std::string& label) {
+            std::vector<char*> argv;
+            for (const char* a : args) argv.push_back(const_cast<char*>(a));
+            bool threw = false;
+            try {
+                (void)Config::parse(static_cast<int>(argv.size()), argv.data());
+            } catch (const std::runtime_error&) {
+                threw = true;
+            }
+            check_true(threw, label);
+        };
+        expectRejected({ "pathways", "--svgf" }, "Removed --svgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--esvgf" }, "Removed --esvgf flag must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "svgf" }, "Removed --denoiser svgf must throw std::runtime_error");
+        expectRejected({ "pathways", "--denoiser", "esvgf" }, "Removed --denoiser esvgf must throw std::runtime_error");
 
         const char* argvNrc[] = { "pathways", "--radiance-cache" };
         Config cNrc = Config::parse(2, const_cast<char**>(argvNrc));
@@ -533,10 +652,6 @@ int main(int argc, char** argv) {
         hasDenoiserProvider ? "FFX Ray Regeneration (1.2.1)" : "Ray Regen (Gated -> Off)",
         "--upscaler none --denoiser rayregen --spp 1", &refPixels, refW, refH);
 
-    // 6b. Render In-House E-SVGF Denoiser (--denoiser svgf)
-    FeatureRunResult svgfRun = runFeatureConfig(
-        "05b_esvgf", "Denoiser: E-SVGF (Native 1.0x)", "--upscaler none --denoiser svgf --spp 1", &refPixels, refW, refH);
-
     // 7. Render Radiance Caching (--nrc)
     FeatureRunResult nrcRun = runFeatureConfig(
         "06_radiance_cache",
@@ -554,8 +669,6 @@ int main(int argc, char** argv) {
         "07c1_fsr3_upways_denoiser", supportsUpways ? "FSR 3.1 + Upways Denoiser" : "FSR 3.1 + Upways (Gated -> Off)", "--upscaler fsr3 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr4UpwaysDenRun = runFeatureConfig(
         "07c2_fsr4_upways_denoiser", supportsUpways ? "FSR 4.1 ML + Upways Denoiser" : "FSR 4.1 ML + Upways (Gated -> Off)", "--upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
-    FeatureRunResult fsr4SvgfDenRun = runFeatureConfig(
-        "07c3_fsr4_esvgf_denoiser", "FSR 4.1 ML + E-SVGF Denoiser", "--upscaler fsr4 --render-scale 0.67 --denoiser svgf --spp 1", &refPixels, refW, refH);
 
     // 10. Render ReSTIR PT & Real-Time Caustics
     FeatureRunResult restirRun = runFeatureConfig(
@@ -566,16 +679,16 @@ int main(int argc, char** argv) {
     // 11. Render Combined Stack: Supported Upscaler + Denoiser + Radiance Caching + ReSTIR + Caustics
     FeatureRunResult combinedRun = runFeatureConfig(
         "07_combined_ffx_stack",
-        hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + E-SVGF + GI",
+        hasDenoiserProvider ? "Combined FSR + RayRegen + GI" : "Combined FSR + Upways + GI",
         hasDenoiserProvider
             ? "--upscaler fsr --render-scale 0.67 --denoiser rayregen --nrc --restir --caustics --spp 1"
-            : "--upscaler fsr --render-scale 0.67 --denoiser svgf --nrc --restir --caustics --spp 1",
+            : "--upscaler fsr --render-scale 0.67 --denoiser upways --nrc --restir --caustics --spp 1",
         &refPixels, refW, refH);
 
     std::vector<FeatureRunResult> allRuns = {
         raw1SppRun, baseMcRun, fsr3Run, fsr4Run, upwaysSrRun,
-        rayRegenRun, svgfRun, upwaysDenRun, fsr3UpwaysDenRun,
-        fsr4UpwaysDenRun, fsr4SvgfDenRun,
+        rayRegenRun, upwaysDenRun, fsr3UpwaysDenRun,
+        fsr4UpwaysDenRun,
         nrcRun, restirRun, causticsRun, combinedRun
     };
 
@@ -622,10 +735,8 @@ int main(int argc, char** argv) {
                        "FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'Upways'");
         } else {
             check_true(fsr4UpwaysDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4UpwaysDenRun.reportedDenoiser == "None",
-                       "Without RDNA 4 FP8, FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'None'");
+                       "Without Wave32 WMMA (FP8/INT8/FP16), FSR 4.1 ML + Upways Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'None'");
         }
-        check_true(fsr4SvgfDenRun.reportedUpscaler == "FSR 4.1 ML" && fsr4SvgfDenRun.reportedDenoiser == "SVGF",
-                   "FSR 4.1 ML + E-SVGF Denoiser must report upscaler_mode == 'FSR 4.1 ML' and denoiser_mode == 'SVGF'");
         check_true(combinedRun.reportedUpscaler == "FSR 4.1 ML",
                    "Combined run must report upscaler_mode == 'FSR 4.1 ML'");
     } else {
@@ -641,10 +752,8 @@ int main(int argc, char** argv) {
                    "Ray Regeneration run must report FFX Ray Regeneration denoiser mode, got '" + rayRegenRun.reportedDenoiser + "'");
     } else {
         check_true(rayRegenRun.reportedDenoiser == "None",
-                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected (never fall back to SVGF) and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
+                   "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
     }
-    check_true(svgfRun.reportedDenoiser == "SVGF",
-               "E-SVGF run must report denoiser_mode == 'SVGF', got '" + svgfRun.reportedDenoiser + "'");
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
     if (supportsUpways) {
         check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
@@ -654,11 +763,11 @@ int main(int argc, char** argv) {
                        "FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'Upways'");
         }
     } else {
-        check_true(upwaysSrRun.reportedUpscaler == "None", "Without RDNA 4 FP8, Upways SR run must report upscaler_mode == 'None'");
-        check_true(upwaysDenRun.reportedDenoiser == "None", "Without RDNA 4 FP8, Upways Denoiser run must report denoiser_mode == 'None'");
+        check_true(upwaysSrRun.reportedUpscaler == "None", "Without Wave32 WMMA (FP8/INT8/FP16), Upways SR run must report upscaler_mode == 'None'");
+        check_true(upwaysDenRun.reportedDenoiser == "None", "Without Wave32 WMMA (FP8/INT8/FP16), Upways Denoiser run must report denoiser_mode == 'None'");
         if (hasUpscalerProvider) {
             check_true(fsr3UpwaysDenRun.reportedUpscaler == "FSR 3.1" && fsr3UpwaysDenRun.reportedDenoiser == "None",
-                       "Without RDNA 4 FP8, FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'None'");
+                       "Without Wave32 WMMA (FP8/INT8/FP16), FSR 3.1 + Upways Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'None'");
         }
     }
 
@@ -682,8 +791,6 @@ int main(int argc, char** argv) {
     }
 
     // Assertions: Surface-Guided & ML Edge Retention
-    check_true(svgfRun.visual.gradientEnergyRatio >= 0.70,
-               "Surface-guided native denoiser (E-SVGF) must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
     if (supportsUpways) {
         check_true(upwaysDenRun.visual.gradientEnergyRatio >= 0.70,
                    "Surface-guided native denoiser (Upways) must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
@@ -698,14 +805,14 @@ int main(int argc, char** argv) {
             check_true(fsr4UpwaysDenRun.visual.gradientEnergyRatio >= 0.70,
                        "Coupled FSR 4.1 ML + Upways Denoiser must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
         }
-        check_true(fsr4SvgfDenRun.visual.gradientEnergyRatio >= 0.70,
-                   "Coupled FSR 4.1 ML + E-SVGF Denoiser must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
     }
 
     // Assertions: Denoiser Visual Noise Reduction & Coupled Upscaler+Denoiser Assessment
-    const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : svgfRun;
-    check_true(activeDenoiserRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
-               "Active denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+    const FeatureRunResult& activeDenoiserRun = hasDenoiserProvider ? rayRegenRun : upwaysDenRun;
+    if (hasDenoiserProvider || supportsUpways) {
+        check_true(activeDenoiserRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
+                   "Active denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+    }
     if (supportsUpways) {
         check_true(upwaysDenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
                    "Upways standalone denoiser must reduce 1-SPP high-frequency noise variance by >80%");
@@ -717,8 +824,6 @@ int main(int argc, char** argv) {
             check_true(fsr4UpwaysDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
                        "Coupling FSR 4.1 ML with Upways Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
         }
-        check_true(fsr4SvgfDenRun.visual.laplacianNoiseVar < fsr4Run.visual.laplacianNoiseVar * 0.40,
-                   "Coupling FSR 4.1 ML with E-SVGF Denoiser must reduce residual 1-SPP noise variance by >60% vs standalone FSR 4.1 ML");
     }
 
     // Assertions: Performance Assessment
@@ -730,11 +835,13 @@ int main(int argc, char** argv) {
         check_true(fsr4Run.rtMs < baseMcRun.rtMs && fsr4Run.denoiserSrMs > 0.0 && fsr4Run.denoiserSrMs < 4.0 && fsr4Run.avgFrameMs < 8.33,
                    "FSR 4.1 ML (0.67x) must reduce RT time and record valid ML upscale pass telemetry within 120Hz frame budget");
     }
-    check_true(activeDenoiserRun.denoiserSrMs < 3.5,
-               "Active denoiser pass time at 720p must be < 3.5 ms (got " + std::to_string(activeDenoiserRun.denoiserSrMs) + " ms)");
-    check_true(activeDenoiserRun.rtMs <= baseMcRun.rtMs * 1.25 + 0.35,
-               "Enabling denoiser must not inflate Wavefront RT time by >25% (base RT=" +
-               std::to_string(baseMcRun.rtMs) + " ms, denoiser RT=" + std::to_string(activeDenoiserRun.rtMs) + " ms)");
+    if (hasDenoiserProvider || supportsUpways) {
+        check_true(activeDenoiserRun.denoiserSrMs < 3.5,
+                   "Active denoiser pass time at 720p must be < 3.5 ms (got " + std::to_string(activeDenoiserRun.denoiserSrMs) + " ms)");
+        check_true(activeDenoiserRun.rtMs <= baseMcRun.rtMs * 1.25 + 0.35,
+                   "Enabling denoiser must not inflate Wavefront RT time by >25% (base RT=" +
+                   std::to_string(baseMcRun.rtMs) + " ms, denoiser RT=" + std::to_string(activeDenoiserRun.rtMs) + " ms)");
+    }
 
     // -------------------------------------------------------------------------
     // TEST 5: Temporal Stability / Frame-to-Frame Flicker Assessment
@@ -784,13 +891,11 @@ int main(int argc, char** argv) {
             "10c_motion_upways_sr", "Motion: Upways SR (0.67x)", "--camera-motion --upscaler upways --render-scale 0.67 --denoiser none --spp 1", &mRefPixels, mRefW, mRefH, 12);
         FeatureRunResult motionFsr4Upways = runFeatureConfig(
             "10d_motion_fsr4_upways", "Motion: FSR 4.1 ML + Upways", "--camera-motion --upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
-        FeatureRunResult motionFsr4Svgf = runFeatureConfig(
-            "10e_motion_fsr4_svgf", "Motion: FSR 4.1 ML + E-SVGF", "--camera-motion --upscaler fsr4 --render-scale 0.67 --denoiser svgf --spp 1", &mRefPixels, mRefW, mRefH, 12);
         FeatureRunResult motionUpwaysDen = runFeatureConfig(
             "10f_motion_upways_den", "Motion: Upways Denoiser (1.0x)", "--camera-motion --upscaler none --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
 
         std::vector<FeatureRunResult> motionRuns = {
-            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionFsr4Svgf, motionUpwaysDen
+            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionUpwaysDen
         };
         for (const auto& mr : motionRuns) {
             std::cout << "  -> " << std::left << std::setw(30) << mr.name
@@ -816,17 +921,12 @@ int main(int argc, char** argv) {
                            "Motion FSR 4.1 ML + Upways Denoiser must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
             }
         }
-        if (expectsFsr4) {
-            check_true(motionFsr4Svgf.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
-                       motionFsr4Svgf.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,
-                       "Motion FSR 4.1 ML + E-SVGF Denoiser must significantly reduce 1-SPP noise and boost PSNR under continuous camera motion");
-        }
     }
 
     // -------------------------------------------------------------------------
     // TEST 7: Multi-GPU Checkerboard (--mgpu tile) + Neural Upscaler/Denoiser Parity
     // -------------------------------------------------------------------------
-    if (discreteIndices.size() >= 2) {
+    if (supportsUpways && discreteIndices.size() >= 2) {
         std::cout << "[TEST 7] Evaluating Multi-GPU Checkerboard (--mgpu tile) with Upways SR & FSR 4.1 ML + Upways Denoiser..." << std::endl;
         FeatureRunResult mgpuUpwaysSr = runFeatureConfig(
             "11a_mgpu_upways_sr", "MGPU Tile: Upways SR (0.67x)", "--mgpu tile --upscaler upways --render-scale 0.67 --denoiser none --spp 1", &refPixels, refW, refH);

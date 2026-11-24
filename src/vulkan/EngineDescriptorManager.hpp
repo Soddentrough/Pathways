@@ -37,7 +37,6 @@ struct ImageDescriptorParams {
 
 struct SceneDescriptorParams {
     Buffer* triangleBuffer = nullptr;
-    Buffer* sphereBuffer = nullptr;
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
     Buffer* lightTreeBuffer = nullptr;
@@ -57,7 +56,6 @@ struct WavefrontDescriptorParams {
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
     const std::array<std::unique_ptr<Buffer>, 2>* cameraUBOs = nullptr;
     Buffer* triangleBuffer = nullptr;
-    Buffer* sphereBuffer = nullptr;
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
     Buffer* lightTreeBuffer = nullptr;
@@ -77,6 +75,10 @@ struct WavefrontDescriptorParams {
     Image* mlSpecularImage = nullptr;
     Image* mlSkipImage = nullptr;
     Image* mlSpecAlbedoImage = nullptr;
+    Image* mlDirectDiffuseImage = nullptr;
+    Image* mlIndirectDiffuseImage = nullptr;
+    Image* mlDirectSpecularImage = nullptr;
+    Image* mlIndirectSpecularImage = nullptr;
     Image* filteredCausticImage = nullptr;
 };
 
@@ -109,21 +111,11 @@ public:
     EngineDescriptorManager(const EngineDescriptorManager&) = delete;
     EngineDescriptorManager& operator=(const EngineDescriptorManager&) = delete;
 
-    /// Creates descriptor pool, RT descriptor set layout, allocates RT descriptor sets,
-    /// and performs initial bindings for frame images and camera UBOs.
-    void init(
-        const std::array<Image*, MAX_FRAMES_IN_FLIGHT>& frameImages,
-        const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs
-    );
+    /// Creates descriptor pool for compute post-processing and transfer subsystems.
+    void init();
 
     /// Explicit destruction of Vulkan descriptor resources.
     void destroy();
-
-    /// Updates image storage descriptors (bindings 0, 11, 12, 14, 15) in RT descriptor sets.
-    void updatePrimaryImageDescriptors(const ImageDescriptorParams& params);
-
-    /// Updates scene geometry, material, light buffers, TLAS, environment map, and textures (bindings 2..8, 13).
-    void updatePrimarySceneDescriptors(const SceneDescriptorParams& params);
 
     /// Updates Wavefront compute pipeline scene descriptor sets across frames-in-flight and NRC descriptors.
     void updateWavefrontDescriptors(const WavefrontDescriptorParams& params);
@@ -132,9 +124,6 @@ public:
     void updateMergeDescriptors(const MergeDescriptorParams& params);
 
     [[nodiscard]] VkDescriptorPool getPool() const noexcept { return m_descriptorPool; }
-    [[nodiscard]] VkDescriptorSetLayout getRtDescLayout() const noexcept { return m_rtDescLayout; }
-    [[nodiscard]] VkDescriptorSet getRtDescSet(uint32_t slot) const noexcept { return m_rtDescSets[slot]; }
-    [[nodiscard]] const std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT>& getRtDescSets() const noexcept { return m_rtDescSets; }
     [[nodiscard]] Buffer* getSecTransferBuffer() const noexcept { return m_secTransferBuffer.get(); }
 
 private:
@@ -142,8 +131,6 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
 
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSetLayout m_rtDescLayout = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_rtDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
 
     std::unique_ptr<Buffer> m_secTransferBuffer;
 };

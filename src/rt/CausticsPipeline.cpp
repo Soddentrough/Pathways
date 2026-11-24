@@ -72,10 +72,9 @@ VkShaderModule CausticsPipeline::createShaderModule(const std::vector<char>& cod
 }
 
 void CausticsPipeline::createDescriptorLayouts() {
-    // 1a. Trace Layout: Triangles(2), Spheres(3), Materials(4), Lights(5), TLAS(6), Textures(8), Photons(20), Instances(30)
+    // 1a. Trace Layout: Triangles(2), Materials(4), Lights(5), TLAS(6), Textures(8), Photons(20), Instances(30)
     std::vector<VkDescriptorSetLayoutBinding> traceBindings = {
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -313,14 +312,13 @@ void CausticsPipeline::resize(uint32_t width, uint32_t height, ImmediateSubmitFn
 
 void CausticsPipeline::updateDescriptors(
     Buffer* triangleBuffer,
-    Buffer* sphereBuffer,
     Buffer* materialBuffer,
     Buffer* lightBuffer,
     VkAccelerationStructureKHR tlasHandle,
     const std::vector<std::unique_ptr<Texture>>& sceneTextures,
     Texture* dummyWhite,
     Buffer* instanceBuffer,
-        const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs,
+    const std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT>& cameraUBOs,
     Image* normalDepthImage,
     Image* motionVectorImage,
     Image* prevNormalDepthImage)
@@ -332,7 +330,6 @@ void CausticsPipeline::updateDescriptors(
     }
 
     VkDescriptorBufferInfo triInfo{ triangleBuffer->getBuffer(), 0, triangleBuffer->getSize() };
-    VkDescriptorBufferInfo sphereInfo{ sphereBuffer ? sphereBuffer->getBuffer() : triangleBuffer->getBuffer(), 0, sphereBuffer ? sphereBuffer->getSize() : triangleBuffer->getSize() };
     VkDescriptorBufferInfo matInfo{ materialBuffer ? materialBuffer->getBuffer() : triangleBuffer->getBuffer(), 0, materialBuffer ? materialBuffer->getSize() : triangleBuffer->getSize() };
     VkDescriptorBufferInfo lightInfo{ lightBuffer ? lightBuffer->getBuffer() : triangleBuffer->getBuffer(), 0, lightBuffer ? lightBuffer->getSize() : triangleBuffer->getSize() };
 
@@ -374,7 +371,6 @@ void CausticsPipeline::updateDescriptors(
         // 1. Caustic Trace Set
         VkDescriptorSet traceSet = m_traceDescSets[slot];
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr });
-        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, traceSet, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr });
         if (tlasHandle != VK_NULL_HANDLE) {
@@ -411,7 +407,6 @@ void CausticsPipeline::recordTrace(
     VkCommandBuffer cmd,
     uint32_t frameSlot,
     uint32_t numTriangles,
-    uint32_t numSpheres,
     uint32_t numMaterials,
     uint32_t numLights,
     uint32_t numOpaqueTriangles,
@@ -427,7 +422,7 @@ void CausticsPipeline::recordTrace(
 
     struct CausticTracePC {
         uint32_t numTriangles;
-        uint32_t numSpheres;
+        uint32_t _pad0;
         uint32_t numMaterials;
         uint32_t numLights;
         uint32_t photonCount;
@@ -437,9 +432,11 @@ void CausticsPipeline::recordTrace(
         glm::vec4 targetBBoxMin;
         glm::vec4 targetBBoxMax;
     } pc;
+    static_assert(sizeof(CausticTracePC) == 64 && offsetof(CausticTracePC, targetBBoxMin) == 32,
+                  "CausticTracePC layout mismatch with caustic_photon_trace.comp");
 
     pc.numTriangles = numTriangles;
-    pc.numSpheres = numSpheres;
+    pc._pad0 = 0u;
     pc.numMaterials = numMaterials;
     pc.numLights = numLights;
     pc.photonCount = m_photonCount;
@@ -625,7 +622,7 @@ void CausticsPipeline::recordSplatAndFilter(
     VkImageMemoryBarrier2 finalBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
     finalBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
     finalBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    finalBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     finalBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
     finalBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
     finalBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -636,37 +633,6 @@ void CausticsPipeline::recordSplatAndFilter(
     finalDep.imageMemoryBarrierCount = 1;
     finalDep.pImageMemoryBarriers = &finalBarrier;
     vkCmdPipelineBarrier2(cmd, &finalDep);
-}
-
-void CausticsPipeline::recordFullPass(
-    VkCommandBuffer cmd,
-    uint32_t frameSlot,
-    uint32_t numTriangles,
-    uint32_t numSpheres,
-    uint32_t numMaterials,
-    uint32_t numLights,
-    uint32_t numOpaqueTriangles,
-    uint32_t frameIndex,
-    Image* normalDepthImage,
-    float cameraFov,
-    bool progressiveAccumulation,
-    bool cameraMovedLastFrame,
-    bool hasDielectrics,
-    const glm::vec3& dielectricBoundsMin,
-    const glm::vec3& dielectricBoundsMax,
-    uint32_t fullScreenWidth,
-    uint32_t checkerboardTileSize)
-{
-    if (!hasDielectrics || numLights == 0) return;
-
-    recordTrace(cmd, frameSlot, numTriangles, numSpheres, numMaterials, numLights,
-                numOpaqueTriangles, frameIndex, hasDielectrics,
-                dielectricBoundsMin, dielectricBoundsMax);
-
-    recordSplatAndFilter(cmd, frameSlot, normalDepthImage, cameraFov, frameIndex,
-                         progressiveAccumulation, cameraMovedLastFrame,
-                         hasDielectrics, dielectricBoundsMin, dielectricBoundsMax,
-                         fullScreenWidth, checkerboardTileSize);
 }
 
 } // namespace pathways

@@ -83,7 +83,7 @@ void Texture::updatePixelsAsync(
     // Transition image: SHADER_READ_ONLY_OPTIMAL -> TRANSFER_DST_OPTIMAL
     m_image->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
     );
@@ -105,7 +105,7 @@ void Texture::updatePixelsAsync(
     m_image->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
     );
 }
@@ -230,7 +230,7 @@ std::unique_ptr<Texture> Texture::createFromPixels(
 
             barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
             barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
-            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
             barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -244,7 +244,7 @@ std::unique_ptr<Texture> Texture::createFromPixels(
         lastBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
         lastBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
         lastBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-        lastBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+        lastBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
         lastBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
         lastBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         lastBarrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;

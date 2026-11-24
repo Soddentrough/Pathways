@@ -21,12 +21,14 @@ SuperResolutionManager::SuperResolutionManager(VkDevice device,
                                                VkPhysicalDevice physicalDevice,
                                                VmaAllocator allocator,
                                                VkQueue queue,
-                                               ShaderLoaderFunc shaderLoader)
+                                               ShaderLoaderFunc shaderLoader,
+                                               VkInstance instance)
     : m_device(device),
       m_physicalDevice(physicalDevice),
       m_allocator(allocator),
       m_queue(queue),
-      m_shaderLoader(std::move(shaderLoader)) {
+      m_shaderLoader(std::move(shaderLoader)),
+      m_instance(instance) {
 }
 
 SuperResolutionManager::~SuperResolutionManager() {
@@ -99,8 +101,15 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         return;
     }
     try {
-        const bool useFp8 = UpwaysPipeline::supportsFp8CoopMatrix(m_physicalDevice);
-        const char* ext = useFp8 ? ".comp.spv" : ".fp16.comp.spv";
+        const UpwaysComputePrecision prec = UpwaysPipeline::selectPrecision(
+            m_physicalDevice, config.upways_precision, m_instance
+        );
+        const char* ext = ".comp.spv";
+        if (prec == UpwaysComputePrecision::Int8) {
+            ext = ".int8.comp.spv";
+        } else if (prec == UpwaysComputePrecision::Fp16) {
+            ext = ".fp16.comp.spv";
+        }
         auto denoisePrepCode    = m_shaderLoader(std::string("upways_denoise_prep") + ext);
         auto denoiserWmmaCode   = m_shaderLoader(std::string("upways_denoiser_wmma") + ext);
         auto upscalerWmmaCode   = m_shaderLoader(std::string("upways_upscaler_wmma") + ext);
@@ -128,9 +137,12 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
             config.upways_weights_path,
             isSuperRes,
             format,
-            useFp8
+            prec
         );
-        Logger::info("Upways 4.0 Neural Denoiser & Super-Resolution Pipeline initialized on demand.");
+        Logger::info(
+            "Upways 4.0 ({}) Neural Denoiser & Super-Resolution Pipeline initialized on demand.",
+            upwaysPrecisionDisplayName(prec)
+        );
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("Upways was requested but initialization failed: ") + e.what());
     }
@@ -267,7 +279,8 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
                                     UpscalerMode upscalerMode, DenoiserMode denoiserMode,
                                     bool upwaysSuperres, AccumFormat accumFormat,
                                     PostProcessPipeline* postProcess, VkCommandBuffer cmd,
-                                    FsrVersion fsrVersion) {
+                                    FsrVersion fsrVersion,
+                                    UpwaysPrecision upwaysPrecision) {
     Config cfgStub{};
     cfgStub.width = width;
     cfgStub.height = height;
@@ -277,6 +290,7 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     cfgStub.upways_superres = upwaysSuperres;
     cfgStub.accum_format = accumFormat;
     cfgStub.fsr_version = fsrVersion;
+    cfgStub.upways_precision = upwaysPrecision;
 
     releaseInactivePipelines(cfgStub);
 
@@ -288,12 +302,25 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
 
     destroyUpwaysResources();
     if (isUpwaysRequested(cfgStub)) {
+        const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
+            m_physicalDevice, cfgStub.upways_precision, m_instance
+        );
+        bool recreated = false;
+        if (m_upwaysPipeline && m_upwaysPipeline->getPrecision() != targetPrec) {
+            vkDeviceWaitIdle(m_device);
+            destroyUpwaysPipelines();
+            recreated = true;
+        }
         if (!m_upwaysPipeline) {
             createUpwaysPipelines(cfgStub);
+            recreated = true;
         } else {
             m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
         }
         createUpwaysResources(cfgStub, postProcess, cmd);
+        if (recreated) {
+            refreshCachedDescriptors();
+        }
     }
 
     destroyFsrResources();
@@ -380,6 +407,14 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
                                             PostProcessPipeline* postProcess, Image* outputImage) {
     if (config.denoiser_mode != DenoiserMode::Upways && config.upscaler_mode != UpscalerMode::Upways) {
         return false;
+    }
+
+    const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
+        m_physicalDevice, config.upways_precision, m_instance
+    );
+    if (m_upwaysPipeline && m_upwaysPipeline->getPrecision() != targetPrec) {
+        vkDeviceWaitIdle(m_device);
+        destroyUpwaysPipelines();
     }
 
     if (!m_upwaysPipeline) {

@@ -16,10 +16,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      const std::vector<char>& shadowCode,
                                      const std::vector<char>& shadeDiffuseCode,
                                      const std::vector<char>& shadeDielectricCode,
-                                     const std::vector<char>& shadeConductorCode,
                                      const std::vector<char>& shadeComplexCode,
                                      const std::vector<char>& shadeEmissiveCode,
-                                     const std::vector<char>& shadePassthroughCode,
                                      bool supportsExecutionSet,
                                      const std::vector<char>& shadeDiffuseSecCode,
                                      const std::vector<char>& shadeComplexSecCode,
@@ -39,8 +37,8 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     allocateQueues(m_maxCapacity);
     updateQueueDescriptors();
     createPipelines(classifyCode, intersectCode, shadeCode, shadowCode,
-                    shadeDiffuseCode, shadeDielectricCode, shadeConductorCode, shadeComplexCode,
-                    shadeEmissiveCode, shadePassthroughCode,
+                    shadeDiffuseCode, shadeDielectricCode, shadeComplexCode,
+                    shadeEmissiveCode,
                     shadeDiffuseSecCode, shadeComplexSecCode,
                     tailMegakernelCode);
 
@@ -87,10 +85,8 @@ WavefrontPipeline::~WavefrontPipeline() {
 
     if (m_shadeDiffusePipeline) vkDestroyPipeline(m_device, m_shadeDiffusePipeline, nullptr);
     if (m_shadeDielectricPipeline) vkDestroyPipeline(m_device, m_shadeDielectricPipeline, nullptr);
-    if (m_shadeConductorPipeline) vkDestroyPipeline(m_device, m_shadeConductorPipeline, nullptr);
     if (m_shadeComplexPipeline) vkDestroyPipeline(m_device, m_shadeComplexPipeline, nullptr);
     if (m_shadeEmissivePipeline) vkDestroyPipeline(m_device, m_shadeEmissivePipeline, nullptr);
-    if (m_shadePassthroughPipeline) vkDestroyPipeline(m_device, m_shadePassthroughPipeline, nullptr);
     if (m_shadeDiffuseSecPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecPipeline, nullptr);
     if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
     if (m_tailMegakernelPipeline) vkDestroyPipeline(m_device, m_tailMegakernelPipeline, nullptr);
@@ -130,7 +126,6 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uAccumImage
         { 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // CameraUBO
         { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // TrianglesBuffer
-        { 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // SpheresBuffer
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // MaterialsBuffer
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // LightsBuffer
         { 6, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },// topLevelAS
@@ -168,7 +163,11 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 38, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiCurrentReservoirsBuffer
         { 39, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // GiHistoryReservoirsBuffer
         { 40, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSkipImage
-        { 41, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uMlSpecAlbedoImage
+        { 41, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSpecAlbedoImage
+        { 42, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uDirectDiffuseImage
+        { 43, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uIndirectDiffuseImage
+        { 44, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uDirectSpecularImage
+        { 45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uIndirectSpecularImage
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -183,7 +182,7 @@ void WavefrontPipeline::createDescriptorLayout() {
 
 void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 96 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
@@ -314,38 +313,41 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                              VkImageView accumImageView,
                                              VkBuffer cameraUBO,
                                              VkBuffer triangleBuffer, VkDeviceSize triSize,
-                                             VkBuffer sphereBuffer, VkDeviceSize sphereSize,
                                              VkBuffer matBuffer, VkDeviceSize matSize,
                                              VkBuffer lightBuffer, VkDeviceSize lightSize,
                                              VkAccelerationStructureKHR tlas,
-                                              VkDescriptorImageInfo envMapInfo,
-                                              const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
-                                               VkBuffer nrcQueryBuffer,
-                                               VkBuffer nrcTrainBuffer,
-                                                VkBuffer nrcCountersBuffer,
-                                                VkImageView motionVectorImageView,
-                                                VkImageView normalDepthImageView,
-                                                VkBuffer lightTreeBuffer,
-                                                VkDeviceSize lightTreeSize,
-                                                VkImageView mlAlbedoRoughnessImageView,
-                                                VkImageView mlSpecularMotionImageView,
-                                                VkImageView mlDiffuseImageView,
-                                                VkImageView mlSpecularImageView,
-                                                VkBuffer instanceBuffer,
-                                                VkDeviceSize instanceSize,
-                                                VkImageView causticImageView,
-                                                VkBuffer restirReservoirBuffer,
-                                                VkBuffer materialArchetypeBuffer,
-                                                VkDeviceSize matArchetypeSize,
-                                                VkBuffer shadeMaterialBuffer,
-                                                VkDeviceSize shadeMaterialSize,
-                                                VkBuffer restirHistoryReservoirBuffer,
-                                                VkBuffer x1ContextBuffer,
-                                                VkBuffer giReservoirBuffer,
-                                                VkBuffer giHistoryReservoirBuffer,
-                                                VkImageView prevNormalDepthImageView,
-                                                VkImageView mlSkipImageView,
-                                                VkImageView mlSpecAlbedoImageView) {
+                                             VkDescriptorImageInfo envMapInfo,
+                                             const std::vector<VkDescriptorImageInfo>& sceneTexInfos,
+                                              VkBuffer nrcQueryBuffer,
+                                              VkBuffer nrcTrainBuffer,
+                                               VkBuffer nrcCountersBuffer,
+                                               VkImageView motionVectorImageView,
+                                               VkImageView normalDepthImageView,
+                                               VkBuffer lightTreeBuffer,
+                                               VkDeviceSize lightTreeSize,
+                                               VkImageView mlAlbedoRoughnessImageView,
+                                               VkImageView mlSpecularMotionImageView,
+                                               VkImageView mlDiffuseImageView,
+                                               VkImageView mlSpecularImageView,
+                                               VkBuffer instanceBuffer,
+                                               VkDeviceSize instanceSize,
+                                               VkImageView causticImageView,
+                                               VkBuffer restirReservoirBuffer,
+                                               VkBuffer materialArchetypeBuffer,
+                                               VkDeviceSize matArchetypeSize,
+                                               VkBuffer shadeMaterialBuffer,
+                                               VkDeviceSize shadeMaterialSize,
+                                               VkBuffer restirHistoryReservoirBuffer,
+                                               VkBuffer x1ContextBuffer,
+                                               VkBuffer giReservoirBuffer,
+                                               VkBuffer giHistoryReservoirBuffer,
+                                               VkImageView prevNormalDepthImageView,
+                                               VkImageView mlSkipImageView,
+                                               VkImageView mlSpecAlbedoImageView,
+                                               VkImageView mlDirectDiffuseImageView,
+                                               VkImageView mlIndirectDiffuseImageView,
+                                               VkImageView mlDirectSpecularImageView,
+                                               VkImageView mlIndirectSpecularImageView) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -369,12 +371,19 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo skipImageInfo{ VK_NULL_HANDLE, skipView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView specAlbView = (mlSpecAlbedoImageView != VK_NULL_HANDLE) ? mlSpecAlbedoImageView : defaultStorageView;
     VkDescriptorImageInfo specAlbImageInfo{ VK_NULL_HANDLE, specAlbView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView directDiffView = (mlDirectDiffuseImageView != VK_NULL_HANDLE) ? mlDirectDiffuseImageView : defaultStorageView;
+    VkDescriptorImageInfo directDiffImageInfo{ VK_NULL_HANDLE, directDiffView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView indirectDiffView = (mlIndirectDiffuseImageView != VK_NULL_HANDLE) ? mlIndirectDiffuseImageView : defaultStorageView;
+    VkDescriptorImageInfo indirectDiffImageInfo{ VK_NULL_HANDLE, indirectDiffView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView directSpecView = (mlDirectSpecularImageView != VK_NULL_HANDLE) ? mlDirectSpecularImageView : defaultStorageView;
+    VkDescriptorImageInfo directSpecImageInfo{ VK_NULL_HANDLE, directSpecView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView indirectSpecView = (mlIndirectSpecularImageView != VK_NULL_HANDLE) ? mlIndirectSpecularImageView : defaultStorageView;
+    VkDescriptorImageInfo indirectSpecImageInfo{ VK_NULL_HANDLE, indirectSpecView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : defaultStorageView;
     VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
 
     VkDescriptorBufferInfo camInfo{ cameraUBO, 0, VK_WHOLE_SIZE };
     VkDescriptorBufferInfo triInfo{ triangleBuffer, 0, triSize };
-    VkDescriptorBufferInfo sphereInfo{ sphereBuffer, 0, sphereSize };
     VkDescriptorBufferInfo matInfo{ matBuffer, 0, matSize };
     VkDescriptorBufferInfo lightInfo{ lightBuffer, 0, lightSize };
 
@@ -429,7 +438,6 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &accumImageInfo, nullptr, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 1, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &camInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &triInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &sphereInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 5, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &lightInfo, nullptr }
         };
@@ -473,6 +481,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 39, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &giHistoryInfo, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 40, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &skipImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 41, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &specAlbImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 42, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directDiffImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 43, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &indirectDiffImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 44, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directSpecImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 45, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &indirectSpecImageInfo, nullptr, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -500,10 +512,8 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
                                         const std::vector<char>& shadowCode,
                                         const std::vector<char>& shadeDiffuseCode,
                                         const std::vector<char>& shadeDielectricCode,
-                                        const std::vector<char>& shadeConductorCode,
                                         const std::vector<char>& shadeComplexCode,
                                         const std::vector<char>& shadeEmissiveCode,
-                                        const std::vector<char>& shadePassthroughCode,
                                         const std::vector<char>& shadeDiffuseSecCode,
                                         const std::vector<char>& shadeComplexSecCode,
                                         const std::vector<char>& tailMegakernelCode) {
@@ -535,17 +545,11 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     if (!shadeDielectricCode.empty()) {
         m_shadeDielectricPipeline = buildComputePipeline(shadeDielectricCode, "shade_dielectric");
     }
-    if (!shadeConductorCode.empty()) {
-        m_shadeConductorPipeline = buildComputePipeline(shadeConductorCode, "shade_conductor");
-    }
     if (!shadeComplexCode.empty()) {
         m_shadeComplexPipeline = buildComputePipeline(shadeComplexCode, "shade_complex");
     }
     if (!shadeEmissiveCode.empty()) {
         m_shadeEmissivePipeline = buildComputePipeline(shadeEmissiveCode, "shade_emissive");
-    }
-    if (!shadePassthroughCode.empty()) {
-        m_shadePassthroughPipeline = buildComputePipeline(shadePassthroughCode, "shade_passthrough");
     }
     if (!shadeDiffuseSecCode.empty()) {
         m_shadeDiffuseSecPipeline = buildComputePipeline(shadeDiffuseSecCode, "shade_diffuse_sec");
@@ -844,7 +848,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             WavefrontClassifyPC classifyPC{
                 .numTriangles = sceneData.numTriangles,
-                .numSpheres = sceneData.numSpheres,
                 .numMaterials = sceneData.numMaterials,
                 .numLights = sceneData.numLights,
                 .width = curBatchW,
@@ -854,7 +857,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .envMapIntensity = sceneData.envMapIntensity,
                 .maxQueueCapacity = activeMaxCapacity,
                 .sppSampleIndex = sampleIdx,
-                .useHardwareRT = sceneData.useHardwareRT,
                 .tileOffsetX = batchOffX,
                 .tileOffsetY = batchOffY,
                 .tileSizeX = tileSzX,
@@ -898,7 +900,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             // 4a. Shading microkernel(s)
             WavefrontShadePC shadePC{
                 .numTriangles = sceneData.numTriangles,
-                .numSpheres = sceneData.numSpheres,
                 .numMaterials = sceneData.numMaterials,
                 .numLights = sceneData.numLights,
                 .width = storeWidth,
@@ -909,7 +910,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .sppSampleIndex = sampleIdx,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
-                .useHardwareRT = sceneData.useHardwareRT,
                 .secondarySortMode = effectiveSecondarySortMode,
                 .enableNrc = sceneData.enableNrc ? 1u : 0u,
                 .nrcBounce = sceneData.nrcBounce,
@@ -971,7 +971,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.shadeEnd);
 
             // Determine if shadow and intersect passes are required
-            bool hasInlineShadows = sceneData.inlineShadows && (sceneData.useHardwareRT == 1u) && ((sceneData.cameraFlags & (1u << 6)) != 0);
+            bool hasInlineShadows = sceneData.inlineShadows && ((sceneData.cameraFlags & (1u << 6)) != 0);
             bool hasRestirPtIndirectShadow = ((sceneData.cameraFlags & (1u << 9)) != 0) && (b <= 1);
             bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirPtIndirectShadow) && (!hasInlineShadows || b > 0 || hasRestirPtIndirectShadow);
             bool needIntersect = (b + 1 < cutoffBounce);
@@ -996,7 +996,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             WavefrontShadowPC shadowPC{
                 .numTriangles = sceneData.numTriangles,
-                .numSpheres = sceneData.numSpheres,
                 .numMaterials = sceneData.numMaterials,
                 .numLights = sceneData.numLights,
                 .width = storeWidth,
@@ -1023,7 +1022,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             WavefrontIntersectPC intersectPC{
                 .numTriangles = sceneData.numTriangles,
-                .numSpheres = sceneData.numSpheres,
                 .numMaterials = sceneData.numMaterials,
                 .numLights = sceneData.numLights,
                 .width = storeWidth,
@@ -1034,7 +1032,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .sppSampleIndex = sampleIdx,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
-                .useHardwareRT = sceneData.useHardwareRT,
                 .sortMode = sceneData.sortMode,
                 .numOpaqueTriangles = sceneData.numOpaqueTriangles,
                 .secondarySortMode = effectiveSecondarySortMode,
@@ -1103,7 +1100,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
                 WavefrontTailPC tailPC{
                     .numTriangles = sceneData.numTriangles,
-                    .numSpheres = sceneData.numSpheres,
                     .numMaterials = sceneData.numMaterials,
                     .numLights = sceneData.numLights,
                     .width = storeWidth,
@@ -1114,7 +1110,6 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     .sppSampleIndex = sampleIdx,
                     .hasEnvMap = sceneData.hasEnvMap,
                     .envMapIntensity = sceneData.envMapIntensity,
-                    .useHardwareRT = sceneData.useHardwareRT,
                     .secondarySortMode = sceneData.secondarySortMode,
                     .enableNrc = sceneData.enableNrc ? 1u : 0u,
                     .nrcBounce = sceneData.nrcBounce,

@@ -1,120 +1,74 @@
 #pragma once
 
+#include "vulkan/Image.hpp"
+#include "core/Config.hpp"
+#include "rt/FfxSdkRuntime.hpp"
+
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
-#include <memory>
-#include <array>
-#include <vector>
-#include <functional>
-#include <string>
+#include <glm/glm.hpp>
 
-#include "vulkan/Image.hpp"
-#include "vulkan/Buffer.hpp"
-#include "core/Config.hpp"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace pathways {
 
 class PostProcessPipeline;
 
-using ShaderLoaderFunc = std::function<std::vector<char>(const std::string&)>;
-
-// =============================================================================
-// Authoritative 5-Dispatch Dilated Edge-Aware SVGF (E-SVGF) Denoiser
-// Reference: docs/design/adaptive_svgf_denoiser_proposal.md
-//
-//   Pass 1: denoise_fused_temporal.comp            (16x16 wg, 22x22 LDS apron,
-//           in-LDS Sobel + tile thresholding + dual-model reprojection +
-//           firefly soft-clamping + history + dual-channel edge density)
-//   Pass 2: denoise_atrous_step1.comp              (s=1,  5 px, radiance+variance)
-//   Pass 3: denoise_atrous_step2.comp              (s=2, 13 px, covers k=9)
-//   Pass 4: denoise_atrous_step3.comp              (s=4, 29 px, covers k=17,
-//           subgroupAll dense-edge bypass + smoothstep crossfade)
-//   Pass 5: denoise_atrous_coarse_remodulate.comp  (s=8, 61 px, covers k=33,
-//           subgroupAll moderate bypass + fused albedo remodulation)
-// =============================================================================
+/**
+ * 3-stage AMD FSR Ray Regeneration (FFX Denoiser 1.2.1) compute pipeline:
+ *   Pass 0: ffx_rr_prep.comp    -> signed linear depth, motion vectors, octahedral normals + roughness,
+ *                                  non-encoded diffuse/specular albedos, demodulated 4-signal inputs
+ *   Pass 1: ffx::Dispatch       -> FFX Denoiser 1.2.1 4-signal chain (or vkCmdCopyImage passthrough)
+ *   Pass 2: ffx_rr_compose.comp -> recomposes denoised 4 signals with albedos + primary skip radiance
+ */
 class DenoiserPipeline {
 public:
     static constexpr uint32_t MAX_FRAMES_IN_FLIGHT = 2;
     static constexpr uint32_t NUM_PASSES = 5;
 
-    // Camera matrices bound via CameraMatricesUBO at Binding 0 of Pass 1
-    // (keeps push constants <= 80 bytes; std140 binary compatible, 160 bytes).
-    struct alignas(16) CameraMatrices {
-        float currViewToPrevView[16];   // 4x4 matrix, 64 bytes (offset 0)
-        struct { float x, y, z, pad; } rotCols[3]; // 3x16B columns (mat3 std140), 48 bytes (offset 64)
-        float currCameraJitter[2];      // UV units (offset 112)
-        float prevCameraJitter[2];      // UV units (offset 120)
-        float tanHalfFovY;              // offset 128
-        float aspectRatio;              // offset 132
-        float prevTanHalfFovY;          // offset 136
-        float prevAspectRatio;          // offset 140
-        float padTail[4];               // 16 bytes (offset 144)
+    struct CameraMatrices {
+        glm::mat4 view{ 1.0f };
+        glm::mat4 prevView{ 1.0f };
+        glm::mat4 viewInverse{ 1.0f };
+        glm::mat4 projection{ 1.0f }; // View-to-clip WITHOUT Vulkan Y-flip (proj[1][1] > 0) for FFX Denoiser
+        float nearZ = 0.1f;
+        float farZ = 10000.0f;
+        float jitterOffsets[2] = { 0.0f, 0.0f };             // FFX subpixel jitter offset in pixels (-pixelJitter)
+        float cameraPositionDelta[3] = { 0.0f, 0.0f, 0.0f }; // PreviousPosition - CurrentPosition (world space)
     };
-    static_assert(sizeof(CameraMatrices) == 160, "CameraMatricesUBO must be exactly 160 bytes");
-    static_assert(offsetof(CameraMatrices, rotCols) == 64, "rotCols offset mismatch");
-    static_assert(offsetof(CameraMatrices, currCameraJitter) == 112, "currCameraJitter offset mismatch");
-    static_assert(offsetof(CameraMatrices, tanHalfFovY) == 128, "tanHalfFovY offset mismatch");
 
-    // Pass 1 push constants (80 bytes, strictly <= 128 B Vulkan guarantee)
-    struct FusedTemporalPushConstants {
+    struct PrepPushConstants {
         uint32_t width;
         uint32_t height;
-        uint32_t resetHistory;
-        float    maxHistoryLength;          // Default: 32.0f
-        float    weightAlbedo;              // Default: 0.50f
-        float    weightDepth;               // Default: 0.30f
-        float    weightNormal;              // Default: 0.20f
-        float    sigmaMultiplier;           // Default: 1.20f
-        float    noiseFloor;                // Default: 0.05f
-        float    contrastFloor;             // Default: 0.02f
-        float    sigmaMin;                  // Default: 0.02f
-        float    temporalAlpha;             // Default: 0.15f
-        float    normalThreshold;           // Default: 0.85f (static geometry)
-        float    normalThresholdDynamic;    // Default: 0.50f (dynamic objects)
-        float    depthThreshold;            // Default: 0.08f (static geometry)
-        float    dynamicDepthThreshold;     // Default: 0.15f (dynamic objects)
-        float    mvDiscrepancyThreshold;    // Default: 2.00f
-        uint32_t accumulatedSamples;        // Stationary accumulated sample count
-        uint32_t upscalerCoupled;           // 1 when coupled to external temporal upscaler (FSR)
-        uint32_t _pad;
+        float nearZ;
+        float farZ;
+        glm::mat4 viewInverse;
     };
-    static_assert(sizeof(FusedTemporalPushConstants) == 80, "FusedTemporalPushConstants must be 80 bytes");
+    static_assert(sizeof(PrepPushConstants) == 80, "PrepPushConstants must be 80 bytes");
+    static_assert(offsetof(PrepPushConstants, viewInverse) == 16, "PrepPushConstants::viewInverse offset mismatch");
 
-    // Passes 2-4 push constants (32 bytes)
-    struct AtrousPushConstants {
+    struct ComposePushConstants {
         uint32_t width;
         uint32_t height;
-        int32_t  stepSize;        // 1, 2 or 4
-        float    phiNormal;       // Default: 32.0f
-        float    phiPlaneDepth;   // Default: 2.00f (metric tangent-plane scale)
-        float    phiLuminance;    // Default: 4.00f
-        float    tanHalfFovY;
-        float    aspectRatio;
+        uint32_t pad0;
+        uint32_t pad1;
     };
-    static_assert(sizeof(AtrousPushConstants) == 32, "AtrousPushConstants must be 32 bytes");
+    static_assert(sizeof(ComposePushConstants) == 16, "ComposePushConstants must be 16 bytes");
 
-    // Pass 5 push constants (48 bytes)
-    struct AtrousCoarseRemodulatePushConstants {
-        uint32_t width;
-        uint32_t height;
-        int32_t  stepSize;               // 8
-        float    phiNormal;              // Default: 32.0f
-        float    phiPlaneDepth;          // Default: 2.00f
-        float    phiLuminance;           // Default: 4.00f
-        float    tanHalfFovY;
-        float    aspectRatio;
-        float    edgeThresholdLow;       // Default: 0.35f (ramp top)
-        uint32_t accumulatedSamples;     // Used only if ENABLE_STATIONARY_PREVIEW
-        float    padding[2];
-    };
-    static_assert(sizeof(AtrousCoarseRemodulatePushConstants) == 48, "AtrousCoarseRemodulatePushConstants must be 48 bytes");
+    using ShaderLoader = std::function<std::vector<char>(const std::string&)>;
 
     DenoiserPipeline(
         VkDevice device,
-        VkPhysicalDevice physicalDevice,
+        VkPhysicalDevice physDevice,
         VmaAllocator allocator,
         VkQueue queue,
-        ShaderLoaderFunc shaderLoader,
+        ShaderLoader shaderLoader,
         bool forceWave32 = false
     );
     ~DenoiserPipeline();
@@ -122,127 +76,106 @@ public:
     DenoiserPipeline(const DenoiserPipeline&) = delete;
     DenoiserPipeline& operator=(const DenoiserPipeline&) = delete;
 
-    void resize(uint32_t width, uint32_t height, AccumFormat accumFormat, VkCommandBuffer cmd);
+    void resize(uint32_t width, uint32_t height, AccumFormat accumFormat, VkCommandBuffer cmd = VK_NULL_HANDLE);
+    void initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage);
+    void invalidateDescriptors();
 
     void recordDenoise(
         VkCommandBuffer cmd,
-        uint32_t frameSlot,
+        uint32_t frameIndex,
         bool resetHistory,
-        uint32_t accumulatedSamples,
-        float crossfadeBlend,
-        Image* currentDiffuse,
-        Image* currentSpecular,
-        Image* motionVectors,
         Image* normalDepth,
+        Image* motionVectors,
         Image* albedoRoughness,
-        Image* accumImage,
-        Image* specularMotion,
-        const CameraMatrices& cameraMatrices,
-        DenoiserMode denoiserMode = DenoiserMode::Svgf,
-        bool fastUpscalerCoupled = false
+        Image* specAlbedo,
+        Image* skipImage,
+        Image* directDiffuse,
+        Image* indirectDiffuse,
+        Image* directSpecular,
+        Image* indirectSpecular,
+        const CameraMatrices& cameraMatrices
     );
 
-    void initTonemapDescriptors(PostProcessPipeline* postProcess, Image* outputImage);
-    void invalidateDescriptors() { m_descriptorsBound = false; }
+    void collectQueryResults();
+    [[nodiscard]] const std::array<double, NUM_PASSES>& getPassTimingsMs() const { return m_lastPassTimingsMs; }
 
     [[nodiscard]] Image* getDenoisedImage() const { return m_denoisedImage.get(); }
     [[nodiscard]] VkDescriptorSet getTonemapDescSet() const { return m_tonemapDescSet; }
-    [[nodiscard]] bool isInitialized() const { return m_width > 0 && m_height > 0 && m_denoisedImage != nullptr; }
+    [[nodiscard]] bool isInitialized() const { return m_denoisedImage != nullptr && m_prepPipeline != VK_NULL_HANDLE; }
+    [[nodiscard]] bool isUsingSdkProvider() const { return m_usingSdkProvider && m_ffxDenoiserContext != nullptr; }
     [[nodiscard]] uint32_t getWidth() const { return m_width; }
     [[nodiscard]] uint32_t getHeight() const { return m_height; }
-    [[nodiscard]] bool isUsingSdkProvider() const { return m_ffxDenoiserContext != nullptr; }
-    [[nodiscard]] uint64_t getVramUsageBytes() const { return m_vramUsageBytes; }
-
-    // Per-pass GPU timestamps (ms) collected asynchronously from the internal
-    // 20-query pool (10 queries x 2 frames in flight, indexed frameSlot * 10).
-    // Order: fusedTemporal, atrousStep1, atrousStep2, atrousStep3, coarseRemodulate.
-    [[nodiscard]] const std::array<float, NUM_PASSES>& getPassTimingsMs() const { return m_passTimingsMs; }
-    void collectQueryResults();
 
 private:
-    void initFfxDenoiserContext();
-    void destroyFfxDenoiserContext();
-    void initPipelines();
     void createDescriptorSetLayouts();
     void allocateDescriptorSets();
-    void updateDescriptors(
-        Image* currentDiffuse,
-        Image* currentSpecular,
-        Image* motionVectors,
-        Image* normalDepth,
-        Image* albedoRoughness,
-        Image* accumImage,
-        Image* specularMotion
-    );
-    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotQueriesRecorded = { false, false };
-    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotFastCoupled = { false, false };
+    void initPipelines();
+    void initFfxDenoiserContext();
+    void destroyFfxDenoiserContext();
+    void updateSlotDescriptors(uint32_t slot, const std::array<VkImageView, 9>& extViews);
+    void recordPassthroughCopy(VkCommandBuffer cmd);
+    void ensureGeneralLayout(VkCommandBuffer cmd, Image* img);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkQueue m_queue = VK_NULL_HANDLE;
-    ShaderLoaderFunc m_shaderLoader;
+    ShaderLoader m_shaderLoader;
     bool m_forceWave32 = false;
-    double m_timestampPeriodNs = 1.0;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     AccumFormat m_accumFormat = AccumFormat::RGBA16_SFLOAT;
 
-    // Descriptor set layouts (one per dispatch)
-    VkDescriptorSetLayout m_fusedTemporalDescSetLayout = VK_NULL_HANDLE;   // 19 bindings (UBO + 18 images)
-    VkDescriptorSetLayout m_atrousStep1DescSetLayout = VK_NULL_HANDLE;     // 6 image bindings
-    VkDescriptorSetLayout m_atrousStep2DescSetLayout = VK_NULL_HANDLE;     // 7 image bindings
-    VkDescriptorSetLayout m_atrousStep3DescSetLayout = VK_NULL_HANDLE;     // 7 image bindings
-    VkDescriptorSetLayout m_atrousCoarseRemodulateDescSetLayout = VK_NULL_HANDLE; // 6 image bindings
+    ffx::Context m_ffxDenoiserContext = nullptr;
+    bool m_usingSdkProvider = false;
+    bool m_historyValid = false;
+    uint32_t m_ffxFrameIndex = 0;
 
     VkDescriptorPool m_descPool = VK_NULL_HANDLE;
-
-    // Descriptor sets, double-buffered across frames in flight
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_fusedTemporalDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_atrousStep1DescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_atrousStep2DescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_atrousStep3DescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_coarseRemodulateDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDescriptorSetLayout m_prepDescSetLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_composeDescSetLayout = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_prepDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_composeDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkDescriptorSet m_tonemapDescSet = VK_NULL_HANDLE;
 
-    // Pipeline layouts & pipelines
-    VkPipelineLayout m_fusedTemporalPipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_atrousStep1PipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_atrousStep2PipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_atrousStep3PipelineLayout = VK_NULL_HANDLE;
-    VkPipelineLayout m_coarseRemodulatePipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_prepPipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_composePipelineLayout = VK_NULL_HANDLE;
+    VkPipeline m_prepPipeline = VK_NULL_HANDLE;
+    VkPipeline m_composePipeline = VK_NULL_HANDLE;
 
-    VkPipeline m_fusedTemporalPipeline = VK_NULL_HANDLE;
-    VkPipeline m_atrousStep1Pipeline = VK_NULL_HANDLE;
-    VkPipeline m_atrousStep2Pipeline = VK_NULL_HANDLE;
-    VkPipeline m_atrousStep3Pipeline = VK_NULL_HANDLE;
-    VkPipeline m_coarseRemodulatePipeline = VK_NULL_HANDLE;
+    // FFX RR intermediate guide & prepared 4-signal buffers
+    std::unique_ptr<Image> m_rrLinearDepth;
+    std::unique_ptr<Image> m_rrMotionVectors;
+    std::unique_ptr<Image> m_rrNormals;
+    std::unique_ptr<Image> m_rrDiffuseAlbedo;
+    std::unique_ptr<Image> m_rrSpecularAlbedo;
 
-    // Camera matrices UBO (per frame in flight)
-    std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraMatricesUBO;
+    std::unique_ptr<Image> m_prepDirectDiffuse;
+    std::unique_ptr<Image> m_prepIndirectDiffuse;
+    std::unique_ptr<Image> m_prepDirectSpecular;
+    std::unique_ptr<Image> m_prepIndirectSpecular;
 
-    // Internal storage images (17 total, 124 B/px unpadded)
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_edgeDensity;          // R8G8: R raw rho, G rho_effective
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_historyDiffuse;       // RGBA16F: RGB + V^d
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_historySpecular;      // RGBA16F: RGB + V^s
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_historyMoments;       // RGBA16F: M1d, M2d, M1s, M2s
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_historyLength;        // RGBA16F: Ndiff, Nspec, d_refl, dyn
-    std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT> m_historyNormalDepth;   // RGBA16F: normal + linear depth
+    // FFX RR denoised outputs (also passthrough copy destinations)
+    std::unique_ptr<Image> m_rrOutDirectDiffuse;
+    std::unique_ptr<Image> m_rrOutIndirectDiffuse;
+    std::unique_ptr<Image> m_rrOutDirectSpecular;
+    std::unique_ptr<Image> m_rrOutIndirectSpecular;
 
-    std::array<std::unique_ptr<Image>, 2> m_pingPongDiffuse;
-    std::array<std::unique_ptr<Image>, 2> m_pingPongSpecular;
-
+    // Final composed linear HDR radiance output
     std::unique_ptr<Image> m_denoisedImage;
-    std::unique_ptr<Image> m_specMotionFallback; // 1x1 black fallback when VMV unavailable
 
-    // Internal GPU profiling: 20 timestamp queries (10 x MAX_FRAMES_IN_FLIGHT)
+    // 1x1 zero-initialized fallback for optional null inputs
+    std::unique_ptr<Image> m_fallbackBlack1x1;
+    bool m_fallbackCleared = false;
+
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotBound = { false, false };
+    std::array<std::array<VkImageView, 9>, MAX_FRAMES_IN_FLIGHT> m_cachedSlotViews{};
+
     VkQueryPool m_queryPool = VK_NULL_HANDLE;
-    std::array<float, NUM_PASSES> m_passTimingsMs = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-
-    bool m_descriptorsBound = false;
-    void* m_ffxDenoiserContext = nullptr;
-    uint64_t m_vramUsageBytes = 0;
+    float m_timestampPeriodNs = 0.0f;
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_querySlotUsed = { false, false };
+    std::array<double, NUM_PASSES> m_lastPassTimingsMs = { 0.0, 0.0, 0.0, 0.0, 0.0 };
 };
 
 } // namespace pathways

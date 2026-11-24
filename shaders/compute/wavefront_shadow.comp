@@ -4,6 +4,7 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 
 #include "wavefront_common.glsl"
+#include "wavefront_radiance_output.glsl"
 
 layout(local_size_x = 32) in;
 
@@ -27,10 +28,6 @@ layout(binding = 1) uniform CameraUBO {
 
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
-};
-
-layout(std430, binding = 3) readonly buffer SpheresBuffer {
-    Sphere spheres[];
 };
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
@@ -137,27 +134,6 @@ void main() {
         occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     }
 
-
-    if (!occluded && pc.numSpheres > 0u) {
-        bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
-        for (uint i = 0; i < pc.numSpheres; ++i) {
-            uint sMatId = spheres[i].materialId;
-            ShadeMaterial sMat = shadeMaterials[sMatId];
-            uint sType = smGetTypeFlags(sMat) & MATERIAL_TYPE_MASK;
-            bool isDielectric = (sType == 2u || smIsTransmissive(sMat));
-            if (transparentShadows) {
-                if (sType == 3u || (!enableCaustics && isDielectric)) continue;
-                if (enableCaustics && isDielectric && smIsThin(sMat)) continue;
-            }
-            float spT;
-            vec3 spNorm;
-            if (intersectSphere(origin, dir, spheres[i], EPSILON, maxDist - EPSILON * 2.0, spT, spNorm)) {
-                occluded = true;
-                break;
-            }
-        }
-    }
-
     if (!occluded) {
         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
@@ -169,20 +145,27 @@ void main() {
         if (pc.captureMlData != 0u) {
             vec3 diffRad = radiance * (1.0 - specFrac);
             vec3 specRad = radiance * specFrac;
-            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-            if (dot(diffRad, diffRad) > 1e-12) {
-                if (isV4) {
-                    diffRad = demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb);
-                }
-                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffRad, seed), prevDiff.a));
+            if (pc.currentBounce == 0u) {
+                wfAddSplitDirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
+            } else {
+                wfAddSplitIndirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
             }
-            if (dot(specRad, specRad) > 1e-12) {
-                if (isV4) {
-                    specRad = demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb);
+            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+            if ((pc.captureMlData & 1u) != 0u) {
+                if (dot(diffRad, diffRad) > 1e-12) {
+                    if (isV4) {
+                        diffRad = demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb);
+                    }
+                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffRad, seed), prevDiff.a));
                 }
-                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specRad, seed), prevSpec.a));
+                if (dot(specRad, specRad) > 1e-12) {
+                    if (isV4) {
+                        specRad = demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb);
+                    }
+                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specRad, seed), prevSpec.a));
+                }
             }
         }
     }

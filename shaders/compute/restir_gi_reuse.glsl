@@ -70,7 +70,6 @@ bool giApplyTapEx(
     uint mCap,
     uint ageNew,
     bool verifyVisInline,
-    uint numSpheres,
     uint numOpaqueTriangles,
     float wSrcMax,
     float wFactorMax,
@@ -143,7 +142,7 @@ bool giApplyTapEx(
                             vec3 visTo = visTarget - visOrig;
                             float visDist = length(visTo);
                             if (visDist <= 2.0 * EPSILON ||
-                                traceShadowRayInline(visOrig, visTo / visDist, visDist, (ubo.flags & (1u << 5)) != 0u, numSpheres, numOpaqueTriangles)) {
+                                traceShadowRayInline(visOrig, visTo / visDist, visDist, (ubo.flags & (1u << 5)) != 0u, numOpaqueTriangles)) {
                                 weight = 0.0;
                             }
                         }
@@ -189,7 +188,6 @@ bool giApplyTap(
     uint mCap,
     uint ageNew,
     bool verifyVisInline,
-    uint numSpheres,
     uint numOpaqueTriangles,
     float wSrcMax,
     float wFactorMax,
@@ -198,7 +196,7 @@ bool giApplyTap(
     GiTapEval unusedEval;
     return giApplyTapEx(
         r, tap, giBsdf, x1, n1, wo, roughness, mCap, ageNew, verifyVisInline,
-        numSpheres, numOpaqueTriangles, wSrcMax, wFactorMax, seed, unusedEval
+        numOpaqueTriangles, wSrcMax, wFactorMax, seed, unusedEval
     );
 }
 
@@ -246,7 +244,6 @@ void restirGiRunReuse(
     uint captureMlData,
     float indirectClamp,
     bool useInlineVis,
-    uint numSpheres,
     uint numOpaqueTriangles,
     X1Context giCtx,
     vec3 giX1,
@@ -293,9 +290,9 @@ void restirGiRunReuse(
     bool hasGiMotion = false;
     bool canReuseHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
     bool isV4Gi = (captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-    bool isEsvgfGi = (captureMlData != 0u) && !isV4Gi;
-    bool useRbGi = (!isV4Gi) && inlineVisActive;
-    bool mergeMatteSpecRb = (!isV4Gi) && (giRoughness >= 0.70 && giMetallic < 0.05);
+    bool isMlGi = (captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
+    bool useRbGi = (!isMlGi) && inlineVisActive;
+    bool mergeMatteSpecRb = (!isMlGi) && (giRoughness >= 0.70 && giMetallic < 0.05);
     vec3 rbDiffSum = vec3(0.0);
     vec3 rbSpecSum = vec3(0.0);
     uint rbMTotal = 1u;
@@ -316,7 +313,7 @@ void restirGiRunReuse(
         expectedPrevDepth = max(selfDepth + mvData.z, 1e-4);
         giPrev = ivec2(round(vec2(giPix) - giMvPx));
 
-        bool allowTemporalGiHistory = isV4Gi || isEsvgfGi || hasGiMotion;
+        bool allowTemporalGiHistory = isMlGi || hasGiMotion;
         if (allowTemporalGiHistory && abs(mvData.x) < 1.5 && abs(mvData.y) < 1.5 &&
             giPrev.x >= 0 && giPrev.y >= 0 && giPrev.x < int(width) && giPrev.y < int(height)) {
             float prevTapDepth = imageLoad(uPrevNormalDepthImage, giPrev).w;
@@ -324,11 +321,11 @@ void restirGiRunReuse(
             float tempDepthGate = hasGiMotion ? 0.03 : 0.05;
             if (relDepthDiff <= tempDepthGate) {
                 GiReservoir giTap = giHistoryReservoirs[uint(giPrev.y) * width + uint(giPrev.x)];
-                uint tempMCap = min(restirMCap, hasGiMotion ? 4u : (isV4Gi ? 10u : (isEsvgfGi ? 2u : 3u)));
+                uint tempMCap = min(restirMCap, hasGiMotion ? 4u : (isMlGi ? 8u : 3u));
                 uint giAgeNew = min(giGetAge(giTap) + 1u, GI_MAX_AGE);
-                bool inlineVisTemp = inlineVisActive && (!isEsvgfGi || hasGiMotion);
+                bool inlineVisTemp = inlineVisActive;
                 if (giApplyTapEx(giTempR, giTap, giTargetBsdf, giX1, giN1, giWo, giRoughness,
-                                 tempMCap, giAgeNew, inlineVisTemp, numSpheres, numOpaqueTriangles,
+                                 tempMCap, giAgeNew, inlineVisTemp, numOpaqueTriangles,
                                  hasGiMotion ? 22.0 : 0.0, hasGiMotion ? 28.0 : 0.0, seed, tempEval)) {
                     giTempWinnerSelf = false;
                 }
@@ -364,29 +361,29 @@ void restirGiRunReuse(
         );
     }
 
-    bool useTempForGiShade = isV4Gi || hasGiMotion;
+    bool useTempForGiShade = isMlGi || hasGiMotion;
     GiReservoir giShadeR = useTempForGiShade ? giTempR : giR;
     bool giShadeWinnerSelf = useTempForGiShade ? giTempWinnerSelf : giWinnerSelf;
 
-    if (canReuseHistory && (isV4Gi || hasGiMotion || !isEsvgfGi)) {
+    if (canReuseHistory) {
         uint tapHash = (pixelIndex * 0x9E3779B9u) ^ (frameIndex * 0x85EBCA6Bu);
-        if (isV4Gi) {
+        if (isMlGi) {
             tapHash ^= 0xA3C59AC3u;
         }
         pcg_hash(tapHash);
         uint rot = (tapHash >> 30u) & 3u;
-        uint numSpatialTaps = isV4Gi
+        uint numSpatialTaps = isMlGi
             ? 1u
             : (hasGiMotion ? 1u : ((numOpaqueTriangles > 2000000u) ? 1u : 8u));
         uint tapOff = (tapHash >> 24u) % 24u;
-        uint spatialMCap = isV4Gi
+        uint spatialMCap = isMlGi
             ? min(restirMCap, hasGiMotion ? 4u : 8u)
             : (hasGiMotion ? min(restirMCap, 4u) : 1u);
-        float spatDepthGate = isV4Gi ? 0.03 : RESTIR_TAP_DEPTH_REL_GATE;
-        float spatNormalGate = isV4Gi ? 0.95 : RESTIR_TAP_NORMAL_MIN_DOT;
+        float spatDepthGate = isMlGi ? 0.03 : RESTIR_TAP_DEPTH_REL_GATE;
+        float spatNormalGate = isMlGi ? 0.95 : RESTIR_TAP_NORMAL_MIN_DOT;
 
         for (uint tap = 0u; tap < numSpatialTaps; ++tap) {
-            uint tapIdx = isV4Gi
+            uint tapIdx = isMlGi
                 ? (((tapHash >> 27u) + tap) & 7u)
                 : (hasGiMotion
                     ? (8u + ((tapOff + tap * 7u) % 24u))
@@ -407,7 +404,7 @@ void restirGiRunReuse(
             if (dot(giN1, giGetX1Normal(giTap)) < spatNormalGate) continue;
             GiTapEval spatEval;
             if (giApplyTapEx(giShadeR, giTap, giTargetBsdf, giX1, giN1, giWo, giRoughness,
-                             spatialMCap, giGetAge(giTap), inlineVisActive, numSpheres, numOpaqueTriangles,
+                             spatialMCap, giGetAge(giTap), inlineVisActive, numOpaqueTriangles,
                              hasGiMotion ? 22.0 : 28.0, hasGiMotion ? 28.0 : 32.0, seed, spatEval)) {
                 giShadeWinnerSelf = false;
             }
@@ -441,6 +438,7 @@ void restirGiRunReuse(
                 vec4 prevAcc = imageLoad(uAccumImage, giPix);
                 imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib, seed), prevAcc.a));
             }
+            wfAddSplitIndirect(giPix, diffContrib, specContrib, captureMlData, seed);
             if (captureMlData != 0u) {
                 if (dot(diffContrib, diffContrib) > 1e-12) {
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, giPix);
@@ -472,7 +470,8 @@ void restirGiRunReuse(
                 vec3 scaleW = giL2w * (giW * invSpp);
 
                 bool isV4 = (captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                bool mergeMatteSpec = (!isV4) && (giRoughness >= 0.70 && giMetallic < 0.05);
+                bool isMlGiOut = (captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
+                bool mergeMatteSpec = (!isMlGiOut) && (giRoughness >= 0.70 && giMetallic < 0.05);
                 vec3 diffContrib = mergeMatteSpec ? (fCosW * scaleW) : (max(fCosW - specFCosW, vec3(0.0)) * scaleW);
                 vec3 specContrib = mergeMatteSpec ? vec3(0.0) : (specFCosW * scaleW);
                 vec3 rawTotal = diffContrib + specContrib;
@@ -490,6 +489,7 @@ void restirGiRunReuse(
                             vec4 prevAcc = imageLoad(uAccumImage, giPix);
                             imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib, seed), prevAcc.a));
                         }
+                        wfAddSplitIndirect(giPix, diffContrib, specContrib, captureMlData, seed);
                         if (captureMlData != 0u) {
                             if (dot(diffContrib, diffContrib) > 1e-12) {
                                 vec3 outDiff = isV4

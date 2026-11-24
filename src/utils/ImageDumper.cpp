@@ -320,6 +320,8 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("      \"vk_ext_shader_float8\": {},\n", stats.has_shader_float8 ? "true" : "false")
         << std::format("      \"wmma_int8_coop_matrix\": {},\n", stats.has_int8_coop_matrix ? "true" : "false")
         << std::format("      \"wmma_fp8_coop_matrix\": {},\n", stats.has_fp8_coop_matrix ? "true" : "false")
+        << std::format("      \"wmma_fp16_coop_matrix\": {},\n", stats.has_fp16_coop_matrix ? "true" : "false")
+        << std::format("      \"supports_upways_wmma\": {},\n", stats.supports_upways_wmma ? "true" : "false")
         << std::format("      \"vk_ext_mutable_descriptor_type\": {},\n", stats.has_mutable_descriptor_type ? "true" : "false")
         << std::format("      \"supports_fsr4_ml\": {}\n", stats.supports_fsr4 ? "true" : "false")
         << "    }\n"
@@ -330,6 +332,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"denoiser_mode\": \"{}\",\n", stats.denoiser_mode_str)
         << std::format("    \"enable_nrc\": {},\n", stats.enable_nrc ? "true" : "false")
         << std::format("    \"upscaler_mode\": \"{}\",\n", stats.upscaler_mode_str)
+        << std::format("    \"upways_precision\": \"{}\",\n", stats.upways_precision_str)
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)
         << std::format("    \"max_bounces\": {},\n", stats.max_bounces)
@@ -640,9 +643,11 @@ bool ImageDumper::savePTTD(const std::string& filepath, uint32_t width, uint32_t
     };
 
     PTTDHeader header;
-    header.version = (channels == 32u || channels == 12u || channels == 8u)
-        ? 4u
-        : ((channels >= 23u || jitterXY != nullptr) ? 3u : ((channels == 20u) ? 2u : 1u));
+    header.version = (channels >= 44u)
+        ? 5u
+        : ((channels == 32u || channels == 12u || channels == 8u)
+            ? 4u
+            : ((channels >= 23u || jitterXY != nullptr) ? 3u : ((channels == 20u) ? 2u : 1u)));
     header.width = width;
     header.height = height;
     header.channels = channels;

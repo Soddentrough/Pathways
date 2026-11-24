@@ -66,6 +66,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         m_engine->m_wavefrontPipeline->resize(width, height, requiredCapacity);
         m_engine->updateWavefrontSceneDescriptors();
     }
+    if (!isReference && m_engine->m_config.capture_channels >= 44u &&
+        (!m_engine->m_renderTargets || !m_engine->m_renderTargets->hasSplitSignalResources())) {
+        m_engine->ensureSplitSignalResources();
+    }
 
     uint32_t flags = 0;
     if (m_engine->m_config.enable_direct_light)    flags |= (1 << 0);
@@ -149,12 +153,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
             WavefrontSceneData wfSceneData{};
             wfSceneData.numTriangles = m_engine->m_numTriangles;
-            wfSceneData.numSpheres = m_engine->m_numSpheres;
             wfSceneData.numMaterials = m_engine->m_numMaterials;
             wfSceneData.numLights = m_engine->m_numLights;
             wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
             wfSceneData.envMapIntensity = 1.0f;
-            wfSceneData.useHardwareRT = 1u;
             wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
             wfSceneData.accumulateHistory = 1u;
             wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
@@ -344,6 +346,12 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             clearImage(cmd, m_engine->m_mlSkipImage);
             clearImage(cmd, m_engine->m_mlSpecAlbedoImage);
         }
+        if (outChannels >= 44u) {
+            clearImage(cmd, m_engine->m_mlDirectDiffuseImage);
+            clearImage(cmd, m_engine->m_mlIndirectDiffuseImage);
+            clearImage(cmd, m_engine->m_mlDirectSpecularImage);
+            clearImage(cmd, m_engine->m_mlIndirectSpecularImage);
+        }
         clearImage(cmd, m_engine->m_motionVectorImage);
         clearImage(cmd, m_engine->m_normalDepthImage);
         if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
@@ -362,12 +370,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         // 3. Dispatch inputSpp with captureMlData
         WavefrontSceneData wfSceneData{};
         wfSceneData.numTriangles = m_engine->m_numTriangles;
-        wfSceneData.numSpheres = m_engine->m_numSpheres;
         wfSceneData.numMaterials = m_engine->m_numMaterials;
         wfSceneData.numLights = m_engine->m_numLights;
         wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
         wfSceneData.envMapIntensity = 1.0f;
-        wfSceneData.useHardwareRT = 1u;
         wfSceneData.frameIndex = frameIdx;
         wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 0u;
@@ -384,11 +390,12 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
         wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
         wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
-        wfSceneData.captureMlData = (outChannels >= 32u) ? (1u | 4u) : 1u;
+        wfSceneData.captureMlData = (outChannels >= 44u) ? (1u | 4u | 8u)
+                                  : ((outChannels >= 32u) ? (1u | 4u) : 1u);
 
         m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, inputSpp, m_engine->m_config.max_bounces, wfSceneData);
 
-        // 4. Staging copy for 6 (or 8 for V4) ML images
+        // 4. Staging copy for 6 (or 8 for V4, or 12 for V5) ML images
         VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
         VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
 
@@ -406,6 +413,18 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             offsetSkip = totalInputStagingSize;
             offsetSA   = offsetSkip + rgba16Size;
             totalInputStagingSize = offsetSA + rgba16Size;
+        }
+
+        VkDeviceSize offsetDD = 0;
+        VkDeviceSize offsetID = 0;
+        VkDeviceSize offsetDS = 0;
+        VkDeviceSize offsetIS = 0;
+        if (outChannels >= 44u) {
+            offsetDD = totalInputStagingSize;
+            offsetID = offsetDD + rgba16Size;
+            offsetDS = offsetID + rgba16Size;
+            offsetIS = offsetDS + rgba16Size;
+            totalInputStagingSize = offsetIS + rgba16Size;
         }
 
         VkDeviceSize offsetRes = 0;
@@ -453,6 +472,12 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         if (outChannels >= 32u) {
             copyImgToBuffer(m_engine->m_mlSkipImage, offsetSkip);
             copyImgToBuffer(m_engine->m_mlSpecAlbedoImage, offsetSA);
+        }
+        if (outChannels >= 44u) {
+            copyImgToBuffer(m_engine->m_mlDirectDiffuseImage, offsetDD);
+            copyImgToBuffer(m_engine->m_mlIndirectDiffuseImage, offsetID);
+            copyImgToBuffer(m_engine->m_mlDirectSpecularImage, offsetDS);
+            copyImgToBuffer(m_engine->m_mlIndirectSpecularImage, offsetIS);
         }
 
         if (useCaptureRestir && m_engine->m_normalDepthImage && m_engine->m_prevNormalDepthImage) {
@@ -530,6 +555,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
         const uint16_t* skipPixels = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSkip) : nullptr;
         const uint16_t* saPixels   = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSA)   : nullptr;
+        const uint16_t* ddPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDD)   : nullptr;
+        const uint16_t* idPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetID)   : nullptr;
+        const uint16_t* dsPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDS)   : nullptr;
+        const uint16_t* isPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetIS)   : nullptr;
         const DiReservoirGPU* resPixels = resBuffer ? reinterpret_cast<const DiReservoirGPU*>(basePtr + offsetRes) : nullptr;
 
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
@@ -537,7 +566,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
         for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
             if (outChannels >= 32u) {
-                // Upways 4.0 (PTTD v4, 32 channels)
+                // Upways 4.0 (PTTD v4, 32 channels) and 4-signal un-demodulated extension (PTTD v5, 44 channels)
                 // Group 0 (0..3): Demodulated Diffuse Irradiance RGB + DiffHitDist
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0];
                 inputPayload[p * outChannels + 1]  = diffPixels[p * 4 + 1];
@@ -578,6 +607,25 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 inputPayload[p * outChannels + 29] = smPixels[p * 4 + 2];
                 inputPayload[p * outChannels + 30] = smPixels[p * 4 + 3];
                 inputPayload[p * outChannels + 31] = zeroHalf;
+
+                if (outChannels >= 44u) {
+                    // Canonical 4-signal un-demodulated radiance decomposition (PTTD v5, ch 32..43)
+                    inputPayload[p * outChannels + 32] = ddPixels ? ddPixels[p * 4 + 0] : zeroHalf;
+                    inputPayload[p * outChannels + 33] = ddPixels ? ddPixels[p * 4 + 1] : zeroHalf;
+                    inputPayload[p * outChannels + 34] = ddPixels ? ddPixels[p * 4 + 2] : zeroHalf;
+                    inputPayload[p * outChannels + 35] = idPixels ? idPixels[p * 4 + 0] : zeroHalf;
+                    inputPayload[p * outChannels + 36] = idPixels ? idPixels[p * 4 + 1] : zeroHalf;
+                    inputPayload[p * outChannels + 37] = idPixels ? idPixels[p * 4 + 2] : zeroHalf;
+                    inputPayload[p * outChannels + 38] = dsPixels ? dsPixels[p * 4 + 0] : zeroHalf;
+                    inputPayload[p * outChannels + 39] = dsPixels ? dsPixels[p * 4 + 1] : zeroHalf;
+                    inputPayload[p * outChannels + 40] = dsPixels ? dsPixels[p * 4 + 2] : zeroHalf;
+                    inputPayload[p * outChannels + 41] = isPixels ? isPixels[p * 4 + 0] : zeroHalf;
+                    inputPayload[p * outChannels + 42] = isPixels ? isPixels[p * 4 + 1] : zeroHalf;
+                    inputPayload[p * outChannels + 43] = isPixels ? isPixels[p * 4 + 2] : zeroHalf;
+                    for (uint32_t c = 44u; c < outChannels; ++c) {
+                        inputPayload[p * outChannels + c] = zeroHalf;
+                    }
+                }
             } else if (outChannels >= 20) {
                 // Vector 0 (Ch 00..03): Diffuse Radiance RGB + Roughness
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0]; // diffuse R
@@ -1101,7 +1149,7 @@ void TrainingCaptureManager::run() {
     Logger::info("  Frames to Capture: {}", m_engine->m_config.capture_frames);
     Logger::info("  Reference SPP    : {}", m_engine->m_config.capture_reference_spp);
     Logger::info("  Capture Channels : {} (PTTD v{})", m_engine->m_config.capture_channels,
-                 m_engine->m_config.capture_channels >= 32 ? 4 : (m_engine->m_config.capture_channels >= 23 ? 3 : (m_engine->m_config.capture_channels == 20 ? 2 : 1)));
+                 m_engine->m_config.capture_channels >= 44 ? 5 : (m_engine->m_config.capture_channels >= 32 ? 4 : (m_engine->m_config.capture_channels >= 23 ? 3 : (m_engine->m_config.capture_channels == 20 ? 2 : 1))));
     Logger::info("  Capture Normals  : {}", m_engine->m_config.capture_normals ? "YES" : "NO");
     Logger::info("  Camera Mode      : {}",
                  m_engine->m_config.capture_camera_mode == CaptureCameraMode::Static ? "Static (Stationary)" :

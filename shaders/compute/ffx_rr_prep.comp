@@ -1,0 +1,110 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D uInNormalDepth;
+layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D uInMotionVectors;
+layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D uInAlbedoRoughness;
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uInSpecAlbedo;
+layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D uInDirectDiffuse;
+layout(set = 0, binding = 5, rgba16f) readonly  uniform image2D uInIndirectDiffuse;
+layout(set = 0, binding = 6, rgba16f) readonly  uniform image2D uInDirectSpecular;
+layout(set = 0, binding = 7, rgba16f) readonly  uniform image2D uInIndirectSpecular;
+
+layout(set = 0, binding = 8,  r32f)    writeonly uniform image2D uOutLinearDepth;
+layout(set = 0, binding = 9,  rgba16f) writeonly uniform image2D uOutMotionVectors;
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D uOutNormals;
+layout(set = 0, binding = 11, rgba16f) writeonly uniform image2D uOutDiffuseAlbedo;
+layout(set = 0, binding = 12, rgba16f) writeonly uniform image2D uOutSpecularAlbedo;
+layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D uOutDirectDiffuse;
+layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D uOutIndirectDiffuse;
+layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D uOutDirectSpecular;
+layout(set = 0, binding = 16, rgba16f) writeonly uniform image2D uOutIndirectSpecular;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    float nearZ;
+    float farZ;
+    mat4 viewInverse;
+} pc;
+
+vec2 normalToOctahedronUv(vec3 n) {
+    float l1 = abs(n.x) + abs(n.y) + abs(n.z);
+    if (l1 <= 1e-8) return vec2(0.5, 0.5);
+    n.xy /= l1;
+    if (n.z < 0.0) {
+        vec2 s = vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+        n.xy = (1.0 - abs(n.yx)) * s;
+    }
+    return n.xy * 0.5 + 0.5;
+}
+
+vec3 safeRgb(vec3 v) {
+    bvec3 bad = bvec3(isnan(v.x) || isinf(v.x),
+                      isnan(v.y) || isinf(v.y),
+                      isnan(v.z) || isinf(v.z));
+    return vec3(bad.x ? 0.0 : max(v.x, 0.0),
+                bad.y ? 0.0 : max(v.y, 0.0),
+                bad.z ? 0.0 : max(v.z, 0.0));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(pc.width) || px.y >= int(pc.height)) return;
+
+    vec4 nd = imageLoad(uInNormalDepth, px);
+    vec4 mv = imageLoad(uInMotionVectors, px);
+    vec4 ar = imageLoad(uInAlbedoRoughness, px);
+    vec4 sa = imageLoad(uInSpecAlbedo, px);
+    vec4 dd = imageLoad(uInDirectDiffuse, px);
+    vec4 id = imageLoad(uInIndirectDiffuse, px);
+    vec4 ds = imageLoad(uInDirectSpecular, px);
+    vec4 ispec = imageLoad(uInIndirectSpecular, px);
+
+    // Signed view-space Z (GLM lookAt looks along -Z, so foreground hits have z_view = -primaryDepth < 0).
+    // Sky/miss pixels (depth <= 0 or >= farZ) fall outside linearDepthBounds [nearZ, farZ] for passthrough.
+    float posDepth = (isnan(nd.w) || isinf(nd.w)) ? 0.0 : nd.w;
+    bool isSky = (posDepth <= 0.0 || posDepth >= pc.farZ);
+    float signedDepth = isSky ? -1e6 : -posDepth;
+    imageStore(uOutLinearDepth, px, vec4(signedDepth, 0.0, 0.0, 0.0));
+
+    // Pathways stores (CurrUV - PrevUV, PrevPosDepth - CurrPosDepth).
+    // FFX Denoiser expects (PrevUV - CurrUV, PrevSignedZ - CurrSignedZ) with scale (+1, +1, +1).
+    vec2 mvUv = (any(isnan(mv.xy)) || any(isinf(mv.xy))) ? vec2(0.0) : -mv.xy;
+    float mvZ = (isnan(mv.z) || isinf(mv.z)) ? 0.0 : -mv.z;
+    imageStore(uOutMotionVectors, px, vec4(mvUv, mvZ, 0.0));
+
+    // World-space octahedral UV normals in RG, linear roughness in B, materialType (0) in A.
+    vec3 viewN = nd.xyz;
+    vec3 worldN = vec3(0.0, 1.0, 0.0);
+    float nLen = length(viewN);
+    if (nLen > 1e-4 && !any(isnan(viewN)) && !any(isinf(viewN))) {
+        worldN = normalize(mat3(pc.viewInverse) * (viewN / nLen));
+    }
+    float roughness = (isnan(ar.a) || isinf(ar.a)) ? 1.0 : clamp(ar.a, 0.0, 1.0);
+    imageStore(uOutNormals, px, vec4(normalToOctahedronUv(worldN), roughness, 0.0));
+
+    // Linear first-bounce diffuse & specular albedos (identity encoded via FFX_DENOISER_DISPATCH_NON_ENCODED_ALBEDO).
+    // Matching effective albedos here and in ffx_rr_compose keeps zero/near-zero albedo pixels energy-exact.
+    vec3 rawDiffAlb = safeRgb(ar.rgb);
+    vec3 effDiffAlb = any(greaterThan(rawDiffAlb, vec3(1e-3))) ? max(rawDiffAlb, vec3(0.02)) : vec3(1.0);
+    vec3 rawSpecAlb = safeRgb(sa.rgb);
+    vec3 effSpecAlb = any(greaterThan(rawSpecAlb, vec3(1e-3))) ? max(rawSpecAlb, vec3(0.02)) : vec3(1.0);
+
+    imageStore(uOutDiffuseAlbedo, px, vec4(effDiffAlb, 1.0));
+    imageStore(uOutSpecularAlbedo, px, vec4(effSpecAlb, 1.0));
+
+    // Demodulate first-bounce albedo per FFX Denoiser 1.2.1 contract while preserving hitT in .a
+    vec3 ddDemod = min(safeRgb(dd.rgb) / effDiffAlb, vec3(65000.0));
+    vec3 idDemod = min(safeRgb(id.rgb) / effDiffAlb, vec3(65000.0));
+    vec3 dsDemod = min(safeRgb(ds.rgb) / effSpecAlb, vec3(65000.0));
+    vec3 isDemod = min(safeRgb(ispec.rgb) / effSpecAlb, vec3(65000.0));
+
+    float idHitT = (isnan(id.a) || isinf(id.a)) ? 0.0 : max(id.a, 0.0);
+    float isHitT = (isnan(ispec.a) || isinf(ispec.a)) ? 0.0 : max(ispec.a, 0.0);
+
+    imageStore(uOutDirectDiffuse, px, vec4(ddDemod, 0.0));
+    imageStore(uOutIndirectDiffuse, px, vec4(idDemod, idHitT));
+    imageStore(uOutDirectSpecular, px, vec4(dsDemod, 0.0));
+    imageStore(uOutIndirectSpecular, px, vec4(isDemod, isHitT));
+}

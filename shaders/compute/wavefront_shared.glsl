@@ -43,13 +43,14 @@ struct QueueCountersBuffer {
     wf_uint pad[20];
 };
 
-#define ML_CAPTURE_ENABLED_BIT   1u
-#define ML_CAPTURE_KEEP_ACCUM_BIT 2u
-#define ML_CAPTURE_UPWAYS_V4_BIT 4u
+#define ML_CAPTURE_ENABLED_BIT     1u
+#define ML_CAPTURE_KEEP_ACCUM_BIT  2u
+#define ML_CAPTURE_UPWAYS_V4_BIT   4u
+#define ML_CAPTURE_SPLIT_4SIG_BIT  8u
+#define ML_CAPTURE_ML_DENOISER_MASK (ML_CAPTURE_UPWAYS_V4_BIT | ML_CAPTURE_SPLIT_4SIG_BIT)
 
 struct WavefrontClassifyPC {
     wf_uint numTriangles;
-    wf_uint numSpheres;
     wf_uint numMaterials;
     wf_uint numLights;
     wf_uint width;
@@ -59,7 +60,6 @@ struct WavefrontClassifyPC {
     float envMapIntensity;
     wf_uint maxQueueCapacity;
     wf_uint sppSampleIndex;
-    wf_uint useHardwareRT;
     wf_uint tileOffsetX;
     wf_uint tileOffsetY;
     wf_uint tileSizeX;
@@ -74,7 +74,6 @@ struct WavefrontClassifyPC {
 
 struct WavefrontShadePC {
     wf_uint numTriangles;
-    wf_uint numSpheres;
     wf_uint numMaterials;
     wf_uint numLights;
     wf_uint width;
@@ -85,7 +84,6 @@ struct WavefrontShadePC {
     wf_uint sppSampleIndex;
     wf_uint hasEnvMap;
     float envMapIntensity;
-    wf_uint useHardwareRT;
     wf_uint secondarySortMode;
     wf_uint enableNrc;
     wf_uint nrcBounce;
@@ -101,7 +99,6 @@ struct WavefrontShadePC {
 
 struct WavefrontShadowPC {
     wf_uint numTriangles;
-    wf_uint numSpheres;
     wf_uint numMaterials;
     wf_uint numLights;
     wf_uint width;
@@ -115,7 +112,6 @@ struct WavefrontShadowPC {
 
 struct WavefrontIntersectPC {
     wf_uint numTriangles;
-    wf_uint numSpheres;
     wf_uint numMaterials;
     wf_uint numLights;
     wf_uint width;
@@ -126,7 +122,6 @@ struct WavefrontIntersectPC {
     wf_uint sppSampleIndex;
     wf_uint hasEnvMap;
     float envMapIntensity;
-    wf_uint useHardwareRT;
     wf_uint sortMode;
     wf_uint numOpaqueTriangles;
     wf_uint secondarySortMode;
@@ -137,7 +132,6 @@ struct WavefrontIntersectPC {
 
 struct WavefrontTailPC {
     wf_uint numTriangles;
-    wf_uint numSpheres;
     wf_uint numMaterials;
     wf_uint numLights;
     wf_uint width;
@@ -148,7 +142,6 @@ struct WavefrontTailPC {
     wf_uint sppSampleIndex;
     wf_uint hasEnvMap;
     float envMapIntensity;
-    wf_uint useHardwareRT;
     wf_uint secondarySortMode;
     wf_uint enableNrc;
     wf_uint nrcBounce;
@@ -163,11 +156,11 @@ struct WavefrontTailPC {
 #ifdef __cplusplus
 static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
 static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
-static_assert(sizeof(WavefrontClassifyPC) == 88, "WavefrontClassifyPC must be 88 bytes");
-static_assert(sizeof(WavefrontShadePC) == 96, "WavefrontShadePC must be 96 bytes");
-static_assert(sizeof(WavefrontShadowPC) == 44, "WavefrontShadowPC must be 44 bytes");
-static_assert(sizeof(WavefrontIntersectPC) == 76, "WavefrontIntersectPC must be 76 bytes");
-static_assert(sizeof(WavefrontTailPC) == 88, "WavefrontTailPC must be 88 bytes");
+static_assert(sizeof(WavefrontClassifyPC) == 80, "WavefrontClassifyPC must be 80 bytes");
+static_assert(sizeof(WavefrontShadePC) == 88, "WavefrontShadePC must be 88 bytes");
+static_assert(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
+static_assert(sizeof(WavefrontIntersectPC) == 68, "WavefrontIntersectPC must be 68 bytes");
+static_assert(sizeof(WavefrontTailPC) == 80, "WavefrontTailPC must be 80 bytes");
 } // namespace pathways
 #else
 #undef wf_uint

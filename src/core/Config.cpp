@@ -303,7 +303,7 @@ void Config::printUsage(const char* progName) {
               << "  --dump-hdr <path.exr>   Save linear HDR radiance buffer to OpenEXR\n"
               << "  --dump-stats <path.json> Export per-frame telemetry breakdown to JSON\n\n"
               << "Rendering & Path Tracing:\n"
-              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Ray Queues & DGC [default]) or 'rtp' (KHR RTP)\n"
+              << "  --pipeline <type>       Path tracing pipeline: 'wavefront' (Wavefront Ray Queues & DGC [default])\n"
               << "  --spp <int>             Samples per pixel to accumulate (default: 1)\n"
               << "  --max-bounces <int>     Maximum ray bounces / depth (or --bounces, default: 4)\n"
               << "  --scene-bounces         Adopt scene metadata default max bounces if present [default: disabled]\n"
@@ -333,9 +333,10 @@ void Config::printUsage(const char* progName) {
               << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
-              << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'svgf'/'esvgf' (5-dispatch dilated E-SVGF), 'rayregen' (FFX stub), or 'none' [default: none]\n"
-              << "  --upways, --svgf        Shortcut to enable Upways or Adaptive E-SVGF real-time denoiser\n"
-              << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
+              << "  --upways                Shortcut to enable Upways real-time denoiser\n"
+              << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n"
+              << "  --upways-precision <m>  Upways WMMA compute precision: 'auto' [default] (fp8->int8->fp16), 'fp8', 'int8', or 'fp16'\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -843,9 +844,7 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "esvgf") {
-                cfg.denoiser_mode = DenoiserMode::Svgf;
-            } else if (mode == "upways") {
+            if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
                     cfg.upways_superres = false;
                 }
@@ -855,21 +854,19 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
                 if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
-            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ffx-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, svgf, esvgf, rayregen, or none.");
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, rayregen, or none.");
             }
             continue;
         }
         if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "svgf" || mode == "esvgf") {
-                cfg.denoiser_mode = DenoiserMode::Svgf;
-            } else if (mode == "upways") {
+            if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
                     cfg.upways_superres = false;
                 }
@@ -879,12 +876,12 @@ Config Config::parse(int argc, char* argv[]) {
                 cfg.upways_superres = true;
                 cfg.denoiser_mode = DenoiserMode::Upways;
                 if (cfg.render_scale >= 1.0f && cfg.render_width == 0) cfg.render_scale = 0.5f;
-            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
+            } else if (mode == "ffx" || mode == "fsr" || mode == "fsr-rr" || mode == "ffx-rr" || mode == "rayregen" || mode == "ray-regeneration" || mode == "ray_regeneration") {
                 cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, svgf, esvgf, rayregen, or none.");
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, rayregen, or none.");
             }
             continue;
         }
@@ -969,11 +966,7 @@ Config Config::parse(int argc, char* argv[]) {
             cfg.upways_heuristic_fallback = true;
             continue;
         }
-        if (arg == "--svgf" || arg == "--esvgf") {
-            cfg.denoiser_mode = DenoiserMode::Svgf;
-            continue;
-        }
-        if (arg == "--ray-regeneration" || arg == "--ffx-denoiser" || arg == "--fsr-ray-regeneration") {
+        if (arg == "--ray-regeneration" || arg == "--ffx-denoiser" || arg == "--fsr-ray-regeneration" || arg == "--ffx-rr") {
             cfg.denoiser_mode = DenoiserMode::FfxRayRegeneration;
             continue;
         }
@@ -1032,6 +1025,24 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--upways-weights=")) {
             cfg.upways_weights_path = arg.substr(arg.find('=') + 1);
+            continue;
+        }
+        auto parseUpwaysPrecision = [](const std::string& raw) -> UpwaysPrecision {
+            std::string v = raw;
+            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (v == "fp8") return UpwaysPrecision::Fp8;
+            if (v == "int8") return UpwaysPrecision::Int8;
+            if (v == "fp16") return UpwaysPrecision::Fp16;
+            return UpwaysPrecision::Auto;
+        };
+        if (arg == "--upways-precision" && i + 1 < argc) {
+            cfg.upways_precision = parseUpwaysPrecision(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--upways-precision=")) {
+            cfg.upways_precision = parseUpwaysPrecision(arg.substr(arg.find('=') + 1));
             continue;
         }
         if (arg == "--light-tree") {
@@ -1613,20 +1624,20 @@ Config Config::parse(int argc, char* argv[]) {
         if ((arg == "--pipeline" || arg == "-p") && i + 1 < argc) {
             std::string pipeStr = argv[++i];
             std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
-            if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
-                cfg.pipeline_type = PipelineType::RTP;
-            } else {
+            if (pipeStr == "wavefront") {
                 cfg.pipeline_type = PipelineType::Wavefront;
+            } else {
+                throw std::runtime_error("Unsupported pipeline '" + pipeStr + "'. Only 'wavefront' is supported.");
             }
             continue;
         }
         if (arg.starts_with("--pipeline=")) {
             std::string pipeStr = arg.substr(arg.find('=') + 1);
             std::transform(pipeStr.begin(), pipeStr.end(), pipeStr.begin(), ::tolower);
-            if (pipeStr == "rtp" || pipeStr == "khr" || pipeStr == "rtpipeline") {
-                cfg.pipeline_type = PipelineType::RTP;
-            } else {
+            if (pipeStr == "wavefront") {
                 cfg.pipeline_type = PipelineType::Wavefront;
+            } else {
+                throw std::runtime_error("Unsupported pipeline '" + pipeStr + "'. Only 'wavefront' is supported.");
             }
             continue;
         }
@@ -1771,7 +1782,8 @@ Config Config::parse(int argc, char* argv[]) {
             continue;
         }
 
-        if (arg == "--relax" || arg == "--asvgf" || arg == "--gateway" || arg == "--gateway-sr" ||
+        if (arg == "--svgf" || arg == "--esvgf" ||
+            arg == "--relax" || arg == "--asvgf" || arg == "--gateway" || arg == "--gateway-sr" ||
             arg == "--fsr1" || arg == "--fsr2" || arg == "--fsr5" || arg == "--taa" ||
             arg == "--restir-di" || arg == "--restir-gi") {
             throw std::runtime_error("Unsupported or removed CLI flag '" + arg + "'");

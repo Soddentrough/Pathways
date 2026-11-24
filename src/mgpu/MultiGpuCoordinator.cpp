@@ -95,7 +95,6 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     plan.dispatchHeight = (plan.mgpuBaseH + 1) / 2;
     plan.isSampleBlendFsr3 = (params.config.upscaler_mode == UpscalerMode::FSR &&
                               params.config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
-                              params.config.denoiser_mode != DenoiserMode::Svgf &&
                               params.config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
     plan.totalCompositeSpp = 0u;
     plan.secAccumHistory = 0u;
@@ -175,7 +174,7 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
 
         plan.totalCompositeSpp = (plan.activeMode == MultiGpuMode::SampleParallel && !plan.isSampleBlendFsr3) ? (plan.primSpp + plan.secSpp) : 0u;
         plan.uboPrim = uboModified;
-        if (plan.activeMode == MultiGpuMode::SampleParallel && params.config.pipeline_type == PipelineType::Wavefront && plan.totalCompositeSpp > 0u) {
+        if (plan.activeMode == MultiGpuMode::SampleParallel && plan.totalCompositeSpp > 0u) {
             plan.uboPrim.spp = plan.totalCompositeSpp;
         } else {
             plan.uboPrim.spp = plan.primSpp;
@@ -197,7 +196,6 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         size_t planeAligned = align64k(static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * 8u);
         bool needMlGbuffers = (params.config.upscaler_mode == UpscalerMode::Upways ||
                                params.config.denoiser_mode == DenoiserMode::Upways ||
-                               params.config.denoiser_mode == DenoiserMode::Svgf ||
                                params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                                !params.config.capture_training_data_dir.empty());
         bool needNormals = (needMlGbuffers ||
@@ -249,7 +247,7 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         }
         bool isSecMotion = params.cameraMovedThisFrame || params.cameraMovedLastFrame;
         params.mgpu->launchSecondaryWork(plan.uboSec, plan.slot, plan.tileOffsetX_sec, plan.tileOffsetY_sec, plan.mgpuBaseW, plan.mgpuBaseH,
-                                         params.numTriangles, params.numSpheres, params.numMaterials, params.numLights, params.useHwRT,
+                                         params.numTriangles, params.numMaterials, params.numLights,
                                          params.hasEnvMap, params.envIntensity, plan.secAccumHistory, params.activeFractionalSpp, plan.dstHost, plan.frameBytes,
                                          plan.totalCompositeSpp, params.numOpaqueTriangles,
                                          plan.isSampleBlendFsr3, params.renderW, params.renderH, params.config.width, params.config.height,
@@ -278,10 +276,15 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
     Image* mlSpecularImage,
     Image* normalDepthImage,
     Image* prevNormalDepthImage,
-    VkDescriptorSet rtDescSet,
     CausticsPipeline* causticsPipeline,
     const SceneData& sceneData,
-    const std::function<void(VkCommandBuffer)>& onPreRecord
+    const std::function<void(VkCommandBuffer)>& onPreRecord,
+    Image* mlSkipImage,
+    Image* mlSpecAlbedoImage,
+    Image* mlDirectDiffuseImage,
+    Image* mlIndirectDiffuseImage,
+    Image* mlDirectSpecularImage,
+    Image* mlIndirectSpecularImage
 ) {
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo rtBeginInfo{};
@@ -330,14 +333,19 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
             normalDepthImage,
             prevNormalDepthImage,
             nullptr,
-            rtDescSet,
             causticsPipeline,
             params.governor,
             params.camera,
             sceneData,
-            params.numTriangles, params.numSpheres, params.numMaterials, params.numLights, params.numOpaqueTriangles,
-            params.hasEnvMap, params.envIntensity, params.useHwRT,
-            params.config
+            params.numTriangles, params.numMaterials, params.numLights, params.numOpaqueTriangles,
+            params.hasEnvMap, params.envIntensity,
+            params.config,
+            mlSkipImage,
+            mlSpecAlbedoImage,
+            mlDirectDiffuseImage,
+            mlIndirectDiffuseImage,
+            mlDirectSpecularImage,
+            mlIndirectSpecularImage
         );
     }
 
@@ -351,7 +359,7 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
 
     VkSemaphoreSubmitInfo signalInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO };
     signalInfo.semaphore = rtCompleteSemaphore;
-    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    signalInfo.stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 
     VkSubmitInfo2 rtSubmit{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
     rtSubmit.commandBufferInfoCount = 1;
@@ -397,7 +405,6 @@ void MultiGpuCoordinator::recordMergePass(
         const bool needMlGbuffers =
             (params.config.upscaler_mode == UpscalerMode::Upways ||
              params.config.denoiser_mode == DenoiserMode::Upways ||
-             params.config.denoiser_mode == DenoiserMode::Svgf ||
              params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
              !params.config.capture_training_data_dir.empty());
         bool needNormals = (needMlGbuffers ||
@@ -499,14 +506,13 @@ void MultiGpuCoordinator::recordMergePass(
         vkCmdPipelineBarrier2(activeCmd, &postCopyDep);
     }
 
-    const bool needDecoupledPost = (params.config.denoiser_mode == DenoiserMode::Svgf ||
-                                    params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+    const bool needDecoupledPost = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                                     params.config.denoiser_mode == DenoiserMode::Upways ||
                                     params.config.upscaler_mode == UpscalerMode::Upways ||
                                     params.config.upscaler_mode == UpscalerMode::FSR);
     const bool isDenoisedWithoutRunningAvg =
         (params.config.denoiser_mode == DenoiserMode::Upways || params.config.upscaler_mode == UpscalerMode::Upways) ||
-        ((params.config.denoiser_mode == DenoiserMode::Svgf || params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
+        (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
          params.config.capture_training_data_dir.empty());
     const bool useFusedMgpuTonemap = !m_hasDedicatedAsyncCompute && !needDecoupledPost && !params.skipRayTracing && !plan.isSampleBlendFsr3 &&
                                      !params.config.visualize_mgpu_split && (plan.slot == params.currentFrame) &&

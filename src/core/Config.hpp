@@ -27,7 +27,6 @@ enum class AccumFormat {
 };
 
 enum class PipelineType {
-    RTP,       // Dedicated Hardware Ray Tracing Pipeline (VK_KHR_ray_tracing_pipeline)
     Wavefront  // Wavefront Path Tracing with Ray Queues & DGC
 };
 
@@ -46,10 +45,9 @@ enum class SecondarySortMode {
 };
 
 enum class DenoiserMode {
-    None,               // Raw stochastic path traced output (unfiltered progressive)
-    Upways,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    Svgf,               // Adaptive Edge-Aware SVGF (E-SVGF): 5-dispatch dilated A-Trous pipeline
-    FfxRayRegeneration  // AMD FidelityFX Ray Regeneration (stub until native Vulkan provider is available)
+    None = 0,               // Raw stochastic path traced output (unfiltered progressive)
+    Upways = 1,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
+    FfxRayRegeneration = 2  // AMD FidelityFX Ray Regeneration 1.2.1 (4-Signal)
 };
 
 enum class FsrVersion : uint32_t {
@@ -70,6 +68,13 @@ enum class UpscalerMode {
     Upways,  // Upways Neural Super-Resolution via Wave32 WMMA
     // Legacy alias
     FSR3 = FSR
+};
+
+enum class UpwaysPrecision : uint8_t {
+    Auto = 0, // Highest-speed supported tier: FP8 -> INT8 QAT -> FP16
+    Fp8  = 1, // RDNA 4 FP8 E4M3fn WMMA
+    Int8 = 2, // RDNA 3/3.5/4 INT8 QAT WMMA
+    Fp16 = 3  // IEEE FP16 WMMA fallback
 };
 
 // Post-mortem visualization overlays written directly over the output image
@@ -198,6 +203,7 @@ struct Config {
     bool upways_superres = false;         // Upways Continuous Super-Resolution (e.g. 1080p -> 4K)
     bool upways_heuristic_fallback = false; // Debug bypass: force analytical temporal/spatial heuristic instead of WMMA U-Net + KPN
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
+    UpwaysPrecision upways_precision = UpwaysPrecision::Auto; // WMMA precision tier: Auto (FP8->INT8->FP16), Fp8, Int8, Fp16
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
     FsrVersion fsr_version = FsrVersion::Auto;       // Target FSR version when UpscalerMode::FSR is active [Default: Auto]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]
@@ -272,7 +278,7 @@ struct Config {
     uint32_t capture_input_spp = 1;
     uint32_t capture_reference_spp = 256;
     bool capture_normals = true;
-    uint32_t capture_channels = 24; // 16, 19, 20, 23, or 24 (PTTD v3 default)
+    uint32_t capture_channels = 24; // 16, 19, 20, 23, 24 (PTTD v3), 32 (v4), or 44 (PTTD v5)
     CaptureCameraMode capture_camera_mode = CaptureCameraMode::Gaming;
     uint32_t capture_input_width = 0;   // 0 = inherit config.width * render_scale
     uint32_t capture_input_height = 0;  // 0 = inherit config.height * render_scale
