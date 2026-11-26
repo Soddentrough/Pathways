@@ -31,6 +31,16 @@ void check_true(bool cond, const char* msg = "") {
     }
 }
 
+struct ScopedFileCleanup {
+    std::filesystem::path path;
+    ~ScopedFileCleanup() {
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+};
+
 // Helper to base64 encode binary buffer for embedded glTF URI
 std::string base64_encode(const uint8_t* data, size_t len) {
     static const char base64_chars[] =
@@ -128,6 +138,7 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "[Step 2] Building synthetic KHR_mesh_quantization glTF asset..." << std::endl;
     std::filesystem::path tempGltfPath = std::filesystem::temp_directory_path() / "test_quantized_mesh.gltf";
+    ScopedFileCleanup tempGltfCleanup{ tempGltfPath };
 
     {
         // 3 vertices forming a triangle:
@@ -383,25 +394,53 @@ int main() {
     // -------------------------------------------------------------------------
     // Test 6: MiniJsonParser Malformed / Unterminated Input O(N) Termination
     // -------------------------------------------------------------------------
-    std::cout << "[Step 8] Validating MiniJsonParser malformed input safety..." << std::endl;
+    std::cout << "[Step 8] Validating MiniJsonParser malformed input safety & edge cases..." << std::endl;
     {
-        const char* malformedInputs[] = {
-            "{broken",
-            "[1, 2, tru",
-            "{\"a\": @@@ }",
-            "\"unterminated_string",
-            "[1, 2, ---, +++]",
-            "{\"nested\": [1, {\"bad\": ???}]}"
-        };
-        for (const char* bad : malformedInputs) {
-            MiniJsonParser parser(bad);
-            JsonVal v = parser.parseVal();
-            (void)v;
+        {
+            MiniJsonParser p("{broken");
+            JsonVal v = p.parseVal();
+            check_true(v.is_object() && v.obj.empty(), "Truncated object parses as empty object without hang");
         }
-        MiniJsonParser goodParser("{\"ok\": true, \"num\": 42.5}");
+        {
+            MiniJsonParser p("[1, 2, tru");
+            JsonVal v = p.parseVal();
+            check_true(v.is_array() && v.arr.size() >= 2 && v[0].as_int() == 1 && v[1].as_int() == 2,
+                       "Partially valid array preserves leading numeric elements");
+            check_true(v[2].is_null() && v[99].is_null(), "Truncated 'tru' and out-of-bounds index yield null");
+        }
+        {
+            MiniJsonParser p("{\"a\": @@@ }");
+            JsonVal v = p.parseVal();
+            check_true(v.is_object() && v["a"].is_null() && v["missing"].is_null(),
+                       "Invalid token value and missing key yield null");
+        }
+        {
+            MiniJsonParser p("\"unterminated_string");
+            JsonVal v = p.parseVal();
+            check_true(v.is_string() && v.as_string() == "unterminated_string",
+                       "Unterminated string terminates safely without infinite loop");
+        }
+        {
+            MiniJsonParser p("[1, 2, ---, +++]");
+            JsonVal v = p.parseVal();
+            check_true(v.is_array() && v[0].as_int() == 1 && v[1].as_int() == 2,
+                       "Invalid numeric signs inside array terminate cleanly");
+        }
+        {
+            MiniJsonParser p("{\"nested\": [1, {\"bad\": ???}]}");
+            JsonVal v = p.parseVal();
+            check_true(v.is_object() && v["nested"].is_array() && v["nested"][0].as_int() == 1 &&
+                       v["nested"][1]["bad"].is_null(),
+                       "Nested malformed value safely yields null");
+        }
+
+        MiniJsonParser goodParser("{\"ok\": true, \"nope\": false, \"none\": null, \"num\": 42.5, \"sci\": -3.5e-2, \"esc\": \"a\\nb\\tc\\\"d\\\\e\"}");
         JsonVal good = goodParser.parseVal();
-        check_true(good.is_object() && good["ok"].as_bool() && std::abs(good["num"].as_float() - 42.5f) < 1e-3f,
-                   "Valid MiniJson object parses accurately");
+        check_true(good.is_object() && good["ok"].as_bool() && !good["nope"].as_bool(true) &&
+                   good["none"].is_null() && std::abs(good["num"].as_float() - 42.5f) < 1e-4f &&
+                   std::abs(good["sci"].as_float() - (-0.035f)) < 1e-5f &&
+                   good["esc"].as_string() == "a\nb\tc\"d\\e",
+                   "Valid MiniJson object with escapes, scientific float, false, null parses accurately");
     }
 
     // -------------------------------------------------------------------------
@@ -428,12 +467,12 @@ int main() {
   "scene": 0
 })";
         std::filesystem::path specPath = std::filesystem::temp_directory_path() / "test_khr_specular_factor.gltf";
+        ScopedFileCleanup specCleanup{ specPath };
         {
             std::ofstream out(specPath);
             out << specGltf;
         }
         SceneData specScene = GltfLoader::loadSceneData(specPath.string());
-        std::filesystem::remove(specPath, ec);
         check_true(!specScene.materials.empty(), "KHR_materials_specular test scene must produce material");
         assert_near(specScene.materials[0].specularFactor, 0.25f, 0.005f,
                     "KHR_materials_specular specularFactor=0.25 must be preserved (not zeroed)");

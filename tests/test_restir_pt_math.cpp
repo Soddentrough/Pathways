@@ -157,15 +157,13 @@ int main() {
         bool invalidNormal = validateReconnectionFootprint(pPos, pNorm, 0.8f, qPos, cornerNorm, 0.8f, secPos);
         assert_true(!invalidNormal, "Sharp corner / normal discontinuity correctly rejected");
 
-        // 2c. Extreme distance ratio (> 5.0) -> reject
-        glm::vec3 farPos(0.0f, 25.0f, 0.0f);
-        glm::vec3 nearPos(0.0f, 1.0f, 0.0f);
-        bool invalidDist = validateReconnectionFootprint(pPos, pNorm, 0.8f, qPos, qNorm, 0.8f, nearPos);
-        float pD = glm::length(farPos - pPos);
-        float qD = glm::length(nearPos - qPos);
-        assert_true(pD / qD > 5.0f, "Distance ratio > 5.0 configured");
-        bool rejectedDist = (pD / qD > 5.0f);
-        assert_true(rejectedDist, "Extreme depth disparity correctly rejected");
+        // 2c. Extreme distance ratio (< 0.2 or > 5.0) -> reject
+        glm::vec3 closeSecPos(0.0f, 1.0f, 0.0f);
+        glm::vec3 farQPos(0.0f, 0.0f, 10.0f); // pDist = 1.0, qDist = sqrt(101) ~= 10.05 -> ratio < 0.1 < 0.2
+        bool invalidDistLow = validateReconnectionFootprint(pPos, pNorm, 0.8f, farQPos, qNorm, 0.8f, closeSecPos);
+        assert_true(!invalidDistLow, "Extreme depth disparity (distRatio < 0.2) correctly rejected");
+        bool invalidDistHigh = validateReconnectionFootprint(farQPos, pNorm, 0.8f, pPos, qNorm, 0.8f, closeSecPos);
+        assert_true(!invalidDistHigh, "Extreme depth disparity (distRatio > 5.0) correctly rejected");
 
         // 2d. Low-roughness specular cone check (roughness < 0.15)
         // If secPos lies close between p and q, the reconnection ray directions diverge widely
@@ -284,8 +282,9 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "\n[TEST 6] GI Disocclusion & Relative Depth Similarity Gates..." << std::endl;
     {
-        const float RESTIR_TAP_NORMAL_MIN_DOT = 0.70f;
-        const float RESTIR_TAP_DEPTH_REL_GATE = 0.15f;
+        // Matches shaders/compute/restir_common.glsl constants
+        const float RESTIR_TAP_NORMAL_MIN_DOT = 0.90f;
+        const float RESTIR_TAP_DEPTH_REL_GATE = 0.10f;
 
         auto testDisocclusion = [&](const glm::vec3& nSelf, float depthSelf,
                                     const glm::vec3& nTap, float depthTap) -> bool {
@@ -297,17 +296,22 @@ int main() {
 
         glm::vec3 nWall(0.0f, 0.0f, 1.0f);
         glm::vec3 nJamb(1.0f, 0.0f, 0.0f); // 90 degree corner
+        glm::vec3 nBevel = glm::normalize(glm::vec3(0.52f, 0.0f, 0.85f)); // ~31.5 deg tilt (dot ~= 0.853 < 0.90)
 
-        // 6a. 90-degree corner (dot = 0.0 < 0.70) must be rejected
+        // 6a. 90-degree corner and >26-degree bevel (dot < 0.90) must be rejected
         bool passCorner = testDisocclusion(nWall, 5.0f, nJamb, 5.0f);
         assert_true(!passCorner, "90-degree corner tap rejected by normal gate");
+        bool passBevel = testDisocclusion(nWall, 5.0f, nBevel, 5.0f);
+        assert_true(!passBevel, "31.5-degree tilted normal (dot < 0.90) rejected by normal gate");
 
-        // 6b. Depth silhouette jump (e.g. 5.0m vs 10.0m, relDiff = 0.50 > 0.15) must be rejected
+        // 6b. Depth silhouette jump (5.0m vs 10.0m -> 0.50, and 5.0m vs 5.68m -> 0.12 > 0.10) must be rejected
         bool passDepth = testDisocclusion(nWall, 5.0f, nWall, 10.0f);
         assert_true(!passDepth, "Depth silhouette discontinuity rejected by depth gate");
+        bool passMildDepth = testDisocclusion(nWall, 5.0f, nWall, 5.68f);
+        assert_true(!passMildDepth, "12% depth jump (> 0.10) rejected by depth gate");
 
-        // 6c. Co-planar neighbor on same wall (dot = 1.0, depth 5.0 vs 5.05) must be accepted
-        bool passNeighbor = testDisocclusion(nWall, 5.0f, nWall, 5.05f);
+        // 6c. Co-planar neighbor on same wall (dot = 1.0, depth 5.0 vs 5.25 -> relDiff ~0.048 <= 0.10) must be accepted
+        bool passNeighbor = testDisocclusion(nWall, 5.0f, nWall, 5.25f);
         assert_true(passNeighbor, "Co-planar continuous surface neighbor accepted for GI reuse");
     }
 
@@ -887,25 +891,21 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "\n[TEST 11] X1Context Roughness Fidelity & Reconnection Gating Guards..." << std::endl;
     {
-        // 11a. X1Context roughness preservation across [0.0, 1.0]
-        auto packHalf2x16 = [](glm::vec2 v) -> uint32_t {
-            return glm::packHalf2x16(v);
-        };
-        auto unpackHalf2x16 = [](uint32_t p) -> glm::vec2 {
-            return glm::unpackHalf2x16(p);
-        };
-
-        // Test representative materials: mirror/delta (0.001), semi-glossy (0.08, 0.14),
-        // moderately rough diffuse (0.25, 0.5), completely rough (1.0).
-        std::vector<float> testRoughness = { 0.001f, 0.05f, 0.10f, 0.149f, 0.151f, 0.25f, 0.5f, 0.8f, 1.0f };
+        // 11a. X1ContextGPU data[3] unorm8 bitfield packing for roughness ([9:2]) and sqrt(f0) ([17:10])
+        std::vector<float> testRoughness = { 0.001f, 0.05f, 0.10f, 0.145f, 0.155f, 0.25f, 0.5f, 0.8f, 1.0f };
         for (float r : testRoughness) {
             float f0 = 0.04f;
-            uint32_t f0Pad = packHalf2x16(glm::vec2(std::clamp(f0, 0.0f, 1.0f), std::clamp(r, 0.0f, 1.0f)));
-            float recoveredF0 = unpackHalf2x16(f0Pad).x;
-            float recoveredRoughness = unpackHalf2x16(f0Pad).y;
+            uint32_t rQ = static_cast<uint32_t>(std::round(std::clamp(r, 0.0f, 1.0f) * 255.0f));
+            uint32_t fQ = static_cast<uint32_t>(std::round(std::sqrt(std::clamp(f0, 0.0f, 1.0f)) * 255.0f));
+            pathways::X1ContextGPU ctx{};
+            ctx.data[3] = 1u | (rQ << 2u) | (fQ << 10u);
 
-            assert_near(recoveredF0, f0, 1e-3f, "X1Context F0 fp16 fidelity");
-            assert_near(recoveredRoughness, r, 1e-3f, "X1Context roughness fp16 fidelity");
+            float recoveredRoughness = static_cast<float>((ctx.data[3] >> 2u) & 0xFFu) / 255.0f;
+            float recoveredSqrtF0 = static_cast<float>((ctx.data[3] >> 10u) & 0xFFu) / 255.0f;
+            float recoveredF0 = recoveredSqrtF0 * recoveredSqrtF0;
+
+            assert_near(recoveredF0, f0, 1e-4f, "X1Context sqrt-unorm8 F0 fidelity");
+            assert_near(recoveredRoughness, r, 0.5f / 255.0f + 1e-5f, "X1Context unorm8 roughness fidelity");
 
             // Verify the roughness < 0.15 gate behavior
             bool isGlossyReceiver = (recoveredRoughness < 0.15f);
@@ -1015,31 +1015,35 @@ int main() {
         assert_near(worldNorm.y, expectedWorldNorm.y, 1e-5f, "Affine instance transform normal Y orthogonal to edges");
         assert_near(worldNorm.z, expectedWorldNorm.z, 1e-5f, "Affine instance transform normal Z orthogonal to edges");
 
-        // 12c. Direct Illumination Occlusion Confidence Preservation (Fix 1)
-        // Simulate a reservoir after finding a candidate light
+        // 12c. DiReservoirGPU bitfield packing & range verification (24-bit lightIdx, 8-bit M, FP16 targetCos/distHitT)
+        const uint32_t testLightIdx = 640834u; // > 65535 (tests 24-bit capacity up to 16.7M lights)
+        const uint32_t testM = 4u;
+        const float testTarget = 2.5f;
+        const float testCosLight = 0.75f;
+        const float testLightDist = 3.25f;
+        const float testHitT = 5.5f;
+
         pathways::DiReservoirGPU r{};
-        r.idxM = (4u << 24) | 640834u; // M = 4 (8-bit), light index = 640,834 (24-bit, > 65535)
+        r.idxM = ((testM & 0xFFu) << 24u) | (testLightIdx & 0xFFFFFFu);
         r.wSum = 12.5f;
-        r.targetCosBits = 0x3C004100u; // packed FP16 (targetPdf=2.5, cosLight=1.0)
-        r.flags = 0x100u; // valid bit set
-        r.distHitT = 0x42004200u; // packed FP16 (dist=3.0, hitT=3.0)
+        const uint32_t uCosL = static_cast<uint32_t>(std::clamp(std::round(testCosLight * 255.0f), 0.0f, 255.0f));
+        r.targetCosBits = (std::bit_cast<uint32_t>(testTarget) & 0xFFFFFF00u) | (uCosL & 0xFFu);
+        r.flags = (1u << 8u) | 7u; // valid bit + age=7
+        r.distHitT = glm::packHalf2x16(glm::vec2(testLightDist, testHitT));
 
-        // Under inline shadow query: shadow ray is occluded
-        bool occluded = true;
-        glm::vec3 secDirectL(0.0f);
-        if (!occluded) {
-            secDirectL = glm::vec3(1.0f);
-        } else {
-            secDirectL = glm::vec3(0.0f);
-            // CRITICAL FIX: Do NOT destroy reservoir r!
-            // r remains intact with its M and wSum so temporal reuse carries confidence forward.
-        }
+        const uint32_t recLightIdx = r.idxM & 0xFFFFFFu;
+        const uint32_t recM = (r.idxM >> 24u) & 0xFFu;
+        const float recTarget = std::bit_cast<float>(r.targetCosBits & 0xFFFFFF00u);
+        const float recCosLight = static_cast<float>(r.targetCosBits & 0xFFu) / 255.0f;
+        const glm::vec2 recDistHit = glm::unpackHalf2x16(r.distHitT);
 
-        assert_near(secDirectL.x, 0.0f, 1e-6f, "Occluded shadow ray produces zero current-frame radiance");
-        assert_true((r.flags & 0x100u) != 0u, "Reservoir valid flag PRESERVED despite occlusion");
-        assert_near(r.wSum, 12.5f, 1e-6f, "Reservoir wSum PRESERVED despite occlusion");
-        assert_true(((r.idxM >> 24) & 0xFFu) == 4u, "Reservoir confidence counter M (8-bit) PRESERVED despite occlusion");
-        assert_true((r.idxM & 0xFFFFFFu) == 640834u, "Reservoir 24-bit light index (>65535) PRESERVED without 16-bit wraparound");
+        assert_true((r.flags & 0x100u) != 0u && (r.flags & 0xFFu) == 7u, "DiReservoirGPU valid flag and age preserved");
+        assert_true(recM == testM, "DiReservoirGPU 8-bit confidence M preserved");
+        assert_true(recLightIdx == testLightIdx, "DiReservoirGPU 24-bit light index (>65535) preserved without 16-bit wraparound");
+        assert_near(recTarget, testTarget, 1e-4f, "DiReservoirGPU 24-bit fp32 target preserved");
+        assert_near(recCosLight, testCosLight, 1.0f / 255.0f, "DiReservoirGPU unorm8 cosLight preserved");
+        assert_near(recDistHit.x, testLightDist, 1e-3f, "DiReservoirGPU fp16 light hitDist preserved");
+        assert_near(recDistHit.y, testHitT, 1e-3f, "DiReservoirGPU fp16 primary hitT preserved");
 
         // 12d. Specular Mirror Partitioning (Roughness Gating, Fix 3)
         auto evaluateRoughnessPartitioning = [](float roughness, bool enableRestirFlag) {

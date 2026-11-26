@@ -44,6 +44,29 @@ void check_true(bool cond, const char* msg = "") {
     }
 }
 
+std::filesystem::path resolveScenePath(const std::string& rel) {
+    for (const std::filesystem::path& cand : {
+        std::filesystem::path(rel),
+        std::filesystem::path("..") / rel,
+        std::filesystem::path("../..") / rel
+    }) {
+        if (std::filesystem::exists(cand)) {
+            return cand;
+        }
+    }
+    return {};
+}
+
+struct ScopedFileCleanup {
+    std::filesystem::path path;
+    ~ScopedFileCleanup() {
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+};
+
 } // anonymous namespace
 
 int main() {
@@ -72,6 +95,7 @@ int main() {
     // -------------------------------------------------------------------------
     std::cout << "[Step 2] Constructing synthetic OpenUSD stage (USDA ASCII)..." << std::endl;
     std::filesystem::path tempUsdaPath = std::filesystem::temp_directory_path() / "test_pathways_scene.usda";
+    ScopedFileCleanup tempUsdaCleanup{ tempUsdaPath };
 
     {
         // USDA scene containing:
@@ -214,18 +238,11 @@ def Xform "Root"
               << scene.cameraPosition.y << ", " << scene.cameraPosition.z << "), FOV="
               << scene.cameraFov << " deg verified." << std::endl;
 
-    // Clean up temporary USDA file
-    std::error_code ec;
-    std::filesystem::remove(tempUsdaPath, ec);
-
     // -------------------------------------------------------------------------
     // Test 7: PointInstancedMedCity.usd Validation & Hierarchy Inspection
     // -------------------------------------------------------------------------
-    std::filesystem::path medCityPath = "scenes/PointInstancedMedCity/PointInstancedMedCity.usd";
-    if (!std::filesystem::exists(medCityPath)) {
-        medCityPath = "../scenes/PointInstancedMedCity/PointInstancedMedCity.usd";
-    }
-    if (std::filesystem::exists(medCityPath)) {
+    std::filesystem::path medCityPath = resolveScenePath("scenes/PointInstancedMedCity/PointInstancedMedCity.usd");
+    if (!medCityPath.empty()) {
         std::cout << "[Step 7] Inspecting PointInstancedMedCity.usd..." << std::endl;
         pxr::UsdStageRefPtr cityStage = pxr::UsdStage::Open(medCityPath.string());
         check_true(cityStage != nullptr, "PointInstancedMedCity.usd opens successfully");
@@ -405,80 +422,71 @@ def Xform "Root"
         check_true(metaTris > 0, "populateMetadata must report >0 triangles (not 0 tris)");
         check_true(metaMats == 14, "populateMetadata must report 14 materials");
         std::cout << "[PASS] populateMetadata returned: " << metaTris << " triangles, " << metaMats << " materials" << std::endl;
+    }
 
-        // Step 10: Verify Kitchen_set.usd
-        std::filesystem::path kitchenPath = "scenes/Kitchen_set/Kitchen_set.usd";
-        if (!std::filesystem::exists(kitchenPath)) {
-            kitchenPath = "../scenes/Kitchen_set/Kitchen_set.usd";
-        }
-        if (std::filesystem::exists(kitchenPath)) {
-            std::cout << "[Step 10] Testing UsdLoader on Kitchen_set.usd..." << std::endl;
-            uint64_t kTris = 0;
-            uint32_t kMats = 0;
-            bool kMetaOk = UsdLoader::populateMetadata(kitchenPath.string(), kTris, kMats);
-            check_true(kMetaOk, "populateMetadata must succeed for Kitchen_set");
-            check_true(kTris > 0, "Kitchen_set metadata must report >0 triangles");
-            std::cout << "  Kitchen_set metadata: " << kTris << " triangles, " << kMats << " materials" << std::endl;
-            SceneData kScene = UsdLoader::loadSceneData(kitchenPath.string());
-            check_true(!kScene.triangles.empty(), "Kitchen_set must produce triangles");
-            check_true(kScene.hasCamera, "Kitchen_set must have camera configured");
-            std::cout << "  Kitchen_set Camera: pos=(" << kScene.cameraPosition.x << ", "
-                      << kScene.cameraPosition.y << ", " << kScene.cameraPosition.z << "), target=("
-                      << kScene.cameraTarget.x << ", " << kScene.cameraTarget.y << ", "
-                      << kScene.cameraTarget.z << "), fov=" << kScene.cameraFov << " deg" << std::endl;
-            std::cout << "[PASS] Kitchen_set successfully loaded: " << kScene.triangles.size()
-                      << " triangles, " << kScene.materials.size() << " materials, "
-                      << kScene.lights.size() << " lights" << std::endl;
-        }
+    // Step 10: Verify Kitchen_set.usd
+    std::filesystem::path kitchenPath = resolveScenePath("scenes/Kitchen_set/Kitchen_set.usd");
+    if (!kitchenPath.empty()) {
+        std::cout << "[Step 10] Testing UsdLoader on Kitchen_set.usd..." << std::endl;
+        uint64_t kTris = 0;
+        uint32_t kMats = 0;
+        bool kMetaOk = UsdLoader::populateMetadata(kitchenPath.string(), kTris, kMats);
+        check_true(kMetaOk, "populateMetadata must succeed for Kitchen_set");
+        check_true(kTris > 0, "Kitchen_set metadata must report >0 triangles");
+        std::cout << "  Kitchen_set metadata: " << kTris << " triangles, " << kMats << " materials" << std::endl;
+        SceneData kScene = UsdLoader::loadSceneData(kitchenPath.string());
+        check_true(!kScene.triangles.empty(), "Kitchen_set must produce triangles");
+        check_true(kScene.hasCamera, "Kitchen_set must have camera configured");
+        std::cout << "  Kitchen_set Camera: pos=(" << kScene.cameraPosition.x << ", "
+                  << kScene.cameraPosition.y << ", " << kScene.cameraPosition.z << "), target=("
+                  << kScene.cameraTarget.x << ", " << kScene.cameraTarget.y << ", "
+                  << kScene.cameraTarget.z << "), fov=" << kScene.cameraFov << " deg" << std::endl;
+        std::cout << "[PASS] Kitchen_set successfully loaded: " << kScene.triangles.size()
+                  << " triangles, " << kScene.materials.size() << " materials, "
+                  << kScene.lights.size() << " lights" << std::endl;
+    }
 
-        // Step 11: Verify Kitchen_set_instanced.usd (USD Native Instancing)
-        std::filesystem::path kitchenInstPath = "scenes/Kitchen_set/Kitchen_set_instanced.usd";
-        if (!std::filesystem::exists(kitchenInstPath)) {
-            kitchenInstPath = "../scenes/Kitchen_set/Kitchen_set_instanced.usd";
-        }
-        if (std::filesystem::exists(kitchenInstPath)) {
-            std::cout << "[Step 11] Testing UsdLoader on Kitchen_set_instanced.usd..." << std::endl;
-            uint64_t kiTris = 0;
-            uint32_t kiMats = 0;
-            bool kiMetaOk = UsdLoader::populateMetadata(kitchenInstPath.string(), kiTris, kiMats);
-            check_true(kiMetaOk, "populateMetadata must succeed for Kitchen_set_instanced");
-            check_true(kiTris > 0, "Kitchen_set_instanced metadata must report >0 triangles");
-            std::cout << "  Kitchen_set_instanced metadata: " << kiTris << " triangles, " << kiMats << " materials" << std::endl;
-            SceneData kiScene = UsdLoader::loadSceneData(kitchenInstPath.string());
-            check_true(!kiScene.triangles.empty(), "Kitchen_set_instanced must produce triangles");
-            std::cout << "[PASS] Kitchen_set_instanced successfully loaded: " << kiScene.triangles.size()
-                      << " triangles, " << kiScene.materials.size() << " materials, "
-                      << kiScene.lights.size() << " lights" << std::endl;
-        }
+    // Step 11: Verify Kitchen_set_instanced.usd (USD Native Instancing)
+    std::filesystem::path kitchenInstPath = resolveScenePath("scenes/Kitchen_set/Kitchen_set_instanced.usd");
+    if (!kitchenInstPath.empty()) {
+        std::cout << "[Step 11] Testing UsdLoader on Kitchen_set_instanced.usd..." << std::endl;
+        uint64_t kiTris = 0;
+        uint32_t kiMats = 0;
+        bool kiMetaOk = UsdLoader::populateMetadata(kitchenInstPath.string(), kiTris, kiMats);
+        check_true(kiMetaOk, "populateMetadata must succeed for Kitchen_set_instanced");
+        check_true(kiTris > 0, "Kitchen_set_instanced metadata must report >0 triangles");
+        std::cout << "  Kitchen_set_instanced metadata: " << kiTris << " triangles, " << kiMats << " materials" << std::endl;
+        SceneData kiScene = UsdLoader::loadSceneData(kitchenInstPath.string());
+        check_true(!kiScene.triangles.empty(), "Kitchen_set_instanced must produce triangles");
+        std::cout << "[PASS] Kitchen_set_instanced successfully loaded: " << kiScene.triangles.size()
+                  << " triangles, " << kiScene.materials.size() << " materials, "
+                  << kiScene.lights.size() << " lights" << std::endl;
+    }
 
-        // Step 12: Verify Buick Riviera (buick rivera-ANKA3DCITY_.usdc)
-        std::filesystem::path carPath = "scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
-        if (!std::filesystem::exists(carPath)) {
-            carPath = "../scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc";
-        }
-        if (std::filesystem::exists(carPath)) {
-            std::cout << "[Step 12] Testing UsdLoader on Buick Riviera..." << std::endl;
-            uint64_t carTris = 0;
-            uint32_t carMats = 0;
-            bool carMetaOk = UsdLoader::populateMetadata(carPath.string(), carTris, carMats);
-            check_true(carMetaOk, "populateMetadata must succeed for Buick Riviera");
-            check_true(carTris > 0, "Buick Riviera metadata must report >0 triangles");
-            std::cout << "  Buick Riviera metadata: " << carTris << " triangles, " << carMats << " materials" << std::endl;
-            SceneData carScene = UsdLoader::loadSceneData(carPath.string());
-            check_true(!carScene.triangles.empty(), "Buick Riviera must produce triangles");
-            std::cout << "  Buick Riviera Camera: pos=(" << carScene.cameraPosition.x << ", "
-                      << carScene.cameraPosition.y << ", " << carScene.cameraPosition.z << "), target=("
-                      << carScene.cameraTarget.x << ", " << carScene.cameraTarget.y << ", "
-                      << carScene.cameraTarget.z << "), fov=" << carScene.cameraFov << " deg, hasCamera=" << carScene.hasCamera << std::endl;
-            std::cout << "  Buick Riviera Textures loaded: " << carScene.textures.size() << std::endl;
-            check_true(!carScene.textures.empty(), "Buick Riviera must have textures loaded");
-            std::cout << "  Buick Riviera Bounds: min=(" << carScene.boundsMin.x << ", " << carScene.boundsMin.y << ", " << carScene.boundsMin.z
-                      << ") max=(" << carScene.boundsMax.x << ", " << carScene.boundsMax.y << ", " << carScene.boundsMax.z << ")" << std::endl;
-            std::cout << "[PASS] Buick Riviera successfully loaded: " << carScene.triangles.size()
-                      << " triangles, " << carScene.materials.size() << " materials, "
-                      << carScene.textures.size() << " textures, "
-                      << carScene.lights.size() << " lights" << std::endl;
-        }
+    // Step 12: Verify Buick Riviera (buick rivera-ANKA3DCITY_.usdc)
+    std::filesystem::path carPath = resolveScenePath("scenes/BuickRiviera/usd/buick rivera-ANKA3DCITY_.usdc");
+    if (!carPath.empty()) {
+        std::cout << "[Step 12] Testing UsdLoader on Buick Riviera..." << std::endl;
+        uint64_t carTris = 0;
+        uint32_t carMats = 0;
+        bool carMetaOk = UsdLoader::populateMetadata(carPath.string(), carTris, carMats);
+        check_true(carMetaOk, "populateMetadata must succeed for Buick Riviera");
+        check_true(carTris > 0, "Buick Riviera metadata must report >0 triangles");
+        std::cout << "  Buick Riviera metadata: " << carTris << " triangles, " << carMats << " materials" << std::endl;
+        SceneData carScene = UsdLoader::loadSceneData(carPath.string());
+        check_true(!carScene.triangles.empty(), "Buick Riviera must produce triangles");
+        std::cout << "  Buick Riviera Camera: pos=(" << carScene.cameraPosition.x << ", "
+                  << carScene.cameraPosition.y << ", " << carScene.cameraPosition.z << "), target=("
+                  << carScene.cameraTarget.x << ", " << carScene.cameraTarget.y << ", "
+                  << carScene.cameraTarget.z << "), fov=" << carScene.cameraFov << " deg, hasCamera=" << carScene.hasCamera << std::endl;
+        std::cout << "  Buick Riviera Textures loaded: " << carScene.textures.size() << std::endl;
+        check_true(!carScene.textures.empty(), "Buick Riviera must have textures loaded");
+        std::cout << "  Buick Riviera Bounds: min=(" << carScene.boundsMin.x << ", " << carScene.boundsMin.y << ", " << carScene.boundsMin.z
+                  << ") max=(" << carScene.boundsMax.x << ", " << carScene.boundsMax.y << ", " << carScene.boundsMax.z << ")" << std::endl;
+        std::cout << "[PASS] Buick Riviera successfully loaded: " << carScene.triangles.size()
+                  << " triangles, " << carScene.materials.size() << " materials, "
+                  << carScene.textures.size() << " textures, "
+                  << carScene.lights.size() << " lights" << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

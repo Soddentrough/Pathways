@@ -2,13 +2,7 @@
 #include <iostream>
 #include <vector>
 #include <cstring>
-#include <cassert>
-#if defined(_WIN32)
-#include <io.h>
-#define close _close
-#else
 #include <unistd.h>
-#endif
 
 int main() {
     std::cout << "=== Running test_p2p_direct_bar ===" << std::endl;
@@ -93,7 +87,10 @@ int main() {
             break;
         }
     }
-    assert(devLocalIdx1 != UINT32_MAX);
+    if (devLocalIdx1 == UINT32_MAX) {
+        std::cerr << "No device-local memory type found on Dev 1." << std::endl;
+        return 1;
+    }
 
     const VkDeviceSize bufferSize = 4 * 1024 * 1024; // 4 MB test buffer
     auto handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
@@ -119,14 +116,38 @@ int main() {
     reqInfo.buffer = buf1;
     VkMemoryRequirements2 memReq2{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
     vkGetBufferMemoryRequirements2(dev1, &reqInfo, &memReq2);
+    // 1b. Create buffer on Dev 0 first so we can query its memory requirements before importing
+    VkExternalMemoryBufferCreateInfo extBufInfo0{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+    extBufInfo0.handleTypes = handleType;
+
+    VkBufferCreateInfo bufInfo0{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufInfo0.pNext = &extBufInfo0;
+    bufInfo0.size = bufferSize;
+    bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkBuffer buf0 = VK_NULL_HANDLE;
+    res = vkCreateBuffer(dev0, &bufInfo0, nullptr, &buf0);
+    if (res != VK_SUCCESS) {
+        std::cerr << "vkCreateBuffer on Dev 0 failed: " << res << std::endl;
+        return 1;
+    }
+
+    VkBufferMemoryRequirementsInfo2 reqInfo0{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+    reqInfo0.buffer = buf0;
+    VkMemoryRequirements2 memReq2_0{ VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+    vkGetBufferMemoryRequirements2(dev0, &reqInfo0, &memReq2_0);
+    VkMemoryRequirements memReq0 = memReq2_0.memoryRequirements;
+
     VkMemoryRequirements memReq1 = memReq2.memoryRequirements;
+    const VkDeviceSize exportAllocSize = std::max(memReq1.size, memReq0.size);
 
     VkExportMemoryAllocateInfo exportAllocInfo{ VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO };
     exportAllocInfo.handleTypes = handleType;
 
     VkMemoryAllocateInfo allocInfo1{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     allocInfo1.pNext = &exportAllocInfo;
-    allocInfo1.allocationSize = memReq1.size;
+    allocInfo1.allocationSize = exportAllocSize;
     allocInfo1.memoryTypeIndex = devLocalIdx1;
 
     VkDeviceMemory mem1 = VK_NULL_HANDLE;
@@ -153,7 +174,7 @@ int main() {
         return 1;
     }
 
-    // 3. Query properties on Dev 0
+    // 3. Query properties on Dev 0 and intersect with buf0 memoryTypeBits
     VkMemoryFdPropertiesKHR fdProps{ VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
     res = pfnGetMemoryFdPropertiesKHR(dev0, handleType, memFd, &fdProps);
     if (res != VK_SUCCESS) {
@@ -162,9 +183,10 @@ int main() {
         return 1;
     }
 
+    const uint32_t compatTypeBits = fdProps.memoryTypeBits & memReq0.memoryTypeBits;
     uint32_t memIdx0 = UINT32_MAX;
     for (uint32_t i = 0; i < memProps0.memoryTypeCount; ++i) {
-        if (fdProps.memoryTypeBits & (1 << i)) {
+        if (compatTypeBits & (1u << i)) {
             memIdx0 = i;
             break;
         }
@@ -182,7 +204,7 @@ int main() {
 
     VkMemoryAllocateInfo allocInfo0{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
     allocInfo0.pNext = &importInfo;
-    allocInfo0.allocationSize = memReq1.size;
+    allocInfo0.allocationSize = exportAllocSize;
     allocInfo0.memoryTypeIndex = memIdx0;
 
     VkDeviceMemory mem0 = VK_NULL_HANDLE;
@@ -193,23 +215,7 @@ int main() {
         return 1;
     }
 
-    // 5. Create buffer on Dev 0
-    VkExternalMemoryBufferCreateInfo extBufInfo0{ VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
-    extBufInfo0.handleTypes = handleType;
-
-    VkBufferCreateInfo bufInfo0{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-    bufInfo0.pNext = &extBufInfo0;
-    bufInfo0.size = bufferSize;
-    bufInfo0.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bufInfo0.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    VkBuffer buf0 = VK_NULL_HANDLE;
-    res = vkCreateBuffer(dev0, &bufInfo0, nullptr, &buf0);
-    if (res != VK_SUCCESS) {
-        std::cerr << "vkCreateBuffer on Dev 0 failed: " << res << std::endl;
-        return 1;
-    }
-
+    // 5. Bind buffer on Dev 0
     res = vkBindBufferMemory(dev0, buf0, mem0, 0);
     if (res != VK_SUCCESS) {
         std::cerr << "vkBindBufferMemory on Dev 0 failed: " << res << std::endl;
@@ -230,7 +236,10 @@ int main() {
             break;
         }
     }
-    assert(hostVisIdx0 != UINT32_MAX);
+    if (hostVisIdx0 == UINT32_MAX) {
+        std::cerr << "No host-visible coherent memory type found on Dev 0." << std::endl;
+        return 1;
+    }
 
     VkBufferCreateInfo rbBufInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     rbBufInfo.size = bufferSize;

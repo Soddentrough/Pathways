@@ -449,39 +449,41 @@ void DenoiserPipeline::recordPassthroughCopy(VkCommandBuffer cmd) {
     }
 }
 
-void DenoiserPipeline::collectQueryResults() {
-    if (m_queryPool == VK_NULL_HANDLE || m_timestampPeriodNs <= 0.0f) {
+void DenoiserPipeline::collectQueryResultsForSlot(uint32_t slot) {
+    if (m_queryPool == VK_NULL_HANDLE || m_timestampPeriodNs <= 0.0f ||
+        slot >= MAX_FRAMES_IN_FLIGHT || !m_querySlotUsed[slot]) {
         return;
     }
-    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
-        if (!m_querySlotUsed[slot]) {
-            continue;
-        }
-        std::array<uint64_t, 12> results{};
-        const VkResult res = vkGetQueryPoolResults(
-            m_device,
-            m_queryPool,
-            slot * 6,
-            6,
-            sizeof(results),
-            results.data(),
-            sizeof(uint64_t) * 2,
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
-        );
-        if (res == VK_SUCCESS) {
-            for (uint32_t p = 0; p < 3; ++p) {
-                const uint64_t t0 = results[(p * 2) * 2];
-                const uint64_t a0 = results[(p * 2) * 2 + 1];
-                const uint64_t t1 = results[(p * 2 + 1) * 2];
-                const uint64_t a1 = results[(p * 2 + 1) * 2 + 1];
-                if (a0 != 0 && a1 != 0 && t1 >= t0) {
-                    m_lastPassTimingsMs[p] = static_cast<double>(t1 - t0) * static_cast<double>(m_timestampPeriodNs) * 1e-6;
-                }
+    std::array<uint64_t, 12> results{};
+    const VkResult res = vkGetQueryPoolResults(
+        m_device,
+        m_queryPool,
+        slot * 6,
+        6,
+        sizeof(results),
+        results.data(),
+        sizeof(uint64_t) * 2,
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT
+    );
+    if (res == VK_SUCCESS) {
+        for (uint32_t p = 0; p < 3; ++p) {
+            const uint64_t t0 = results[(p * 2) * 2];
+            const uint64_t a0 = results[(p * 2) * 2 + 1];
+            const uint64_t t1 = results[(p * 2 + 1) * 2];
+            const uint64_t a1 = results[(p * 2 + 1) * 2 + 1];
+            if (a0 != 0 && a1 != 0 && t1 >= t0) {
+                m_lastPassTimingsMs[p] = static_cast<double>(t1 - t0) * static_cast<double>(m_timestampPeriodNs) * 1e-6;
             }
-            m_lastPassTimingsMs[3] = 0.0;
-            m_lastPassTimingsMs[4] = 0.0;
-            m_querySlotUsed[slot] = false;
         }
+        m_lastPassTimingsMs[3] = 0.0;
+        m_lastPassTimingsMs[4] = 0.0;
+        m_querySlotUsed[slot] = false;
+    }
+}
+
+void DenoiserPipeline::collectQueryResults() {
+    for (uint32_t slot = 0; slot < MAX_FRAMES_IN_FLIGHT; ++slot) {
+        collectQueryResultsForSlot(slot);
     }
 }
 
@@ -578,7 +580,7 @@ void DenoiserPipeline::recordDenoise(
     insertComputeBarrier(VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                          VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
 
-    collectQueryResults();
+    collectQueryResultsForSlot(frameSlot);
     const uint32_t qBase = frameSlot * 6;
     if (m_queryPool != VK_NULL_HANDLE) {
         vkCmdResetQueryPool(cmd, m_queryPool, qBase, 6);

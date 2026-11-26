@@ -19,28 +19,32 @@ int main() {
         return 1;
     }
 
-    uint32_t gpuCount = 0;
-    vkEnumeratePhysicalDevices(instance, &gpuCount, nullptr);
-    if (gpuCount < 2) {
-        std::cout << "Less than 2 GPUs found (" << gpuCount << "). Skipping cross-GPU sync test (requires dual GPUs)." << std::endl;
+    uint32_t rawGpuCount = 0;
+    vkEnumeratePhysicalDevices(instance, &rawGpuCount, nullptr);
+    std::vector<VkPhysicalDevice> allDevs(rawGpuCount);
+    if (rawGpuCount > 0) {
+        vkEnumeratePhysicalDevices(instance, &rawGpuCount, allDevs.data());
+    }
+    std::vector<VkPhysicalDevice> gpus;
+    for (VkPhysicalDevice pd : allDevs) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(pd, &props);
+        if (props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU && props.apiVersion >= VK_API_VERSION_1_4) {
+            gpus.push_back(pd);
+        }
+    }
+    if (gpus.size() < 2) {
+        std::cout << "Less than 2 hardware Vulkan 1.4 GPUs found (" << gpus.size()
+                  << "). Skipping cross-GPU sync test (requires dual hardware GPUs)." << std::endl;
         vkDestroyInstance(instance, nullptr);
         return 0;
     }
-
-    std::vector<VkPhysicalDevice> gpus(gpuCount);
-    vkEnumeratePhysicalDevices(instance, &gpuCount, gpus.data());
 
     VkPhysicalDeviceProperties p0{}, p1{};
     vkGetPhysicalDeviceProperties(gpus[0], &p0);
     vkGetPhysicalDeviceProperties(gpus[1], &p1);
     std::cout << "GPU 0: " << p0.deviceName << std::endl;
     std::cout << "GPU 1: " << p1.deviceName << std::endl;
-    if (p0.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU || p1.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
-        std::cout << "One or more devices is a CPU/software renderer (" << (p1.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? p1.deviceName : p0.deviceName)
-                  << "). Skipping cross-GPU sync test (requires dual hardware GPUs)." << std::endl;
-        vkDestroyInstance(instance, nullptr);
-        return 0;
-    }
 
     // Create Device 0 and Device 1 with external_semaphore_fd
     const char* exts[] = { "VK_KHR_external_semaphore_fd" };
@@ -117,8 +121,11 @@ int main() {
     VkCommandPoolCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
     cpInfo.queueFamilyIndex = 0;
     VkCommandPool cp0 = VK_NULL_HANDLE, cp1 = VK_NULL_HANDLE;
-    vkCreateCommandPool(dev0, &cpInfo, nullptr, &cp0);
-    vkCreateCommandPool(dev1, &cpInfo, nullptr, &cp1);
+    if (vkCreateCommandPool(dev0, &cpInfo, nullptr, &cp0) != VK_SUCCESS ||
+        vkCreateCommandPool(dev1, &cpInfo, nullptr, &cp1) != VK_SUCCESS) {
+        std::cerr << "Failed to create command pools." << std::endl;
+        return 1;
+    }
 
     VkCommandBufferAllocateInfo cbInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -126,11 +133,17 @@ int main() {
 
     cbInfo.commandPool = cp0;
     VkCommandBuffer cmd0 = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(dev0, &cbInfo, &cmd0);
+    if (vkAllocateCommandBuffers(dev0, &cbInfo, &cmd0) != VK_SUCCESS) {
+        std::cerr << "Failed to allocate cmd0." << std::endl;
+        return 1;
+    }
 
     cbInfo.commandPool = cp1;
     VkCommandBuffer cmd1 = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(dev1, &cbInfo, &cmd1);
+    if (vkAllocateCommandBuffers(dev1, &cbInfo, &cmd1) != VK_SUCCESS) {
+        std::cerr << "Failed to allocate cmd1." << std::endl;
+        return 1;
+    }
 
     // Record empty cmd buffers
     VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -199,14 +212,22 @@ int main() {
 
         VkFence fence0 = VK_NULL_HANDLE;
         VkFenceCreateInfo fInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-        vkCreateFence(dev0, &fInfo, nullptr, &fence0);
-
-        if (vkQueueSubmit2(q0, 1, &submit0, fence0) != VK_SUCCESS) {
-            std::cerr << "vkQueueSubmit2 on Dev 0 failed at iter " << iter << std::endl;
+        if (vkCreateFence(dev0, &fInfo, nullptr, &fence0) != VK_SUCCESS) {
+            std::cerr << "vkCreateFence on Dev 0 failed at iter " << iter << std::endl;
             return 1;
         }
 
-        vkWaitForFences(dev0, 1, &fence0, VK_TRUE, UINT64_MAX);
+        if (vkQueueSubmit2(q0, 1, &submit0, fence0) != VK_SUCCESS) {
+            std::cerr << "vkQueueSubmit2 on Dev 0 failed at iter " << iter << std::endl;
+            vkDestroyFence(dev0, fence0, nullptr);
+            return 1;
+        }
+
+        if (vkWaitForFences(dev0, 1, &fence0, VK_TRUE, 5'000'000'000ULL) != VK_SUCCESS) {
+            std::cerr << "vkWaitForFences timed out/failed on Dev 0 at iter " << iter << std::endl;
+            vkDestroyFence(dev0, fence0, nullptr);
+            return 1;
+        }
         vkDestroyFence(dev0, fence0, nullptr);
     }
 
@@ -293,9 +314,19 @@ int main() {
 
             VkFence fence0 = VK_NULL_HANDLE;
             VkFenceCreateInfo fInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-            vkCreateFence(dev0, &fInfo, nullptr, &fence0);
-            if (vkQueueSubmit2(q0, 1, &sub0, fence0) != VK_SUCCESS) return 1;
-            vkWaitForFences(dev0, 1, &fence0, VK_TRUE, UINT64_MAX);
+            if (vkCreateFence(dev0, &fInfo, nullptr, &fence0) != VK_SUCCESS) {
+                std::cerr << "Failed to create timeline fence on Dev 0 at step " << step << std::endl;
+                return 1;
+            }
+            if (vkQueueSubmit2(q0, 1, &sub0, fence0) != VK_SUCCESS) {
+                vkDestroyFence(dev0, fence0, nullptr);
+                return 1;
+            }
+            if (vkWaitForFences(dev0, 1, &fence0, VK_TRUE, 5'000'000'000ULL) != VK_SUCCESS) {
+                std::cerr << "Timeline vkWaitForFences timed out/failed on Dev 0 at step " << step << std::endl;
+                vkDestroyFence(dev0, fence0, nullptr);
+                return 1;
+            }
             vkDestroyFence(dev0, fence0, nullptr);
 
             uint64_t counterVal0 = 0;

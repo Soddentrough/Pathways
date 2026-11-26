@@ -1,6 +1,7 @@
 #include "core/Config.hpp"
 #include "utils/ImageDumper.hpp"
 #include "rt/DenoiserPipeline.hpp"
+#include "rt/WavefrontPipeline.hpp"
 #include "vulkan/VulkanContext.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
@@ -263,31 +264,55 @@ int main() {
     }
 
     // -------------------------------------------------------------------------
-    // 2. Test Wavefront Queue Memory Sizing & Theoretical Traffic Model
+    // 2. Test Wavefront Queue Memory Sizing & ABI Struct Contracts
     // -------------------------------------------------------------------------
     {
-        std::cout << "[TEST 2] Wavefront Queue Memory Footprint & Bandwidth Model..." << std::endl;
+        std::cout << "[TEST 2] Wavefront Queue Memory Footprint & ABI Contracts..." << std::endl;
 
-        // Queue struct sizes in bytes:
-        // RayGeometry = 32 B, RayState = 32 B, RayHit = 16 B, PackedShadowRay = 48 B
-        // Ping-pong buffers: 2x RayGeom (32*4*2 = 256 B/ray), 2x RayState (32*4*2 = 256 B/ray),
-        // RayHit (16*4 = 64 B/ray), ShadowQueue (48 B/ray)
-        const uint32_t bytesPerRayQueue = (32 * 4 * 2) + (32 * 4 * 2) + (16 * 4) + 48; // 624 bytes/ray
+        // Verify shared C++/GLSL push-constant & counter ABI sizes from wavefront_shared.glsl
+        check_true(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
+        check_true(sizeof(WavefrontClassifyPC) == 80, "WavefrontClassifyPC must be 80 bytes");
+        check_true(sizeof(WavefrontShadePC) == 92, "WavefrontShadePC must be 92 bytes");
+        check_true(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
+        check_true(sizeof(WavefrontIntersectPC) == 68, "WavefrontIntersectPC must be 68 bytes");
+        check_true(sizeof(WavefrontTailPC) == 80, "WavefrontTailPC must be 80 bytes");
 
-        // 1080p (1920x1080 = 2,073,600 rays)
-        uint32_t rays1080p = 1920 * 1080;
-        double mb1080p = (static_cast<double>(rays1080p) * bytesPerRayQueue) / (1024.0 * 1024.0);
-        check_true(mb1080p > 1200.0 && mb1080p < 1300.0, "1080p queue footprint is ~1234 MB");
-        assert_near(static_cast<float>(mb1080p), 1233.984f, 0.01f, "1080p queue footprint check");
+        // Actual WavefrontPipeline::allocateQueues per-slot ray queue sizes:
+        // RayGeometry (16 B x 2 ping-pong) + RayState (16 B x 2 ping-pong) +
+        // RayHit (16 B) + PackedShadowRay (32 B) + MaterialIndexQueue (16 B) = 128 B/ray/slot.
+        // Double-buffered across 2 in-flight frame slots = 256 B/ray (320 B/ray with secondary octant queues).
+        constexpr uint32_t bytesPerRayPerSlot = 16u * 2u + 16u * 2u + 16u + 32u + 16u;
+        constexpr uint32_t bytesPerRayDoubleBuffered = bytesPerRayPerSlot * 2u; // 256 B/ray
+        check_true(bytesPerRayDoubleBuffered == 256u, "Double-buffered base queue footprint == 256 B/ray");
 
-        // 4K (3840x2160 = 8,294,400 rays)
-        uint32_t rays4k = 3840 * 2160;
-        double mb4k = (static_cast<double>(rays4k) * bytesPerRayQueue) / (1024.0 * 1024.0);
-        check_true(mb4k > 4900.0 && mb4k < 5000.0, "4K queue footprint is ~4936 MB");
-        assert_near(static_cast<float>(mb4k), 4935.9375f, 0.01f, "4K queue footprint check");
+        // 1080p (1920x1080 = 2,073,600 rays) -> 506.25 MiB
+        uint32_t rays1080p = 1920u * 1080u;
+        double mb1080p = (static_cast<double>(rays1080p) * bytesPerRayDoubleBuffered) / (1024.0 * 1024.0);
+        assert_near(static_cast<float>(mb1080p), 506.25f, 0.01f, "1080p double-buffered queue footprint check");
 
-        std::cout << "  -> Queue memory footprints: 1080p=" << mb1080p << " MB, 4K=" << mb4k << " MB." << std::endl;
+        // 4K (3840x2160 = 8,294,400 rays) -> 2025.0 MiB
+        uint32_t rays4k = 3840u * 2160u;
+        double mb4k = (static_cast<double>(rays4k) * bytesPerRayDoubleBuffered) / (1024.0 * 1024.0);
+        assert_near(static_cast<float>(mb4k), 2025.0f, 0.01f, "4K double-buffered queue footprint check");
+
+        std::cout << "  -> Queue memory footprints (2x slots): 1080p=" << mb1080p << " MiB, 4K=" << mb4k << " MiB." << std::endl;
     }
+
+    struct ScopedTempDirCleanup {
+        std::filesystem::path dir;
+        ~ScopedTempDirCleanup() {
+            if (!dir.empty()) {
+                std::error_code ec;
+                std::filesystem::remove_all(dir, ec);
+            }
+        }
+    };
+    const std::filesystem::path tempOutDir = std::filesystem::temp_directory_path() / "pathways_test_pipeline_comparison";
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(tempOutDir, ec);
+    }
+    ScopedTempDirCleanup tempDirCleanup{ tempOutDir };
 
     // -------------------------------------------------------------------------
     // 3. Test Telemetry Serialization to JSON
@@ -333,9 +358,7 @@ int main() {
         cfgSummary.pipeline_stages.tonemap_ms = 0.120;
         stats.configurations_breakdown.push_back(cfgSummary);
 
-        std::string testJsonPath = "output/test_telemetry_dump.json";
-        std::error_code ec;
-        std::filesystem::create_directories("output", ec);
+        std::string testJsonPath = (tempOutDir / "test_telemetry_dump.json").string();
         ImageDumper::saveStatsJSON(testJsonPath, stats);
 
         check_true(std::filesystem::exists(testJsonPath), "JSON stats file must exist on disk");
@@ -353,25 +376,21 @@ int main() {
         check_true(content.find("machine_learning_and_cooperative_matrix") != std::string::npos, "JSON contains machine_learning_and_cooperative_matrix");
         check_true(content.find("supports_fsr4_ml") != std::string::npos, "JSON contains supports_fsr4_ml");
 
-        // Clean up test file
-        std::filesystem::remove(testJsonPath, ec);
         std::cout << "  -> Telemetry JSON serialization successfully verified." << std::endl;
     }
 
     // -------------------------------------------------------------------------
-    // 6. Test High-Quality 16-bit PNG Screenshot Output & Naming Pattern
+    // 4. Test High-Quality 16-bit PNG Screenshot Output & Naming Pattern
     // -------------------------------------------------------------------------
     {
-        std::cout << "[TEST 6] High-Quality 16-bit PNG Screenshot Output & Naming Pattern..." << std::endl;
-        std::error_code ec;
-        std::filesystem::create_directories("screenshots", ec);
+        std::cout << "[TEST 4] High-Quality 16-bit PNG Screenshot Output & Naming Pattern..." << std::endl;
 
         std::string testScene = "cornell_caustic_extended";
         uint32_t spp = 1;
         uint32_t bounce = 4;
         uint32_t accum = 10;
-        std::string testPath = std::format("screenshots/pw_{}_{}spp_{}bounce_{}accum_test.png",
-                                           testScene, spp, bounce, accum);
+        std::string testPath = (tempOutDir / std::format("pw_{}_{}spp_{}bounce_{}accum_test.png",
+                                            testScene, spp, bounce, accum)).string();
 
         // Create a small 4x4 test pattern in 16-bit RGBA
         uint32_t w = 4, h = 4;
@@ -383,11 +402,10 @@ int main() {
         check_true(std::filesystem::exists(testPath), "16-bit PNG file must exist on disk");
         check_true(std::filesystem::file_size(testPath) > 50, "16-bit PNG file size must be non-trivial");
 
-        std::filesystem::remove(testPath, ec);
         std::cout << "  -> 16-bit PNG async screenshot pipeline & naming format verified." << std::endl;
 
         // Verify uncapped HDR OpenEXR output via TinyEXR
-        std::string exrPath = "screenshots/pw_hdr_test.exr";
+        std::string exrPath = (tempOutDir / "pw_hdr_test.exr").string();
         std::vector<float> hdrPixels(w * h * 4, 0.0f);
         for (uint32_t i = 0; i < w * h; ++i) {
             hdrPixels[i * 4 + 0] = 14.5f;
@@ -397,7 +415,6 @@ int main() {
         }
         check_true(ImageDumper::saveEXR(exrPath, w, h, hdrPixels.data()), "ImageDumper::saveEXR must succeed");
         check_true(std::filesystem::exists(exrPath) && std::filesystem::file_size(exrPath) > 64, "EXR file must be non-empty");
-        std::filesystem::remove(exrPath, ec);
         std::cout << "  -> Uncapped HDR OpenEXR serialization verified." << std::endl;
     }
 
@@ -409,7 +426,7 @@ int main() {
         const uint32_t w = 4, h = 4, ch = 44;
         const size_t numFloats = static_cast<size_t>(w) * h * ch;
         std::vector<uint16_t> payload(numFloats, glm::packHalf1x16(0.25f));
-        const std::string pttdPath = "screenshots/pw_pttd_v5_test.pttd";
+        const std::string pttdPath = (tempOutDir / "pw_pttd_v5_test.pttd").string();
         const float camPos[3] = { 1.0f, 2.0f, 3.0f };
         const float jitter[2] = { 0.25f, -0.25f };
         check_true(ImageDumper::savePTTD(pttdPath, w, h, ch, /*dataType=*/0, /*frameIndex=*/7, /*spp=*/1,
@@ -664,6 +681,7 @@ int main() {
             submitInfo.pCommandBuffers = &cmd;
             check_true(vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE) == VK_SUCCESS, "Submit denoiser test");
             vkQueueWaitIdle(queue);
+            denoiser.collectQueryResults();
 
             std::vector<uint16_t> outHalf(numPx * 4);
             readbackBuf.invalidate(0, rgba16Bytes);
@@ -690,8 +708,10 @@ int main() {
             }
 
             vkDestroyCommandPool(device, cmdPool, nullptr);
+            check_true(vkCtx.getValidationErrors() == 0,
+                       "Zero Vulkan validation errors during DenoiserPipeline test");
             std::cout << "  -> 3-stage DenoiserPipeline (" << (denoiser.isUsingSdkProvider() ? "FFX SDK" : "Passthrough Fallback")
-                      << ") multi-frame & energy conservation verified." << std::endl;
+                      << ") multi-frame & energy conservation verified (0 validation errors)." << std::endl;
         }
     }
 

@@ -678,33 +678,33 @@ enable_testing()
 # Camera & FPS Controls Unit Test Target
 add_executable(test_camera_controls tests/test_camera_controls.cpp)
 target_link_libraries(test_camera_controls PRIVATE pathways_engine_core)
-add_test(NAME CameraControls COMMAND test_camera_controls)
+add_test(NAME CameraControls COMMAND test_camera_controls WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Camera Paths & Trajectories Unit Test Target
 add_executable(test_camera_paths tests/test_camera_paths.cpp)
 target_link_libraries(test_camera_paths PRIVATE pathways_engine_core)
-add_test(NAME CameraPaths COMMAND test_camera_paths)
+add_test(NAME CameraPaths COMMAND test_camera_paths WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # GUI Mouse Wheel, Scroll Indicator & GuiManager Unit Test Target
 add_executable(test_gui_scroll tests/test_gui_scroll.cpp)
 target_link_libraries(test_gui_scroll PRIVATE pathways_engine_core)
-add_test(NAME GuiScroll COMMAND test_gui_scroll)
+add_test(NAME GuiScroll COMMAND test_gui_scroll WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Temporal Anti-Aliasing (TAA) & SuperResolutionManager Unit Test Target
 add_executable(test_taa tests/test_taa.cpp)
 target_link_libraries(test_taa PRIVATE pathways_engine_core)
-add_test(NAME TemporalAntiAliasing COMMAND test_taa)
+add_test(NAME TemporalAntiAliasing COMMAND test_taa WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 if(UNIX)
     # P2P Direct BAR DMA-BUF Cross-GPU Copy Unit Test Target
     add_executable(test_p2p_direct_bar tests/test_p2p_direct_bar.cpp)
     target_link_libraries(test_p2p_direct_bar PRIVATE pathways_engine_core)
-    add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar)
+    add_test(NAME P2PDirectBar COMMAND test_p2p_direct_bar WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
     # Cross-GPU Hardware Synchronization (VK_KHR_external_semaphore_fd + Timeline) Unit Test Target
     add_executable(test_cross_gpu_sync tests/test_cross_gpu_sync.cpp)
     target_link_libraries(test_cross_gpu_sync PRIVATE pathways_engine_core)
-    add_test(NAME CrossGpuSync COMMAND test_cross_gpu_sync)
+    add_test(NAME CrossGpuSync COMMAND test_cross_gpu_sync WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # Pipeline Comparison, CLI Validation & Telemetry Unit Test Target
@@ -713,79 +713,89 @@ target_compile_definitions(test_pipeline_comparison PRIVATE
     PATHWAYS_SPV_DIR="${SPV_OUTPUT_DIR}"
 )
 target_link_libraries(test_pipeline_comparison PRIVATE pathways_engine_core)
-add_test(NAME PipelineComparison COMMAND test_pipeline_comparison)
+add_test(NAME PipelineComparison COMMAND test_pipeline_comparison WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Multi-GPU Frame Pacing, Coordinator & Shared Buffer Unit Test Target
 add_executable(test_mgpu_frame_pacing tests/test_mgpu_frame_pacing.cpp)
 target_link_libraries(test_mgpu_frame_pacing PRIVATE pathways_engine_core)
-add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing)
+add_test(NAME MgpuFramePacing COMMAND test_mgpu_frame_pacing WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Tier 3 GPU TLAS Refit & GpuTlasUpdatePipeline Unit Test Target
 add_executable(test_tlas_gpu_refit tests/test_tlas_gpu_refit.cpp)
 target_link_libraries(test_tlas_gpu_refit PRIVATE pathways_engine_core)
-add_test(NAME TlasGpuRefit COMMAND test_tlas_gpu_refit)
+add_test(NAME TlasGpuRefit COMMAND test_tlas_gpu_refit WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Tier 4 Neural Radiance Caching (NRC) Wave32 WMMA Unit Test Target
 add_executable(test_nrc_wmma tests/test_nrc_wmma.cpp)
 target_link_libraries(test_nrc_wmma PRIVATE pathways_engine_core)
-add_test(NAME NrcWmma COMMAND test_nrc_wmma)
+add_test(NAME NrcWmma COMMAND test_nrc_wmma WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Upways Neural Denoiser & Super-Resolution Wave32 WMMA Unit Test Target
 add_executable(test_upways_pipeline tests/test_upways_pipeline.cpp)
 target_link_libraries(test_upways_pipeline PRIVATE pathways_engine_core)
-add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline)
+add_test(NAME UpwaysPipeline COMMAND test_upways_pipeline WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # ReSTIR PT Mathematical Foundations & Estimator Unit Test Target
 add_executable(test_restir_pt_math tests/test_restir_pt_math.cpp)
 target_link_libraries(test_restir_pt_math PRIVATE pathways_engine_core)
-add_test(NAME RestirPtMath COMMAND test_restir_pt_math)
+add_test(NAME RestirPtMath COMMAND test_restir_pt_math WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # DGC Multi-Slice Ring Buffer & Dedicated Compute Queue Unit Test Target
 add_executable(test_dgc_async_queue tests/test_dgc_async_queue.cpp)
 target_link_libraries(test_dgc_async_queue PRIVATE pathways_engine_core)
-add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue)
+add_test(NAME DgcAsyncQueue COMMAND test_dgc_async_queue WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Batched BLAS Builds & Compaction Unit Test Target
 add_executable(test_blas_batch tests/test_blas_batch.cpp)
 target_link_libraries(test_blas_batch PRIVATE pathways_engine_core)
-add_test(NAME BlasBatch COMMAND test_blas_batch)
+add_test(NAME BlasBatch COMMAND test_blas_batch WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Hierarchical Light Tree & Emissive Geometry Pipeline Unit Test Target
 add_executable(test_light_tree tests/test_light_tree.cpp)
 target_link_libraries(test_light_tree PRIVATE pathways_engine_core)
-add_test(NAME LightTree COMMAND test_light_tree)
+add_test(NAME LightTree COMMAND test_light_tree WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# Light Mapping, Emissive Geometry Lights & Alias Table Unit Test Target
+add_executable(test_light_mapping tests/test_light_mapping.cpp)
+target_link_libraries(test_light_mapping PRIVATE pathways_engine_core)
+add_test(NAME LightMapping COMMAND test_light_mapping WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# Core Subsystems (QualityGovernor, ConfigTally, InputController, SceneRegistry, Config) Unit Test Target
+add_executable(test_core_subsystems tests/test_core_subsystems.cpp)
+target_link_libraries(test_core_subsystems PRIVATE pathways_engine_core)
+add_test(NAME CoreSubsystems COMMAND test_core_subsystems WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # 2D Equirectangular Environment Importance Table & MIS Math Unit Test Target
 add_executable(test_env_importance tests/test_env_importance.cpp)
 target_link_libraries(test_env_importance PRIVATE pathways_engine_core)
-add_test(NAME EnvImportance COMMAND test_env_importance)
+add_test(NAME EnvImportance COMMAND test_env_importance WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # glTF KHR_mesh_quantization, KHR_materials_specular & MiniJson Unit Test Target
 add_executable(test_mesh_quantization tests/test_mesh_quantization.cpp)
 target_link_libraries(test_mesh_quantization PRIVATE pathways_engine_core)
-add_test(NAME MeshQuantization COMMAND test_mesh_quantization)
+add_test(NAME MeshQuantization COMMAND test_mesh_quantization WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Procedural Cyber City Megastructure Unit Test Target
 add_executable(test_procedural_cyber_city tests/test_procedural_cyber_city.cpp)
 target_link_libraries(test_procedural_cyber_city PRIVATE pathways_engine_core)
-add_test(NAME ProceduralCyberCity COMMAND test_procedural_cyber_city)
+add_test(NAME ProceduralCyberCity COMMAND test_procedural_cyber_city WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Real-Time Caustics Dielectric Target & Bounding Volume Unit Test Target
 add_executable(test_caustics_detection tests/test_caustics_detection.cpp)
 target_link_libraries(test_caustics_detection PRIVATE pathways_engine_core)
-add_test(NAME CausticsDetection COMMAND test_caustics_detection)
+add_test(NAME CausticsDetection COMMAND test_caustics_detection WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # AMD FidelityFX SDK 2.4 Feature, Performance & Visual Assessment Test Target
 add_executable(test_fidelityfx_features tests/test_fidelityfx_features.cpp)
 target_link_libraries(test_fidelityfx_features PRIVATE pathways_engine_core)
 add_dependencies(test_fidelityfx_features pathways)
-add_test(NAME FidelityFxFeatures COMMAND test_fidelityfx_features)
+add_test(NAME FidelityFxFeatures COMMAND test_fidelityfx_features WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # OpenUSD Native Scene Ingestion Unit Test Target
 if(pxr_FOUND)
     add_executable(test_usd_loader tests/test_usd_loader.cpp)
     target_link_libraries(test_usd_loader PRIVATE pathways_engine_core)
-    add_test(NAME UsdLoader COMMAND test_usd_loader)
+    add_test(NAME UsdLoader COMMAND test_usd_loader WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 endif() # BUILD_TESTING
 

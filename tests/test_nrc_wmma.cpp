@@ -70,18 +70,21 @@ int main() {
     check_true(offsetof(NRCCountersBuffer, dispatchX) == 8, "dispatchX must be at byte 8");
     std::cout << "  -> NRCCountersBuffer layout verified (16B std430 aligned)." << std::endl;
 
-    // 2. Verify Spatial Hash Coordinate Parity (Legacy Hash Grid Math)
+    // 2. Verify Spatial Hash Coordinate Parity (Legacy + Active 8-Level Hash Grid Math)
     std::cout << "[TEST 2] Spatial Hash Math & Bounded Index Verification..." << std::endl;
     const float GRID_SCALES[12] = {
         16.0f, 23.36f, 34.12f, 49.83f, 72.78f, 106.28f,
         155.23f, 226.70f, 331.09f, 483.54f, 706.18f, 1031.33f
     };
-    check_true(GRID_SCALES[0] >= 16.0f, "Min grid scale should be 16");
-    check_true(GRID_SCALES[11] >= 1000.0f, "Max grid scale should exceed 1000 for sub-millimeter detail");
+    const float ACTIVE_SCALES[8] = {
+        16.0f, 29.0f, 52.6f, 95.4f, 173.0f, 313.8f, 569.1f, 1031.33f
+    };
+    check_true(GRID_SCALES[0] >= 16.0f && ACTIVE_SCALES[0] >= 16.0f, "Min grid scale should be 16");
+    check_true(GRID_SCALES[11] >= 1000.0f && ACTIVE_SCALES[7] >= 1000.0f, "Max grid scale should exceed 1000 for sub-millimeter detail");
 
     // Test hash boundedness and determinism across random normalized coords
-    for (uint32_t l = 0; l < 12; ++l) {
-        float s = GRID_SCALES[l];
+    for (uint32_t l = 0; l < 8; ++l) {
+        float s = ACTIVE_SCALES[l];
         for (int i = 0; i < 50; ++i) {
             float px = (i * 0.021f);
             float py = (i * 0.017f);
@@ -100,26 +103,28 @@ int main() {
             }
         }
     }
-    std::cout << "  -> Hash table index bounded to [0, 262143] across all 12 multi-resolution levels." << std::endl;
+    std::cout << "  -> Hash table index bounded to [0, 262143] across all 8 active multi-resolution levels." << std::endl;
 
-    // 3. Verify WMMA Cooperative Matrix 16x16x16 Tiling Math
+    // 3. Verify WMMA Cooperative Matrix 16x16x16 Tiling Math (NRC_TOTAL_WEIGHTS == 9360)
     std::cout << "[TEST 3] WMMA Wave32 Cooperative Matrix MLP Topology..." << std::endl;
     // Input features: 64. Hidden: 64. Output: 16 (first 3 channels = RGB).
     // Batch size per SIMD32 wave: 16 rays.
-    // Matrix A: 16 x 64 (16 queries, 64 features)
-    // Matrix B0: 64 x 64 (Layer 0 weights)
-    // Matrix B1: 64 x 64 (Layer 1 weights)
-    // Matrix B2: 64 x 16 (Layer 2 weights)
+    // Layer 0: W0 (64x64) + B0 (64)
+    // Layer 1: W1 (64x64) + B1 (64)
+    // Layer 2: W2 (64x16) + B2 (16)
     const uint32_t w0_count = 64 * 64; // 4096
+    const uint32_t b0_count = 64;
     const uint32_t w1_count = 64 * 64; // 4096
+    const uint32_t b1_count = 64;
     const uint32_t w2_count = 64 * 16; // 1024
-    const uint32_t total_weights = w0_count + w1_count + w2_count; // 9216 float16
-    check_true(total_weights == 9216, "MLP total weights must be 9216 float16 parameters");
-    check_true(total_weights * sizeof(uint16_t) == 18432, "Weights buffer must be 18432 bytes");
+    const uint32_t b2_count = 16;
+    const uint32_t total_weights = w0_count + b0_count + w1_count + b1_count + w2_count + b2_count; // 9360 float16
+    check_true(total_weights == 9360u, "MLP total weights + biases must equal NRC_TOTAL_WEIGHTS (9360)");
+    check_true(total_weights * sizeof(uint16_t) == 18720u, "Weights buffer must be 18720 bytes");
     check_true((w0_count % (16 * 16)) == 0, "Layer 0 dimensions must be multiple of 16x16 WMMA tile");
     check_true((w1_count % (16 * 16)) == 0, "Layer 1 dimensions must be multiple of 16x16 WMMA tile");
     check_true((w2_count % (16 * 16)) == 0, "Layer 2 dimensions must be multiple of 16x16 WMMA tile");
-    std::cout << "  -> Wave32 WMMA 16x16x16 tiling alignment verified for all 3 layers." << std::endl;
+    std::cout << "  -> Wave32 WMMA 16x16x16 tiling alignment verified for all 3 layers (9360 params)." << std::endl;
 
     // 4. Verify Relative L1 Loss & Adam Optimizer Numerical Stability
     std::cout << "[TEST 4] Relative L1 Loss & Adam Optimizer Numerical Stability..." << std::endl;
@@ -377,7 +382,7 @@ int main() {
                     glm::vec3 initRgb(0.0f), trainedRgb(0.0f);
                     runProbe(0, initRgb);
 
-                    // Compute exact CPU reference of initWeights() on qVec[0]
+                    // Compute exact CPU reference of initWeights() averaged across all 4 X-phases (qVec[0..3])
                     glm::vec3 cpuPred(0.0f);
                     {
                         std::mt19937 rng(42);
@@ -391,52 +396,55 @@ int main() {
                         for (size_t i = 0; i < 1024; ++i) setP(8320 + i, weightDist(rng) * 0.02f);
                         for (size_t i = 0; i < 16; ++i) setP(9344 + i, i < 3 ? 0.02f : 0.0f);
 
-                        glm::vec3 np = glm::clamp((glm::vec3(qVec[0].pos_roughness) - glm::vec3(-1.5f)) / glm::vec3(3.0f), glm::vec3(0.0f), glm::vec3(1.0f));
-                        float x[64]{};
                         const float PI = 3.14159265359f;
-                        // Channels 0..15 stay 0.0 (untrained hash grid starts zero-initialized)
-                        // Channels 16..23: linear skip-encoding
-                        x[16] = np.x; x[17] = np.y; x[18] = np.z;
-                        x[19] = 0.0f; x[20] = 0.0f; x[21] = 1.0f;
-                        x[22] = 0.0f; x[23] = 0.0f;
-                        // Channels 24..41: 3-octave Fourier encoding (axes 0..2, amp *= 0.5)
-                        for (int ax = 0; ax < 3; ++ax) {
-                            float th = np[ax] * PI, s = std::sin(th), c = std::cos(th), amp = 1.0f;
-                            for (int o = 0; o < 3; ++o) {
-                                x[24 + ax * 6 + o * 2 + 0] = s * amp;
-                                x[24 + ax * 6 + o * 2 + 1] = c * amp;
-                                if (o < 2) { float s2 = 2*s*c, c2 = c*c - s*s; s = s2; c = c2; amp *= 0.5f; }
+                        for (uint32_t qIdx = 0; qIdx < 4; ++qIdx) {
+                            glm::vec3 np = glm::clamp((glm::vec3(qVec[qIdx].pos_roughness) - glm::vec3(-1.5f)) / glm::vec3(3.0f), glm::vec3(0.0f), glm::vec3(1.0f));
+                            float x[64]{};
+                            // Channels 0..15 stay 0.0 (untrained hash grid starts zero-initialized)
+                            // Channels 16..23: linear skip-encoding
+                            x[16] = np.x; x[17] = np.y; x[18] = np.z;
+                            x[19] = 0.0f; x[20] = 0.0f; x[21] = 1.0f;
+                            x[22] = 0.0f; x[23] = 0.0f;
+                            // Channels 24..41: 3-octave Fourier encoding (axes 0..2, amp *= 0.5)
+                            for (int ax = 0; ax < 3; ++ax) {
+                                float th = np[ax] * PI, s = std::sin(th), c = std::cos(th), amp = 1.0f;
+                                for (int o = 0; o < 3; ++o) {
+                                    x[24 + ax * 6 + o * 2 + 0] = s * amp;
+                                    x[24 + ax * 6 + o * 2 + 1] = c * amp;
+                                    if (o < 2) { float s2 = 2*s*c, c2 = c*c - s*s; s = s2; c = c2; amp *= 0.5f; }
+                                }
+                            }
+                            // Channels 42..50: Order-2 SH of N=(0,0,1)
+                            x[42] = 0.282095f;
+                            x[44] = 0.488603f;
+                            x[48] = 0.315392f * 2.0f;
+                            // Channels 51..63: V=(0,0,1), R=(0,0,1), NdotV=1, rough=0.8, rough^2=0.64, specRatio=0, 1-spec=1, F=0, bias=1
+                            x[51]=0.0f; x[52]=0.0f; x[53]=1.0f;
+                            x[54]=0.0f; x[55]=0.0f; x[56]=1.0f;
+                            x[57]=1.0f; x[58]=0.8f; x[59]=0.64f;
+                            x[60]=0.0f; x[61]=1.0f; x[62]=0.0f; x[63]=1.0f;
+                            for (int i = 0; i < 64; ++i) x[i] = glm::unpackHalf1x16(glm::packHalf1x16(x[i]));
+                            float h0[64]{}, h1[64]{};
+                            for (int j = 0; j < 64; ++j) {
+                                float s = W[4096 + j];
+                                for (int i = 0; i < 64; ++i) s += x[i] * W[i * 64 + j];
+                                h0[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
+                            }
+                            for (int j = 0; j < 64; ++j) {
+                                float s = W[8256 + j];
+                                for (int i = 0; i < 64; ++i) s += h0[i] * W[4160 + i * 64 + j];
+                                h1[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
+                            }
+                            for (int c = 0; c < 3; ++c) {
+                                float s = W[9344 + c];
+                                for (int i = 0; i < 64; ++i) s += h1[i] * W[8320 + i * 16 + c];
+                                cpuPred[c] += std::max(0.0f, s);
                             }
                         }
-                        // Channels 42..50: Order-2 SH of N=(0,0,1)
-                        x[42] = 0.282095f;
-                        x[44] = 0.488603f;
-                        x[48] = 0.315392f * 2.0f;
-                        // Channels 51..63: V=(0,0,1), R=(0,0,1), NdotV=1, rough=0.8, rough^2=0.64, specRatio=0, 1-spec=1, F=0, bias=1
-                        x[51]=0.0f; x[52]=0.0f; x[53]=1.0f;
-                        x[54]=0.0f; x[55]=0.0f; x[56]=1.0f;
-                        x[57]=1.0f; x[58]=0.8f; x[59]=0.64f;
-                        x[60]=0.0f; x[61]=1.0f; x[62]=0.0f; x[63]=1.0f;
-                        for (int i = 0; i < 64; ++i) x[i] = glm::unpackHalf1x16(glm::packHalf1x16(x[i]));
-                        float h0[64]{}, h1[64]{};
-                        for (int j = 0; j < 64; ++j) {
-                            float s = W[4096 + j];
-                            for (int i = 0; i < 64; ++i) s += x[i] * W[i * 64 + j];
-                            h0[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
-                        }
-                        for (int j = 0; j < 64; ++j) {
-                            float s = W[8256 + j];
-                            for (int i = 0; i < 64; ++i) s += h0[i] * W[4160 + i * 64 + j];
-                            h1[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
-                        }
-                        for (int c = 0; c < 3; ++c) {
-                            float s = W[9344 + c];
-                            for (int i = 0; i < 64; ++i) s += h1[i] * W[8320 + i * 16 + c];
-                            cpuPred[c] = std::max(0.0f, s);
-                        }
+                        cpuPred /= 4.0f;
                     }
 
-                    // Uniform query 0 prediction matches CPU FP16 reference (qVec has 4 x-phases; mean is close to initRgb)
+                    // Mean prediction across 32 queries matches 4-phase CPU FP16 reference
                     float initErr = std::max({ std::abs(initRgb.r - cpuPred.r), std::abs(initRgb.g - cpuPred.g), std::abs(initRgb.b - cpuPred.b) });
                     if (initErr >= 5e-3f) {
                         std::cerr << "  -> [FAIL] CPU init=(" << cpuPred.r << ", " << cpuPred.g << ", " << cpuPred.b
@@ -454,7 +462,9 @@ int main() {
                     }
                     check_true(targetErr < 0.15f && channelSpread < 0.10f,
                                "NRC GPU WMMA training converges neutrally toward gray target without channel bias");
-                    std::cout << "  -> [TEST 6] NRC WMMA numeric inference & neutral training parity passed." << std::endl;
+                    check_true(vkCtx.getValidationErrors() == 0,
+                               "Zero Vulkan validation errors during NRC numeric training/inference parity test");
+                    std::cout << "  -> [TEST 6] NRC WMMA numeric inference & neutral training parity passed (0 validation errors)." << std::endl;
                 }
             }
         }

@@ -99,6 +99,7 @@ int main() {
     // 2. Test Dual-GPU Vulkan Host Memory Zero-Copy Import (VK_EXT_external_memory_host)
     // -------------------------------------------------------------------------
     std::cout << "[TEST 2] Dual-GPU VK_EXT_external_memory_host Import..." << std::endl;
+    bool hasDualHardwareGpus = false;
     {
         VkApplicationInfo appInfo{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
         appInfo.apiVersion = VK_API_VERSION_1_4;
@@ -114,18 +115,10 @@ int main() {
 
         uint32_t gpuCount = 0;
         vkEnumeratePhysicalDevices(instance, &gpuCount, nullptr);
-        if (gpuCount < 2) {
-            std::cout << "  -> Less than 2 GPUs found (" << gpuCount
-                      << "). Gracefully skipping dual-GPU Vulkan host memory test." << std::endl;
-            vkDestroyInstance(instance, nullptr);
-            std::cout << "==========================================================" << std::endl;
-            std::cout << "  ALL MULTI-GPU FRAME PACING TESTS PASSED!" << std::endl;
-            std::cout << "==========================================================" << std::endl;
-            return 0;
-        }
-
         std::vector<VkPhysicalDevice> allDevs(gpuCount);
-        vkEnumeratePhysicalDevices(instance, &gpuCount, allDevs.data());
+        if (gpuCount > 0) {
+            vkEnumeratePhysicalDevices(instance, &gpuCount, allDevs.data());
+        }
         std::vector<VkPhysicalDevice> gpus;
         for (VkPhysicalDevice pd : allDevs) {
             VkPhysicalDeviceProperties props{};
@@ -134,15 +127,12 @@ int main() {
                 gpus.push_back(pd);
             }
         }
-        if (gpus.size() < 2) {
+        hasDualHardwareGpus = (gpus.size() >= 2);
+        if (!hasDualHardwareGpus) {
             std::cout << "  -> Less than 2 hardware Vulkan 1.4 GPUs found (" << gpus.size()
-                      << "). Gracefully skipping dual-GPU hardware test." << std::endl;
+                      << "). Skipping dual-GPU hardware tests (Tests 2 & 3)." << std::endl;
             vkDestroyInstance(instance, nullptr);
-            std::cout << "==========================================================" << std::endl;
-            std::cout << "  ALL MULTI-GPU FRAME PACING TESTS PASSED!" << std::endl;
-            std::cout << "==========================================================" << std::endl;
-            return 0;
-        }
+        } else {
 
         // Check if both devices support VK_EXT_external_memory_host
         auto checkExt = [](VkPhysicalDevice physDev, const char* extName) -> bool {
@@ -301,13 +291,14 @@ int main() {
         vkDestroyDevice(dev0, nullptr);
         vkDestroyDevice(dev1, nullptr);
         vkDestroyInstance(instance, nullptr);
+        }
     }
 
     // -------------------------------------------------------------------------
     // 3. Real MultiGpuManager Lazy Standby Init, Timeline Sync & 6-Plane Buffer Sizing
     // -------------------------------------------------------------------------
     std::cout << "[TEST 3] Real MultiGpuManager Lazy Standby Init & 6-Plane Shared Buffer..." << std::endl;
-    {
+    if (hasDualHardwareGpus) {
         Config cfgOff;
         cfgOff.headless = true;
         cfgOff.validation_layers = true;

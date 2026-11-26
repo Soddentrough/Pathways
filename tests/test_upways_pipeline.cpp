@@ -1205,34 +1205,36 @@ int main(int argc, char** argv) {
                     const uint16_t* bandH = static_cast<const uint16_t*>(bandReadbackBuf.map());
                     check_true(fullH != nullptr && bandH != nullptr, "Map full vs fused band tonemap readback");
 
-                    float maxAbsDiffAll = 0.0f;
-                    float maxAbsDiffSeam = 0.0f;
-                    bool allFinite = true;
-                    for (uint32_t y = 0; y < outH; ++y) {
-                        for (uint32_t x = 0; x < outW; ++x) {
-                            const size_t off = (static_cast<size_t>(y) * outW + x) * 4u;
-                            for (int c = 0; c < 3; ++c) {
-                                const float fv = glm::unpackHalf1x16(fullH[off + c]);
-                                const float bv = glm::unpackHalf1x16(bandH[off + c]);
-                                if (!std::isfinite(fv) || !std::isfinite(bv)) {
-                                    allFinite = false;
-                                }
-                                const float d = std::abs(fv - bv);
-                                maxAbsDiffAll = std::max(maxAbsDiffAll, d);
-                                if (y + 2u >= splitY && y <= splitY + 1u) {
-                                    maxAbsDiffSeam = std::max(maxAbsDiffSeam, d);
+                    if (fullH && bandH) {
+                        float maxAbsDiffAll = 0.0f;
+                        float maxAbsDiffSeam = 0.0f;
+                        bool allFinite = true;
+                        for (uint32_t y = 0; y < outH; ++y) {
+                            for (uint32_t x = 0; x < outW; ++x) {
+                                const size_t off = (static_cast<size_t>(y) * outW + x) * 4u;
+                                for (int c = 0; c < 3; ++c) {
+                                    const float fv = glm::unpackHalf1x16(fullH[off + c]);
+                                    const float bv = glm::unpackHalf1x16(bandH[off + c]);
+                                    if (!std::isfinite(fv) || !std::isfinite(bv)) {
+                                        allFinite = false;
+                                    }
+                                    const float d = std::abs(fv - bv);
+                                    maxAbsDiffAll = std::max(maxAbsDiffAll, d);
+                                    if (y + 2u >= splitY && y <= splitY + 1u) {
+                                        maxAbsDiffSeam = std::max(maxAbsDiffSeam, d);
+                                    }
                                 }
                             }
                         }
+                        std::cout << "    -> Fused Band-Parallel vs Full [" << modeLabel << ", prec=" << upwaysPrecisionName(fullP.getPrecision())
+                                  << "]: max_abs_diff_all=" << maxAbsDiffAll
+                                  << ", max_abs_diff_seam=" << maxAbsDiffSeam << std::endl;
+                        check_true(allFinite, "Fused Band-Parallel outputs are all finite");
+                        check_true(maxAbsDiffAll < maxTol, "Fused Band-Parallel stitched tonemap matches full-screen output");
+                        check_true(maxAbsDiffSeam < maxTol, "Fused Band-Parallel seam across splitHrY has no discontinuity");
                     }
-                    readbackBuf.unmap();
-                    bandReadbackBuf.unmap();
-                    std::cout << "    -> Fused Band-Parallel vs Full [" << modeLabel << ", prec=" << upwaysPrecisionName(fullP.getPrecision())
-                              << "]: max_abs_diff_all=" << maxAbsDiffAll
-                              << ", max_abs_diff_seam=" << maxAbsDiffSeam << std::endl;
-                    check_true(allFinite, "Fused Band-Parallel outputs are all finite");
-                    check_true(maxAbsDiffAll < maxTol, "Fused Band-Parallel stitched tonemap matches full-screen output");
-                    check_true(maxAbsDiffSeam < maxTol, "Fused Band-Parallel seam across splitHrY has no discontinuity");
+                    if (fullH) readbackBuf.unmap();
+                    if (bandH) bandReadbackBuf.unmap();
                     vkDeviceWaitIdle(device);
                 };
 
@@ -1270,19 +1272,21 @@ int main(int argc, char** argv) {
                     readbackBuf.invalidate();
                     const uint16_t* halfPtr = static_cast<const uint16_t*>(readbackBuf.map());
                     check_true(halfPtr != nullptr, "Map 128x128 SR readback");
-                    bool allFinitePos = true;
-                    const size_t nPix = 128ULL * 128ULL;
-                    for (size_t i = 0; i < nPix; ++i) {
-                        const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
-                        const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
-                        const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
-                        if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || r <= 0.0f) {
-                            allFinitePos = false;
-                            break;
+                    if (halfPtr) {
+                        bool allFinitePos = true;
+                        const size_t nPix = 128ULL * 128ULL;
+                        for (size_t i = 0; i < nPix; ++i) {
+                            const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
+                            const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
+                            const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
+                            if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || r <= 0.0f) {
+                                allFinitePos = false;
+                                break;
+                            }
                         }
+                        readbackBuf.unmap();
+                        check_true(allFinitePos, "All 128x128 SR output pixels must be finite and positive");
                     }
-                    readbackBuf.unmap();
-                    check_true(allFinitePos, "All 128x128 SR output pixels must be finite and positive");
                 }
 
                 // Phase B: Lossless DRS resize (64x64 -> 96x96 @ 128x128)
@@ -1314,20 +1318,22 @@ int main(int argc, char** argv) {
                     readbackBuf.invalidate();
                     const uint16_t* halfPtr = static_cast<const uint16_t*>(readbackBuf.map());
                     check_true(halfPtr != nullptr, "Map 64x64 native zero-residual readback");
-                    bool energyExact = true;
-                    const size_t nPix = 64ULL * 64ULL;
-                    for (size_t i = 0; i < nPix; ++i) {
-                        const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
-                        const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
-                        const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
-                        if (!std::isfinite(r) || std::abs(r - 0.865f) > 0.02f ||
-                            std::abs(g - 0.865f) > 0.02f || std::abs(b - 0.865f) > 0.02f) {
-                            energyExact = false;
-                            break;
+                    if (halfPtr) {
+                        bool energyExact = true;
+                        const size_t nPix = 64ULL * 64ULL;
+                        for (size_t i = 0; i < nPix; ++i) {
+                            const float r = glm::unpackHalf1x16(halfPtr[i * 4 + 0]);
+                            const float g = glm::unpackHalf1x16(halfPtr[i * 4 + 1]);
+                            const float b = glm::unpackHalf1x16(halfPtr[i * 4 + 2]);
+                            if (!std::isfinite(r) || std::abs(r - 0.865f) > 0.02f ||
+                                std::abs(g - 0.865f) > 0.02f || std::abs(b - 0.865f) > 0.02f) {
+                                energyExact = false;
+                                break;
+                            }
                         }
+                        readbackBuf.unmap();
+                        check_true(energyExact, "Native 1.0x zero-residual output matches remodulated 0.865 radiance");
                     }
-                    readbackBuf.unmap();
-                    check_true(energyExact, "Native 1.0x zero-residual output matches remodulated 0.865 radiance");
                 }
                     vkDeviceWaitIdle(device);
 
@@ -1426,38 +1432,40 @@ int main(int argc, char** argv) {
                         readbackBuf.invalidate();
                         const uint16_t* edgeH = static_cast<const uint16_t*>(readbackBuf.map());
                         check_true(edgeH != nullptr, "Map Phase F edge readback");
-                        bool allEdgeFinite = true;
-                        bool skyPassOk = true;
-                        bool dielBit16Ok = true;
-                        for (uint32_t y = 0; y < 64u; ++y) {
-                            for (uint32_t x = 0; x < 64u; ++x) {
-                                const size_t idx = (static_cast<size_t>(y) * 64u + x) * 4u;
-                                const float r = glm::unpackHalf1x16(edgeH[idx + 0]);
-                                const float g = glm::unpackHalf1x16(edgeH[idx + 1]);
-                                const float b = glm::unpackHalf1x16(edgeH[idx + 2]);
-                                if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) {
-                                    allEdgeFinite = false;
-                                }
-                                if (y >= 4u && y < 28u && x >= 4u && x < 60u) {
-                                    if (std::abs(r - skyRgb.r) > 0.02f ||
-                                        std::abs(g - skyRgb.g) > 0.02f ||
-                                        std::abs(b - skyRgb.b) > 0.02f) {
-                                        skyPassOk = false;
+                        if (edgeH) {
+                            bool allEdgeFinite = true;
+                            bool skyPassOk = true;
+                            bool dielBit16Ok = true;
+                            for (uint32_t y = 0; y < 64u; ++y) {
+                                for (uint32_t x = 0; x < 64u; ++x) {
+                                    const size_t idx = (static_cast<size_t>(y) * 64u + x) * 4u;
+                                    const float r = glm::unpackHalf1x16(edgeH[idx + 0]);
+                                    const float g = glm::unpackHalf1x16(edgeH[idx + 1]);
+                                    const float b = glm::unpackHalf1x16(edgeH[idx + 2]);
+                                    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) {
+                                        allEdgeFinite = false;
                                     }
-                                }
-                                if (y >= 36u && y < 60u && x >= 4u && x < 60u) {
-                                    if (std::abs(r - 0.62f) > 0.025f ||
-                                        std::abs(g - 0.62f) > 0.025f ||
-                                        std::abs(b - 0.62f) > 0.025f) {
-                                        dielBit16Ok = false;
+                                    if (y >= 4u && y < 28u && x >= 4u && x < 60u) {
+                                        if (std::abs(r - skyRgb.r) > 0.02f ||
+                                            std::abs(g - skyRgb.g) > 0.02f ||
+                                            std::abs(b - skyRgb.b) > 0.02f) {
+                                            skyPassOk = false;
+                                        }
+                                    }
+                                    if (y >= 36u && y < 60u && x >= 4u && x < 60u) {
+                                        if (std::abs(r - 0.62f) > 0.025f ||
+                                            std::abs(g - 0.62f) > 0.025f ||
+                                            std::abs(b - 0.62f) > 0.025f) {
+                                            dielBit16Ok = false;
+                                        }
                                     }
                                 }
                             }
+                            readbackBuf.unmap();
+                            check_true(allEdgeFinite, "Separated compact edge-case output has zero NaN/Inf");
+                            check_true(skyPassOk, "Sky pixels still read uMlSkipCompact cleanly");
+                            check_true(dielBit16Ok, "specVmv.y==0 fallback & primaryTrans bit 16 match exact dielectric radiance");
                         }
-                        readbackBuf.unmap();
-                        check_true(allEdgeFinite, "Separated compact edge-case output has zero NaN/Inf");
-                        check_true(skyPassOk, "Sky pixels still read uMlSkipCompact cleanly");
-                        check_true(dielBit16Ok, "specVmv.y==0 fallback & primaryTrans bit 16 match exact dielectric radiance");
                         vkDeviceWaitIdle(device);
                     }
                     std::cout << "    -> Verified V4 precision=" << upwaysPrecisionName(prec) << " on live GPU." << std::endl;
@@ -1481,13 +1489,21 @@ int main(int argc, char** argv) {
                     check_true(!v5Precs.empty(), "At least FP8 or INT8 WMMA must be supported for Upways 5.0");
 
                     namespace fs = std::filesystem;
-                    const fs::path scratchDir("/home/naoki/.gemini/antigravity/brain/e086d770-ac0a-4cee-807b-84dc3c752b9c/scratch");
-                    fs::create_directories(scratchDir);
-                    const fs::path zeroV5Path = scratchDir / "zero_v5_weights.bin";
+                    struct ScopedTempCleanup {
+                        fs::path path;
+                        ~ScopedTempCleanup() {
+                            if (!path.empty()) {
+                                std::error_code ec;
+                                fs::remove(path, ec);
+                            }
+                        }
+                    };
+                    const fs::path zeroV5Path = fs::temp_directory_path() / "pathways_test_zero_v5_weights.bin";
+                    ScopedTempCleanup zeroV5Cleanup{ zeroV5Path };
                     {
                         std::vector<uint8_t> zeros(upways_v5::TOTAL_WEIGHT_BYTES, 0u);
                         std::ofstream zf(zeroV5Path, std::ios::binary | std::ios::trunc);
-                        check_true(zf.is_open(), "Create zero_v5_weights.bin in scratch directory");
+                        check_true(zf.is_open(), "Create pathways_test_zero_v5_weights.bin in temp directory");
                         zf.write(reinterpret_cast<const char*>(zeros.data()), static_cast<std::streamsize>(zeros.size()));
                     }
                     check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::Auto, zeroV5Path.string()) == UpwaysRuntimeVersion::V5,
@@ -1570,20 +1586,22 @@ int main(int argc, char** argv) {
                             readbackBuf.invalidate();
                             const uint16_t* zh1 = static_cast<const uint16_t*>(readbackBuf.map());
                             check_true(zh1 != nullptr, "Map V5 Gate M3 1x readback");
-                            float maxAbsZero1x = 0.0f;
-                            bool allFiniteZero1x = true;
-                            for (size_t i = 0; i < 64ULL * 64ULL; ++i) {
-                                for (int c = 0; c < 3; ++c) {
-                                    const float v = glm::unpackHalf1x16(zh1[i * 4u + c]);
-                                    if (!std::isfinite(v)) allFiniteZero1x = false;
-                                    maxAbsZero1x = std::max(maxAbsZero1x, std::abs(v - gt64[i][c]));
+                            if (zh1) {
+                                float maxAbsZero1x = 0.0f;
+                                bool allFiniteZero1x = true;
+                                for (size_t i = 0; i < 64ULL * 64ULL; ++i) {
+                                    for (int c = 0; c < 3; ++c) {
+                                        const float v = glm::unpackHalf1x16(zh1[i * 4u + c]);
+                                        if (!std::isfinite(v)) allFiniteZero1x = false;
+                                        maxAbsZero1x = std::max(maxAbsZero1x, std::abs(v - gt64[i][c]));
+                                    }
                                 }
+                                readbackBuf.unmap();
+                                std::cout << "    -> V5 Gate M3 [prec=" << upwaysPrecisionName(prec)
+                                          << "] 1x max_abs=" << maxAbsZero1x << std::endl;
+                                check_true(allFiniteZero1x && maxAbsZero1x < 0.02f,
+                                           "V5 Gate M3 1x zero-weight identity max_abs < 2e-2");
                             }
-                            readbackBuf.unmap();
-                            std::cout << "    -> V5 Gate M3 [prec=" << upwaysPrecisionName(prec)
-                                      << "] 1x max_abs=" << maxAbsZero1x << std::endl;
-                            check_true(allFiniteZero1x && maxAbsZero1x < 0.02f,
-                                       "V5 Gate M3 1x zero-weight identity max_abs < 2e-2");
 
                             // Gate M3 2x SR (64x64 -> 128x128)
                             zeroPipe.resize(64u, 64u, 128u, 128u, true);
@@ -1593,30 +1611,32 @@ int main(int argc, char** argv) {
                             readbackBuf.invalidate();
                             const uint16_t* zh2 = static_cast<const uint16_t*>(readbackBuf.map());
                             check_true(zh2 != nullptr, "Map V5 Gate M3 2x SR readback");
-                            glm::dvec3 sumHr(0.0), sumSqHr(0.0);
-                            bool allFiniteZero2x = true;
-                            for (size_t i = 0; i < 128ULL * 128ULL; ++i) {
-                                const glm::dvec3 rgb(
-                                    glm::unpackHalf1x16(zh2[i * 4u + 0u]),
-                                    glm::unpackHalf1x16(zh2[i * 4u + 1u]),
-                                    glm::unpackHalf1x16(zh2[i * 4u + 2u])
-                                );
-                                if (!std::isfinite(rgb.r) || !std::isfinite(rgb.g) || !std::isfinite(rgb.b)) {
-                                    allFiniteZero2x = false;
+                            if (zh2) {
+                                glm::dvec3 sumHr(0.0), sumSqHr(0.0);
+                                bool allFiniteZero2x = true;
+                                for (size_t i = 0; i < 128ULL * 128ULL; ++i) {
+                                    const glm::dvec3 rgb(
+                                        glm::unpackHalf1x16(zh2[i * 4u + 0u]),
+                                        glm::unpackHalf1x16(zh2[i * 4u + 1u]),
+                                        glm::unpackHalf1x16(zh2[i * 4u + 2u])
+                                    );
+                                    if (!std::isfinite(rgb.r) || !std::isfinite(rgb.g) || !std::isfinite(rgb.b)) {
+                                        allFiniteZero2x = false;
+                                    }
+                                    sumHr += rgb;
+                                    sumSqHr += rgb * rgb;
                                 }
-                                sumHr += rgb;
-                                sumSqHr += rgb * rgb;
+                                readbackBuf.unmap();
+                                const double n128 = 128.0 * 128.0;
+                                const glm::dvec3 meanHr = sumHr / n128;
+                                const glm::dvec3 varHr = glm::max(sumSqHr / n128 - meanHr * meanHr, glm::dvec3(0.0));
+                                const double hrStd = std::sqrt((varHr.r + varHr.g + varHr.b) / 3.0);
+                                const double stdRatio = hrStd / std::max(rawStd, 1e-6);
+                                std::cout << "    -> V5 Gate M3 [prec=" << upwaysPrecisionName(prec)
+                                          << "] 2x SR hr_std/raw_std=" << stdRatio << std::endl;
+                                check_true(allFiniteZero2x && stdRatio >= 0.90,
+                                           "V5 Gate M3 2x SR preserves detail (hr_std/raw_std >= 0.90)");
                             }
-                            readbackBuf.unmap();
-                            const double n128 = 128.0 * 128.0;
-                            const glm::dvec3 meanHr = sumHr / n128;
-                            const glm::dvec3 varHr = glm::max(sumSqHr / n128 - meanHr * meanHr, glm::dvec3(0.0));
-                            const double hrStd = std::sqrt((varHr.r + varHr.g + varHr.b) / 3.0);
-                            const double stdRatio = hrStd / std::max(rawStd, 1e-6);
-                            std::cout << "    -> V5 Gate M3 [prec=" << upwaysPrecisionName(prec)
-                                      << "] 2x SR hr_std/raw_std=" << stdRatio << std::endl;
-                            check_true(allFiniteZero2x && stdRatio >= 0.90,
-                                       "V5 Gate M3 2x SR preserves detail (hr_std/raw_std >= 0.90)");
                             vkDeviceWaitIdle(device);
                         }
 
@@ -1642,19 +1662,21 @@ int main(int argc, char** argv) {
                                 readbackBuf.invalidate();
                                 const uint16_t* hPtr = static_cast<const uint16_t*>(readbackBuf.map());
                                 check_true(hPtr != nullptr, "Map V5 trained readback");
-                                bool ok = true;
-                                const size_t nP = static_cast<size_t>(w) * h;
-                                for (size_t i = 0; i < nP; ++i) {
-                                    const float r = glm::unpackHalf1x16(hPtr[i * 4u + 0u]);
-                                    const float g = glm::unpackHalf1x16(hPtr[i * 4u + 1u]);
-                                    const float b = glm::unpackHalf1x16(hPtr[i * 4u + 2u]);
-                                    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || r < 0.0f || g < 0.0f || b < 0.0f) {
-                                        ok = false;
-                                        break;
+                                if (hPtr) {
+                                    bool ok = true;
+                                    const size_t nP = static_cast<size_t>(w) * h;
+                                    for (size_t i = 0; i < nP; ++i) {
+                                        const float r = glm::unpackHalf1x16(hPtr[i * 4u + 0u]);
+                                        const float g = glm::unpackHalf1x16(hPtr[i * 4u + 1u]);
+                                        const float b = glm::unpackHalf1x16(hPtr[i * 4u + 2u]);
+                                        if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b) || r < 0.0f || g < 0.0f || b < 0.0f) {
+                                            ok = false;
+                                            break;
+                                        }
                                     }
+                                    readbackBuf.unmap();
+                                    check_true(ok, msg);
                                 }
-                                readbackBuf.unmap();
-                                check_true(ok, msg);
                             };
                             checkFinitePos(128u, 128u, "V5 trained T=4 128x128 SR output finite & non-negative");
 
@@ -1685,28 +1707,30 @@ int main(int argc, char** argv) {
                                 readbackBuf.invalidate();
                                 const uint16_t* edgeV5H = static_cast<const uint16_t*>(readbackBuf.map());
                                 check_true(edgeV5H != nullptr, "Map V5 sky/dielectric readback");
-                                bool finiteV5 = true, skyOkV5 = true, dielOkV5 = true;
-                                for (uint32_t y = 0; y < 64u; ++y) {
-                                    for (uint32_t x = 0; x < 64u; ++x) {
-                                        const size_t idx = (static_cast<size_t>(y) * 64u + x) * 4u;
-                                        const float r = glm::unpackHalf1x16(edgeV5H[idx + 0]);
-                                        const float g = glm::unpackHalf1x16(edgeV5H[idx + 1]);
-                                        const float b = glm::unpackHalf1x16(edgeV5H[idx + 2]);
-                                        if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) finiteV5 = false;
-                                        if (y >= 4u && y < 28u && x >= 4u && x < 60u) {
-                                            if (std::abs(r - skyRgbV5.r) > 0.02f || std::abs(g - skyRgbV5.g) > 0.02f || std::abs(b - skyRgbV5.b) > 0.02f) {
-                                                skyOkV5 = false;
+                                if (edgeV5H) {
+                                    bool finiteV5 = true, skyOkV5 = true, dielOkV5 = true;
+                                    for (uint32_t y = 0; y < 64u; ++y) {
+                                        for (uint32_t x = 0; x < 64u; ++x) {
+                                            const size_t idx = (static_cast<size_t>(y) * 64u + x) * 4u;
+                                            const float r = glm::unpackHalf1x16(edgeV5H[idx + 0]);
+                                            const float g = glm::unpackHalf1x16(edgeV5H[idx + 1]);
+                                            const float b = glm::unpackHalf1x16(edgeV5H[idx + 2]);
+                                            if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) finiteV5 = false;
+                                            if (y >= 4u && y < 28u && x >= 4u && x < 60u) {
+                                                if (std::abs(r - skyRgbV5.r) > 0.02f || std::abs(g - skyRgbV5.g) > 0.02f || std::abs(b - skyRgbV5.b) > 0.02f) {
+                                                    skyOkV5 = false;
+                                                }
                                             }
-                                        }
-                                        if (y >= 36u && y < 60u && x >= 4u && x < 60u) {
-                                            if (std::abs(r - 0.62f) > 0.025f || std::abs(g - 0.62f) > 0.025f || std::abs(b - 0.62f) > 0.025f) {
-                                                dielOkV5 = false;
+                                            if (y >= 36u && y < 60u && x >= 4u && x < 60u) {
+                                                if (std::abs(r - 0.62f) > 0.025f || std::abs(g - 0.62f) > 0.025f || std::abs(b - 0.62f) > 0.025f) {
+                                                    dielOkV5 = false;
+                                                }
                                             }
                                         }
                                     }
+                                    readbackBuf.unmap();
+                                    check_true(finiteV5 && skyOkV5 && dielOkV5, "V5 sky/dielectric bit-16 exact under zeroResidual=true");
                                 }
-                                readbackBuf.unmap();
-                                check_true(finiteV5 && skyOkV5 && dielOkV5, "V5 sky/dielectric bit-16 exact under zeroResidual=true");
                             }
                             submitFrame(v5Pipe, 10u, true, { 0.0f, 0.0f }, false, false);
                             submitFrame(v5Pipe, 11u, false, { 0.0f, 0.0f }, false, true);
@@ -1793,6 +1817,6 @@ int main(int argc, char** argv) {
         std::cerr << "\n[RESULT] " << g_failures << " check(s) FAILED" << std::endl;
         return 1;
     }
-    std::cout << "\n[RESULT] All Upways 4.0 pipeline checks PASSED" << std::endl;
+    std::cout << "\n[RESULT] All Upways 4.0/5.0 pipeline checks PASSED" << std::endl;
     return 0;
 }

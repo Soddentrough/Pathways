@@ -116,6 +116,7 @@ private:
     void updateSlotDescriptors(uint32_t slot, const std::array<VkImageView, 9>& extViews);
     void recordPassthroughCopy(VkCommandBuffer cmd);
     void ensureGeneralLayout(VkCommandBuffer cmd, Image* img);
+    void collectQueryResultsForSlot(uint32_t slot);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
