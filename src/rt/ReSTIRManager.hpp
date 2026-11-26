@@ -50,6 +50,8 @@ public:
     Buffer* getX1ContextBuffer() const { return m_x1Context.get(); }
 
     bool isInitialized() const { return m_width > 0 && m_height > 0; }
+    uint32_t getWidth() const { return m_width; }
+    uint32_t getHeight() const { return m_height; }
 
 private:
     void initBuffers();

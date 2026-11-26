@@ -363,6 +363,12 @@ void RayTracingOrchestrator::recordRayTracing(
     Image* mlIndirectDiffuseImage,
     Image* mlDirectSpecularImage,
     Image* mlIndirectSpecularImage,
+    Image* mlIrradianceImage,
+    Image* mlPrimaryGuideImage,
+    Image* mlSurfaceMvImage,
+    Image* mlDiffHitDistImage,
+    Image* mlSpecVmvImage,
+    Image* mlSkipCompactImage,
     Image* motionVectorImage
 ) {
     if (params.skipRayTracing || !m_wavefrontPipeline) return;
@@ -385,33 +391,50 @@ void RayTracingOrchestrator::recordRayTracing(
         VkImageSubresourceRange clearRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
         bool needAccumReset = params.accumReset || !config.progressive_accumulation;
-        bool isDenoisingActive = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                                  config.denoiser_mode == DenoiserMode::Upways ||
-                                  config.upscaler_mode == UpscalerMode::Upways ||
-                                  config.upways_superres);
-        const bool needSplit4SigBuffers = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                                           config.capture_channels >= 44u);
-        bool keepAccumWithMl = (!config.capture_training_data_dir.empty() || params.isMultiGpu);
+        const bool isUpwaysActive = (config.denoiser_mode == DenoiserMode::Upways ||
+                                     config.upscaler_mode == UpscalerMode::Upways ||
+                                     config.upways_superres);
+        const bool isFfxRrActive = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        const bool isTrainingCapture = !config.capture_training_data_dir.empty();
+        bool isDenoisingActive = (isFfxRrActive || isUpwaysActive);
+        const bool needSplit4SigBuffers = (isFfxRrActive || config.capture_channels >= 44u);
+        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive &&
+                                      (mlIrradianceImage != nullptr) &&
+                                      (mlPrimaryGuideImage != nullptr) &&
+                                      (mlSurfaceMvImage != nullptr) &&
+                                      (mlDiffHitDistImage != nullptr) &&
+                                      (mlSpecVmvImage != nullptr) &&
+                                      (mlSkipCompactImage != nullptr);
+        bool keepAccumWithMl = (isTrainingCapture || (params.isMultiGpu && params.mgpuMode == MultiGpuMode::SampleParallel && !useCompactMlLive));
         bool needFrameImage = !isDenoisingActive || keepAccumWithMl;
         if (frameImage && needFrameImage) {
             vkCmdClearColorImage(cmd, frameImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
         }
 
-        // uMlDiffuseImage and uMlSpecularImage capture the full decoupled diffuse and specular
-        // radiance signals for active compute denoisers and upscalers.
-        bool needMlBuffers = isDenoisingActive || !config.capture_training_data_dir.empty() || needSplit4SigBuffers;
+        // Compact live mode only needs to zero-clear sparse/additive compact targets
+        // (classify overwrites every primary guide & surface MV pixel);
+        // legacy training / FFX Ray Regeneration keeps the 64 B/px cleared float targets.
+        bool needMlBuffers = isDenoisingActive || isTrainingCapture || needSplit4SigBuffers;
         if (needMlBuffers) {
-            if (mlDiffuseImage) {
-                vkCmdClearColorImage(cmd, mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            }
-            if (mlSpecularImage) {
-                vkCmdClearColorImage(cmd, mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            }
-            if (mlSkipImage) {
-                vkCmdClearColorImage(cmd, mlSkipImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
-            }
-            if (mlSpecAlbedoImage) {
-                vkCmdClearColorImage(cmd, mlSpecAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+            if (useCompactMlLive) {
+                VkClearColorValue clearUintZero{};
+                vkCmdClearColorImage(cmd, mlIrradianceImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
+                vkCmdClearColorImage(cmd, mlDiffHitDistImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
+                vkCmdClearColorImage(cmd, mlSpecVmvImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
+                vkCmdClearColorImage(cmd, mlSkipCompactImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
+            } else {
+                if (mlDiffuseImage) {
+                    vkCmdClearColorImage(cmd, mlDiffuseImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (mlSpecularImage) {
+                    vkCmdClearColorImage(cmd, mlSpecularImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (mlSkipImage) {
+                    vkCmdClearColorImage(cmd, mlSkipImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (mlSpecAlbedoImage) {
+                    vkCmdClearColorImage(cmd, mlSpecAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
             }
         }
         if (needSplit4SigBuffers) {
@@ -447,10 +470,15 @@ void RayTracingOrchestrator::recordRayTracing(
             addClearBarrier(frameImage);
         }
         if (needMlBuffers) {
-            addClearBarrier(mlDiffuseImage);
-            addClearBarrier(mlSpecularImage);
-            addClearBarrier(mlSkipImage);
-            addClearBarrier(mlSpecAlbedoImage);
+            if (useCompactMlLive) {
+                addClearBarrier(mlIrradianceImage);
+                addClearBarrier(mlDiffHitDistImage);
+            } else {
+                addClearBarrier(mlDiffuseImage);
+                addClearBarrier(mlSpecularImage);
+                addClearBarrier(mlSkipImage);
+                addClearBarrier(mlSpecAlbedoImage);
+            }
         }
         if (needSplit4SigBuffers) {
             addClearBarrier(mlDirectDiffuseImage);
@@ -537,24 +565,27 @@ void RayTracingOrchestrator::recordRayTracing(
                             config.denoiser_mode == DenoiserMode::Upways ||
                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                             config.enable_caustics ||
-                            !config.capture_training_data_dir.empty());
-        bool needNdStore = needNormals;
-        bool needMvStore = needNormals || params.isRestirActive || (config.upscaler_mode == UpscalerMode::FSR);
-        bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
-                          config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                          config.upscaler_mode == UpscalerMode::Upways ||
-                          config.upways_superres ||
-                          !config.capture_training_data_dir.empty());
-        bool captureMlV4 = (config.denoiser_mode == DenoiserMode::Upways ||
-                            config.upscaler_mode == UpscalerMode::Upways ||
-                            config.upways_superres ||
-                            config.capture_channels >= 32u);
-        const bool captureSplit4Sig = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                                       config.capture_channels >= 44u);
+                            isTrainingCapture);
+        bool needNdStore = (!useCompactMlLive && needNormals) ||
+                           (config.upscaler_mode == UpscalerMode::FSR) ||
+                           isFfxRrActive ||
+                           config.enable_caustics ||
+                           isTrainingCapture;
+        bool needMvStore = (!useCompactMlLive && needNormals) ||
+                           (config.upscaler_mode == UpscalerMode::FSR) ||
+                           isFfxRrActive ||
+                           params.isRestirActive ||
+                           config.enable_caustics ||
+                           isTrainingCapture;
+        bool captureMl = (isUpwaysActive || isFfxRrActive || isTrainingCapture);
+        bool captureMlV4 = (isUpwaysActive || config.capture_channels >= 32u);
+        const bool captureSplit4Sig = (isFfxRrActive || config.capture_channels >= 44u);
         wfSceneData.captureMlData = (captureMl ? 1u : 0u)
                                   | (((captureMl || captureSplit4Sig) && keepAccumWithMl) ? 2u : 0u)
                                   | (captureMlV4 ? 4u : 0u)
-                                  | (captureSplit4Sig ? 8u : 0u);
+                                  | (captureSplit4Sig ? 8u : 0u)
+                                  | (useCompactMlLive ? 16u : 0u)
+                                  | ((useCompactMlLive && needNdStore) ? 32u : 0u);
         wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needNdStore ? 2u : 0u) | (needMvStore ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
@@ -584,10 +615,11 @@ void RayTracingOrchestrator::recordRayTracing(
                                              activeDispatchSpp, params.bounces, wfSceneData);
         }
 
+        const bool isBandParallel = (params.isMultiGpu && params.tileOffsetX == 3u);
         if (enableNrcThisFrame && m_nrcManager) {
             m_nrcManager->setBackend(config.nrc_backend);
-            uint32_t nrcW = params.isMultiGpu ? params.fullWidth : params.dispatchWidth;
-            uint32_t nrcH = params.isMultiGpu ? params.fullHeight : params.dispatchHeight;
+            uint32_t nrcW = (params.isMultiGpu && !isBandParallel) ? params.fullWidth : params.dispatchWidth;
+            uint32_t nrcH = (params.isMultiGpu && !isBandParallel) ? params.fullHeight : params.dispatchHeight;
             const uint32_t adamStep = m_nrcManager->getAdamStep();
             const bool nrcWarmBatch = (adamStep < 20u);
             const bool nrcWarmLr = (adamStep < 20u);
@@ -602,15 +634,15 @@ void RayTracingOrchestrator::recordRayTracing(
                                                      activeDispatchSpp == 1u);
         }
 
-        const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile);
+        const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile) && !isBandParallel;
         Image* depthHistorySrc = (needNdStore || !motionVectorImage) ? normalDepthImage : motionVectorImage;
         if ((params.isRestirActive || config.enable_caustics) && !deferNdHistoryToMgpuMerge && depthHistorySrc && prevNormalDepthImage) {
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.extent = {
-                params.isMultiGpu ? params.fullWidth : params.dispatchWidth,
-                params.isMultiGpu ? params.fullHeight : params.dispatchHeight,
+                (params.isMultiGpu && !isBandParallel) ? params.fullWidth : params.dispatchWidth,
+                (params.isMultiGpu && !isBandParallel) ? params.fullHeight : params.dispatchHeight,
                 1
             };
 

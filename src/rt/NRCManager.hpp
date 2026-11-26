@@ -61,14 +61,16 @@ public:
                            VkImageView mlAlbedoRoughnessView = VK_NULL_HANDLE,
                            VkImageView mlSpecAlbedoView = VK_NULL_HANDLE,
                            VkImageView mlIndirectDiffuseView = VK_NULL_HANDLE,
-                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE);
+                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE,
+                           VkImageView mlIrradianceView = VK_NULL_HANDLE);
     void updateDescriptors(uint32_t slot, VkImageView accumImageView,
                            VkImageView mlDiffuseImageView = VK_NULL_HANDLE,
                            VkImageView mlSpecularImageView = VK_NULL_HANDLE,
                            VkImageView mlAlbedoRoughnessView = VK_NULL_HANDLE,
                            VkImageView mlSpecAlbedoView = VK_NULL_HANDLE,
                            VkImageView mlIndirectDiffuseView = VK_NULL_HANDLE,
-                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE);
+                           VkImageView mlIndirectSpecularView = VK_NULL_HANDLE,
+                           VkImageView mlIrradianceView = VK_NULL_HANDLE);
 
     void resetCounters(VkCommandBuffer cmd);
     void resetWeights() { initWeights(); }
@@ -95,6 +97,8 @@ public:
     uint32_t getMaxQueries() const { return m_maxQueries; }
     uint32_t getMaxTrainRecords() const { return m_maxTrainRecords; }
     uint32_t getAdamStep() const { return m_adamStep; }
+    uint32_t getWidth() const { return m_width; }
+    uint32_t getHeight() const { return m_height; }
 
     bool isInitialized() const { return m_initialized; }
     NrcBackend getBackend() const { return m_backend; }
@@ -143,6 +147,7 @@ private:
     std::unique_ptr<Buffer> m_counters;
     std::unique_ptr<Buffer> m_atomicAccumBuffer; // 32-bit fixed-point atomic accumulation buffer (CRIT-05)
     std::unique_ptr<Image> m_dummyStorageImage;  // 1x1 RGBA16F fallback for unbound resolve storage images
+    std::unique_ptr<Image> m_dummyRg32uiImage;    // 1x1 RG32UI fallback for unbound compact irradiance image
 
     // Descriptors & Pipelines
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;

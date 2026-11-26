@@ -295,6 +295,10 @@ For complete Windows toolchain configuration and presets, see [BUILD_WINDOWS.md]
 | `--upscaler` | `none` \| `fsr` \| `fsr3` \| `fsr4` \| `upways` | Super-resolution mode (or `--scaler <fsr3\|fsr4\|upways> <native\|quality\|balanced\|performance\|ultraperf>`) | `none` |
 | `--render-scale` | `<float>` | Internal render resolution scale factor in `[0.25, 1.0]` when upscaling is active | `1.0` (`0.67` when upscaler enabled) |
 | `--upways-heuristic` | *(flag)* | Debug toggle: bypass Upways trained neural weights with analytical bilateral fallback | Disabled (trained neural active) |
+| `--upways-version` | `auto` \| `4` \| `v4` \| `5` \| `v5` | Upways runtime version: `auto` (V4 unless 5.0 weights supplied), `4`/`v4` (Upways 4.0), or `5`/`v5` (Upways 5.0 Pure-ML) | `auto` |
+| `--upways-precision` | `auto` \| `fp8` \| `int8` \| `fp16` | Upways WMMA compute precision tier (`auto` prefers FP8 → INT8 → FP16; Upways 5.0 supports FP8 and INT8 only) | `auto` |
+| `--upways-band-halo` | `<int>` | LR halo overlap rows per side in mGPU Upways Band-Parallel (`8..64`, rounded to a multiple of `4`) | `24` |
+| `--upways-band-balance` / `--no-upways-band-balance` | *(flag)* | Enable or disable dynamic top/bottom band load balancing for mGPU Upways Band-Parallel | Enabled |
 | `--mgpu` | *(flag)* | Enable Multi-GPU load balancing | Disabled |
 | `--mgpu-mode` | `tile` \| `sample` \| `auto` | Multi-GPU strategy: Checkerboard 2D tile (`tile`), sample parallelism (`sample`), or adaptive (`auto`) | `tile` |
 | `--mgpu-transfer` | `host` \| `p2p` | Inter-GPU transfer mechanism: push-DMA P2P into primary VRAM (`p2p`, default, auto-fallback to `host` on small BAR / no DMA-BUF) or zero-copy host pinned memory (`host`). `staging`/`cpu` were removed and now hard-error. | `p2p` |

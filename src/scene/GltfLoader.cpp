@@ -184,14 +184,14 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             gpuMat.albedo = glm::make_vec4(pbr.base_color_factor);
             gpuMat.metallic = pbr.metallic_factor;
             gpuMat.roughness = pbr.roughness_factor;
-            if (gpuMat.metallic > 0.5f) {
-                gpuMat.type = MATERIAL_METALLIC;
-            }
             if (pbr.base_color_texture.texture) {
                 gpuMat.albedoTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.base_color_texture.texture)) + 1;
             }
             if (pbr.metallic_roughness_texture.texture) {
                 gpuMat.mrTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.metallic_roughness_texture.texture)) + 1;
+            }
+            if (gpuMat.mrTex == 0u && gpuMat.metallic >= 0.99f) {
+                gpuMat.type = MATERIAL_METALLIC;
             }
         } else if (mat.has_pbr_specular_glossiness) {
             const auto& pbr = mat.pbr_specular_glossiness;
@@ -199,11 +199,11 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
             gpuMat.roughness = 1.0f - pbr.glossiness_factor;
             float specLum = 0.299f * pbr.specular_factor[0] + 0.587f * pbr.specular_factor[1] + 0.114f * pbr.specular_factor[2];
             gpuMat.metallic = specLum;
-            if (gpuMat.metallic > 0.5f) {
-                gpuMat.type = MATERIAL_METALLIC;
-            }
             if (pbr.diffuse_texture.texture) {
                 gpuMat.albedoTex = static_cast<uint32_t>(cgltf_texture_index(data, pbr.diffuse_texture.texture)) + 1;
+            }
+            if (gpuMat.metallic >= 0.99f) {
+                gpuMat.type = MATERIAL_METALLIC;
             }
         }
 

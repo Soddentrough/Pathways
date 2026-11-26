@@ -1,8 +1,10 @@
 #include "UpwaysPipeline.hpp"
 
 #include "core/Logger.hpp"
+#include "rt/UpwaysV5Engine.hpp"
 #include "rt/upways_default_int8_weights.hpp"
 #include "rt/upways_default_weights.hpp"
+#include "rt/upways_v5_weights.hpp"
 #include "rt/upways_weights.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
@@ -257,18 +259,44 @@ bool UpwaysPipeline::supportsFp16CoopMatrix(VkPhysicalDevice physicalDevice, VkI
     return queryCoopMatrixSupport(physicalDevice, instance).fp16;
 }
 
+UpwaysRuntimeVersion UpwaysPipeline::resolveVersion(
+    UpwaysVersion requested,
+    const std::string& weightsPath
+) {
+    if (requested == UpwaysVersion::V5) {
+        return UpwaysRuntimeVersion::V5;
+    }
+    if (requested == UpwaysVersion::V4) {
+        return UpwaysRuntimeVersion::V4;
+    }
+    if (!weightsPath.empty()) {
+        std::ifstream f(weightsPath, std::ios::binary | std::ios::ate);
+        if (f.is_open()) {
+            const std::streamsize sz = f.tellg();
+            if (sz == static_cast<std::streamsize>(upways_v5::TOTAL_WEIGHT_BYTES)) {
+                return UpwaysRuntimeVersion::V5;
+            }
+        }
+    }
+    return UpwaysRuntimeVersion::V4;
+}
+
 UpwaysComputePrecision UpwaysPipeline::selectPrecision(
     VkPhysicalDevice physicalDevice,
     UpwaysPrecision requested,
-    VkInstance instance
+    VkInstance instance,
+    UpwaysRuntimeVersion version
 ) {
     const CoopMatrixSupport sup = queryCoopMatrixSupport(physicalDevice, instance);
+    const bool allowFp16 = (version != UpwaysRuntimeVersion::V5);
     auto pickAuto = [&]() -> UpwaysComputePrecision {
         if (sup.fp8) return UpwaysComputePrecision::Fp8;
         if (sup.int8) return UpwaysComputePrecision::Int8;
-        if (sup.fp16) return UpwaysComputePrecision::Fp16;
+        if (allowFp16 && sup.fp16) return UpwaysComputePrecision::Fp16;
         throw std::runtime_error(
-            "UpwaysPipeline: GPU lacks Wave32 16x16x16 VK_KHR_cooperative_matrix WMMA support for FP8, INT8, and FP16."
+            allowFp16
+                ? "UpwaysPipeline: GPU lacks Wave32 16x16x16 VK_KHR_cooperative_matrix WMMA support for FP8, INT8, and FP16."
+                : "UpwaysPipeline 5.0: GPU lacks Wave32 16x16x16 VK_KHR_cooperative_matrix WMMA support for FP8 and INT8."
         );
     };
 
@@ -282,8 +310,12 @@ UpwaysComputePrecision UpwaysPipeline::selectPrecision(
             Logger::warn("UpwaysPipeline: Requested precision 'int8' is unsupported on this GPU; falling back automatically.");
             return pickAuto();
         case UpwaysPrecision::Fp16:
-            if (sup.fp16) return UpwaysComputePrecision::Fp16;
-            Logger::warn("UpwaysPipeline: Requested precision 'fp16' is unsupported on this GPU; falling back automatically.");
+            if (allowFp16 && sup.fp16) return UpwaysComputePrecision::Fp16;
+            if (allowFp16) {
+                Logger::warn("UpwaysPipeline: Requested precision 'fp16' is unsupported on this GPU; falling back automatically.");
+            } else {
+                Logger::warn("UpwaysPipeline 5.0: Requested precision 'fp16' is unsupported (V5 supports FP8/INT8 only); falling back automatically.");
+            }
             return pickAuto();
         case UpwaysPrecision::Auto:
         default:
@@ -306,15 +338,18 @@ UpwaysPipeline::UpwaysPipeline(
     const std::string& weightsPath,
     bool enableSuperRes,
     VkFormat imageFormat,
-    UpwaysComputePrecision precision
+    UpwaysComputePrecision precision,
+    uint32_t outputFullHeight
 )
-    : m_device(device)
+    : m_version(UpwaysRuntimeVersion::V4)
+    , m_device(device)
     , m_physDevice(physicalDevice)
     , m_allocator(allocator)
     , m_inputWidth(std::max(1u, inputWidth))
     , m_inputHeight(std::max(1u, inputHeight))
     , m_outputWidth(std::max(1u, outputWidth))
     , m_outputHeight(std::max(1u, outputHeight))
+    , m_outputFullHeight((outputFullHeight > 0u) ? std::max(outputFullHeight, std::max(1u, outputHeight)) : std::max(1u, outputHeight))
     , m_enableSuperRes(enableSuperRes)
     , m_precision(precision)
     , m_weightQuantBytes((precision == UpwaysComputePrecision::Fp16) ? (upways::FP8_WEIGHT_SECTION_BYTES * 2u) : upways::FP8_WEIGHT_SECTION_BYTES)
@@ -372,7 +407,41 @@ UpwaysPipeline::UpwaysPipeline(
     );
 }
 
+UpwaysPipeline::UpwaysPipeline(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VmaAllocator allocator,
+    uint32_t inputWidth,
+    uint32_t inputHeight,
+    uint32_t outputWidth,
+    uint32_t outputHeight,
+    const std::vector<char>& v5PrepSpv,
+    const std::vector<char>& v5UnetWmmaSpv,
+    const std::vector<char>& v5AffinitySpv,
+    const std::vector<char>& v5UpscalerWmmaSpv,
+    const std::vector<char>& v5ResolveSpv,
+    const std::string& weightsPath,
+    bool enableSuperRes,
+    VkFormat imageFormat,
+    UpwaysComputePrecision precision,
+    uint32_t outputFullHeight
+)
+    : m_version(UpwaysRuntimeVersion::V5)
+    , m_v5Engine(std::make_unique<UpwaysV5Engine>(
+          device, physicalDevice, allocator,
+          inputWidth, inputHeight, outputWidth, outputHeight,
+          v5PrepSpv, v5UnetWmmaSpv, v5AffinitySpv, v5UpscalerWmmaSpv, v5ResolveSpv,
+          weightsPath, enableSuperRes, imageFormat, precision, outputFullHeight
+      ))
+    , m_device(device)
+    , m_physDevice(physicalDevice)
+    , m_allocator(allocator) {}
+
 UpwaysPipeline::~UpwaysPipeline() {
+    if (m_v5Engine) {
+        m_v5Engine.reset();
+        return;
+    }
     if (m_device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(m_device);
     }
@@ -655,12 +724,44 @@ void UpwaysPipeline::initDisplayResources() {
     }
 
     m_outputImage = std::make_unique<Image>(
-        m_device, m_allocator, m_outputWidth, m_outputHeight, m_imageFormat, kDisplayUsage
+        m_device, m_allocator, m_outputWidth, m_outputFullHeight, m_imageFormat, kDisplayUsage
     );
+
+    if (!m_dummyBandPackBuffer) {
+        m_dummyBandPackBuffer = std::make_unique<Buffer>(
+            m_allocator, 256ULL,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE
+        );
+    }
 
     if (!m_dummyBlackImage) {
         m_dummyBlackImage = std::make_unique<Image>(
             m_device, m_allocator, 1u, 1u, VK_FORMAT_R16G16B16A16_SFLOAT, kDisplayUsage
+        );
+    }
+    if (!m_dummyR32uiImage) {
+        m_dummyR32uiImage = std::make_unique<Image>(
+            m_device, m_allocator, 1u, 1u, VK_FORMAT_R32_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
+    if (!m_dummyRg32uiImage) {
+        m_dummyRg32uiImage = std::make_unique<Image>(
+            m_device, m_allocator, 1u, 1u, VK_FORMAT_R32G32_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
+    if (!m_dummyRgba32uiImage) {
+        m_dummyRgba32uiImage = std::make_unique<Image>(
+            m_device, m_allocator, 1u, 1u, VK_FORMAT_R32G32B32A32_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
+    if (!m_dummyR8Image) {
+        m_dummyR8Image = std::make_unique<Image>(
+            m_device, m_allocator, 1u, 1u, VK_FORMAT_R8_UNORM,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
         );
     }
 
@@ -706,6 +807,10 @@ void UpwaysPipeline::ensureActiveSlotSized() {
 }
 
 void UpwaysPipeline::transitionInitialLayouts(VkCommandBuffer cmd) {
+    if (m_v5Engine) {
+        m_v5Engine->transitionInitialLayouts(cmd);
+        return;
+    }
     if (m_initialLayoutsTransitioned) {
         return;
     }
@@ -780,6 +885,10 @@ void UpwaysPipeline::transitionInitialLayouts(VkCommandBuffer cmd) {
     if (!m_hrTransitioned) {
         transitionAndClear(m_outputImage.get());
         transitionAndClear(m_dummyBlackImage.get());
+        transitionAndClear(m_dummyR32uiImage.get());
+        transitionAndClear(m_dummyRg32uiImage.get());
+        transitionAndClear(m_dummyRgba32uiImage.get());
+        transitionAndClear(m_dummyR8Image.get());
         for (int i = 0; i < 2; ++i) {
             transitionAndClear(m_colorHr[i].get());
         }
@@ -850,37 +959,39 @@ void UpwaysPipeline::createDescriptorSetLayouts() {
         return layout;
     };
 
-    // Pass 1 (upways_denoise_prep.comp): 0..13 storage images, 14 SSBO
-    std::vector<VkDescriptorType> prepTypes(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-    prepTypes[14] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    // Pass 1 (upways_denoise_prep.comp): 0..9 storage images, 10 SSBO, 11..12 storage images
+    std::vector<VkDescriptorType> prepTypes(13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    prepTypes[10] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     m_prepDescLayout = createLayout(makeBindings(prepTypes));
 
-    // Pass 2 (upways_denoiser_wmma.comp): 0..2 SSBOs, 3..14 storage images
-    std::vector<VkDescriptorType> denoiserTypes(15, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    // Pass 2 (upways_denoiser_wmma.comp): 0..2 SSBOs, 3..10 storage images, 11 SSBO (fused band pack)
+    std::vector<VkDescriptorType> denoiserTypes(12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     denoiserTypes[0] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     denoiserTypes[1] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     denoiserTypes[2] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    denoiserTypes[11] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     m_denoiserDescLayout = createLayout(makeBindings(denoiserTypes));
 
     // Pass 3 (upways_upscaler_wmma.comp): 0..3 SSBOs
     std::vector<VkDescriptorType> upscalerTypes(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     m_upscalerDescLayout = createLayout(makeBindings(upscalerTypes));
 
-    // Pass 4 (upways_upscale_resolve.comp): 0..4 storage images, 5 SSBO, 6..8 storage images
-    std::vector<VkDescriptorType> resolveTypes(9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
-    resolveTypes[5] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    // Pass 4 (upways_upscale_resolve.comp): 0..2 storage images, 3 SSBO, 4..6 storage images, 7 SSBO (fused band pack)
+    std::vector<VkDescriptorType> resolveTypes(8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    resolveTypes[3] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    resolveTypes[7] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     m_resolveDescLayout = createLayout(makeBindings(resolveTypes));
 }
 
 void UpwaysPipeline::allocateDescriptorSets() {
     std::array<VkDescriptorPoolSize, 2> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 128u;
+    poolSizes[0].descriptorCount = 144u;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[1].descriptorCount = 32u;
+    poolSizes[1].descriptorCount = 64u;
 
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 16u;
+    poolInfo.maxSets = 24u;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
 
@@ -903,54 +1014,87 @@ void UpwaysPipeline::allocateDescriptorSets() {
     m_upscalerDescSet = allocSet(m_upscalerDescLayout);
     for (int i = 0; i < 2; ++i) {
         m_prepDescSets[i] = allocSet(m_prepDescLayout);
-        m_denoiserDescSets[i] = allocSet(m_denoiserDescLayout);
-        m_resolveDescSets[i] = allocSet(m_resolveDescLayout);
+        for (int p = 0; p < 2; ++p) {
+            m_denoiserDescSets[i][p] = allocSet(m_denoiserDescLayout);
+            m_resolveDescSets[i][p] = allocSet(m_resolveDescLayout);
+        }
     }
 }
 
 void UpwaysPipeline::updateDescriptors(
-    VkImageView mlDiffuseView,
-    VkImageView mlSpecularView,
-    VkImageView albedoRoughnessView,
-    VkImageView specAlbedoView,
-    VkImageView skipView,
-    VkImageView normalDepthView,
-    VkImageView motionVectorView,
-    VkImageView specularMotionView
+    VkImageView mlIrradianceView,
+    VkImageView mlPrimaryGuideView,
+    VkImageView mlSurfaceMvView,
+    VkImageView mlDiffHitDistView,
+    VkImageView mlSpecVmvView,
+    VkImageView mlSkipCompactView
 ) {
-    m_cachedMlDiffView = mlDiffuseView;
-    m_cachedMlSpecView = mlSpecularView;
-    m_cachedAlbRoughView = albedoRoughnessView;
-    m_cachedSpecAlbView = specAlbedoView;
-    m_cachedSkipView = skipView;
-    m_cachedNormalDepthView = normalDepthView;
-    m_cachedMotionVectorView = motionVectorView;
-    m_cachedSpecularMotionView = specularMotionView;
+    if (m_v5Engine) {
+        m_v5Engine->updateDescriptors(
+            mlIrradianceView, mlPrimaryGuideView, mlSurfaceMvView,
+            mlDiffHitDistView, mlSpecVmvView, mlSkipCompactView
+        );
+        return;
+    }
+    m_cachedMlIrradianceView = mlIrradianceView;
+    m_cachedMlPrimaryGuideView = mlPrimaryGuideView;
+    m_cachedMlSurfaceMvView = mlSurfaceMvView;
+    m_cachedMlDiffHitDistView = mlDiffHitDistView;
+    m_cachedMlSpecVmvView = mlSpecVmvView;
+    m_cachedMlSkipCompactView = mlSkipCompactView;
 
     refreshDescriptors();
 }
 
+void UpwaysPipeline::setBandPackTargets(
+    VkBuffer slot0Buffer,
+    VkDeviceSize slot0Size,
+    VkBuffer slot1Buffer,
+    VkDeviceSize slot1Size
+) {
+    if (m_v5Engine) {
+        m_v5Engine->setBandPackTargets(slot0Buffer, slot0Size, slot1Buffer, slot1Size);
+        return;
+    }
+    const VkBuffer s1Buf = (slot1Buffer != VK_NULL_HANDLE) ? slot1Buffer : slot0Buffer;
+    const VkDeviceSize s1Sz = (slot1Buffer != VK_NULL_HANDLE) ? slot1Size : slot0Size;
+    if (m_bandPackBuf[0] == slot0Buffer &&
+        m_bandPackSize[0] == slot0Size &&
+        m_bandPackBuf[1] == s1Buf &&
+        m_bandPackSize[1] == s1Sz) {
+        return;
+    }
+    if (m_bandPackBuf[0] != VK_NULL_HANDLE && m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
+    m_bandPackBuf[0] = slot0Buffer;
+    m_bandPackSize[0] = slot0Size;
+    m_bandPackBuf[1] = s1Buf;
+    m_bandPackSize[1] = s1Sz;
+    refreshDescriptors();
+}
+
 void UpwaysPipeline::refreshDescriptors() {
-    if (!m_outputImage || !m_weightBuffer || !m_actBuffer || !m_srSubpixelBuffer) {
+    if (!m_outputImage || !m_weightBuffer || !m_actBuffer || !m_srSubpixelBuffer || !m_dummyBandPackBuffer) {
         return;
     }
 
-    VkImageView fallbackZero = m_dummyBlackImage
-        ? m_dummyBlackImage->getImageView()
-        : m_outputImage->getImageView();
+    VkImageView fallbackR32ui = m_dummyR32uiImage ? m_dummyR32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView fallbackRg32ui = m_dummyRg32uiImage ? m_dummyRg32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView fallbackRgba32ui = m_dummyRgba32uiImage ? m_dummyRgba32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView fallbackR8 = m_dummyR8Image ? m_dummyR8Image->getImageView() : VK_NULL_HANDLE;
 
-    auto resolveView = [fallbackZero](VkImageView v) {
-        return (v != VK_NULL_HANDLE) ? v : fallbackZero;
-    };
-
-    const VkImageView diffView = resolveView(m_cachedMlDiffView);
-    const VkImageView specView = resolveView(m_cachedMlSpecView);
-    const VkImageView albRoughView = resolveView(m_cachedAlbRoughView);
-    const VkImageView specAlbView = resolveView(m_cachedSpecAlbView);
-    const VkImageView skipView = resolveView(m_cachedSkipView);
-    const VkImageView ndView = resolveView(m_cachedNormalDepthView);
-    const VkImageView mvView = resolveView(m_cachedMotionVectorView);
-    const VkImageView smvView = resolveView(m_cachedSpecularMotionView);
+    const VkImageView irrView = (m_cachedMlIrradianceView != VK_NULL_HANDLE) ? m_cachedMlIrradianceView : fallbackRg32ui;
+    const VkImageView primGuideView = (m_cachedMlPrimaryGuideView != VK_NULL_HANDLE) ? m_cachedMlPrimaryGuideView : fallbackRgba32ui;
+    const VkImageView surfaceMvView = (m_cachedMlSurfaceMvView != VK_NULL_HANDLE) ? m_cachedMlSurfaceMvView : fallbackR32ui;
+    const VkImageView diffHitDistView = (m_cachedMlDiffHitDistView != VK_NULL_HANDLE) ? m_cachedMlDiffHitDistView : fallbackR8;
+    const VkImageView specVmvView = (m_cachedMlSpecVmvView != VK_NULL_HANDLE) ? m_cachedMlSpecVmvView : fallbackRg32ui;
+    const VkImageView skipCompactView = (m_cachedMlSkipCompactView != VK_NULL_HANDLE) ? m_cachedMlSkipCompactView : fallbackR32ui;
+    if (irrView == VK_NULL_HANDLE || primGuideView == VK_NULL_HANDLE ||
+        surfaceMvView == VK_NULL_HANDLE || diffHitDistView == VK_NULL_HANDLE ||
+        specVmvView == VK_NULL_HANDLE || skipCompactView == VK_NULL_HANDLE) {
+        return;
+    }
 
     const VkDescriptorBufferInfo w8Bi{
         m_weightBuffer->getBuffer(),
@@ -964,6 +1108,14 @@ void UpwaysPipeline::refreshDescriptors() {
     };
     const VkDescriptorBufferInfo actBi{ m_actBuffer->getBuffer(), 0u, m_actBuffer->getSize() };
     const VkDescriptorBufferInfo srSubBi{ m_srSubpixelBuffer->getBuffer(), 0u, m_srSubpixelBuffer->getSize() };
+    std::array<VkDescriptorBufferInfo, 2> packBi{};
+    for (int p = 0; p < 2; ++p) {
+        if (m_bandPackBuf[p] != VK_NULL_HANDLE) {
+            packBi[p] = { m_bandPackBuf[p], 0u, std::max<VkDeviceSize>(m_bandPackSize[p], 256ULL) };
+        } else {
+            packBi[p] = { m_dummyBandPackBuffer->getBuffer(), 0u, m_dummyBandPackBuffer->getSize() };
+        }
+    }
 
     // Pass 3: upways_upscaler_wmma.comp (4 bindings)
     {
@@ -983,29 +1135,27 @@ void UpwaysPipeline::refreshDescriptors() {
     for (int curr = 0; curr < 2; ++curr) {
         const int prev = 1 - curr;
 
-        // Pass 1: upways_denoise_prep.comp (15 bindings)
+        // Pass 1: upways_denoise_prep.comp (13 bindings: 0..9 images, 10 SSBO, 11..12 images)
         {
-            std::array<VkDescriptorImageInfo, 14> ii{};
+            std::array<VkDescriptorImageInfo, 12> ii{};
             auto setImg = [&](uint32_t idx, VkImageView view) {
                 ii[idx] = { VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
             };
-            setImg(0u, diffView);
-            setImg(1u, specView);
-            setImg(2u, albRoughView);
-            setImg(3u, specAlbView);
-            setImg(4u, skipView);
-            setImg(5u, ndView);
-            setImg(6u, mvView);
-            setImg(7u, smvView);
-            setImg(8u, m_diffHist[prev]->getImageView());
-            setImg(9u, m_specHist[prev]->getImageView());
-            setImg(10u, m_geomHist[prev]->getImageView());
-            setImg(11u, m_hiddenHist[prev]->getImageView());
-            setImg(12u, m_baseAnchorLr.view);
-            setImg(13u, m_geomHist[curr]->getImageView());
+            setImg(0u, irrView);
+            setImg(1u, primGuideView);
+            setImg(2u, surfaceMvView);
+            setImg(3u, diffHitDistView);
+            setImg(4u, m_diffHist[prev]->getImageView());
+            setImg(5u, m_specHist[prev]->getImageView());
+            setImg(6u, m_geomHist[prev]->getImageView());
+            setImg(7u, m_hiddenHist[prev]->getImageView());
+            setImg(8u, m_baseAnchorLr.view);
+            setImg(9u, m_geomHist[curr]->getImageView());
+            setImg(10u, specVmvView);
+            setImg(11u, skipCompactView);
 
-            std::array<VkWriteDescriptorSet, 15> writes{};
-            for (uint32_t b = 0; b < 14u; ++b) {
+            std::array<VkWriteDescriptorSet, 13> writes{};
+            for (uint32_t b = 0; b < 10u; ++b) {
                 writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
                 writes[b].dstSet = m_prepDescSets[curr];
                 writes[b].dstBinding = b;
@@ -1013,86 +1163,104 @@ void UpwaysPipeline::refreshDescriptors() {
                 writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 writes[b].pImageInfo = &ii[b];
             }
-            writes[14].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[14].dstSet = m_prepDescSets[curr];
-            writes[14].dstBinding = 14u;
-            writes[14].descriptorCount = 1u;
-            writes[14].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[14].pBufferInfo = &actBi;
+            writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[10].dstSet = m_prepDescSets[curr];
+            writes[10].dstBinding = 10u;
+            writes[10].descriptorCount = 1u;
+            writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[10].pBufferInfo = &actBi;
+            for (uint32_t b = 11u; b < 13u; ++b) {
+                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[b].dstSet = m_prepDescSets[curr];
+                writes[b].dstBinding = b;
+                writes[b].descriptorCount = 1u;
+                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                writes[b].pImageInfo = &ii[b - 1u];
+            }
 
             vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
         }
 
-        // Pass 2: upways_denoiser_wmma.comp (15 bindings)
+        // Pass 2: upways_denoiser_wmma.comp (12 bindings)
         {
             std::array<VkDescriptorBufferInfo, 3> bi = { w8Bi, w32Bi, actBi };
-            std::array<VkDescriptorImageInfo, 12> ii{};
+            std::array<VkDescriptorImageInfo, 8> ii{};
             auto setImg = [&](uint32_t bindingIdx, VkImageView view) {
                 ii[bindingIdx - 3u] = { VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL };
             };
             setImg(3u, m_baseAnchorLr.view);
-            setImg(4u, diffView);
-            setImg(5u, specView);
-            setImg(6u, albRoughView);
-            setImg(7u, specAlbView);
-            setImg(8u, skipView);
-            setImg(9u, ndView);
-            setImg(10u, m_diffHist[curr]->getImageView());
-            setImg(11u, m_specHist[curr]->getImageView());
-            setImg(12u, m_hiddenHist[curr]->getImageView());
-            setImg(13u, m_cleanRadLr->getImageView());
-            setImg(14u, m_outputImage->getImageView());
+            setImg(4u, primGuideView);
+            setImg(5u, skipCompactView);
+            setImg(6u, m_diffHist[curr]->getImageView());
+            setImg(7u, m_specHist[curr]->getImageView());
+            setImg(8u, m_hiddenHist[curr]->getImageView());
+            setImg(9u, m_cleanRadLr->getImageView());
+            setImg(10u, m_outputImage->getImageView());
 
-            std::array<VkWriteDescriptorSet, 15> writes{};
-            for (uint32_t b = 0; b < 3u; ++b) {
-                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[b].dstSet = m_denoiserDescSets[curr];
-                writes[b].dstBinding = b;
-                writes[b].descriptorCount = 1u;
-                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                writes[b].pBufferInfo = &bi[b];
-            }
-            for (uint32_t b = 3u; b < 15u; ++b) {
-                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[b].dstSet = m_denoiserDescSets[curr];
-                writes[b].dstBinding = b;
-                writes[b].descriptorCount = 1u;
-                writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                writes[b].pImageInfo = &ii[b - 3u];
-            }
+            for (int p = 0; p < 2; ++p) {
+                std::array<VkWriteDescriptorSet, 12> writes{};
+                for (uint32_t b = 0; b < 3u; ++b) {
+                    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[b].dstSet = m_denoiserDescSets[curr][p];
+                    writes[b].dstBinding = b;
+                    writes[b].descriptorCount = 1u;
+                    writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    writes[b].pBufferInfo = &bi[b];
+                }
+                for (uint32_t b = 3u; b < 11u; ++b) {
+                    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[b].dstSet = m_denoiserDescSets[curr][p];
+                    writes[b].dstBinding = b;
+                    writes[b].descriptorCount = 1u;
+                    writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    writes[b].pImageInfo = &ii[b - 3u];
+                }
+                writes[11].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[11].dstSet = m_denoiserDescSets[curr][p];
+                writes[11].dstBinding = 11u;
+                writes[11].descriptorCount = 1u;
+                writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[11].pBufferInfo = &packBi[p];
 
-            vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+                vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+            }
         }
 
-        // Pass 4: upways_upscale_resolve.comp (9 bindings)
+        // Pass 4: upways_upscale_resolve.comp (8 bindings)
         {
-            std::array<VkDescriptorImageInfo, 8> ii{};
+            std::array<VkDescriptorImageInfo, 6> ii{};
             ii[0] = { VK_NULL_HANDLE, m_cleanRadLr->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-            ii[1] = { VK_NULL_HANDLE, ndView, VK_IMAGE_LAYOUT_GENERAL };
-            ii[2] = { VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
-            ii[3] = { VK_NULL_HANDLE, specView, VK_IMAGE_LAYOUT_GENERAL };
-            ii[4] = { VK_NULL_HANDLE, skipView, VK_IMAGE_LAYOUT_GENERAL };
-            ii[5] = { VK_NULL_HANDLE, m_colorHr[prev]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-            ii[6] = { VK_NULL_HANDLE, m_colorHr[curr]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
-            ii[7] = { VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            ii[1] = { VK_NULL_HANDLE, primGuideView, VK_IMAGE_LAYOUT_GENERAL };
+            ii[2] = { VK_NULL_HANDLE, surfaceMvView, VK_IMAGE_LAYOUT_GENERAL };
+            ii[3] = { VK_NULL_HANDLE, m_colorHr[prev]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            ii[4] = { VK_NULL_HANDLE, m_colorHr[curr]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            ii[5] = { VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
 
-            std::array<VkWriteDescriptorSet, 9> writes{};
-            for (uint32_t b = 0; b < 9u; ++b) {
-                writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[b].dstSet = m_resolveDescSets[curr];
-                writes[b].dstBinding = b;
-                writes[b].descriptorCount = 1u;
-                if (b == 5u) {
-                    writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    writes[b].pBufferInfo = &srSubBi;
-                } else {
-                    const uint32_t imgIdx = (b < 5u) ? b : (b - 1u);
-                    writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                    writes[b].pImageInfo = &ii[imgIdx];
+            for (int p = 0; p < 2; ++p) {
+                std::array<VkWriteDescriptorSet, 8> writes{};
+                for (uint32_t b = 0; b < 7u; ++b) {
+                    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[b].dstSet = m_resolveDescSets[curr][p];
+                    writes[b].dstBinding = b;
+                    writes[b].descriptorCount = 1u;
+                    if (b == 3u) {
+                        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                        writes[b].pBufferInfo = &srSubBi;
+                    } else {
+                        const uint32_t imgIdx = (b < 3u) ? b : (b - 1u);
+                        writes[b].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                        writes[b].pImageInfo = &ii[imgIdx];
+                    }
                 }
-            }
+                writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[7].dstSet = m_resolveDescSets[curr][p];
+                writes[7].dstBinding = 7u;
+                writes[7].descriptorCount = 1u;
+                writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[7].pBufferInfo = &packBi[p];
 
-            vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+                vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+            }
         }
     }
 }
@@ -1309,15 +1477,21 @@ void UpwaysPipeline::resize(
     uint32_t inputHeight,
     uint32_t outputWidth,
     uint32_t outputHeight,
-    bool enableSuperRes
+    bool enableSuperRes,
+    uint32_t outputFullHeight
 ) {
+    if (m_v5Engine) {
+        m_v5Engine->resize(inputWidth, inputHeight, outputWidth, outputHeight, enableSuperRes, outputFullHeight);
+        return;
+    }
     const uint32_t newInW = std::max(1u, inputWidth);
     const uint32_t newInH = std::max(1u, inputHeight);
     const uint32_t newOutW = std::max(1u, outputWidth);
     const uint32_t newOutH = std::max(1u, outputHeight);
+    const uint32_t newFullOutH = (outputFullHeight > 0u) ? std::max(outputFullHeight, newOutH) : newOutH;
 
     const bool renderChanged = (newInW != m_inputWidth || newInH != m_inputHeight);
-    const bool displayChanged = (newOutW != m_outputWidth || newOutH != m_outputHeight);
+    const bool displayChanged = (newOutW != m_outputWidth || newOutH != m_outputHeight || newFullOutH != m_outputFullHeight);
     m_enableSuperRes = enableSuperRes;
 
     if (!renderChanged && !displayChanged) {
@@ -1329,23 +1503,19 @@ void UpwaysPipeline::resize(
     }
 
     if (renderChanged) {
-        // External LR G-buffer views belong to the previous render dimensions and may
-        // already be destroyed by RenderTargetManager before resize() runs; clear to
-        // VK_NULL_HANDLE so refreshDescriptors() binds fallbackZero until updateDescriptors().
-        m_cachedMlDiffView = VK_NULL_HANDLE;
-        m_cachedMlSpecView = VK_NULL_HANDLE;
-        m_cachedAlbRoughView = VK_NULL_HANDLE;
-        m_cachedSpecAlbView = VK_NULL_HANDLE;
-        m_cachedSkipView = VK_NULL_HANDLE;
-        m_cachedNormalDepthView = VK_NULL_HANDLE;
-        m_cachedMotionVectorView = VK_NULL_HANDLE;
-        m_cachedSpecularMotionView = VK_NULL_HANDLE;
+        m_cachedMlIrradianceView = VK_NULL_HANDLE;
+        m_cachedMlPrimaryGuideView = VK_NULL_HANDLE;
+        m_cachedMlSurfaceMvView = VK_NULL_HANDLE;
+        m_cachedMlDiffHitDistView = VK_NULL_HANDLE;
+        m_cachedMlSpecVmvView = VK_NULL_HANDLE;
+        m_cachedMlSkipCompactView = VK_NULL_HANDLE;
     }
 
     m_inputWidth = newInW;
     m_inputHeight = newInH;
     m_outputWidth = newOutW;
     m_outputHeight = newOutH;
+    m_outputFullHeight = newFullOutH;
 
     if (!displayChanged && renderChanged && m_historyValid) {
         // Lossless DRS: preserve m_colorHr ping-pong and the prev LR slot so temporal history survives
@@ -1432,8 +1602,16 @@ void UpwaysPipeline::recordFrame(
     glm::vec2 jitter,
     bool coupledWithExternalUpscaler,
     bool zeroResidualMode,
-    float exposureScale
+    float exposureScale,
+    const UpwaysBandParams& band
 ) {
+    if (m_v5Engine) {
+        m_v5Engine->recordFrame(
+            cmd, frameIndex, resetHistory, jitter,
+            coupledWithExternalUpscaler, zeroResidualMode, exposureScale, band
+        );
+        return;
+    }
     if (!isInitialized()) {
         return;
     }
@@ -1471,12 +1649,23 @@ void UpwaysPipeline::recordFrame(
     if (zeroResidualMode) {
         pc.flags |= UPWAYS_FLAG_ZERO_RESIDUAL_MODE;
     }
+    const bool useFusedPack = band.fusedBandPack;
+    const uint32_t packSlot = useFusedPack ? (band.bandPackSlot & 1u) : 0u;
+    if (useFusedPack) {
+        pc.flags |= UPWAYS_FLAG_FUSED_BAND_PACK;
+    }
     pc.offX0 = m_pyramidDims.offX0;
     pc.offHw0 = m_pyramidDims.offHw0;
     pc.offS0 = m_pyramidDims.offS0;
     pc.offB1 = m_pyramidDims.offB1;
     pc.offB2 = m_pyramidDims.offB2;
     pc.exposureScale = (exposureScale > 0.0f) ? exposureScale : 1.0f;
+    pc.bandLrY0 = band.bandLrY0;
+    pc.bandHrY0 = band.bandHrY0;
+    pc.fullLrHeight = (band.fullLrHeight > 0u) ? band.fullLrHeight : m_inputHeight;
+    pc.fullHrHeight = (band.fullHrHeight > 0u) ? band.fullHrHeight : m_outputHeight;
+    pc.keepHrYStart = band.keepHrYStart;
+    pc.keepHrYEnd = (band.keepHrYEnd > 0u) ? band.keepHrYEnd : m_outputHeight;
 
     const uint32_t qSlot = m_querySlot;
     const uint32_t qBase = qSlot * QUERIES_PER_SLOT;
@@ -1497,7 +1686,7 @@ void UpwaysPipeline::recordFrame(
     }
 
     // Pass 2: upways_denoiser_wmma.comp (4 specialized Wave32 stages: 0, 1 @ W1xH1; 2 @ W2xH2; 3 @ W1xH1)
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_denoiserPipeLayout, 0u, 1u, &m_denoiserDescSets[curr], 0u, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_denoiserPipeLayout, 0u, 1u, &m_denoiserDescSets[curr][packSlot], 0u, nullptr);
     vkCmdPushConstants(cmd, m_denoiserPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(UpwaysPushConstants), &pc);
 
     for (uint32_t stage = 0; stage < NUM_DENOISER_STAGES; ++stage) {
@@ -1526,7 +1715,7 @@ void UpwaysPipeline::recordFrame(
 
         // Pass 4: upways_upscale_resolve.comp
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeLayout, 0u, 1u, &m_resolveDescSets[curr], 0u, nullptr);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_resolvePipeLayout, 0u, 1u, &m_resolveDescSets[curr][packSlot], 0u, nullptr);
         vkCmdPushConstants(cmd, m_resolvePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(UpwaysPushConstants), &pc);
         vkCmdDispatch(cmd, divCeil(m_outputWidth, 8u), divCeil(m_outputHeight, 8u), 1u);
 
@@ -1552,6 +1741,59 @@ void UpwaysPipeline::recordFrame(
 
     m_pingPongIndex = 1u - curr;
     m_historyValid = true;
+}
+
+Image* UpwaysPipeline::getOutputImage() const {
+    return m_v5Engine ? m_v5Engine->getOutputImage() : m_outputImage.get();
+}
+
+Image* UpwaysPipeline::getCleanRadLrImage() const {
+    return m_v5Engine ? m_v5Engine->getCleanRadLrImage() : m_cleanRadLr.get();
+}
+
+uint32_t UpwaysPipeline::getInputWidth() const {
+    return m_v5Engine ? m_v5Engine->getInputWidth() : m_inputWidth;
+}
+
+uint32_t UpwaysPipeline::getInputHeight() const {
+    return m_v5Engine ? m_v5Engine->getInputHeight() : m_inputHeight;
+}
+
+uint32_t UpwaysPipeline::getOutputWidth() const {
+    return m_v5Engine ? m_v5Engine->getOutputWidth() : m_outputWidth;
+}
+
+uint32_t UpwaysPipeline::getOutputHeight() const {
+    return m_v5Engine ? m_v5Engine->getOutputHeight() : m_outputHeight;
+}
+
+uint32_t UpwaysPipeline::getOutputFullHeight() const {
+    return m_v5Engine ? m_v5Engine->getOutputFullHeight() : m_outputFullHeight;
+}
+
+bool UpwaysPipeline::isSuperResEnabled() const {
+    return m_v5Engine ? m_v5Engine->isSuperResEnabled() : m_enableSuperRes;
+}
+
+bool UpwaysPipeline::isHistoryValid() const {
+    return m_v5Engine ? m_v5Engine->isHistoryValid() : m_historyValid;
+}
+
+UpwaysComputePrecision UpwaysPipeline::getPrecision() const {
+    return m_v5Engine ? m_v5Engine->getPrecision() : m_precision;
+}
+
+bool UpwaysPipeline::isInitialized() const {
+    if (m_v5Engine) {
+        return m_v5Engine->isInitialized();
+    }
+    return m_prepPipeline != VK_NULL_HANDLE &&
+           m_resolvePipeline != VK_NULL_HANDLE &&
+           m_denoiserPipelines[0] != VK_NULL_HANDLE;
+}
+
+const UpwaysPassTimings& UpwaysPipeline::getLastPassTimings() const {
+    return m_v5Engine ? m_v5Engine->getLastPassTimings() : m_lastTimings;
 }
 
 } // namespace pathways

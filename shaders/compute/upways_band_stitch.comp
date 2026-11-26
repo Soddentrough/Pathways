@@ -1,0 +1,26 @@
+#version 460
+#include "rgb9e5.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer SrcPacked {
+    uint src[];
+} uSrcPacked;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D uDstOutputColor;
+
+layout(push_constant) uniform BandStitchPC {
+    uint width;
+    uint dstYStart;
+    uint rowCount;
+    uint pad;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.rowCount) {
+        return;
+    }
+    vec3 rgb = unpackRGB9E5(uSrcPacked.src[y * pc.width + x]);
+    imageStore(uDstOutputColor, ivec2(int(x), int(pc.dstYStart + y)), vec4(rgb, 1.0));
+}

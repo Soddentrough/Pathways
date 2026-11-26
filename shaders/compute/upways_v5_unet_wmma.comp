@@ -1,0 +1,494 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#include "upways_v5_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+// U-Net Stages (L1=0..1,10..11; L2=2..3,8..9; L3=4..7):
+//   0  = ENC1_PW1        (L1: X1[128,static] -> out0=f1[48])
+//   1  = ENC1_DW_PW2     (L1: DW1(f1) -> PW2 + f1 -> out0=s1[48])
+//   2  = ENC2_POOL_PW1   (L2: avgpool(s1) -> PW1 -> out0=f2[80])
+//   3  = ENC2_DW_PW2     (L2: DW(f2) -> PW2 + f2 -> out0=s2[80])
+//   4  = BOT3_POOL_PW1   (L3: avgpool(s2) -> PW1 -> out0=b3_0[128])
+//   5  = BOT3_DW1_PW2    (L3: DW1(b3_0) -> PW2 + b3_0 -> out0=b3_1[128])
+//   6  = BOT3_DW2_PW3    (L3: DW2(d=2,b3_1) -> PW3 + b3_1 -> out0=b3_2[128])
+//   7  = BOT3_PW4_KHEAD  (L3: PW4(b3_2) -> out0=b3[96]; KHEAD -> out1=k3[32])
+//   8  = DEC2_UP_CAT_PW1 (L2: up(b3)+s2[176] -> PW1 -> out0=u2_0[96])
+//   9  = DEC2_DW_PW2_KH  (L2: DW(u2_0) -> PW2 -> out0=u2[80]; KHEAD -> out1=k2[32])
+//   10 = DEC1_UP_CAT_PW1 (L1: up(u2)+s1[128] -> PW1 -> out0=u1_0[64])
+//   11 = DEC1_DW_PW2_HD  (L1: DW(u1_0) -> PW2+u1_0 -> u1[64]; out0=k1[32], out1=den_l0[32]@L0)
+layout(constant_id = 0) const uint SPEC_STAGE_ID = 0u;
+
+layout(set = 0, binding = 0) readonly  buffer Weight8Buf    { uint w8[]; }    g_w8;
+layout(set = 0, binding = 1) readonly  buffer WeightFp32Buf { vec4 w32v[]; }  g_w32;
+layout(set = 0, binding = 2) readonly  buffer InAct0Buf     { uvec2 act2[]; } g_in0;
+layout(set = 0, binding = 3) readonly  buffer InAct1Buf     { uvec2 act2[]; } g_in1;
+layout(set = 0, binding = 4) writeonly buffer OutAct0Buf    { uvec2 act2[]; } g_out0;
+layout(set = 0, binding = 5) writeonly buffer OutAct1Buf    { uvec2 act2[]; } g_out1;
+
+// Max LDS: s_buf 5632 * 4 = 22,528 B + s_acc 2304 * 4 = 9,216 B = 31,744 B <= 32 KiB
+shared uint s_buf[5632];
+#if UPWAYS_IS_INT8
+shared int  s_acc[2304];
+#else
+shared float s_acc[2304];
+#endif
+
+void loadHalfRegsIn0(uint inBase2, uint pxIdx, uint cw4, out uvec2 regs[44]) {
+    uint base = inBase2 + pxIdx * cw4;
+    for (uint i = 0u; i < cw4; ++i) {
+        regs[i] = g_in0.act2[base + i];
+    }
+}
+
+void loadAvgPoolRegsIn0(int Wf, int Hf, int gx, int gy, uint inBase2, uint cw4, out uvec2 regs[44]) {
+    int x0 = min(gx * 2,     Wf - 1);
+    int x1 = min(gx * 2 + 1, Wf - 1);
+    int y0 = min(gy * 2,     Hf - 1);
+    int y1 = min(gy * 2 + 1, Hf - 1);
+    uint p00 = inBase2 + uint(y0 * Wf + x0) * cw4;
+    uint p10 = inBase2 + uint(y0 * Wf + x1) * cw4;
+    uint p01 = inBase2 + uint(y1 * Wf + x0) * cw4;
+    uint p11 = inBase2 + uint(y1 * Wf + x1) * cw4;
+    for (uint i = 0u; i < cw4; ++i) {
+        vec4 s = 0.25 * (
+            unpackHalf4(g_in0.act2[p00 + i]) +
+            unpackHalf4(g_in0.act2[p10 + i]) +
+            unpackHalf4(g_in0.act2[p01 + i]) +
+            unpackHalf4(g_in0.act2[p11 + i])
+        );
+        regs[i] = packHalf4(s);
+    }
+}
+
+void loadUpsampleCatRegs(
+    int Wc, int Hc, int Wf, int Hf, int gx, int gy,
+    uint coarseBase2, uint coarseW4,
+    uint skipBase2, uint skipW4,
+    out uvec2 regs[44]
+) {
+    vec2 coord = (vec2(float(gx), float(gy)) + vec2(0.5)) * (vec2(float(Wc), float(Hc)) / vec2(float(Wf), float(Hf))) - vec2(0.5);
+    BilinearTaps bt = computeBilinearTaps(coord, ivec2(Wc, Hc));
+    uint p00 = coarseBase2 + uint(bt.i00.y * Wc + bt.i00.x) * coarseW4;
+    uint p10 = coarseBase2 + uint(bt.i10.y * Wc + bt.i10.x) * coarseW4;
+    uint p01 = coarseBase2 + uint(bt.i01.y * Wc + bt.i01.x) * coarseW4;
+    uint p11 = coarseBase2 + uint(bt.i11.y * Wc + bt.i11.x) * coarseW4;
+    for (uint i = 0u; i < coarseW4; ++i) {
+        vec4 v = bt.w.x * unpackHalf4(g_in0.act2[p00 + i])
+               + bt.w.y * unpackHalf4(g_in0.act2[p10 + i])
+               + bt.w.z * unpackHalf4(g_in0.act2[p01 + i])
+               + bt.w.w * unpackHalf4(g_in0.act2[p11 + i]);
+        regs[i] = packHalf4(v);
+    }
+    uint sIdx = skipBase2 + uint(gy * Wf + gx) * skipW4;
+    for (uint i = 0u; i < skipW4; ++i) {
+        regs[coarseW4 + i] = g_in1.act2[sIdx + i];
+    }
+}
+
+void runChunkedDw3x3(
+    uint C,
+    int dil,
+    uint dwWBase4,
+    uint dwBBase4,
+    int W,
+    int H,
+    int wgX,
+    int wgY,
+    uint lx,
+    uint ly,
+    uint t,
+    uint inBase2,
+    out uvec2 outHalf[44]
+) {
+    uint cw4    = C >> 2u;
+    uint chunks = C >> 4u; // 16 channels (4 vec4 = 4 uvec2 = 8 uint32/px) per chunk
+    uint apW    = 16u + uint(2 * dil);
+    uint apH    = 8u  + uint(2 * dil);
+    uint numAp  = apW * apH;
+    uint passes = (numAp + 127u) >> 7u;
+
+    for (uint ch = 0u; ch < chunks; ++ch) {
+        uint cBase4 = ch * 4u;
+        for (uint pass = 0u; pass < passes; ++pass) {
+            uint ap = pass * 128u + t;
+            if (ap < numAp) {
+                uint ay = ap / apW;
+                uint ax = ap - ay * apW;
+                ivec2 gp = clamp(ivec2(wgX + int(ax) - dil, wgY + int(ay) - dil), ivec2(0), ivec2(W - 1, H - 1));
+                uint gIdx = inBase2 + uint(gp.y * W + gp.x) * cw4 + cBase4;
+                uint sb   = ap * 8u;
+                for (uint i = 0u; i < 4u; ++i) {
+                    uvec2 h = g_in0.act2[gIdx + i];
+                    s_buf[sb + i * 2u + 0u] = h.x;
+                    s_buf[sb + i * 2u + 1u] = h.y;
+                }
+            }
+        }
+        barrier();
+
+        for (uint c4 = 0u; c4 < 4u; ++c4) {
+            vec4 acc = g_w32.w32v[dwBBase4 + cBase4 + c4];
+            for (int dy = -1; dy <= 1; ++dy) {
+                int ayp = int(ly) + dil + dy * dil;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int axp  = int(lx) + dil + dx * dil;
+                    uint apN = uint(ayp) * apW + uint(axp);
+                    uint sbN = apN * 8u + c4 * 2u;
+                    vec4 x   = unpackHalf4(uvec2(s_buf[sbN + 0u], s_buf[sbN + 1u]));
+                    uint tap = uint((dy + 1) * 3 + (dx + 1));
+                    acc     += x * g_w32.w32v[dwWBase4 + tap * cw4 + cBase4 + c4];
+                }
+            }
+            outHalf[cBase4 + c4] = packHalf4(acc);
+        }
+        barrier();
+    }
+}
+
+void packHalfRegsToSbuf(uint cw4, uvec2 regs[44], uint t, bool zeroOut, out float actScale) {
+#if UPWAYS_IS_FP8
+    actScale = 1.0;
+    for (uint i = 0u; i < cw4; ++i) {
+        s_buf[t * cw4 + i] = zeroOut ? 0u : packFp8Vec4(unpackHalf4(regs[i]));
+    }
+#else
+    if (zeroOut) {
+        actScale = 1.0;
+        for (uint i = 0u; i < cw4; ++i) {
+            s_buf[t * cw4 + i] = 0u;
+        }
+        return;
+    }
+    float m = UPWAYS_V5_INT8_DYN_FLOOR;
+    for (uint i = 0u; i < cw4; ++i) {
+        m = max(m, dynInt8AbsMax4(unpackHalf4(regs[i])));
+    }
+    actScale = m * (1.0 / 127.0);
+    vec4 invS = vec4(127.0 / m);
+    for (uint i = 0u; i < cw4; ++i) {
+        s_buf[t * cw4 + i] = packInt8Vec4Inv(unpackHalf4(regs[i]), invS);
+    }
+#endif
+}
+
+void evalPwTile(
+    uint inTiles,
+    uint wBaseU32,
+    uint ob,
+    uint sOff4,
+    uint bOff4,
+    float actScale,
+    bool applyLrelu,
+    out vec4 o0, out vec4 o1, out vec4 o2, out vec4 o3
+) {
+    uint sg      = gl_SubgroupID;
+    uint lane    = gl_SubgroupInvocationID;
+    uint aStride = inTiles * 4u;
+
+#if UPWAYS_IS_FP8
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_buf, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_buf, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#else
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_buf, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_buf, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#endif
+
+    coopMatStore(acc0, s_acc, sg * 576u,        18u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, s_acc, sg * 576u + 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint baseAcc = sg * 576u + lane * 18u;
+    vec4 a0 = vec4(s_acc[baseAcc + 0u],  s_acc[baseAcc + 1u],  s_acc[baseAcc + 2u],  s_acc[baseAcc + 3u]);
+    vec4 a1 = vec4(s_acc[baseAcc + 4u],  s_acc[baseAcc + 5u],  s_acc[baseAcc + 6u],  s_acc[baseAcc + 7u]);
+    vec4 a2 = vec4(s_acc[baseAcc + 8u],  s_acc[baseAcc + 9u],  s_acc[baseAcc + 10u], s_acc[baseAcc + 11u]);
+    vec4 a3 = vec4(s_acc[baseAcc + 12u], s_acc[baseAcc + 13u], s_acc[baseAcc + 14u], s_acc[baseAcc + 15u]);
+
+    uint cb  = ob * 4u;
+    vec4 sc0 = g_w32.w32v[sOff4 + cb + 0u] * actScale;
+    vec4 sc1 = g_w32.w32v[sOff4 + cb + 1u] * actScale;
+    vec4 sc2 = g_w32.w32v[sOff4 + cb + 2u] * actScale;
+    vec4 sc3 = g_w32.w32v[sOff4 + cb + 3u] * actScale;
+    vec4 bi0 = g_w32.w32v[bOff4 + cb + 0u];
+    vec4 bi1 = g_w32.w32v[bOff4 + cb + 1u];
+    vec4 bi2 = g_w32.w32v[bOff4 + cb + 2u];
+    vec4 bi3 = g_w32.w32v[bOff4 + cb + 3u];
+
+    o0 = a0 * sc0 + bi0;
+    o1 = a1 * sc1 + bi1;
+    o2 = a2 * sc2 + bi2;
+    o3 = a3 * sc3 + bi3;
+    if (applyLrelu) {
+        o0 = upwaysLrelu4(o0);
+        o1 = upwaysLrelu4(o1);
+        o2 = upwaysLrelu4(o2);
+        o3 = upwaysLrelu4(o3);
+    }
+    subgroupBarrier();
+}
+
+void runPwToHalfRegs(
+    uint inCh, uint outCh,
+    uint wBaseU32, uint sOff4, uint bOff4,
+    float actScale,
+    bool applyLrelu,
+    bool addSkipFromIn0,
+    uint pxIdx, uint inBase2,
+    out uvec2 outRegs[44]
+) {
+    uint inTiles  = inCh >> 4u;
+    uint outTiles = outCh >> 4u;
+    uint skipW4   = outCh >> 2u;
+    for (uint ob = 0u; ob < outTiles; ++ob) {
+        vec4 o0, o1, o2, o3;
+        evalPwTile(inTiles, wBaseU32, ob, sOff4, bOff4, actScale, applyLrelu && !addSkipFromIn0, o0, o1, o2, o3);
+        uint cb = ob * 4u;
+        if (addSkipFromIn0) {
+            uint sBase = inBase2 + pxIdx * skipW4 + cb;
+            o0 = upwaysLrelu4(o0 + unpackHalf4(g_in0.act2[sBase + 0u]));
+            o1 = upwaysLrelu4(o1 + unpackHalf4(g_in0.act2[sBase + 1u]));
+            o2 = upwaysLrelu4(o2 + unpackHalf4(g_in0.act2[sBase + 2u]));
+            o3 = upwaysLrelu4(o3 + unpackHalf4(g_in0.act2[sBase + 3u]));
+        }
+        outRegs[cb + 0u] = packHalf4(o0);
+        outRegs[cb + 1u] = packHalf4(o1);
+        outRegs[cb + 2u] = packHalf4(o2);
+        outRegs[cb + 3u] = packHalf4(o3);
+    }
+}
+
+void storeHalfRegsOut0(bool inImg, uint outPxIdx, uint cw4, uvec2 regs[44], bool zeroOut) {
+    if (!inImg) {
+        return;
+    }
+    uint b = outPxIdx * cw4;
+    for (uint i = 0u; i < cw4; ++i) {
+        g_out0.act2[b + i] = zeroOut ? uvec2(0u) : regs[i];
+    }
+}
+
+void storeHalfRegsOut1(bool inImg, uint outPxIdx, uint cw4, uvec2 regs[44], bool zeroOut) {
+    if (!inImg) {
+        return;
+    }
+    uint b = outPxIdx * cw4;
+    for (uint i = 0u; i < cw4; ++i) {
+        g_out1.act2[b + i] = zeroOut ? uvec2(0u) : regs[i];
+    }
+}
+
+void main() {
+    uint t   = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
+    uint lx  = t & 15u;
+    uint ly  = t >> 4u;
+    int  wgX = int(gl_WorkGroupID.x * 16u);
+    int  wgY = int(gl_WorkGroupID.y * 8u);
+    int  gx  = wgX + int(lx);
+    int  gy  = wgY + int(ly);
+    int  W   = int(pc.outW);
+    int  H   = int(pc.outH);
+    bool inImg = (gx < W && gy < H);
+    uint pxIdx = inImg ? uint(gy * W + gx) : 0u;
+    uint inBase2  = pc.off0 >> 1u;
+    uint in1Base2 = pc.off1 >> 1u;
+    bool zeroRes  = (pc.flags & UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE) != 0u;
+
+    uvec2 regsA[44];
+    uvec2 regsB[44];
+    float actScale = 1.0;
+
+    if (SPEC_STAGE_ID == 0u) {
+        // ENC1_PW1: X1[128, static 8-bit] -> f1[48, FP16]
+        uint gBase2 = inBase2 + pxIdx * 16u;
+        for (uint i = 0u; i < 16u; ++i) {
+            uvec2 p = inImg ? g_in0.act2[gBase2 + i] : uvec2(0u);
+            s_buf[t * 32u + i * 2u + 0u] = p.x;
+            s_buf[t * 32u + i * 2u + 1u] = p.y;
+        }
+        barrier();
+        runPwToHalfRegs(128u, 48u, U32_W5_ENC1_PW1, V4_S5_ENC1_PW1, V4_B5_OFFSET + V4_S5_ENC1_PW1, 1.0, true, false, 0u, 0u, regsA);
+        storeHalfRegsOut0(inImg, pxIdx, 12u, regsA, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 1u) {
+        // ENC1_DW_PW2: DW1(f1) -> PW2(48->48) + f1 -> s1[48]
+        runChunkedDw3x3(48u, 1, V4_DW5_ENC1_W, V4_DW5_ENC1_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+        packHalfRegsToSbuf(12u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(48u, 48u, U32_W5_ENC1_PW2, V4_S5_ENC1_PW2, V4_B5_OFFSET + V4_S5_ENC1_PW2, actScale, true, true, pxIdx, inBase2, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 12u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 2u) {
+        // ENC2_POOL_PW1: avgpool2x2_ceil(s1[48]) -> PW1(48->80) -> f2[80]
+        if (inImg) {
+            loadAvgPoolRegsIn0(int(pc.inW), int(pc.inH), gx, gy, inBase2, 12u, regsA);
+        }
+        packHalfRegsToSbuf(12u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(48u, 80u, U32_W5_ENC2_PW1, V4_S5_ENC2_PW1, V4_B5_OFFSET + V4_S5_ENC2_PW1, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 20u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 3u) {
+        // ENC2_DW_PW2: DW(f2) -> PW2(80->80) + f2 -> s2[80]
+        runChunkedDw3x3(80u, 1, V4_DW5_ENC2_W, V4_DW5_ENC2_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+        packHalfRegsToSbuf(20u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(80u, 80u, U32_W5_ENC2_PW2, V4_S5_ENC2_PW2, V4_B5_OFFSET + V4_S5_ENC2_PW2, actScale, true, true, pxIdx, inBase2, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 20u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 4u) {
+        // BOT3_POOL_PW1: avgpool2x2_ceil(s2[80]) -> PW1(80->128) -> b3_0[128]
+        if (inImg) {
+            loadAvgPoolRegsIn0(int(pc.inW), int(pc.inH), gx, gy, inBase2, 20u, regsA);
+        }
+        packHalfRegsToSbuf(20u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(80u, 128u, U32_W5_BOT3_PW1, V4_S5_BOT3_PW1, V4_B5_OFFSET + V4_S5_BOT3_PW1, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 32u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 5u) {
+        // BOT3_DW1_PW2: DW1(b3_0) -> PW2(128->128) + b3_0 -> b3_1[128]
+        runChunkedDw3x3(128u, 1, V4_DW5_BOT3_1_W, V4_DW5_BOT3_1_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+        packHalfRegsToSbuf(32u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(128u, 128u, U32_W5_BOT3_PW2, V4_S5_BOT3_PW2, V4_B5_OFFSET + V4_S5_BOT3_PW2, actScale, true, true, pxIdx, inBase2, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 32u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 6u) {
+        // BOT3_DW2_PW3: DW2(d=2, b3_1) -> PW3(128->128) + b3_1 -> b3_2[128]
+        runChunkedDw3x3(128u, 2, V4_DW5_BOT3_2_W, V4_DW5_BOT3_2_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+        packHalfRegsToSbuf(32u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(128u, 128u, U32_W5_BOT3_PW3, V4_S5_BOT3_PW3, V4_B5_OFFSET + V4_S5_BOT3_PW3, actScale, true, true, pxIdx, inBase2, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 32u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 7u) {
+        // BOT3_PW4_KHEAD: PW4(128->96) -> out0=b3[96]; KHEAD(96->32) -> out1=k3[32]
+        if (inImg) {
+            loadHalfRegsIn0(inBase2, pxIdx, 32u, regsA);
+        }
+        packHalfRegsToSbuf(32u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(128u, 96u, U32_W5_BOT3_PW4, V4_S5_BOT3_PW4, V4_B5_OFFSET + V4_S5_BOT3_PW4, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 24u, regsB, false);
+        barrier();
+        packHalfRegsToSbuf(24u, regsB, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(96u, 32u, U32_W5_BOT3_KHEAD, V4_S5_BOT3_KHEAD, V4_B5_OFFSET + V4_S5_BOT3_KHEAD, actScale, false, false, 0u, 0u, regsA);
+        storeHalfRegsOut1(inImg, pxIdx, 8u, regsA, zeroRes);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 8u) {
+        // DEC2_UP_CAT_PW1: up(b3[96]) + s2[80] = 176 -> PW1(176->96) -> out0=u2_0[96]
+        if (inImg) {
+            loadUpsampleCatRegs(int(pc.inW), int(pc.inH), W, H, gx, gy, inBase2, 24u, in1Base2, 20u, regsA);
+        }
+        packHalfRegsToSbuf(44u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(176u, 96u, U32_W5_DEC2_PW1, V4_S5_DEC2_PW1, V4_B5_OFFSET + V4_S5_DEC2_PW1, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 24u, regsB, false);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 9u) {
+        // DEC2_DW_PW2_KHEAD: DW(u2_0[96]) -> PW2(96->80, NO residual) -> out0=u2[80]; KHEAD(80->32) -> out1=k2[32]
+        runChunkedDw3x3(96u, 1, V4_DW5_DEC2_W, V4_DW5_DEC2_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+        packHalfRegsToSbuf(24u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(96u, 80u, U32_W5_DEC2_PW2, V4_S5_DEC2_PW2, V4_B5_OFFSET + V4_S5_DEC2_PW2, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 20u, regsB, false);
+        barrier();
+        packHalfRegsToSbuf(20u, regsB, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(80u, 32u, U32_W5_DEC2_KHEAD, V4_S5_DEC2_KHEAD, V4_B5_OFFSET + V4_S5_DEC2_KHEAD, actScale, false, false, 0u, 0u, regsA);
+        storeHalfRegsOut1(inImg, pxIdx, 8u, regsA, zeroRes);
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 10u) {
+        // DEC1_UP_CAT_PW1: up(u2[80]) + s1[48] = 128 -> PW1(128->64) -> out0=u1_0[64]
+        if (inImg) {
+            loadUpsampleCatRegs(int(pc.inW), int(pc.inH), W, H, gx, gy, inBase2, 20u, in1Base2, 12u, regsA);
+        }
+        packHalfRegsToSbuf(32u, regsA, t, !inImg, actScale);
+        barrier();
+        runPwToHalfRegs(128u, 64u, U32_W5_DEC1_PW1, V4_S5_DEC1_PW1, V4_B5_OFFSET + V4_S5_DEC1_PW1, actScale, true, false, 0u, 0u, regsB);
+        storeHalfRegsOut0(inImg, pxIdx, 16u, regsB, false);
+        return;
+    }
+
+    // SPEC_STAGE_ID == 11u: DEC1_DW_PW2_HEADS: DW(u1_0[64]) -> PW2+u1_0 -> u1[64]; out0=k1[32], out1=den_l0[32]@L0
+    runChunkedDw3x3(64u, 1, V4_DW5_DEC1_W, V4_DW5_DEC1_B, W, H, wgX, wgY, lx, ly, t, inBase2, regsA);
+    packHalfRegsToSbuf(16u, regsA, t, !inImg, actScale);
+    barrier();
+    runPwToHalfRegs(64u, 64u, U32_W5_DEC1_PW2, V4_S5_DEC1_PW2, V4_B5_OFFSET + V4_S5_DEC1_PW2, actScale, true, true, pxIdx, inBase2, regsB);
+    barrier();
+    packHalfRegsToSbuf(16u, regsB, t, !inImg, actScale);
+    barrier();
+
+    runPwToHalfRegs(64u, 32u, U32_W5_DEC1_KHEAD, V4_S5_DEC1_KHEAD, V4_B5_OFFSET + V4_S5_DEC1_KHEAD, actScale, false, false, 0u, 0u, regsA);
+    storeHalfRegsOut0(inImg, pxIdx, 8u, regsA, zeroRes);
+    subgroupBarrier();
+
+    runPwToHalfRegs(64u, 128u, U32_W5_DEN_HEAD, V4_S5_DEN_HEAD, V4_B5_OFFSET + V4_S5_DEN_HEAD, actScale, false, false, 0u, 0u, regsB);
+    if (inImg) {
+        int W0 = int(pc.lrWidth);
+        int H0 = int(pc.lrHeight);
+        for (uint c = 0u; c < 4u; ++c) {
+            int x0 = gx * 2 + int(c & 1u);
+            int y0 = gy * 2 + int(c >> 1u);
+            if (x0 < W0 && y0 < H0) {
+                uint dBase = uint(y0 * W0 + x0) * 8u;
+                uint sBase = c * 8u;
+                for (uint i = 0u; i < 8u; ++i) {
+                    g_out1.act2[dBase + i] = zeroRes ? uvec2(0u) : regsB[sBase + i];
+                }
+            }
+        }
+    }
+}

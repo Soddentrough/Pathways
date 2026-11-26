@@ -25,6 +25,32 @@
 
 namespace pathways {
 
+namespace {
+
+bool isUpwaysCompactLiveConfig(const Config& cfg) {
+    const bool isUpwaysActive = (cfg.denoiser_mode == DenoiserMode::Upways ||
+                                 cfg.upscaler_mode == UpscalerMode::Upways ||
+                                 cfg.upways_superres);
+    return isUpwaysActive &&
+           cfg.capture_training_data_dir.empty() &&
+           cfg.denoiser_mode != DenoiserMode::FfxRayRegeneration;
+}
+
+bool isUpwaysBandParallelConfig(const Config& cfg, MultiGpuMode mode) {
+    MultiGpuMode effMode = (cfg.mgpu_mode != MultiGpuMode::Off) ? cfg.mgpu_mode : mode;
+    if (effMode == MultiGpuMode::Auto) {
+        effMode = (cfg.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
+    }
+    const uint32_t renderH = (cfg.upscaler_mode != UpscalerMode::None && cfg.render_scale < 1.0f)
+        ? cfg.getRenderHeight() : cfg.height;
+    return (effMode == MultiGpuMode::CheckerboardTile) &&
+           isUpwaysCompactLiveConfig(cfg) &&
+           (cfg.upscaler_mode != UpscalerMode::FSR) &&
+           (renderH > 128u);
+}
+
+} // namespace
+
 static inline void closeFileDescriptor(int fd) {
     if (fd >= 0) {
 #if defined(_WIN32)
@@ -419,6 +445,13 @@ GpuDeviceNode::~GpuDeviceNode() {
     VkDevice device = context->getDevice();
     vkDeviceWaitIdle(device);
 
+    upwaysPipeline.reset();
+    mlIrradianceImage.reset();
+    mlPrimaryGuideImage.reset();
+    mlSurfaceMvImage.reset();
+    mlDiffHitDistImage.reset();
+    mlSpecVmvImage.reset();
+    mlSkipCompactImage.reset();
     causticsPipeline.reset();
     tlasUpdatePipeline.reset();
     wavefrontPipeline.reset();
@@ -557,6 +590,8 @@ void MultiGpuManager::collectSecondaryTimestamps(uint32_t bufferSlot) {
         }
         if (slotTimestamps[3] > slotTimestamps[2]) {
             node->lastTransferTimeMs = (slotTimestamps[3] - slotTimestamps[2]) * node->timestampPeriod * 1e-6;
+        } else {
+            node->lastTransferTimeMs = 0.0;
         }
     }
 }
@@ -564,6 +599,24 @@ void MultiGpuManager::collectSecondaryTimestamps(uint32_t bufferSlot) {
 void MultiGpuManager::setWarmupSppOverride(uint32_t spp) {
     if (!m_devices.empty() && m_devices[0]->wavefrontPipeline) {
         m_devices[0]->wavefrontPipeline->setWarmupSppOverride(spp);
+    }
+}
+
+void MultiGpuManager::resetNrcWeights() {
+    waitWorkerIdle();
+    for (auto& node : m_devices) {
+        if (node && node->nrcManager) {
+            node->nrcManager->resetWeights();
+        }
+    }
+}
+
+void MultiGpuManager::resetCausticsHistory() {
+    waitWorkerIdle();
+    for (auto& node : m_devices) {
+        if (node && node->causticsPipeline) {
+            node->causticsPipeline->resetHistory();
+        }
     }
 }
 
@@ -650,6 +703,15 @@ void MultiGpuManager::destroySharedP2PBuffer() {
             if (m_p2pBufferSecondary[slot] != VK_NULL_HANDLE) {
                 vkDestroyBuffer(dev1, m_p2pBufferSecondary[slot], nullptr);
                 m_p2pBufferSecondary[slot] = VK_NULL_HANDLE;
+                for (auto& d : m_devices) {
+                    if (d) {
+                        if (d->upwaysPipeline) {
+                            d->upwaysPipeline->setBandPackTargets(VK_NULL_HANDLE, 0);
+                        }
+                        d->upwaysBoundPackBuf.fill(VK_NULL_HANDLE);
+                        d->upwaysBoundPackSize = 0;
+                    }
+                }
             }
             if (m_p2pMemSecondary[slot] != VK_NULL_HANDLE) {
                 vkFreeMemory(dev1, m_p2pMemSecondary[slot], nullptr);
@@ -912,6 +974,15 @@ void MultiGpuManager::destroySharedHostBuffer() {
             if (m_sharedBufferSecondary[slot] != VK_NULL_HANDLE) {
                 vkDestroyBuffer(dev1, m_sharedBufferSecondary[slot], nullptr);
                 m_sharedBufferSecondary[slot] = VK_NULL_HANDLE;
+                for (auto& d : m_devices) {
+                    if (d) {
+                        if (d->upwaysPipeline) {
+                            d->upwaysPipeline->setBandPackTargets(VK_NULL_HANDLE, 0);
+                        }
+                        d->upwaysBoundPackBuf.fill(VK_NULL_HANDLE);
+                        d->upwaysBoundPackSize = 0;
+                    }
+                }
             }
             if (m_sharedMemSecondary[slot] != VK_NULL_HANDLE) {
                 vkFreeMemory(dev1, m_sharedMemSecondary[slot], nullptr);
@@ -1236,20 +1307,39 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
     const bool needMvDepth = needNormals || (m_config.upscaler_mode == UpscalerMode::FSR);
     const bool copyMv = needNormals || (needMvDepth && m_config.accum_format == AccumFormat::R11G11B10_UFLOAT);
 
-    // CheckerboardTile: radiance + only the active auxiliary G-buffer planes
-    const VkDeviceSize cbRadAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * bpp);
-    const VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * 8);
-    VkDeviceSize cbTotalSize = cbRadAligned;
-    if (needMl) {
-        cbTotalSize += 8 * cbPlaneAligned;
-    } else if (copyMv) {
-        cbTotalSize += (needNormals ? 2 : 1) * cbPlaneAligned;
+    const bool compactLive = isUpwaysCompactLiveConfig(m_config);
+    const bool bandParallelCapable = compactLive && (m_config.upscaler_mode != UpscalerMode::FSR) && (renderH > 128u);
+    const uint32_t haloLr = (m_config.upways_band_halo > 0u)
+        ? std::clamp((m_config.upways_band_halo + 2u) & ~3u, 8u, 64u)
+        : UPWAYS_DEFAULT_BAND_HALO_LR;
+    const UpwaysBandSplit maxBotSplit = computeUpwaysBandSplit(renderH, height, haloLr, 0.25f);
+    const VkDeviceSize bandBytes = align64k(static_cast<VkDeviceSize>(width) * (height - maxBotSplit.splitHrY) * 4ull);
+    const VkDeviceSize bandMinBytes = std::max(bandBytes, align64k(static_cast<VkDeviceSize>(width) * ((height * 3u + 3u) / 4u) * 4ull));
+
+    VkDeviceSize cbTotalSize = 0;
+    if (bandParallelCapable) {
+        cbTotalSize = bandMinBytes;
+    } else {
+        // CheckerboardTile: radiance + only the active auxiliary G-buffer planes
+        const VkDeviceSize cbRadAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * bpp);
+        const VkDeviceSize cbPlaneAligned = align64k(static_cast<VkDeviceSize>(cbWidth) * renderH * 8);
+        cbTotalSize = cbRadAligned;
+        if (needMl) {
+            cbTotalSize += 8 * cbPlaneAligned;
+        } else if (copyMv) {
+            cbTotalSize += (needNormals ? 2 : 1) * cbPlaneAligned;
+        }
     }
 
-    // SampleParallel: radiance (+ mlDiffuse + mlSpecular + mlSkip only when ML guides are active)
-    const VkDeviceSize spRadAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * bpp);
-    const VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * 8);
-    const VkDeviceSize spTotalSize = spRadAligned + (needMl ? 3 * spPlaneAligned : 0);
+    // SampleParallel: compact 8 B/px irradiance OR legacy radiance (+ mlDiffuse + mlSpecular + mlSkip)
+    VkDeviceSize spTotalSize = 0;
+    if (compactLive) {
+        spTotalSize = align64k(static_cast<VkDeviceSize>(renderW) * renderH * 8ull);
+    } else {
+        const VkDeviceSize spRadAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * bpp);
+        const VkDeviceSize spPlaneAligned = align64k(static_cast<VkDeviceSize>(renderW) * renderH * 8);
+        spTotalSize = spRadAligned + (needMl ? 3 * spPlaneAligned : 0);
+    }
 
     const MultiGpuMode effectiveMode = (m_config.mgpu_mode != MultiGpuMode::Off) ? m_config.mgpu_mode : m_mode;
     if (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off) {
@@ -1475,7 +1565,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
         initEffectiveMode = (config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
     }
     bool initIsCheckerboard = (initEffectiveMode == MultiGpuMode::CheckerboardTile || initEffectiveMode == MultiGpuMode::Off);
-    uint32_t secWidth = initIsCheckerboard ? (initMaxTilesPerGpuX * initTileSize) : std::max(initRenderW, initMaxTilesPerGpuX * initTileSize);
+    bool initIsBandParallel = isUpwaysBandParallelConfig(config, m_mode);
+    uint32_t secWidth = (initIsCheckerboard && !initIsBandParallel) ? (initMaxTilesPerGpuX * initTileSize) : std::max(initRenderW, initMaxTilesPerGpuX * initTileSize);
     uint32_t secHeight = initRenderH;
     VkFormat accumFormat = (config.accum_format == AccumFormat::RGBA16_SFLOAT) ? VK_FORMAT_R16G16B16A16_SFLOAT :
                            (config.accum_format == AccumFormat::R11G11B10_UFLOAT) ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R32G32B32A32_SFLOAT;
@@ -1696,6 +1787,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
             auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
+            auto wfShadeDielectricSecCode = loadShaderSPIRV("wavefront_shade_dielectric_sec.comp.spv");
             std::vector<char> wfTailMegakernelCode;
             if (config.enable_tail_megakernel) {
                 wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
@@ -1715,7 +1807,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 secNode->context->hasSubgroupSizeControl(),
                 0,
                 wfTailMegakernelCode,
-                secNode->context->getPipelineCache()
+                secNode->context->getPipelineCache(),
+                wfShadeDielectricSecCode
             );
             const bool secNeedAlpha = sceneHasAlphaMaterials(scene);
             const bool secNeedRestir = config.enable_restir;
@@ -1729,7 +1822,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                     loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
                     loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
                     loadShaderSPIRV("restir_gi_reuse.comp.spv"),
-                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                    loadShaderSPIRV("restir_di_reuse.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
                 );
             } else if (secNeedAlpha) {
                 secNode->wavefrontPipeline->initAlphaIntersectPipeline(
@@ -1744,7 +1838,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                     loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
                     loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
                     loadShaderSPIRV("restir_gi_reuse.comp.spv"),
-                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                    loadShaderSPIRV("restir_di_reuse.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
                 );
             }
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
@@ -1894,9 +1989,31 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
     uint32_t secW = secNode->accumTargets[0]->getWidth();
     uint32_t secH = secNode->accumTargets[0]->getHeight();
     const bool needed = needSecondaryMlGuides();
+    const bool wantCompact = needed && isUpwaysCompactLiveConfig(m_config);
+    const bool wantLegacy = needed && !wantCompact;
+
+    auto syncNrcAndWavefront = [&]() {
+        if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
+            VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
+            VkImageView mlIrrView = secNode->mlIrradianceImage ? secNode->mlIrradianceImage->getImageView() : VK_NULL_HANDLE;
+            for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
+                if (secNode->accumTargets[slot]) {
+                    secNode->nrcManager->updateDescriptors(
+                        slot, secNode->accumTargets[slot]->getImageView(),
+                        mlDiffView, mlSpecView, mlArView, mlSaView,
+                        VK_NULL_HANDLE, VK_NULL_HANDLE, mlIrrView
+                    );
+                }
+            }
+        }
+        updateSecondaryWavefrontDescriptors(secNode);
+    };
 
     if (!needed) {
-        if (secNode->mlDiffuseImage) {
+        if (secNode->mlDiffuseImage || secNode->mlIrradianceImage) {
             vkDeviceWaitIdle(secDevice);
             secNode->mlDiffuseImage.reset();
             secNode->mlSpecularImage.reset();
@@ -1904,30 +2021,135 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
             secNode->mlSpecularMotionImage.reset();
             secNode->mlSkipImage.reset();
             secNode->mlSpecAlbedoImage.reset();
-
-            if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
-                VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
-                VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
-                VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
-                VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
-                for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-                    if (secNode->accumTargets[slot]) {
-                        secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
-                    }
-                }
-            }
-            updateSecondaryWavefrontDescriptors(secNode);
+            secNode->mlIrradianceImage.reset();
+            secNode->mlPrimaryGuideImage.reset();
+            secNode->mlSurfaceMvImage.reset();
+            secNode->mlDiffHitDistImage.reset();
+            secNode->mlSpecVmvImage.reset();
+            secNode->mlSkipCompactImage.reset();
+            secNode->upwaysPipeline.reset();
+            secNode->resetUpwaysBindingCache();
+            syncNrcAndWavefront();
         }
         return;
     }
 
-    if (secNode->mlDiffuseImage &&
+    if (wantCompact) {
+        const bool alreadySized = secNode->mlIrradianceImage &&
+                                  secNode->mlPrimaryGuideImage &&
+                                  secNode->mlSurfaceMvImage &&
+                                  secNode->mlDiffHitDistImage &&
+                                  secNode->mlSpecVmvImage &&
+                                  secNode->mlSkipCompactImage &&
+                                  secNode->mlIrradianceImage->getWidth() == secW &&
+                                  secNode->mlIrradianceImage->getHeight() == secH;
+        if (alreadySized && !secNode->mlDiffuseImage) {
+            return;
+        }
+
+        vkDeviceWaitIdle(secDevice);
+        secNode->mlDiffuseImage.reset();
+        secNode->mlSpecularImage.reset();
+        secNode->mlAlbedoRoughnessImage.reset();
+        secNode->mlSpecularMotionImage.reset();
+        secNode->mlSkipImage.reset();
+        secNode->mlSpecAlbedoImage.reset();
+
+        if (!alreadySized) {
+            secNode->mlIrradianceImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R32G32_UINT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->mlPrimaryGuideImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R32G32B32A32_UINT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->mlSurfaceMvImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R32_UINT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->mlDiffHitDistImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R8_UNORM,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->mlSpecVmvImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R32G32_UINT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->mlSkipCompactImage = std::make_unique<Image>(
+                secDevice, secAlloc, secW, secH, VK_FORMAT_R32_UINT,
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            );
+            secNode->resetUpwaysBindingCache();
+
+            VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+            allocInfo.commandPool = secNode->commandPool;
+            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocInfo.commandBufferCount = 1;
+            VkCommandBuffer initCmd = VK_NULL_HANDLE;
+            vkAllocateCommandBuffers(secDevice, &allocInfo, &initCmd);
+
+            VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vkBeginCommandBuffer(initCmd, &beginInfo);
+
+            VkClearColorValue zeroClr{};
+            VkImageSubresourceRange clearRng{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            Image* compactImgs[6] = {
+                secNode->mlIrradianceImage.get(),
+                secNode->mlPrimaryGuideImage.get(),
+                secNode->mlSurfaceMvImage.get(),
+                secNode->mlDiffHitDistImage.get(),
+                secNode->mlSpecVmvImage.get(),
+                secNode->mlSkipCompactImage.get()
+            };
+            for (Image* img : compactImgs) {
+                img->transitionLayout(
+                    initCmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+                );
+                vkCmdClearColorImage(initCmd, img->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClr, 1, &clearRng);
+                img->transitionLayout(
+                    initCmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+                );
+            }
+            vkEndCommandBuffer(initCmd);
+
+            VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+            cmdSubmitInfo.commandBuffer = initCmd;
+            VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+            submitInfo.commandBufferInfoCount = 1;
+            submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+            vkQueueSubmit2(secNode->context->getGraphicsQueue(), 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(secNode->context->getGraphicsQueue());
+            vkFreeCommandBuffers(secDevice, secNode->commandPool, 1, &initCmd);
+        }
+
+        syncNrcAndWavefront();
+        return;
+    }
+
+    if (wantLegacy &&
+        secNode->mlDiffuseImage &&
         secNode->mlDiffuseImage->getWidth() == secW &&
-        secNode->mlDiffuseImage->getHeight() == secH) {
+        secNode->mlDiffuseImage->getHeight() == secH &&
+        !secNode->mlIrradianceImage) {
         return;
     }
 
     vkDeviceWaitIdle(secDevice);
+    secNode->mlIrradianceImage.reset();
+    secNode->mlPrimaryGuideImage.reset();
+    secNode->mlSurfaceMvImage.reset();
+    secNode->mlDiffHitDistImage.reset();
+    secNode->mlSpecVmvImage.reset();
+    secNode->mlSkipCompactImage.reset();
+    secNode->upwaysPipeline.reset();
+    secNode->resetUpwaysBindingCache();
     constexpr VkImageUsageFlags mlUsage =
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1980,18 +2202,7 @@ void MultiGpuManager::ensureSecondaryMlGuides(GpuDeviceNode* secNode) {
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
     vkFreeCommandBuffers(secDevice, secNode->commandPool, 1, &initCmd);
 
-    if (secNode->nrcManager && secNode->nrcManager->isInitialized()) {
-        VkImageView mlDiffView = secNode->mlDiffuseImage ? secNode->mlDiffuseImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
-        for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
-            if (secNode->accumTargets[slot]) {
-                secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
-            }
-        }
-    }
-    updateSecondaryWavefrontDescriptors(secNode);
+    syncNrcAndWavefront();
 }
 
 void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
@@ -2093,6 +2304,23 @@ void MultiGpuManager::ensureSecondaryNrc(GpuDeviceNode* secNode) {
     uint32_t nrcW = std::max(m_config.getRenderWidth(), secNode->accumTargets[0]->getWidth());
     uint32_t nrcH = std::max(m_config.getRenderHeight(), secNode->accumTargets[0]->getHeight());
 
+    if (!secNode->wavefrontPipeline->hasNrcPipelines()) {
+        try {
+            vkDeviceWaitIdle(secDevice);
+            secNode->wavefrontPipeline->initNrcVariants(
+                loadShaderSPIRV("wavefront_shade_diffuse_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_diffuse_sec_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_sec_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_dielectric_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_dielectric_sec_nrc.comp.spv")
+            );
+            secNode->context->savePipelineCache();
+        } catch (const std::exception& e) {
+            Logger::warn("Failed to initialize secondary GPU wavefront NRC variant pipelines: {}", e.what());
+        }
+    }
+
     if (secNode->nrcManager && secNode->nrcManager->isInitialized() &&
         secNode->nrcManager->getMaxQueries() == nrcW * nrcH) {
         return;
@@ -2124,9 +2352,14 @@ void MultiGpuManager::ensureSecondaryNrc(GpuDeviceNode* secNode) {
     VkImageView mlSpecView = secNode->mlSpecularImage ? secNode->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
     VkImageView mlArView = secNode->mlAlbedoRoughnessImage ? secNode->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
     VkImageView mlSaView = secNode->mlSpecAlbedoImage ? secNode->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView mlIrrView = secNode->mlIrradianceImage ? secNode->mlIrradianceImage->getImageView() : VK_NULL_HANDLE;
     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
         if (secNode->accumTargets[slot]) {
-            secNode->nrcManager->updateDescriptors(slot, secNode->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
+            secNode->nrcManager->updateDescriptors(
+                slot, secNode->accumTargets[slot]->getImageView(),
+                mlDiffView, mlSpecView, mlArView, mlSaView,
+                VK_NULL_HANDLE, VK_NULL_HANDLE, mlIrrView
+            );
         }
     }
     updateSecondaryWavefrontDescriptors(secNode);
@@ -2205,6 +2438,12 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             VK_NULL_HANDLE,
             VK_NULL_HANDLE,
             VK_NULL_HANDLE,
+            secNode->mlIrradianceImage ? secNode->mlIrradianceImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlPrimaryGuideImage ? secNode->mlPrimaryGuideImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSurfaceMvImage ? secNode->mlSurfaceMvImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlDiffHitDistImage ? secNode->mlDiffHitDistImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSpecVmvImage ? secNode->mlSpecVmvImage->getImageView() : VK_NULL_HANDLE,
+            secNode->mlSkipCompactImage ? secNode->mlSkipCompactImage->getImageView() : VK_NULL_HANDLE,
             secNode->envImportanceBuffer ? secNode->envImportanceBuffer->getBuffer() : VK_NULL_HANDLE,
             secNode->envImportanceBuffer ? secNode->envImportanceBuffer->getSize() : 0
         );
@@ -2293,10 +2532,19 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     ensureSecondaryMlGuides(node);
     ensureSecondaryCaustics(node);
     ensureSecondaryNrc(node);
-    const bool needMl = needSecondaryMlGuides() &&
-                        node->mlDiffuseImage && node->mlSpecularImage &&
-                        node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage &&
-                        node->mlSkipImage && node->mlSpecAlbedoImage;
+    const bool needCompactMl = isUpwaysCompactLiveConfig(m_config) &&
+                               node->mlIrradianceImage &&
+                               node->mlPrimaryGuideImage &&
+                               node->mlSurfaceMvImage &&
+                               node->mlDiffHitDistImage &&
+                               node->mlSpecVmvImage &&
+                               node->mlSkipCompactImage;
+    const bool needLegacyMl = !needCompactMl &&
+                              needSecondaryMlGuides() &&
+                              node->mlDiffuseImage && node->mlSpecularImage &&
+                              node->mlAlbedoRoughnessImage && node->mlSpecularMotionImage &&
+                              node->mlSkipImage && node->mlSpecAlbedoImage;
+    const bool needMl = needLegacyMl || needCompactMl;
 
     // Drain pending dynamic scene updates staged from the primary GPU before recording RT
     bool doInstanceSync = false;
@@ -2427,7 +2675,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     uint32_t dispatchWidth = packet.tileWidth;
     uint32_t dispatchHeight = packet.tileHeight;
 
-    if (packet.tileOffsetY == 0u) {
+    if (packet.isUpwaysBandParallel) {
+        dispatchWidth = packet.renderWidth;
+        dispatchHeight = packet.upwaysBand.botLrH;
+    } else if (packet.tileOffsetY == 0u) {
         if (packet.tileOffsetX == 1u || packet.tileOffsetX == 2u) {
             dispatchWidth = packet.tileWidth;
             dispatchHeight = (packet.tileHeight + 1) / 2;
@@ -2447,19 +2698,19 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     node->currentFrameIndex = packet.frameIndex;
     node->currentCameraMoved = packet.cameraMoved;
     node->currentFullScreenWidth = packet.tileWidth;
-    node->currentCbTileSize = (packet.tileOffsetX == 2u && packet.tileOffsetY > 0u) ? packet.tileOffsetY : 0u;
+    node->currentCbTileSize = (!packet.isUpwaysBandParallel && packet.tileOffsetX == 2u && packet.tileOffsetY > 0u) ? packet.tileOffsetY : 0u;
     node->currentNumLights = packet.numLights;
 
     bool needNormals = (needMl ||
                         m_config.enable_restir ||
                         m_config.enable_caustics);
     bool needMvDepth = needNormals || (m_config.upscaler_mode == UpscalerMode::FSR);
-    bool copyMvImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->motionVectorImage &&
+    bool copyMvImage = (!packet.enableUpscaler && !needCompactMl && packet.tileOffsetX == 2u && node->motionVectorImage &&
                         (needNormals || (needMvDepth && m_config.accum_format == AccumFormat::R11G11B10_UFLOAT)));
-    bool copyNdImage = (!packet.enableUpscaler && packet.tileOffsetX == 2u && node->normalDepthImage && needNormals);
-    bool copyCbMlPlanes = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMl);
-    bool copySpMlPlanes = (!packet.enableUpscaler && packet.tileOffsetX == 0u && needMl);
-    bool packDepthInAlpha = (!packet.enableUpscaler && packet.tileOffsetX == 2u && needMvDepth && !copyMvImage);
+    bool copyNdImage = (!packet.enableUpscaler && !needCompactMl && packet.tileOffsetX == 2u && node->normalDepthImage && needNormals);
+    bool copyCbMlPlanes = (!packet.enableUpscaler && !needCompactMl && packet.tileOffsetX == 2u && needLegacyMl);
+    bool copySpMlPlanes = (!packet.enableUpscaler && !needCompactMl && packet.tileOffsetX == 0u && needLegacyMl);
+    bool packDepthInAlpha = (!packet.enableUpscaler && !needCompactMl && packet.tileOffsetX == 2u && needMvDepth && !copyMvImage);
     bool earlyGbufferCopy = false;
 
     if (node->wavefrontPipeline) {
@@ -2480,14 +2731,21 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             b.subresourceRange = clearRange;
             clearBarriers.push_back(b);
         };
-        if (packet.accumulateHistory == 0u) {
-            clearAndTrack(node->accumTargets[slot].get());
-        }
-        if (needMl) {
-            clearAndTrack(node->mlDiffuseImage.get());
-            clearAndTrack(node->mlSpecularImage.get());
-            clearAndTrack(node->mlSkipImage.get());
-            clearAndTrack(node->mlSpecAlbedoImage.get());
+        if (needCompactMl) {
+            clearAndTrack(node->mlIrradianceImage.get());
+            clearAndTrack(node->mlDiffHitDistImage.get());
+            clearAndTrack(node->mlSpecVmvImage.get());
+            clearAndTrack(node->mlSkipCompactImage.get());
+        } else {
+            if (packet.accumulateHistory == 0u) {
+                clearAndTrack(node->accumTargets[slot].get());
+            }
+            if (needLegacyMl) {
+                clearAndTrack(node->mlDiffuseImage.get());
+                clearAndTrack(node->mlSpecularImage.get());
+                clearAndTrack(node->mlSkipImage.get());
+                clearAndTrack(node->mlSpecAlbedoImage.get());
+            }
         }
         if (!clearBarriers.empty()) {
             VkDependencyInfo clearDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
@@ -2520,8 +2778,14 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.enableNrc = enableSecNrc;
         wfSceneData.nrcBounce = m_config.nrc_bounce;
         wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
-        wfSceneData.boundsMin = m_focalBoundsMin;
-        wfSceneData.boundsMax = m_focalBoundsMax;
+        const bool hasFocalBounds =
+            (m_focalBoundsMin.x < m_focalBoundsMax.x) &&
+            (m_focalBoundsMin.y < m_focalBoundsMax.y) &&
+            (m_focalBoundsMin.z < m_focalBoundsMax.z);
+        const glm::vec3 nrcBMin = hasFocalBounds ? m_focalBoundsMin : m_boundsMin;
+        const glm::vec3 nrcBMax = hasFocalBounds ? m_focalBoundsMax : m_boundsMax;
+        wfSceneData.boundsMin = nrcBMin;
+        wfSceneData.boundsMax = nrcBMax;
         wfSceneData.sceneBoundsMin = m_boundsMin;
         wfSceneData.sceneBoundsMax = m_boundsMax;
         wfSceneData.envNeeEnabled = node->envNeeEnabled;
@@ -2540,16 +2804,23 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.tileOffsetY = packet.tileOffsetY;
         wfSceneData.fullWidth = packet.tileWidth;
         wfSceneData.fullHeight = packet.tileHeight;
-        bool needMlV4 = needMl && (m_config.denoiser_mode == DenoiserMode::Upways ||
-                                   m_config.upscaler_mode == UpscalerMode::Upways ||
-                                   m_config.upways_superres ||
-                                   m_config.capture_channels >= 32u);
-        wfSceneData.captureMlData = needMl ? (3u | (needMlV4 ? 4u : 0u)) : 0u;
-        wfSceneData.gbufferFlags = (1u << 31) |
-                                   (needNormals ? 1u : 0u) |
-                                   ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
-                                   ((copyMvImage || packet.enableUpscaler) ? 4u : 0u) |
-                                   (packDepthInAlpha ? 8u : 0u);
+        if (needCompactMl) {
+            const bool needCompactNd = packet.enableUpscaler || m_config.enable_restir || m_config.enable_caustics;
+            const bool needCompactMv = packet.enableUpscaler || m_config.enable_restir || m_config.enable_caustics;
+            wfSceneData.captureMlData = 1u | 4u | 16u | (needCompactNd ? 32u : 0u);
+            wfSceneData.gbufferFlags = (1u << 31) | 1u | (needCompactNd ? 2u : 0u) | (needCompactMv ? 4u : 0u);
+        } else {
+            bool needMlV4 = needLegacyMl && (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                             m_config.upscaler_mode == UpscalerMode::Upways ||
+                                             m_config.upways_superres ||
+                                             m_config.capture_channels >= 32u);
+            wfSceneData.captureMlData = needLegacyMl ? (3u | (needMlV4 ? 4u : 0u)) : 0u;
+            wfSceneData.gbufferFlags = (1u << 31) |
+                                       (needNormals ? 1u : 0u) |
+                                       ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
+                                       ((copyMvImage || packet.enableUpscaler) ? 4u : 0u) |
+                                       (packDepthInAlpha ? 8u : 0u);
+        }
 
         if (m_config.enable_caustics && node->causticsPipeline && m_hasDielectrics && packet.numLights > 0) {
             node->causticsPipeline->recordTrace(
@@ -2573,18 +2844,265 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
 
         if (enableSecNrc) {
             node->nrcManager->setBackend(m_config.nrc_backend);
-            float nrcLr = (!packet.cameraMoved && packet.accumulateHistory != 0u) ? 5e-4f : 1.5e-3f;
-            uint32_t nrcBatch = (packet.frameIndex == 0u || packet.accumulateHistory == 0u) ? 512u : 256u;
-            node->nrcManager->recordTraining(cmd, packet.frameIndex, m_focalBoundsMin, m_focalBoundsMax, nrcLr, nrcBatch);
-            node->nrcManager->recordInference(cmd, dispatchWidth, dispatchHeight, m_focalBoundsMin, m_focalBoundsMax,
-                                              0, slot, wfSceneData.captureMlData,
-                                              std::min(m_config.indirect_clamp, 8.0f));
+            const uint32_t adamStep = node->nrcManager->getAdamStep();
+            const bool nrcWarmBatch = (adamStep < 20u);
+            const bool nrcWarmLr = (adamStep < 20u);
+            float nrcLr = nrcWarmLr
+                ? 5.8e-3f
+                : ((!packet.cameraMoved && m_config.progressive_accumulation) ? 2.3e-3f : 2.8e-3f);
+            uint32_t nrcBatch = nrcWarmBatch ? 64u : 32u;
+            node->nrcManager->recordInferenceAndTraining(cmd, dispatchWidth, dispatchHeight, nrcBMin, nrcBMax,
+                                                         0, slot, wfSceneData.captureMlData,
+                                                         std::min(m_config.indirect_clamp, 35.0f),
+                                                         packet.frameIndex, nrcLr, nrcBatch,
+                                                         secSppLoop == 1u);
         }
     }
 
 
 
-    if (packet.enableUpscaler && node->upscaler) {
+    if (packet.isUpwaysBandParallel && needCompactMl) {
+        const UpwaysRuntimeVersion targetVer = UpwaysPipeline::resolveVersion(
+            m_config.upways_version, m_config.upways_weights_path
+        );
+        const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
+            node->context->getPhysicalDevice(), m_config.upways_precision, m_primaryContext->getInstance(), targetVer
+        );
+        if (node->upwaysPipeline &&
+            (node->upwaysPipeline->getVersion() != targetVer || node->upwaysPipeline->getPrecision() != targetPrec)) {
+            vkDeviceWaitIdle(device);
+            node->upwaysPipeline.reset();
+            node->resetUpwaysBindingCache();
+        }
+
+        const bool isSuperRes = (packet.renderWidth < packet.displayWidth || packet.renderHeight < packet.displayHeight || m_config.isUpwaysSuperResActive());
+        const VkFormat upwaysFmt = (m_config.accum_format == AccumFormat::RGBA32_SFLOAT)
+            ? VK_FORMAT_R32G32B32A32_SFLOAT
+            : VK_FORMAT_R16G16B16A16_SFLOAT;
+
+        if (!node->upwaysPipeline) {
+            const char* ext = ".comp.spv";
+            if (targetPrec == UpwaysComputePrecision::Int8) {
+                ext = ".int8.comp.spv";
+            } else if (targetPrec == UpwaysComputePrecision::Fp16) {
+                ext = ".fp16.comp.spv";
+            }
+            if (targetVer == UpwaysRuntimeVersion::V5) {
+                node->upwaysPipeline = std::make_unique<UpwaysPipeline>(
+                    device,
+                    node->context->getPhysicalDevice(),
+                    node->context->getAllocator(),
+                    packet.renderWidth,
+                    packet.upwaysBand.botLrH,
+                    packet.displayWidth,
+                    packet.upwaysBand.botHrH,
+                    loadShaderSPIRV(std::string("upways_v5_prep") + ext),
+                    loadShaderSPIRV(std::string("upways_v5_unet_wmma") + ext),
+                    loadShaderSPIRV(std::string("upways_v5_affinity") + ext),
+                    loadShaderSPIRV(std::string("upways_v5_upscaler_wmma") + ext),
+                    loadShaderSPIRV(std::string("upways_v5_resolve") + ext),
+                    m_config.upways_weights_path,
+                    isSuperRes,
+                    upwaysFmt,
+                    targetPrec,
+                    packet.upwaysBand.botHrH
+                );
+            } else {
+                node->upwaysPipeline = std::make_unique<UpwaysPipeline>(
+                    device,
+                    node->context->getPhysicalDevice(),
+                    node->context->getAllocator(),
+                    packet.renderWidth,
+                    packet.upwaysBand.botLrH,
+                    packet.displayWidth,
+                    packet.upwaysBand.botHrH,
+                    loadShaderSPIRV(std::string("upways_denoise_prep") + ext),
+                    loadShaderSPIRV(std::string("upways_denoiser_wmma") + ext),
+                    loadShaderSPIRV(std::string("upways_upscaler_wmma") + ext),
+                    loadShaderSPIRV(std::string("upways_upscale_resolve") + ext),
+                    m_config.upways_weights_path,
+                    isSuperRes,
+                    upwaysFmt,
+                    targetPrec,
+                    packet.upwaysBand.botHrH
+                );
+            }
+            node->resetUpwaysBindingCache();
+        } else if (node->upwaysPipeline->getInputWidth() != packet.renderWidth ||
+                   node->upwaysPipeline->getInputHeight() != packet.upwaysBand.botLrH ||
+                   node->upwaysPipeline->getOutputWidth() != packet.displayWidth ||
+                   node->upwaysPipeline->getOutputHeight() != packet.upwaysBand.botHrH ||
+                   node->upwaysPipeline->getOutputFullHeight() != packet.upwaysBand.botHrH ||
+                   node->upwaysPipeline->isSuperResEnabled() != isSuperRes) {
+            vkDeviceWaitIdle(device);
+            node->upwaysPipeline->resize(
+                packet.renderWidth,
+                packet.upwaysBand.botLrH,
+                packet.displayWidth,
+                packet.upwaysBand.botHrH,
+                isSuperRes,
+                packet.upwaysBand.botHrH
+            );
+            node->resetUpwaysBindingCache();
+        }
+
+        const VkImageView irrView = node->mlIrradianceImage->getImageView();
+        const VkImageView primView = node->mlPrimaryGuideImage->getImageView();
+        const VkImageView surfaceMvView = node->mlSurfaceMvImage->getImageView();
+        const VkImageView diffHitDistView = node->mlDiffHitDistImage->getImageView();
+        const VkImageView specVmvView = node->mlSpecVmvImage->getImageView();
+        const VkImageView skipCompactView = node->mlSkipCompactImage->getImageView();
+        if (node->upwaysBoundIrrView != irrView ||
+            node->upwaysBoundPrimView != primView ||
+            node->upwaysBoundSurfaceMvView != surfaceMvView ||
+            node->upwaysBoundDiffHitDistView != diffHitDistView ||
+            node->upwaysBoundSpecVmvView != specVmvView ||
+            node->upwaysBoundSkipCompactView != skipCompactView) {
+            node->upwaysPipeline->updateDescriptors(
+                irrView, primView, surfaceMvView, diffHitDistView, specVmvView, skipCompactView
+            );
+            node->upwaysBoundIrrView = irrView;
+            node->upwaysBoundPrimView = primView;
+            node->upwaysBoundSurfaceMvView = surfaceMvView;
+            node->upwaysBoundDiffHitDistView = diffHitDistView;
+            node->upwaysBoundSpecVmvView = specVmvView;
+            node->upwaysBoundSkipCompactView = skipCompactView;
+        }
+
+        const uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0u;
+        auto resolveSecBuf = [&](uint32_t sIdx) -> VkBuffer {
+            return (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
+                ? m_p2pBufferSecondary[sIdx]
+                : m_sharedBufferSecondary[sIdx];
+        };
+        VkBuffer secBuf0 = resolveSecBuf(0u);
+        VkBuffer secBuf1 = m_config.double_buffered_shared_mem ? resolveSecBuf(1u) : secBuf0;
+        if (secBuf1 == VK_NULL_HANDLE) {
+            secBuf1 = secBuf0;
+        }
+        if (node->upwaysBoundPackBuf[0] != secBuf0 ||
+            node->upwaysBoundPackBuf[1] != secBuf1 ||
+            node->upwaysBoundPackSize != m_sharedBufferSize) {
+            node->upwaysPipeline->setBandPackTargets(secBuf0, m_sharedBufferSize, secBuf1, m_sharedBufferSize);
+            node->upwaysBoundPackBuf[0] = secBuf0;
+            node->upwaysBoundPackBuf[1] = secBuf1;
+            node->upwaysBoundPackSize = m_sharedBufferSize;
+        }
+
+        // Sync Wavefront/NRC compact image writes before secondary Upways compute
+        VkMemoryBarrier2 rtToUpwaysBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        rtToUpwaysBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        rtToUpwaysBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        rtToUpwaysBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        rtToUpwaysBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        VkDependencyInfo rtToUpwaysDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        rtToUpwaysDep.memoryBarrierCount = 1;
+        rtToUpwaysDep.pMemoryBarriers = &rtToUpwaysBarrier;
+        vkCmdPipelineBarrier2(cmd, &rtToUpwaysDep);
+
+        UpwaysBandParams botBand{};
+        botBand.bandLrY0 = packet.upwaysBand.botLrY0;
+        botBand.bandHrY0 = packet.upwaysBand.botHrY0;
+        botBand.fullLrHeight = packet.upwaysBand.fullLrH;
+        botBand.fullHrHeight = packet.upwaysBand.fullHrH;
+        botBand.keepHrYStart = packet.upwaysBand.splitHrY - packet.upwaysBand.botHrY0;
+        botBand.keepHrYEnd = packet.upwaysBand.botHrH;
+        botBand.fusedBandPack = true;
+        botBand.bandPackSlot = sharedSlot;
+
+        node->upwaysPipeline->recordFrame(
+            cmd,
+            packet.frameIndex,
+            packet.upwaysResetHistory,
+            glm::vec2(packet.jitterX, packet.jitterY),
+            false,
+            m_config.upways_heuristic_fallback,
+            packet.upwaysExposureScale,
+            botBand
+        );
+
+        // Timestamp 1: Bottom-Band RT + Bottom-Band Upways (with Fused RGB9E5 Pack) End
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
+
+        // Timestamp 2..3: Cross-GPU visibility flush for fused RGB9E5 buffer (0 standalone pack dispatch)
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, node->queryPools[slot], 2);
+
+        VkMemoryBarrier2 packFlushBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        packFlushBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        packFlushBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        packFlushBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        packFlushBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+        VkDependencyInfo packFlushDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        packFlushDep.memoryBarrierCount = 1;
+        packFlushDep.pMemoryBarriers = &packFlushBarrier;
+        vkCmdPipelineBarrier2(cmd, &packFlushDep);
+
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, node->queryPools[slot], 3);
+    } else if (needCompactMl && packet.tileOffsetX == 0u) {
+        // SampleParallel compact Upways: transfer only 8 B/px uMlIrradianceImage
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
+
+        VkImageSubresourceRange colorRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageMemoryBarrier2 toSrcBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        toSrcBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        toSrcBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        toSrcBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toSrcBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toSrcBarrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toSrcBarrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toSrcBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrcBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toSrcBarrier.image = node->mlIrradianceImage->getImage();
+        toSrcBarrier.subresourceRange = colorRange;
+
+        VkDependencyInfo toSrcDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toSrcDep.imageMemoryBarrierCount = 1;
+        toSrcDep.pImageMemoryBarriers = &toSrcBarrier;
+        vkCmdPipelineBarrier2(cmd, &toSrcDep);
+
+        VkBufferImageCopy copyRegion{};
+        copyRegion.bufferOffset = 0;
+        copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copyRegion.imageSubresource.layerCount = 1;
+        copyRegion.imageExtent = { dispatchWidth, dispatchHeight, 1 };
+
+        const uint32_t sharedSlot = m_config.double_buffered_shared_mem ? slot : 0u;
+        VkBuffer targetBuffer = (m_transferMode == InterGpuTransferMode::P2P_Direct_BAR)
+            ? m_p2pBufferSecondary[sharedSlot]
+            : m_sharedBufferSecondary[sharedSlot];
+
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 2);
+        vkCmdCopyImageToBuffer(cmd, node->mlIrradianceImage->getImage(),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               targetBuffer, 1, &copyRegion);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, node->queryPools[slot], 3);
+
+        VkImageMemoryBarrier2 toGenBarrier{ VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
+        toGenBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        toGenBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        toGenBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        toGenBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        toGenBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        toGenBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGenBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGenBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toGenBarrier.image = node->mlIrradianceImage->getImage();
+        toGenBarrier.subresourceRange = colorRange;
+
+        VkMemoryBarrier2 copyFlushBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+        copyFlushBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+        copyFlushBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        copyFlushBarrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+        copyFlushBarrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+        VkDependencyInfo toGenDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+        toGenDep.memoryBarrierCount = 1;
+        toGenDep.pMemoryBarriers = &copyFlushBarrier;
+        toGenDep.imageMemoryBarrierCount = 1;
+        toGenDep.pImageMemoryBarriers = &toGenBarrier;
+        vkCmdPipelineBarrier2(cmd, &toGenDep);
+    } else if (packet.enableUpscaler && node->upscaler) {
         // Timestamp 1: RT End
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, node->queryPools[slot], 1);
 
@@ -2963,7 +3481,11 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
                                          bool enableSharpening,
                                          float sharpness,
                                          uint32_t totalSamples,
-                                         uint32_t sortMode) {
+                                         uint32_t sortMode,
+                                         bool isUpwaysBandParallel,
+                                         UpwaysBandSplit upwaysBand,
+                                         bool upwaysResetHistory,
+                                         float upwaysExposureScale) {
     if (!m_active || m_devices.empty()) return;
 
     {
@@ -3001,6 +3523,10 @@ void MultiGpuManager::launchSecondaryWork(const CameraUniform& cameraUniform,
         m_pendingWork.sharpness = sharpness;
         m_pendingWork.totalSamples = totalSamples;
         m_pendingWork.sortMode = sortMode;
+        m_pendingWork.isUpwaysBandParallel = isUpwaysBandParallel;
+        m_pendingWork.upwaysBand = upwaysBand;
+        m_pendingWork.upwaysResetHistory = upwaysResetHistory;
+        m_pendingWork.upwaysExposureScale = upwaysExposureScale;
         m_pendingWork.timelineValue = ++m_currentTimelineValue;
         m_pendingWork.valid = true;
         uint32_t slot = bufferSlot % GpuDeviceNode::NUM_IN_FLIGHT;
@@ -3074,7 +3600,8 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
         }
         bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off);
-        uint32_t secWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
+        bool isBandParallel = isUpwaysBandParallelConfig(m_config, m_mode);
+        uint32_t secWidth = (isCheckerboard && !isBandParallel) ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
         uint32_t secHeight = renderH;
         for (uint32_t i = 0; i < GpuDeviceNode::NUM_IN_FLIGHT; ++i) {
             node->accumTargets[i] = std::make_unique<Image>(
@@ -3190,6 +3717,16 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
             node->mlSkipImage.reset();
             node->mlSpecAlbedoImage.reset();
         }
+        if (node->mlIrradianceImage &&
+            (node->mlIrradianceImage->getWidth() != secWidth || node->mlIrradianceImage->getHeight() != secHeight)) {
+            node->mlIrradianceImage.reset();
+            node->mlPrimaryGuideImage.reset();
+            node->mlSurfaceMvImage.reset();
+            node->mlDiffHitDistImage.reset();
+            node->mlSpecVmvImage.reset();
+            node->mlSkipCompactImage.reset();
+            node->resetUpwaysBindingCache();
+        }
 
         for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
             node->slotHasExecuted[slot] = false;
@@ -3214,9 +3751,14 @@ void MultiGpuManager::resize(uint32_t width, uint32_t height) {
                     VkImageView mlSpecView = node->mlSpecularImage ? node->mlSpecularImage->getImageView() : VK_NULL_HANDLE;
                     VkImageView mlArView = node->mlAlbedoRoughnessImage ? node->mlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
                     VkImageView mlSaView = node->mlSpecAlbedoImage ? node->mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
+                    VkImageView mlIrrView = node->mlIrradianceImage ? node->mlIrradianceImage->getImageView() : VK_NULL_HANDLE;
                     for (uint32_t slot = 0; slot < GpuDeviceNode::NUM_IN_FLIGHT; ++slot) {
                         if (node->accumTargets[slot]) {
-                            node->nrcManager->updateDescriptors(slot, node->accumTargets[slot]->getImageView(), mlDiffView, mlSpecView, mlArView, mlSaView);
+                            node->nrcManager->updateDescriptors(
+                                slot, node->accumTargets[slot]->getImageView(),
+                                mlDiffView, mlSpecView, mlArView, mlSaView,
+                                VK_NULL_HANDLE, VK_NULL_HANDLE, mlIrrView
+                            );
                         }
                     }
                 } else {
@@ -3250,6 +3792,9 @@ void MultiGpuManager::setConfig(const Config& config) {
     bool formatChanged = (config.accum_format != m_config.accum_format);
     bool doubleBufChanged = (config.double_buffered_shared_mem != m_config.double_buffered_shared_mem);
     bool targetLayoutChanged = upscalerChanged || formatChanged ||
+                               (config.denoiser_mode != m_config.denoiser_mode) ||
+                               (config.upways_superres != m_config.upways_superres) ||
+                               (config.capture_training_data_dir != m_config.capture_training_data_dir) ||
                                (config.mgpu_mode != m_config.mgpu_mode) ||
                                (config.tile_size != m_config.tile_size) ||
                                (config.spp != m_config.spp && m_mode == MultiGpuMode::Auto);
@@ -3269,7 +3814,8 @@ void MultiGpuManager::setConfig(const Config& config) {
                 effectiveMode = (m_config.spp > 1) ? MultiGpuMode::SampleParallel : MultiGpuMode::CheckerboardTile;
             }
             bool isCheckerboard = (effectiveMode == MultiGpuMode::CheckerboardTile || effectiveMode == MultiGpuMode::Off);
-            uint32_t secWidth = isCheckerboard ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
+            bool isBandParallel = isUpwaysBandParallelConfig(m_config, m_mode);
+            uint32_t secWidth = (isCheckerboard && !isBandParallel) ? (maxTilesPerGpuX * tileSize) : std::max(renderW, maxTilesPerGpuX * tileSize);
             uint32_t secHeight = renderH;
             if (formatChanged ||
                 secNode->accumTargets[0]->getWidth() != secWidth ||
@@ -3307,7 +3853,8 @@ void MultiGpuManager::setConfig(const Config& config) {
                     loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
                     loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
                     loadShaderSPIRV("restir_gi_reuse.comp.spv"),
-                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                    loadShaderSPIRV("restir_di_reuse.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
                 );
                 secNode->context->savePipelineCache();
             }
@@ -3555,6 +4102,9 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
     // 3b. Unified HDRI sky dome + 2D importance alias synchronization on secondary GPU
     uploadSecondaryEnvAndImportance(*secNode, m_config, scene);
 
+    if (secNode->nrcManager) {
+        secNode->nrcManager->resetWeights();
+    }
     if (secNode->causticsPipeline) {
         secNode->causticsPipeline->resetHistory();
         if (!m_hasDielectrics) {

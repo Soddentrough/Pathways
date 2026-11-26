@@ -68,7 +68,9 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     ivec2 giPix = ivec2(gl_GlobalInvocationID.xy);
-    bool inRange = (giPix.x < int(pc.width) && giPix.y < int(pc.height));
+    int bandH = imageSize(uMotionVectorImage).y;
+    bool inRange = (giPix.x < int(pc.width) && giPix.y < bandH);
+    ivec2 screenPx = ivec2(giPix.x, giPix.y + int(pc.pixelOffsetY));
 
     bool hasGiShadowRay = false;
     PackedShadowRay giShadowCandidate;
@@ -82,10 +84,10 @@ void main() {
             if (((selfFlagsM >> 16u) & 1u) != 0u) {
                 vec4 mvData = imageLoad(uMotionVectorImage, giPix);
                 float linDepth = mvData.w;
-                uint clsSeed = uint(giPix.x * 1973 + giPix.y * 9277 + (ubo.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
+                uint clsSeed = uint(screenPx.x * 1973 + screenPx.y * 9277 + (ubo.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
                 bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
                 vec2 jitter = (enableTaa || pc.captureMlData != 0u) ? vec2(0.0) : (randVec2(clsSeed) - vec2(0.5));
-                vec2 uv = (vec2(giPix) + vec2(0.5) + jitter) / vec2(float(pc.width), float(pc.height));
+                vec2 uv = (vec2(screenPx) + vec2(0.5) + jitter) / vec2(float(pc.width), float(pc.height));
                 vec2 ndc = uv * 2.0 - 1.0;
                 vec4 target = ubo.projInverse * vec4(ndc.x, ndc.y, 1.0, 1.0);
                 vec3 rayDir = normalize((ubo.viewInverse * vec4(normalize(target.xyz / target.w), 0.0)).xyz);
@@ -114,7 +116,7 @@ void main() {
                     giL2 = restirUnpackRgb9e5(selfRadBits);
                 }
 
-                uint giReuseSeed = uint(giPix.x * 1973 + giPix.y * 9277 + (pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) ^ 0xC2B2AE35u;
+                uint giReuseSeed = uint(screenPx.x * 1973 + screenPx.y * 9277 + (pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) ^ 0xC2B2AE35u;
                 giReuseSeed |= 1u;
                 pcg_hash(giReuseSeed);
 

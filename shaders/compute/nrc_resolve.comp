@@ -3,10 +3,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_EXT_shader_image_load_formatted : require
 
+#include "rgb9e5.glsl"
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 #define ML_CAPTURE_UPWAYS_V4_BIT 4u
 #define ML_CAPTURE_SPLIT_4SIG_BIT 8u
+#define ML_CAPTURE_COMPACT_LIVE_BIT 16u
 
 layout(set = 0, binding = 0) uniform image2D uAccumImage;
 
@@ -20,6 +23,7 @@ layout(set = 0, binding = 4, rgba16f) uniform readonly image2D uMlAlbedoRoughnes
 layout(set = 0, binding = 5, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
 layout(set = 0, binding = 6, rgba16f) uniform image2D uIndirectDiffuseImage;
 layout(set = 0, binding = 7, rgba16f) uniform image2D uIndirectSpecularImage;
+layout(set = 0, binding = 8, rg32ui) uniform uimage2D uMlIrradianceImage;
 
 layout(push_constant) uniform PushConstants {
     uint width;
@@ -96,8 +100,26 @@ void main() {
 
         const bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
         const bool isSplit4 = (pc.captureMlData & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u;
+        const bool isCompactLive = (pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u;
 
-        if ((pc.captureMlData & 1u) != 0u && (isV4 || !isSplit4)) {
+        if (isCompactLive) {
+            if ((pc.captureMlData & 1u) != 0u) {
+                bool hasD = (diffR | diffG | diffB) != 0u;
+                bool hasS = (specR | specG | specB) != 0u;
+                if (hasD || hasS) {
+                    uvec2 cur = imageLoad(uMlIrradianceImage, pixelCoord).xy;
+                    if (hasD) {
+                        vec3 prevD = (cur.x != 0u) ? unpackRGB9E5(cur.x) : vec3(0.0);
+                        cur.x = packRGB9E5(prevD + radDiff);
+                    }
+                    if (hasS) {
+                        vec3 prevS = (cur.y != 0u) ? unpackRGB9E5(cur.y) : vec3(0.0);
+                        cur.y = packRGB9E5(prevS + radSpec);
+                    }
+                    imageStore(uMlIrradianceImage, pixelCoord, uvec4(cur, 0u, 0u));
+                }
+            }
+        } else if ((pc.captureMlData & 1u) != 0u && (isV4 || !isSplit4)) {
             if ((diffR | diffG | diffB) != 0u) {
                 vec3 contribDiff = isV4 ? demodulateMlSafe(radDiff, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb) : radDiff;
                 vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);

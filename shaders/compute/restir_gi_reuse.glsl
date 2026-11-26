@@ -371,7 +371,7 @@ void restirGiRunReuse(
                 giCoord += base;
             }
 
-            bool inBounds = (giCoord.x >= 0 && giCoord.y >= 0 && giCoord.x < int(width) && giCoord.y < int(height));
+            bool inBounds = (giCoord.x >= 0 && giCoord.y >= 0 && giCoord.x < int(width) && giCoord.y < imageSize(uPrevNormalDepthImage).y);
             bool motionOk = !isTemp || (abs(mvData.x) < 1.5 && abs(mvData.y) < 1.5);
             if (inBounds && motionOk) {
                 uint tapPix = uint(giCoord.y) * width + uint(giCoord.x);
@@ -480,23 +480,31 @@ void restirGiRunReuse(
                             vec4 prevAcc = imageLoad(uAccumImage, giPix);
                             imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib * invSpp, seed), prevAcc.a));
                         }
-                        wfAddSplitIndirect(giPix, diffContrib * invSpp, specContrib * invSpp, captureMlData, seed);
-                        if ((captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
-                            if (dot(diffContrib, diffContrib) > 1e-12) {
-                                vec3 scaledDiff = diffContrib * invSpp;
-                                vec3 outDiff = isV4
-                                    ? demodulateMlSafe(scaledDiff, imageLoad(uMlAlbedoRoughnessImage, giPix).rgb)
-                                    : scaledDiff;
-                                vec4 prevDiff = imageLoad(uMlDiffuseImage, giPix);
-                                imageStore(uMlDiffuseImage, giPix, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
-                            }
-                            if (dot(specContrib, specContrib) > 1e-12) {
-                                vec3 scaledSpec = specContrib * invSpp;
-                                vec3 outSpec = isV4
-                                    ? demodulateMlSafe(scaledSpec, imageLoad(uMlSpecAlbedoImage, giPix).rgb)
-                                    : scaledSpec;
-                                vec4 prevSpec = imageLoad(uMlSpecularImage, giPix);
-                                imageStore(uMlSpecularImage, giPix, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                        if (captureMlData != 0u) {
+                            if ((captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                                if ((captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                    wfAddCompactMlIrradiance(giPix, diffContrib * invSpp, specContrib * invSpp);
+                                }
+                            } else {
+                                wfAddSplitIndirect(giPix, diffContrib * invSpp, specContrib * invSpp, captureMlData, seed);
+                                if ((captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                    if (dot(diffContrib, diffContrib) > 1e-12) {
+                                        vec3 scaledDiff = diffContrib * invSpp;
+                                        vec3 outDiff = isV4
+                                            ? demodulateMlSafe(scaledDiff, imageLoad(uMlAlbedoRoughnessImage, giPix).rgb)
+                                            : scaledDiff;
+                                        vec4 prevDiff = imageLoad(uMlDiffuseImage, giPix);
+                                        imageStore(uMlDiffuseImage, giPix, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                    }
+                                    if (dot(specContrib, specContrib) > 1e-12) {
+                                        vec3 scaledSpec = specContrib * invSpp;
+                                        vec3 outSpec = isV4
+                                            ? demodulateMlSafe(scaledSpec, imageLoad(uMlSpecAlbedoImage, giPix).rgb)
+                                            : scaledSpec;
+                                        vec4 prevSpec = imageLoad(uMlSpecularImage, giPix);
+                                        imageStore(uMlSpecularImage, giPix, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                    }
+                                }
                             }
                         }
                     } else {

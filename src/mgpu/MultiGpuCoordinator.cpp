@@ -1,8 +1,10 @@
 #include "mgpu/MultiGpuCoordinator.hpp"
+#include "core/Logger.hpp"
 #include "core/QualityGovernor.hpp"
 #include "rt/CausticsPipeline.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace pathways {
 
@@ -107,7 +109,38 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     plan.secDispatchWidth = plan.dispatchWidth;
     plan.primDispatchWidth = plan.dispatchWidth;
 
-    if (plan.activeMode == MultiGpuMode::CheckerboardTile) {
+    const bool isUpwaysActive = (params.config.denoiser_mode == DenoiserMode::Upways ||
+                                 params.config.upscaler_mode == UpscalerMode::Upways ||
+                                 params.config.upways_superres);
+    const bool isFfxRrActive = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+    const bool isTrainingCapture = !params.config.capture_training_data_dir.empty();
+    const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive;
+
+    plan.isUpwaysBandParallel = (plan.activeMode == MultiGpuMode::CheckerboardTile) &&
+                                useCompactMlLive &&
+                                !plan.isSampleBlendFsr3 &&
+                                (params.config.upscaler_mode != UpscalerMode::FSR) &&
+                                (params.renderH > 128u);
+
+    if (plan.isUpwaysBandParallel) {
+        const uint32_t haloLr = (params.config.upways_band_halo > 0u)
+            ? std::clamp((params.config.upways_band_halo + 2u) & ~3u, 8u, 64u)
+            : UPWAYS_DEFAULT_BAND_HALO_LR;
+        const float topFrac = params.config.upways_dynamic_band_balance
+            ? m_upwaysBandBalance.topFraction
+            : UPWAYS_DEFAULT_BAND_TOP_FRACTION;
+        plan.upwaysBand = computeUpwaysBandSplit(params.renderH, params.config.height, haloLr, topFrac);
+        plan.mergeMode = 1u;
+        plan.tileOffsetX_prim = 3u;
+        plan.tileOffsetY_prim = 0u;
+        plan.tileOffsetX_sec = 3u;
+        plan.tileOffsetY_sec = plan.upwaysBand.botLrY0;
+        plan.dispatchWidth = params.renderW;
+        plan.dispatchHeight = plan.upwaysBand.topLrH;
+        plan.primDispatchWidth = params.renderW;
+        plan.secDispatchWidth = params.renderW;
+        plan.secAccumHistory = 0u;
+    } else if (plan.activeMode == MultiGpuMode::CheckerboardTile) {
         plan.mergeMode = 1u;
         plan.tileOffsetX_sec = 2u;
         plan.tileOffsetY_sec = params.config.tile_size;
@@ -158,8 +191,7 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
                             (params.config.getRenderWidth() < params.config.width ||
                              params.config.getRenderHeight() < params.config.height);
         bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
-        bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
-                              (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
+        bool upwaysSuperRes = params.config.isUpwaysSuperResActive();
         bool enableJitter = !isStationaryAccum &&
                             ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes);
         if (enableJitter && params.camera) {
@@ -190,6 +222,10 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
 
     if (plan.isSampleBlendFsr3) {
         plan.frameBytes = static_cast<size_t>(params.config.width) * params.config.height * 8;
+    } else if (plan.isUpwaysBandParallel) {
+        plan.frameBytes = static_cast<size_t>(params.config.width) * (params.config.height - plan.upwaysBand.splitHrY) * 4ull;
+    } else if (plan.activeMode == MultiGpuMode::SampleParallel && useCompactMlLive) {
+        plan.frameBytes = static_cast<size_t>(params.renderW) * params.renderH * 8ull;
     } else {
         auto align64k = [](size_t sz) -> size_t { return (sz + 65535u) & ~static_cast<size_t>(65535u); };
         size_t radRaw = static_cast<size_t>(plan.secDispatchWidth) * plan.dispatchHeight * bytesPerPixel;
@@ -235,7 +271,9 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         const bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
         const bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
                                     (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
-        if (!isStationaryAccum &&
+        if (plan.isUpwaysBandParallel) {
+            jitterSec = glm::vec2(params.ubo.jitterOffset.x, params.ubo.jitterOffset.y);
+        } else if (!isStationaryAccum &&
             ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes)) {
             uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
                 ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
@@ -254,10 +292,126 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
                                          jitterSec, (params.hardReset || params.temporalResetRequested), isSecMotion, params.frameIndex,
                                          params.config.upscaler_sharpening, params.config.upscaler_sharpening ? params.config.upscaler_sharpness : 0.0f,
                                          (params.config.progressive_accumulation && inOutAccumulatedSamples > 0) ? inOutAccumulatedSamples : 1u,
-                                         static_cast<uint32_t>(params.effectiveWavefrontSortMode));
+                                         static_cast<uint32_t>(params.effectiveWavefrontSortMode),
+                                         plan.isUpwaysBandParallel, plan.upwaysBand,
+                                         (params.hardReset || params.temporalResetRequested), 1.0f);
     }
 
     return plan;
+}
+
+void MultiGpuCoordinator::resetUpwaysBandBalance(float initialTopFraction) {
+    m_upwaysBandBalance = UpwaysBandBalanceState{};
+    m_upwaysBandBalance.topFraction = std::clamp(initialTopFraction, 0.30f, 0.70f);
+    m_upwaysBandBalance.cooldownFrames = 2u;
+}
+
+bool MultiGpuCoordinator::updateUpwaysBandBalance(
+    double primTotalMs,
+    double secTotalMs,
+    uint32_t fullLrH,
+    uint32_t fullHrH,
+    uint32_t haloLr,
+    bool enabled
+) {
+    if (!enabled ||
+        !std::isfinite(primTotalMs) || !std::isfinite(secTotalMs) ||
+        primTotalMs <= 0.05 || secTotalMs <= 0.05 ||
+        primTotalMs > 500.0 || secTotalMs > 500.0) {
+        return false;
+    }
+
+    const uint32_t effHalo = (haloLr > 0u) ? std::clamp((haloLr + 2u) & ~3u, 8u, 64u) : 0u;
+    if (fullLrH <= std::max(effHalo * 4u, 32u)) {
+        return false;
+    }
+
+    if (m_upwaysBandBalance.lastFullLrH != fullLrH || m_upwaysBandBalance.lastHaloLr != effHalo) {
+        m_upwaysBandBalance.emaPrimMs = 0.0;
+        m_upwaysBandBalance.emaSecMs = 0.0;
+        m_upwaysBandBalance.samplesInWindow = 0u;
+        m_upwaysBandBalance.consecutiveImbalanceFrames = 0u;
+        m_upwaysBandBalance.cooldownFrames = 2u;
+        m_upwaysBandBalance.lastFullLrH = fullLrH;
+        m_upwaysBandBalance.lastHaloLr = effHalo;
+        return false;
+    }
+
+    if (m_upwaysBandBalance.cooldownFrames > 0u) {
+        --m_upwaysBandBalance.cooldownFrames;
+        return false;
+    }
+
+    if (m_upwaysBandBalance.samplesInWindow == 0u) {
+        m_upwaysBandBalance.emaPrimMs = primTotalMs;
+        m_upwaysBandBalance.emaSecMs = secTotalMs;
+    } else {
+        const double alpha = (m_upwaysBandBalance.samplesInWindow < 4u) ? 0.5 : 0.25;
+        m_upwaysBandBalance.emaPrimMs = alpha * primTotalMs + (1.0 - alpha) * m_upwaysBandBalance.emaPrimMs;
+        m_upwaysBandBalance.emaSecMs = alpha * secTotalMs + (1.0 - alpha) * m_upwaysBandBalance.emaSecMs;
+    }
+    ++m_upwaysBandBalance.samplesInWindow;
+
+    if (m_upwaysBandBalance.samplesInWindow < 3u) {
+        return false;
+    }
+
+    const double diffMs = std::abs(m_upwaysBandBalance.emaSecMs - m_upwaysBandBalance.emaPrimMs);
+    const double relImb = diffMs / std::max(m_upwaysBandBalance.emaPrimMs + m_upwaysBandBalance.emaSecMs, 0.1);
+    if (relImb <= 0.07 || diffMs <= 0.30) {
+        m_upwaysBandBalance.consecutiveImbalanceFrames = 0u;
+        return false;
+    }
+
+    const double emaDiffMs = m_upwaysBandBalance.emaSecMs - m_upwaysBandBalance.emaPrimMs;
+    const double instDiffMs = secTotalMs - primTotalMs;
+    const double instRelImb = std::abs(instDiffMs) / std::max(primTotalMs + secTotalMs, 0.1);
+    if ((instDiffMs * emaDiffMs) <= 0.0 || instRelImb <= 0.05 || std::abs(instDiffMs) <= 0.20) {
+        m_upwaysBandBalance.consecutiveImbalanceFrames = 0u;
+        return false;
+    }
+
+    ++m_upwaysBandBalance.consecutiveImbalanceFrames;
+    if (m_upwaysBandBalance.consecutiveImbalanceFrames < 3u) {
+        return false;
+    }
+
+    const double f = std::clamp(static_cast<double>(m_upwaysBandBalance.topFraction), 0.30, 0.70);
+    const double denom = (1.0 - f) * m_upwaysBandBalance.emaPrimMs + f * m_upwaysBandBalance.emaSecMs;
+    const double fStar = (denom > 1e-6) ? ((f * m_upwaysBandBalance.emaSecMs) / denom) : f;
+    const double delta = std::clamp(0.65 * (fStar - f), -0.12, 0.12);
+    const float fCand = static_cast<float>(std::clamp(f + delta, 0.30, 0.70));
+
+    const uint32_t effHrH = std::max(1u, fullHrH);
+    const UpwaysBandSplit curSplit = computeUpwaysBandSplit(fullLrH, effHrH, effHalo, m_upwaysBandBalance.topFraction);
+    const UpwaysBandSplit newSplit = computeUpwaysBandSplit(fullLrH, effHrH, effHalo, fCand);
+    if (newSplit.splitLrY == curSplit.splitLrY ||
+        std::abs(static_cast<int>(newSplit.splitLrY) - static_cast<int>(curSplit.splitLrY)) < 16) {
+        m_upwaysBandBalance.consecutiveImbalanceFrames = 0u;
+        return false;
+    }
+
+    m_upwaysBandBalance.topFraction = std::clamp(
+        static_cast<float>(newSplit.splitLrY) / static_cast<float>(fullLrH),
+        0.30f, 0.70f
+    );
+    const double loggedPrimMs = m_upwaysBandBalance.emaPrimMs;
+    const double loggedSecMs = m_upwaysBandBalance.emaSecMs;
+    m_upwaysBandBalance.emaPrimMs = 0.0;
+    m_upwaysBandBalance.emaSecMs = 0.0;
+    m_upwaysBandBalance.samplesInWindow = 0u;
+    m_upwaysBandBalance.consecutiveImbalanceFrames = 0u;
+    m_upwaysBandBalance.cooldownFrames = 20u;
+    ++m_upwaysBandBalance.adjustmentCount;
+
+    Logger::info(
+        "Multi-GPU Band-Parallel dynamic rebalance: splitLrY {} -> {} ({:.1f}% top / {:.1f}% bottom, EMA GPU0={:.2f}ms vs GPU1={:.2f}ms)",
+        curSplit.splitLrY, newSplit.splitLrY,
+        static_cast<double>(m_upwaysBandBalance.topFraction) * 100.0,
+        (1.0 - static_cast<double>(m_upwaysBandBalance.topFraction)) * 100.0,
+        loggedPrimMs, loggedSecMs
+    );
+    return true;
 }
 
 void MultiGpuCoordinator::recordPrimaryRayTracing(
@@ -284,7 +438,14 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
     Image* mlDirectDiffuseImage,
     Image* mlIndirectDiffuseImage,
     Image* mlDirectSpecularImage,
-    Image* mlIndirectSpecularImage
+    Image* mlIndirectSpecularImage,
+    Image* mlIrradianceImage,
+    Image* mlPrimaryGuideImage,
+    Image* mlSurfaceMvImage,
+    Image* mlDiffHitDistImage,
+    Image* mlSpecVmvImage,
+    Image* mlSkipCompactImage,
+    const std::function<void(VkCommandBuffer)>& onPostRecord
 ) {
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo rtBeginInfo{};
@@ -346,8 +507,18 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
             mlDirectDiffuseImage,
             mlIndirectDiffuseImage,
             mlDirectSpecularImage,
-            mlIndirectSpecularImage
+            mlIndirectSpecularImage,
+            mlIrradianceImage,
+            mlPrimaryGuideImage,
+            mlSurfaceMvImage,
+            mlDiffHitDistImage,
+            mlSpecVmvImage,
+            mlSkipCompactImage
         );
+    }
+
+    if (onPostRecord) {
+        onPostRecord(cmd);
     }
 
     if (queryPool != VK_NULL_HANDLE) {
@@ -389,6 +560,10 @@ void MultiGpuCoordinator::recordMergePass(
 ) {
     (void)frameImage;
     (void)mlDiffuseImage;
+    if (plan.isUpwaysBandParallel) {
+        return;
+    }
+
     // Barrier: Ensure primary RT writes and secondary DMA host writes are visible before merge compute reads/writes
     VkMemoryBarrier2 rtToMergeBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     rtToMergeBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
@@ -403,17 +578,22 @@ void MultiGpuCoordinator::recordMergePass(
 
     // Merge Pass (Skipped for SampleBlend + FSR3 since both GPUs upscale to 4K independently before resolve)
     if (!params.skipRayTracing && !plan.isSampleBlendFsr3 && postProcess) {
+        const bool isUpwaysActive = (params.config.upscaler_mode == UpscalerMode::Upways ||
+                                     params.config.denoiser_mode == DenoiserMode::Upways ||
+                                     params.config.upways_superres);
+        const bool isFfxRrActive = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        const bool isTrainingCapture = !params.config.capture_training_data_dir.empty();
+        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive;
         const bool needMlGbuffers =
-            (params.config.upscaler_mode == UpscalerMode::Upways ||
-             params.config.denoiser_mode == DenoiserMode::Upways ||
-             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-             !params.config.capture_training_data_dir.empty());
+            (isUpwaysActive || isFfxRrActive || isTrainingCapture);
         bool needNormals = (needMlGbuffers ||
                             params.config.enable_restir ||
                             params.config.enable_caustics);
         bool needMvDepth = needNormals || (params.config.upscaler_mode == UpscalerMode::FSR);
         uint32_t mergeGbuffersMode = needNormals ? 1u : (needMvDepth ? ((plan.formatMode != 2u) ? 3u : 2u) : 0u);
-        if (needMlGbuffers) {
+        if (plan.activeMode == MultiGpuMode::SampleParallel && useCompactMlLive) {
+            mergeGbuffersMode = 32u;
+        } else if (needMlGbuffers) {
             mergeGbuffersMode |= 16u;
         }
         glm::mat4 viewToWorldScaled = params.ubo.viewInverse;
@@ -550,7 +730,7 @@ bool MultiGpuCoordinator::executeAsyncMerge(
     Image* normalDepthImage,
     Image* prevNormalDepthImage
 ) {
-    if (!m_hasDedicatedAsyncCompute || params.skipRayTracing || plan.isSampleBlendFsr3 || !postProcess) {
+    if (!m_hasDedicatedAsyncCompute || params.skipRayTracing || plan.isSampleBlendFsr3 || plan.isUpwaysBandParallel || !postProcess) {
         return false;
     }
 

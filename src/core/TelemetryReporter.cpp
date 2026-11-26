@@ -71,12 +71,23 @@ void TelemetryReporter::dumpOutputFiles() {
         if (gpuUpwaysMs > 10000.0) gpuUpwaysMs = 0.0;
 
         double secGpuMs = 0.0;
+        double secTransferMs = 0.0;
         if (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive()) {
             secGpuMs = m_engine->m_mgpu->getSecondaryGpuTimeMs();
+            secTransferMs = m_engine->m_mgpu->getSecondaryTransferTimeMs();
         }
-        double totalGpuMs = (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
-            : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
+        double totalGpuMs = 0.0;
+        if (m_engine->m_mgpu && m_engine->m_mgpu->isMultiGpuActive()) {
+            if (m_engine->m_slotWasUpwaysBandParallel[slot]) {
+                totalGpuMs = m_engine->m_config.double_buffered_shared_mem
+                    ? std::max(gpuRtMs + gpuUpwaysMs + gpuTonemapMs, secGpuMs + secTransferMs)
+                    : (std::max(gpuRtMs, secGpuMs + secTransferMs) + gpuTonemapMs + gpuUpwaysMs);
+            } else {
+                totalGpuMs = std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs;
+            }
+        } else {
+            totalGpuMs = gpuRtMs + gpuTonemapMs + gpuUpwaysMs;
+        }
 
         uint32_t lastCompletedSlot = (m_engine->m_totalFramesRendered - 1) % Engine::MAX_FRAMES_IN_FLIGHT;
         bool lastSlotSkipped = m_engine->m_slotSkippedRayTracing[lastCompletedSlot];
@@ -137,6 +148,24 @@ void TelemetryReporter::dumpOutputFiles() {
         hdrSourceImage = m_engine->m_denoiser->getDenoisedImage();
     }
     if (!m_engine->m_config.dump_hdr_path.empty() && hdrSourceImage) {
+        VkBuffer hdrBandStitchBuf = VK_NULL_HANDLE;
+        uint32_t hdrBandStitchY = 0u;
+        uint32_t hdrBandStitchRows = 0u;
+        if (m_engine->m_lastFrameWasUpwaysBandParallel &&
+            m_engine->m_superResolution &&
+            m_engine->m_superResolution->getUpwaysPipeline() &&
+            hdrSourceImage == m_engine->m_superResolution->getUpwaysPipeline()->getOutputImage() &&
+            m_engine->m_mgpu) {
+            hdrBandStitchBuf = m_engine->m_mgpu->getPrimarySharedBuffer(m_engine->m_lastUpwaysBandSlot);
+            if (hdrBandStitchBuf == VK_NULL_HANDLE && m_engine->m_secTransferBuffer) {
+                hdrBandStitchBuf = m_engine->m_secTransferBuffer->getBuffer();
+            }
+            hdrBandStitchY = m_engine->m_lastUpwaysBandSplit.splitHrY;
+            hdrBandStitchRows = (hdrSourceImage->getHeight() > hdrBandStitchY)
+                ? (hdrSourceImage->getHeight() - hdrBandStitchY)
+                : 0u;
+        }
+
         VkFormat accumFormat = hdrSourceImage->getFormat();
         const bool isFp16 = (accumFormat == VK_FORMAT_R16G16B16A16_SFLOAT);
         const bool isRg11 = (accumFormat == VK_FORMAT_B10G11R11_UFLOAT_PACK32);
@@ -151,6 +180,17 @@ void TelemetryReporter::dumpOutputFiles() {
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         vkBeginCommandBuffer(m_engine->m_commandBuffers[0], &beginInfo);
+
+        if (hdrBandStitchBuf != VK_NULL_HANDLE && hdrBandStitchRows > 0u) {
+            const VkDeviceSize stitchBytes = std::max<VkDeviceSize>(
+                m_engine->m_lastUpwaysBandBytes,
+                m_engine->m_mgpu->getSharedBufferSize()
+            );
+            m_engine->m_superResolution->dispatchUpwaysBandStitch(
+                m_engine->m_commandBuffers[0], 0u, hdrBandStitchBuf, stitchBytes,
+                dumpW, hdrBandStitchY, hdrBandStitchRows
+            );
+        }
 
         hdrSourceImage->transitionLayout(
             m_engine->m_commandBuffers[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -707,14 +747,20 @@ FrameStats TelemetryReporter::getStats() const {
         (m_engine->m_config.denoiser_mode == DenoiserMode::Upways ||
          m_engine->m_config.upscaler_mode == UpscalerMode::Upways)) {
         if (const UpwaysPipeline* upw = m_engine->getUpwaysPipeline(); upw && upw->isInitialized()) {
+            stats.upways_version_str = upwaysVersionName(upw->getVersion());
             stats.upways_precision_str = upwaysPrecisionName(upw->getPrecision());
         } else {
+            const UpwaysRuntimeVersion ver = UpwaysPipeline::resolveVersion(
+                m_engine->m_config.upways_version, m_engine->m_config.upways_weights_path);
+            stats.upways_version_str = upwaysVersionName(ver);
             stats.upways_precision_str = upwaysPrecisionName(UpwaysPipeline::selectPrecision(
                 m_engine->m_context->getPhysicalDevice(),
                 m_engine->m_config.upways_precision,
-                m_engine->m_context->getInstance()));
+                m_engine->m_context->getInstance(),
+                ver));
         }
     } else {
+        stats.upways_version_str = "none";
         stats.upways_precision_str = "none";
     }
     {

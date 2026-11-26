@@ -856,6 +856,10 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
         m_causticsPipeline->resetHistory();
     }
     m_frameTimesMs.clear();
+    m_lastFrameWasUpwaysBandParallel = false;
+    if (m_mgpuCoordinator) {
+        m_mgpuCoordinator->resetUpwaysBandBalance();
+    }
     if (m_rtOrchestrator) {
         m_rtOrchestrator->invalidateDivergentAreaCache();
         const SceneData& srcScene = m_sceneManager ? m_sceneManager->getSceneData() : m_sceneData;
@@ -1360,6 +1364,12 @@ void Engine::syncRenderTargetPointers() {
         m_mlSpecularImage = m_renderTargets->getMlSpecularImage();
         m_mlSkipImage = m_renderTargets->getMlSkipImage();
         m_mlSpecAlbedoImage = m_renderTargets->getMlSpecAlbedoImage();
+        m_mlIrradianceImage = m_renderTargets->getMlIrradianceImage();
+        m_mlPrimaryGuideImage = m_renderTargets->getMlPrimaryGuideImage();
+        m_mlSurfaceMvImage = m_renderTargets->getMlSurfaceMvImage();
+        m_mlDiffHitDistImage = m_renderTargets->getMlDiffHitDistImage();
+        m_mlSpecVmvImage = m_renderTargets->getMlSpecVmvImage();
+        m_mlSkipCompactImage = m_renderTargets->getMlSkipCompactImage();
         m_mlDirectDiffuseImage = m_renderTargets->getMlDirectDiffuseImage();
         m_mlIndirectDiffuseImage = m_renderTargets->getMlIndirectDiffuseImage();
         m_mlDirectSpecularImage = m_renderTargets->getMlDirectSpecularImage();
@@ -1379,6 +1389,12 @@ void Engine::syncRenderTargetPointers() {
         m_mlSpecularImage = nullptr;
         m_mlSkipImage = nullptr;
         m_mlSpecAlbedoImage = nullptr;
+        m_mlIrradianceImage = nullptr;
+        m_mlPrimaryGuideImage = nullptr;
+        m_mlSurfaceMvImage = nullptr;
+        m_mlDiffHitDistImage = nullptr;
+        m_mlSpecVmvImage = nullptr;
+        m_mlSkipCompactImage = nullptr;
         m_mlDirectDiffuseImage = nullptr;
         m_mlIndirectDiffuseImage = nullptr;
         m_mlDirectSpecularImage = nullptr;
@@ -1394,7 +1410,9 @@ void Engine::updateUpwaysDescriptors() {
             m_normalDepthImage, m_motionVectorImage,
             m_mlAlbedoRoughnessImage, m_mlSpecularMotionImage,
             m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0],
-            m_mlSkipImage, m_mlSpecAlbedoImage
+            m_mlSkipImage, m_mlSpecAlbedoImage,
+            m_mlIrradianceImage, m_mlPrimaryGuideImage, m_mlSurfaceMvImage, m_mlDiffHitDistImage,
+            m_mlSpecVmvImage, m_mlSkipCompactImage
         );
     }
 }
@@ -1415,7 +1433,9 @@ void Engine::updateFsrDescriptors() {
             m_normalDepthImage, m_motionVectorImage,
             m_mlAlbedoRoughnessImage, m_mlSpecularMotionImage,
             m_mlDiffuseImage, m_mlSpecularImage, m_frameImages[0],
-            m_mlSkipImage, m_mlSpecAlbedoImage
+            m_mlSkipImage, m_mlSpecAlbedoImage,
+            m_mlIrradianceImage, m_mlPrimaryGuideImage, m_mlSurfaceMvImage, m_mlDiffHitDistImage,
+            m_mlSpecVmvImage, m_mlSkipCompactImage
         );
     }
 }
@@ -1551,6 +1571,12 @@ void Engine::updateWavefrontSceneDescriptors() {
     wfParams.mlSpecularImage = m_mlSpecularImage;
     wfParams.mlSkipImage = m_mlSkipImage;
     wfParams.mlSpecAlbedoImage = m_mlSpecAlbedoImage;
+    wfParams.mlIrradianceImage = m_mlIrradianceImage;
+    wfParams.mlPrimaryGuideImage = m_mlPrimaryGuideImage;
+    wfParams.mlSurfaceMvImage = m_mlSurfaceMvImage;
+    wfParams.mlDiffHitDistImage = m_mlDiffHitDistImage;
+    wfParams.mlSpecVmvImage = m_mlSpecVmvImage;
+    wfParams.mlSkipCompactImage = m_mlSkipCompactImage;
     wfParams.mlDirectDiffuseImage = m_mlDirectDiffuseImage;
     wfParams.mlIndirectDiffuseImage = m_mlIndirectDiffuseImage;
     wfParams.mlDirectSpecularImage = m_mlDirectSpecularImage;
@@ -1599,6 +1625,7 @@ void Engine::updateMergeDescriptors() {
     mergeParams.mlSpecularMotionImage = m_mlSpecularMotionImage;
     mergeParams.mlSkipImage = m_mlSkipImage;
     mergeParams.mlSpecAlbedoImage = m_mlSpecAlbedoImage;
+    mergeParams.mlIrradianceImage = m_mlIrradianceImage;
     mergeParams.frameImages = m_frameImages;
     mergeParams.width = isCheckerboard ? (maxTilesPerGpuX * tileSize) : renderW;
     mergeParams.height = renderH;
@@ -1782,13 +1809,24 @@ void Engine::renderFrame() {
 
 
         double secGpuMs = 0.0;
+        double secTransferMs = 0.0;
         if (m_mgpu && m_mgpu->isMultiGpuActive()) {
             m_mgpu->collectSecondaryTimestamps(m_currentFrame);
             secGpuMs = m_mgpu->getSecondaryGpuTimeMs();
+            secTransferMs = m_mgpu->getSecondaryTransferTimeMs();
         }
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive())
-            ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs)
-            : (gpuRtMs + gpuTonemapMs + gpuUpwaysMs);
+        double totalGpuMs = 0.0;
+        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            if (m_slotWasUpwaysBandParallel[m_currentFrame]) {
+                totalGpuMs = m_config.double_buffered_shared_mem
+                    ? std::max(gpuRtMs + gpuUpwaysMs + gpuTonemapMs, secGpuMs + secTransferMs)
+                    : (std::max(gpuRtMs, secGpuMs + secTransferMs) + gpuTonemapMs + gpuUpwaysMs);
+            } else {
+                totalGpuMs = std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs;
+            }
+        } else {
+            totalGpuMs = gpuRtMs + gpuTonemapMs + gpuUpwaysMs;
+        }
 
         bool completedSlotSkipped = m_slotSkippedRayTracing[m_currentFrame];
         m_lastTonemapMs = gpuTonemapMs;
@@ -1801,6 +1839,17 @@ void Engine::renderFrame() {
         if (!completedSlotSkipped) {
             m_lastGpuRtMs = gpuRtMs;
             m_lastSecGpuMs = secGpuMs;
+            if (isMgpuActive && m_slotWasUpwaysBandParallel[m_currentFrame] && m_mgpuCoordinator) {
+                const double primBandMs = m_config.double_buffered_shared_mem
+                    ? (gpuRtMs + gpuUpwaysMs + gpuTonemapMs)
+                    : gpuRtMs;
+                const double secBandMs = secGpuMs + secTransferMs;
+                m_mgpuCoordinator->updateUpwaysBandBalance(
+                    primBandMs, secBandMs,
+                    m_config.getRenderHeight(), m_config.height,
+                    m_config.upways_band_halo, m_config.upways_dynamic_band_balance
+                );
+            }
 
             if (m_config.pipeline_type == PipelineType::Wavefront && m_wavefrontPipeline) {
                 if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
@@ -2084,6 +2133,10 @@ void Engine::renderFrame() {
             } else if (m_mgpu) {
                 m_mgpu->setMode(MultiGpuMode::Off);
             }
+            if (m_mgpuCoordinator) {
+                m_mgpuCoordinator->resetUpwaysBandBalance();
+            }
+            m_lastFrameWasUpwaysBandParallel = false;
             m_resetAccumulation = true;
 
             VkCommandBufferBeginInfo clearBegin{};
@@ -2170,7 +2223,9 @@ void Engine::renderFrame() {
                     m_config.upways_superres, m_config.accum_format,
                     m_postProcess.get(), m_commandBuffers[0],
                     m_config.fsr_version,
-                    m_config.upways_precision
+                    m_config.upways_precision,
+                    m_config.upways_version,
+                    m_config.upways_weights_path
                 );
             }
         }
@@ -2521,8 +2576,7 @@ void Engine::renderFrame() {
     (void)0;
     bool fsrJitterActive = (m_config.upscaler_mode == UpscalerMode::FSR) &&
                            !(m_config.fsr_version == FsrVersion::Fsr4 && (!m_context || !m_context->supportsFsr4()));
-    bool upwaysSuperResActive = (m_config.upscaler_mode == UpscalerMode::Upways) &&
-                                (renderW < m_config.width || renderH < m_config.height || m_config.upways_superres);
+    bool upwaysSuperResActive = m_config.isUpwaysSuperResActive();
     bool enableJitter = !isStationaryAccum && (fsrJitterActive || upwaysSuperResActive);
     uint32_t jitterSeqLen = (m_config.upscaler_mode == UpscalerMode::FSR)
         ? getFsrJitterPhaseCount(renderW, m_config.width)
@@ -2583,6 +2637,8 @@ void Engine::renderFrame() {
 
     if (!isMgpu) {
         // --- Single GPU Execution Path ---
+        m_slotWasUpwaysBandParallel[m_currentFrame] = false;
+        m_lastFrameWasUpwaysBandParallel = false;
         vkResetCommandBuffer(cmd, 0);
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -2670,6 +2726,12 @@ void Engine::renderFrame() {
                 m_mlIndirectDiffuseImage,
                 m_mlDirectSpecularImage,
                 m_mlIndirectSpecularImage,
+                m_mlIrradianceImage,
+                m_mlPrimaryGuideImage,
+                m_mlSurfaceMvImage,
+                m_mlDiffHitDistImage,
+                m_mlSpecVmvImage,
+                m_mlSkipCompactImage,
                 m_motionVectorImage
             );
         }
@@ -2803,7 +2865,7 @@ void Engine::renderFrame() {
                 tmSet = m_superResolution->getTonemapFsrDescSet();
                 tonemapConstants.totalSamples = 1u;
             } else if (m_superResolution && (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_superResolution->getUpwaysPipeline()))) {
-                tmSet = m_superResolution->getTonemapUpwaysDescSet();
+                tmSet = m_superResolution->getTonemapUpwaysDescSet(m_currentFrame);
                 tonemapConstants.totalSamples = 1u;
             } else if (ffxRrRun) {
                 tmSet = m_denoiser->getTonemapDescSet();
@@ -2823,8 +2885,11 @@ void Engine::renderFrame() {
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         }
     } else {
-        // --- Multi-GPU Path (Checkerboard Tiling or Sample Parallelism) ---
+        // --- Multi-GPU Path (Checkerboard Tiling / Band-Parallel / Sample Parallelism) ---
         hasPostSubmission = true;
+        bool resetTemporal = hardReset || m_temporalResetRequested;
+        m_temporalResetRequested = false;
+        bool bandPrimaryUpwaysOk = false;
 
         MultiGpuPlanParams planParams{
             m_config,
@@ -2853,7 +2918,7 @@ void Engine::renderFrame() {
             m_numOpaqueTriangles,
             hasEnvMap,
             envIntensity,
-            m_temporalResetRequested,
+            resetTemporal,
             m_accumulatedSamples,
             getEffectiveWavefrontSortMode(),
             m_envNeeEnabled
@@ -2897,6 +2962,7 @@ void Engine::renderFrame() {
                 ? m_mgpu->getPrimarySharedBuffer(0)
                 : VK_NULL_HANDLE;
             mgpuPlan = m_mgpuCoordinator->planAndLaunchSecondary(planParams, m_accumulatedSamples, accumReset);
+            m_slotWasUpwaysBandParallel[m_currentFrame] = mgpuPlan.isUpwaysBandParallel;
             if (m_mgpu && m_mgpu->isSecondaryInitialized() &&
                 (m_mgpu->getPrimarySharedBuffer(0) != prevSharedBuf0 ||
                  m_mgpu->getSharedBufferGeneration() != m_lastMergedSharedGen)) {
@@ -2916,6 +2982,29 @@ void Engine::renderFrame() {
                     m_videoBillboard->uploadFrame(c, m_currentFrame, getSceneTextures()[0].get());
                 }
             };
+
+            std::function<void(VkCommandBuffer)> onPostRecord;
+            if (mgpuPlan.isUpwaysBandParallel && !skipRayTracing && m_superResolution) {
+                onPostRecord = [&](VkCommandBuffer c) {
+                    VkMemoryBarrier2 rtToUpwaysBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+                    rtToUpwaysBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    rtToUpwaysBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    rtToUpwaysBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    rtToUpwaysBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                    VkDependencyInfo rtToUpwaysDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+                    rtToUpwaysDep.memoryBarrierCount = 1u;
+                    rtToUpwaysDep.pMemoryBarriers = &rtToUpwaysBarrier;
+                    vkCmdPipelineBarrier2(c, &rtToUpwaysDep);
+
+                    bandPrimaryUpwaysOk = m_superResolution->dispatchUpways(
+                        c, resetTemporal, m_config, m_camera.get(),
+                        m_frameIndex, m_cameraMovedLastFrame, m_accumulatedSamples,
+                        m_mlAlbedoRoughnessImage, m_normalDepthImage,
+                        m_postProcess.get(), m_outputImage,
+                        &mgpuPlan.upwaysBand
+                    );
+                };
+            }
 
             m_mgpuCoordinator->recordPrimaryRayTracing(
                 cmd, queue, device,
@@ -2937,10 +3026,17 @@ void Engine::renderFrame() {
                 m_mlDirectDiffuseImage,
                 m_mlIndirectDiffuseImage,
                 m_mlDirectSpecularImage,
-                m_mlIndirectSpecularImage
+                m_mlIndirectSpecularImage,
+                m_mlIrradianceImage,
+                m_mlPrimaryGuideImage,
+                m_mlSurfaceMvImage,
+                m_mlDiffHitDistImage,
+                m_mlSpecVmvImage,
+                m_mlSkipCompactImage,
+                onPostRecord
             );
 
-            if (m_context->hasDedicatedAsyncCompute() && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3) {
+            if (m_context->hasDedicatedAsyncCompute() && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3 && !mgpuPlan.isUpwaysBandParallel) {
                 useAsyncComputeMerge = m_mgpuCoordinator->executeAsyncMerge(
                     m_context->getAsyncComputeQueue(),
                     mgpuPlan, planParams,
@@ -2975,9 +3071,6 @@ void Engine::renderFrame() {
         }
 
         // Post-processing passes on activeCmd: FFX RR / Upways / FSR / Tonemap
-        bool resetTemporal = hardReset || m_temporalResetRequested;
-        m_temporalResetRequested = false;
-
         if (hasPostSubmission) {
         // AMD FSR Ray Regeneration Denoiser (runs at internal renderW x renderH)
         bool ffxRrRun = false;
@@ -3000,14 +3093,59 @@ void Engine::renderFrame() {
         }
 
         bool upwaysRun = false;
-        if (!ffxRrRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
-            if (m_superResolution) {
-                upwaysRun = m_superResolution->dispatchUpways(
-                    activeCmd, resetTemporal, m_config, m_camera.get(),
-                    m_frameIndex, m_cameraMovedLastFrame, m_accumulatedSamples,
-                    m_mlAlbedoRoughnessImage, m_normalDepthImage,
-                    m_postProcess.get(), m_outputImage
-                );
+        bool fusedBandStitchActive = false;
+        VkBuffer fusedStitchBuf = VK_NULL_HANDLE;
+        VkDeviceSize fusedStitchSize = 0;
+        uint32_t fusedStitchYStart = 0;
+        uint32_t fusedStitchRowCount = 0;
+        if (mgpuPlan.isUpwaysBandParallel) {
+            if (!skipRayTracing && m_superResolution && m_mgpu) {
+                VkBuffer stitchBuf = m_mgpu->getPrimarySharedBuffer(mgpuPlan.slot);
+                if (stitchBuf == VK_NULL_HANDLE && m_secTransferBuffer) {
+                    stitchBuf = m_secTransferBuffer->getBuffer();
+                }
+                const uint32_t rowCount = m_config.height - mgpuPlan.upwaysBand.splitHrY;
+                if (stitchBuf != VK_NULL_HANDLE && rowCount > 0u) {
+                    fusedBandStitchActive = true;
+                    fusedStitchBuf = stitchBuf;
+                    fusedStitchSize = std::max<VkDeviceSize>(mgpuPlan.frameBytes, m_mgpu->getSharedBufferSize());
+                    fusedStitchYStart = mgpuPlan.upwaysBand.splitHrY;
+                    fusedStitchRowCount = rowCount;
+                    m_lastUpwaysBandSplit = mgpuPlan.upwaysBand;
+                    m_lastUpwaysBandSlot = mgpuPlan.slot;
+                    m_lastUpwaysBandBytes = mgpuPlan.frameBytes;
+                    m_lastFrameWasUpwaysBandParallel = true;
+                }
+            } else if (skipRayTracing && m_lastFrameWasUpwaysBandParallel && m_superResolution && m_mgpu) {
+                VkBuffer stitchBuf = m_mgpu->getPrimarySharedBuffer(m_lastUpwaysBandSlot);
+                if (stitchBuf == VK_NULL_HANDLE && m_secTransferBuffer) {
+                    stitchBuf = m_secTransferBuffer->getBuffer();
+                }
+                const uint32_t rowCount = (m_config.height > m_lastUpwaysBandSplit.splitHrY)
+                    ? (m_config.height - m_lastUpwaysBandSplit.splitHrY)
+                    : 0u;
+                if (stitchBuf != VK_NULL_HANDLE && rowCount > 0u) {
+                    fusedBandStitchActive = true;
+                    fusedStitchBuf = stitchBuf;
+                    fusedStitchSize = std::max<VkDeviceSize>(m_lastUpwaysBandBytes, m_mgpu->getSharedBufferSize());
+                    fusedStitchYStart = m_lastUpwaysBandSplit.splitHrY;
+                    fusedStitchRowCount = rowCount;
+                }
+            } else {
+                m_lastFrameWasUpwaysBandParallel = false;
+            }
+            upwaysRun = bandPrimaryUpwaysOk || (m_superResolution && m_superResolution->getUpwaysPipeline() != nullptr);
+        } else {
+            m_lastFrameWasUpwaysBandParallel = false;
+            if (!ffxRrRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
+                if (m_superResolution) {
+                    upwaysRun = m_superResolution->dispatchUpways(
+                        activeCmd, resetTemporal, m_config, m_camera.get(),
+                        m_frameIndex, m_cameraMovedLastFrame, m_accumulatedSamples,
+                        m_mlAlbedoRoughnessImage, m_normalDepthImage,
+                        m_postProcess.get(), m_outputImage
+                    );
+                }
             }
         }
 
@@ -3048,7 +3186,7 @@ void Engine::renderFrame() {
             tmSet = m_superResolution->getTonemapFsrDescSet();
             tonemapConstants.totalSamples = 1u;
         } else if (m_superResolution && (upwaysRun || (m_config.upscaler_mode == UpscalerMode::Upways && m_superResolution->getUpwaysPipeline()))) {
-            tmSet = m_superResolution->getTonemapUpwaysDescSet();
+            tmSet = m_superResolution->getTonemapUpwaysDescSet(m_currentFrame);
             tonemapConstants.totalSamples = 1u;
         } else if (ffxRrRun) {
             tmSet = m_denoiser->getTonemapDescSet();
@@ -3070,7 +3208,9 @@ void Engine::renderFrame() {
                 isCheckerboard = false;
             }
         }
-        tonemapConstants.visualizeSplit = (m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u;
+        tonemapConstants.visualizeSplit = fusedBandStitchActive
+            ? (m_config.visualize_mgpu_split ? 2u : 0u)
+            : ((m_config.visualize_mgpu_split && isCheckerboard) ? 1u : 0u);
         tonemapConstants.tileSize = m_config.tile_size;
         tonemapConstants.displayMode = (m_swapchain && !m_config.headless) ? static_cast<uint32_t>(m_swapchain->getHdrMode()) : 0u;
         tonemapConstants.peakNits = m_config.hdr_peak_nits;
@@ -3078,6 +3218,26 @@ void Engine::renderFrame() {
         const bool useFusedMgpuTonemap = !useAsyncComputeMerge && !needDecoupledMgpuPost && !skipRayTracing && !mgpuPlan.isSampleBlendFsr3 &&
                                          !m_config.visualize_mgpu_split && (mgpuPlan.slot == m_currentFrame) &&
                                          m_postProcess && m_postProcess->hasFusedPipeline();
+        if (fusedBandStitchActive && !useFusedMgpuTonemap && m_superResolution && m_postProcess) {
+            m_superResolution->updateTonemapUpwaysBandDescriptor(
+                m_currentFrame, m_postProcess.get(), m_outputImage, fusedStitchBuf, fusedStitchSize
+            );
+            tmSet = m_superResolution->getTonemapUpwaysDescSet(m_currentFrame);
+            tonemapConstants.totalSamples = 1u;
+            tonemapConstants.stitchYStart = fusedStitchYStart;
+            tonemapConstants.stitchRowCount = fusedStitchRowCount;
+
+            VkMemoryBarrier2 stitchVisBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+            stitchVisBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            stitchVisBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            stitchVisBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            stitchVisBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+
+            VkDependencyInfo stitchVisDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+            stitchVisDep.memoryBarrierCount = 1u;
+            stitchVisDep.pMemoryBarriers = &stitchVisBarrier;
+            vkCmdPipelineBarrier2(activeCmd, &stitchVisDep);
+        }
         vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 2);
         if (useFusedMgpuTonemap) {
             PostProcessPipeline::FusedAccumTonemapPushConstants fusedPC{};
@@ -3300,7 +3460,22 @@ void Engine::renderFrame() {
         double gpuRtMs = m_lastGpuRtMs;
         double secGpuMs = m_lastSecGpuMs;
         double gpuTonemapMs = m_lastTonemapMs;
-        double totalGpuMs = (m_mgpu && m_mgpu->isMultiGpuActive()) ? (std::max(gpuRtMs, secGpuMs) + gpuTonemapMs) : (gpuRtMs + gpuTonemapMs);
+        double gpuUpwaysMs = m_lastUpwaysMs;
+        const uint32_t lastSlot = (m_currentFrame + MAX_FRAMES_IN_FLIGHT - 1u) % MAX_FRAMES_IN_FLIGHT;
+        const bool isBandParallel = m_mgpu && m_mgpu->isMultiGpuActive() && m_slotWasUpwaysBandParallel[lastSlot];
+        double secTransferMs = isBandParallel ? m_mgpu->getSecondaryTransferTimeMs() : 0.0;
+        double totalGpuMs = 0.0;
+        if (m_mgpu && m_mgpu->isMultiGpuActive()) {
+            if (isBandParallel) {
+                totalGpuMs = m_config.double_buffered_shared_mem
+                    ? std::max(gpuRtMs + gpuUpwaysMs + gpuTonemapMs, secGpuMs + secTransferMs)
+                    : (std::max(gpuRtMs, secGpuMs + secTransferMs) + gpuTonemapMs + gpuUpwaysMs);
+            } else {
+                totalGpuMs = std::max(gpuRtMs, secGpuMs) + gpuTonemapMs + gpuUpwaysMs;
+            }
+        } else {
+            totalGpuMs = gpuRtMs + gpuTonemapMs + gpuUpwaysMs;
+        }
         if (m_governor && m_config.adaptive_spp && m_governor->getState().active) {
             uint32_t curSpp = m_governor->getState().currentSpp;
             uint32_t curBounces = m_governor->getState().currentBounces;
@@ -3462,7 +3637,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
                 m_config.upways_superres, m_config.accum_format,
                 m_postProcess.get(), m_commandBuffers[0],
                 m_config.fsr_version,
-                m_config.upways_precision
+                m_config.upways_precision,
+                m_config.upways_version,
+                m_config.upways_weights_path
             );
         }
     }
@@ -3893,6 +4070,10 @@ void Engine::run() {
         m_resetAccumulation = true;
         if (m_causticsPipeline) m_causticsPipeline->resetHistory();
         if (m_nrcManager) m_nrcManager->resetWeights();
+        if (m_mgpu) {
+            m_mgpu->resetCausticsHistory();
+            m_mgpu->resetNrcWeights();
+        }
         m_temporalResetRequested = true;
         m_lastFrameTimeMs = 0.0;
         m_lastActiveRenderFrameTimeMs = 0.0;
@@ -3900,6 +4081,11 @@ void Engine::run() {
         m_lastSecGpuMs = 0.0;
         m_lastTonemapMs = 0.0;
         m_lastUpwaysMs = 0.0;
+        m_slotWasUpwaysBandParallel.fill(false);
+        m_lastFrameWasUpwaysBandParallel = false;
+        if (m_mgpuCoordinator) {
+            m_mgpuCoordinator->resetUpwaysBandBalance();
+        }
         m_lastPresentationTimeMs = 0.0;
         m_lastWavefrontProfile = {};
         m_frameTimesMs.clear();

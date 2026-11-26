@@ -1,0 +1,314 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#include "upways_v5_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+// SPEC_STAGE_ID (all run at L1 W1 x H1):
+//   0 = SR_PW1              (SrIn[64, static] -> r0[64, FP16])
+//   1 = SR_DW1_PW2          (DW1(r0) -> PW2 + r0 -> r1[64, FP16])
+//   2 = SR_DW2_PW3_PW4_HEAD (DW2(r1) -> PW3+r1 -> PW4+r2 -> SR_HEAD[96] -> 24 FP16 ch/L0px)
+layout(constant_id = 0) const uint SPEC_STAGE_ID = 0u;
+
+layout(set = 0, binding = 0) readonly  buffer Weight8Buf    { uint w8[]; }    g_w8;
+layout(set = 0, binding = 1) readonly  buffer WeightFp32Buf { vec4 w32v[]; }  g_w32;
+layout(set = 0, binding = 2) readonly  buffer InAct0Buf     { uvec2 act2[]; } g_in0;
+layout(set = 0, binding = 3) writeonly buffer OutAct0Buf    { uvec2 act2[]; } g_out0;
+
+// Max LDS: 2048*4 + 2304*4 = 17,408 B (<= 32 KiB)
+shared uint s_buf[2048];
+#if UPWAYS_IS_INT8
+shared int  s_acc[2304];
+#else
+shared float s_acc[2304];
+#endif
+
+void runChunkedDw3x3_64(
+    uint dwWBase4,
+    uint dwBBase4,
+    int W,
+    int H,
+    int wgX,
+    int wgY,
+    uint lx,
+    uint ly,
+    uint t,
+    out uvec2 outHalf[16]
+) {
+    const uint C      = 64u;
+    const uint cw4    = 16u;
+    const uint chunks = 4u; // 4 * 16 ch
+    const uint apW    = 18u;
+    const uint numAp  = 180u;
+
+    for (uint ch = 0u; ch < chunks; ++ch) {
+        uint cBase4 = ch * 4u;
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            uint ap = pass * 128u + t;
+            if (ap < numAp) {
+                uint ay = ap / apW;
+                uint ax = ap - ay * apW;
+                ivec2 gp = clamp(ivec2(wgX + int(ax) - 1, wgY + int(ay) - 1), ivec2(0), ivec2(W - 1, H - 1));
+                uint gIdx = uint(gp.y * W + gp.x) * cw4 + cBase4;
+                uint sb   = ap * 8u;
+                for (uint i = 0u; i < 4u; ++i) {
+                    uvec2 h = g_in0.act2[gIdx + i];
+                    s_buf[sb + i * 2u + 0u] = h.x;
+                    s_buf[sb + i * 2u + 1u] = h.y;
+                }
+            }
+        }
+        barrier();
+
+        for (uint c4 = 0u; c4 < 4u; ++c4) {
+            vec4 acc = g_w32.w32v[dwBBase4 + cBase4 + c4];
+            for (int dy = -1; dy <= 1; ++dy) {
+                int ayp = int(ly) + 1 + dy;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    int axp  = int(lx) + 1 + dx;
+                    uint apN = uint(ayp) * apW + uint(axp);
+                    uint sbN = apN * 8u + c4 * 2u;
+                    vec4 x   = unpackHalf4(uvec2(s_buf[sbN + 0u], s_buf[sbN + 1u]));
+                    uint tap = uint((dy + 1) * 3 + (dx + 1));
+                    acc     += x * g_w32.w32v[dwWBase4 + tap * cw4 + cBase4 + c4];
+                }
+            }
+            outHalf[cBase4 + c4] = packHalf4(acc);
+        }
+        barrier();
+    }
+}
+
+void packHalfRegs16ToSbuf(uvec2 regs[16], uint t, bool zeroOut, out float actScale) {
+#if UPWAYS_IS_FP8
+    actScale = 1.0;
+    for (uint i = 0u; i < 16u; ++i) {
+        s_buf[t * 16u + i] = zeroOut ? 0u : packFp8Vec4(unpackHalf4(regs[i]));
+    }
+#else
+    if (zeroOut) {
+        actScale = 1.0;
+        for (uint i = 0u; i < 16u; ++i) {
+            s_buf[t * 16u + i] = 0u;
+        }
+        return;
+    }
+    float m = UPWAYS_V5_INT8_DYN_FLOOR;
+    for (uint i = 0u; i < 16u; ++i) {
+        m = max(m, dynInt8AbsMax4(unpackHalf4(regs[i])));
+    }
+    actScale = m * (1.0 / 127.0);
+    vec4 invS = vec4(127.0 / m);
+    for (uint i = 0u; i < 16u; ++i) {
+        s_buf[t * 16u + i] = packInt8Vec4Inv(unpackHalf4(regs[i]), invS);
+    }
+#endif
+}
+
+void evalSrPwTile64In(
+    uint wBaseU32,
+    uint ob,
+    uint sOff4,
+    uint bOff4,
+    float actScale,
+    out vec4 o0, out vec4 o1, out vec4 o2, out vec4 o3
+) {
+    const uint inTiles = 4u;  // 64 ch
+    const uint aStride = 16u; // 64 / 4 uint32
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+
+#if UPWAYS_IS_FP8
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_buf, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_buf, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#else
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+
+    uint r0 = (sg * 32u) * aStride;
+    uint r1 = (sg * 32u + 16u) * aStride;
+    for (uint ib = 0u; ib < inTiles; ++ib) {
+        coopMatLoad(matA0, s_buf, r0 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA1, s_buf, r1 + ib * 4u, aStride, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB,  g_w8.w8, wBaseU32 + (ob * inTiles + ib) * 64u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+        acc0 = coopMatMulAdd(matA0, matB, acc0);
+        acc1 = coopMatMulAdd(matA1, matB, acc1);
+    }
+#endif
+
+    coopMatStore(acc0, s_acc, sg * 576u,        18u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, s_acc, sg * 576u + 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint baseAcc = sg * 576u + lane * 18u;
+    vec4 a0 = vec4(s_acc[baseAcc + 0u],  s_acc[baseAcc + 1u],  s_acc[baseAcc + 2u],  s_acc[baseAcc + 3u]);
+    vec4 a1 = vec4(s_acc[baseAcc + 4u],  s_acc[baseAcc + 5u],  s_acc[baseAcc + 6u],  s_acc[baseAcc + 7u]);
+    vec4 a2 = vec4(s_acc[baseAcc + 8u],  s_acc[baseAcc + 9u],  s_acc[baseAcc + 10u], s_acc[baseAcc + 11u]);
+    vec4 a3 = vec4(s_acc[baseAcc + 12u], s_acc[baseAcc + 13u], s_acc[baseAcc + 14u], s_acc[baseAcc + 15u]);
+
+    uint cb  = ob * 4u;
+    vec4 sc0 = g_w32.w32v[sOff4 + cb + 0u] * actScale;
+    vec4 sc1 = g_w32.w32v[sOff4 + cb + 1u] * actScale;
+    vec4 sc2 = g_w32.w32v[sOff4 + cb + 2u] * actScale;
+    vec4 sc3 = g_w32.w32v[sOff4 + cb + 3u] * actScale;
+    vec4 bi0 = g_w32.w32v[bOff4 + cb + 0u];
+    vec4 bi1 = g_w32.w32v[bOff4 + cb + 1u];
+    vec4 bi2 = g_w32.w32v[bOff4 + cb + 2u];
+    vec4 bi3 = g_w32.w32v[bOff4 + cb + 3u];
+
+    o0 = a0 * sc0 + bi0;
+    o1 = a1 * sc1 + bi1;
+    o2 = a2 * sc2 + bi2;
+    o3 = a3 * sc3 + bi3;
+    subgroupBarrier();
+}
+
+void main() {
+    uint t   = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
+    uint lx  = t & 15u;
+    uint ly  = t >> 4u;
+    int  wgX = int(gl_WorkGroupID.x * 16u);
+    int  wgY = int(gl_WorkGroupID.y * 8u);
+    int  gx  = wgX + int(lx);
+    int  gy  = wgY + int(ly);
+    int  W   = int(pc.outW);
+    int  H   = int(pc.outH);
+    bool inImg   = (gx < W && gy < H);
+    uint pxIdx   = inImg ? uint(gy * W + gx) : 0u;
+    bool zeroRes = (pc.flags & UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE) != 0u;
+
+    uvec2 regsA[16];
+    uvec2 regsB[16];
+    float actScale = 1.0;
+
+    if (SPEC_STAGE_ID == 0u) {
+        // SR_PW1: SrIn[64, static 8-bit] -> r0[64, FP16]
+        uint gBase2 = pxIdx * 8u;
+        for (uint i = 0u; i < 8u; ++i) {
+            uvec2 p = inImg ? g_in0.act2[gBase2 + i] : uvec2(0u);
+            s_buf[t * 16u + i * 2u + 0u] = p.x;
+            s_buf[t * 16u + i * 2u + 1u] = p.y;
+        }
+        barrier();
+
+        for (uint ob = 0u; ob < 4u; ++ob) {
+            vec4 o0, o1, o2, o3;
+            evalSrPwTile64In(U32_W5_SR_PW1, ob, V4_S5_SR_PW1, V4_B5_OFFSET + V4_S5_SR_PW1, 1.0, o0, o1, o2, o3);
+            if (inImg) {
+                uint outBase = pxIdx * 16u + ob * 4u;
+                g_out0.act2[outBase + 0u] = packHalf4(upwaysLrelu4(o0));
+                g_out0.act2[outBase + 1u] = packHalf4(upwaysLrelu4(o1));
+                g_out0.act2[outBase + 2u] = packHalf4(upwaysLrelu4(o2));
+                g_out0.act2[outBase + 3u] = packHalf4(upwaysLrelu4(o3));
+            }
+        }
+        return;
+    }
+
+    if (SPEC_STAGE_ID == 1u) {
+        // SR_DW1_PW2: DW1(r0) -> PW2 + r0 -> r1[64]
+        runChunkedDw3x3_64(V4_DW5_SR1_W, V4_DW5_SR1_B, W, H, wgX, wgY, lx, ly, t, regsA);
+        packHalfRegs16ToSbuf(regsA, t, !inImg, actScale);
+        barrier();
+
+        uint skipBase = pxIdx * 16u;
+        for (uint ob = 0u; ob < 4u; ++ob) {
+            vec4 o0, o1, o2, o3;
+            evalSrPwTile64In(U32_W5_SR_PW2, ob, V4_S5_SR_PW2, V4_B5_OFFSET + V4_S5_SR_PW2, actScale, o0, o1, o2, o3);
+            if (inImg) {
+                uint cb = ob * 4u;
+                o0 = upwaysLrelu4(o0 + unpackHalf4(g_in0.act2[skipBase + cb + 0u]));
+                o1 = upwaysLrelu4(o1 + unpackHalf4(g_in0.act2[skipBase + cb + 1u]));
+                o2 = upwaysLrelu4(o2 + unpackHalf4(g_in0.act2[skipBase + cb + 2u]));
+                o3 = upwaysLrelu4(o3 + unpackHalf4(g_in0.act2[skipBase + cb + 3u]));
+                g_out0.act2[skipBase + cb + 0u] = packHalf4(o0);
+                g_out0.act2[skipBase + cb + 1u] = packHalf4(o1);
+                g_out0.act2[skipBase + cb + 2u] = packHalf4(o2);
+                g_out0.act2[skipBase + cb + 3u] = packHalf4(o3);
+            }
+        }
+        return;
+    }
+
+    // SPEC_STAGE_ID == 2u: SR_DW2_PW3_PW4_HEAD
+    runChunkedDw3x3_64(V4_DW5_SR2_W, V4_DW5_SR2_B, W, H, wgX, wgY, lx, ly, t, regsA);
+    packHalfRegs16ToSbuf(regsA, t, !inImg, actScale);
+    barrier();
+
+    uint skipBase = pxIdx * 16u;
+    for (uint ob = 0u; ob < 4u; ++ob) {
+        vec4 o0, o1, o2, o3;
+        evalSrPwTile64In(U32_W5_SR_PW3, ob, V4_S5_SR_PW3, V4_B5_OFFSET + V4_S5_SR_PW3, actScale, o0, o1, o2, o3);
+        if (inImg) {
+            uint cb = ob * 4u;
+            regsB[cb + 0u] = packHalf4(upwaysLrelu4(o0 + unpackHalf4(g_in0.act2[skipBase + cb + 0u])));
+            regsB[cb + 1u] = packHalf4(upwaysLrelu4(o1 + unpackHalf4(g_in0.act2[skipBase + cb + 1u])));
+            regsB[cb + 2u] = packHalf4(upwaysLrelu4(o2 + unpackHalf4(g_in0.act2[skipBase + cb + 2u])));
+            regsB[cb + 3u] = packHalf4(upwaysLrelu4(o3 + unpackHalf4(g_in0.act2[skipBase + cb + 3u])));
+        }
+    }
+    barrier();
+    packHalfRegs16ToSbuf(regsB, t, !inImg, actScale);
+    barrier();
+
+    for (uint ob = 0u; ob < 4u; ++ob) {
+        vec4 o0, o1, o2, o3;
+        evalSrPwTile64In(U32_W5_SR_PW4, ob, V4_S5_SR_PW4, V4_B5_OFFSET + V4_S5_SR_PW4, actScale, o0, o1, o2, o3);
+        uint cb = ob * 4u;
+        regsA[cb + 0u] = packHalf4(upwaysLrelu4(o0 + unpackHalf4(regsB[cb + 0u])));
+        regsA[cb + 1u] = packHalf4(upwaysLrelu4(o1 + unpackHalf4(regsB[cb + 1u])));
+        regsA[cb + 2u] = packHalf4(upwaysLrelu4(o2 + unpackHalf4(regsB[cb + 2u])));
+        regsA[cb + 3u] = packHalf4(upwaysLrelu4(o3 + unpackHalf4(regsB[cb + 3u])));
+    }
+    barrier();
+    packHalfRegs16ToSbuf(regsA, t, !inImg, actScale);
+    barrier();
+
+    uvec2 headH[24];
+    for (uint ob = 0u; ob < 6u; ++ob) {
+        vec4 o0, o1, o2, o3;
+        evalSrPwTile64In(U32_W5_SR_HEAD, ob, V4_S5_SR_HEAD, V4_B5_OFFSET + V4_S5_SR_HEAD, actScale, o0, o1, o2, o3);
+        uint cb = ob * 4u;
+        headH[cb + 0u] = packHalf4(o0);
+        headH[cb + 1u] = packHalf4(o1);
+        headH[cb + 2u] = packHalf4(o2);
+        headH[cb + 3u] = packHalf4(o3);
+    }
+
+    if (inImg) {
+        int W0 = int(pc.lrWidth);
+        int H0 = int(pc.lrHeight);
+        for (uint c = 0u; c < 4u; ++c) {
+            int x0 = gx * 2 + int(c & 1u);
+            int y0 = gy * 2 + int(c >> 1u);
+            if (x0 < W0 && y0 < H0) {
+                uint dBase = uint(y0 * W0 + x0) * 6u;
+                uint sBase = c * 6u;
+                for (uint i = 0u; i < 6u; ++i) {
+                    g_out0.act2[dBase + i] = zeroRes ? uvec2(0u) : headH[sBase + i];
+                }
+            }
+        }
+    }
+}

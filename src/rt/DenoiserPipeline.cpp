@@ -109,8 +109,9 @@ void DenoiserPipeline::createDescriptorSetLayouts() {
     createLayout(17, m_prepDescSetLayout, "ffx_rr_prep");
     createLayout(8, m_composeDescSetLayout, "ffx_rr_compose");
 
-    std::array<VkDescriptorPoolSize, 2> poolSizes = {
+    std::array<VkDescriptorPoolSize, 3> poolSizes = {
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
+        VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8 },
         VkDescriptorPoolSize{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8 },
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };

@@ -22,8 +22,10 @@
 #extension GL_EXT_float_e4m3 : require
 #endif
 
+#include "rgb9e5.glsl"
+
 // -----------------------------------------------------------------------------
-// Push Constants (56 bytes exact)
+// Push Constants (80 bytes exact)
 // -----------------------------------------------------------------------------
 layout(push_constant) uniform UpwaysPC {
     uint  lrWidth;        // 0
@@ -40,11 +42,18 @@ layout(push_constant) uniform UpwaysPC {
     uint  offB1;          // 44
     uint  offB2;          // 48
     float exposureScale;  // 52
+    uint  bandLrY0;       // 56 (band start Y in full LR frame)
+    uint  bandHrY0;       // 60 (band start Y in full HR frame)
+    uint  fullLrHeight;   // 64 (full LR frame height)
+    uint  fullHrHeight;   // 68 (full HR frame height)
+    uint  keepHrYStart;   // 72 (first band-local HR row written to uOutputColor)
+    uint  keepHrYEnd;     // 76 (exclusive band-local HR row written to uOutputColor)
 } pc;
 
 const uint UPWAYS_FLAG_RESET_HISTORY      = 1u;
 const uint UPWAYS_FLAG_ENABLE_SUPERRES    = 2u;
 const uint UPWAYS_FLAG_ZERO_RESIDUAL_MODE = 4u;
+const uint UPWAYS_FLAG_FUSED_BAND_PACK    = 8u;
 
 // -----------------------------------------------------------------------------
 // Weight Offsets (Total = 24,064 bytes: 15,616 B FP8 + 8,448 B FP32)
@@ -371,4 +380,86 @@ BilinearTaps computeBilinearTaps(vec2 coord, ivec2 dims) {
         frac.x * frac.y
     );
     return t;
+}
+
+vec3 demodulateMlSafe(vec3 rad, vec3 demodFactor) {
+    bool valid = any(greaterThan(demodFactor, vec3(1e-4)));
+    vec3 safeDenom = valid ? max(demodFactor, vec3(0.02)) : vec3(1.0);
+    return min(rad / safeDenom, vec3(65000.0));
+}
+
+vec3 octDecodeUpways(vec2 f) {
+    f = clamp(f, vec2(-1.0), vec2(1.0));
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = max(-n.z, 0.0);
+    n.x += (n.x >= 0.0) ? -t : t;
+    n.y += (n.y >= 0.0) ? -t : t;
+    float l2 = dot(n, n);
+    return (l2 > 1e-12) ? (n * inversesqrt(l2)) : vec3(0.0, 0.0, 1.0);
+}
+
+vec3 unpackOct32Upways(uint p) {
+    return octDecodeUpways(unpackSnorm2x16(p));
+}
+
+void unpackCompactNormalDepth(uvec4 pg, out vec3 viewNormal, out float linDepth) {
+    viewNormal = unpackOct32Upways(pg.x);
+    float rawD = unpackHalf2x16(pg.y).x;
+    linDepth = ((floatBitsToUint(rawD) & 0x7FFFFFFFu) < 0x7F800000u) ? clamp(rawD, 0.0, 10000.0) : 10000.0;
+}
+
+void unpackCompactPrimary(
+    uvec4 pg,
+    out vec3 viewNormal,
+    out float linDepth,
+    out float diffHitDist,
+    out float reactiveMask,
+    out vec3 aDiff,
+    out float roughness,
+    out vec3 aSpec,
+    out float matClass
+) {
+    unpackCompactNormalDepth(pg, viewNormal, linDepth);
+    diffHitDist  = float((pg.y >> 16u) & 0xFFu) * (1.0 / 255.0);
+    reactiveMask = float((pg.y >> 24u) & 0xFFu) * (1.0 / 255.0);
+    vec4 albR = unpackUnorm4x8(pg.z);
+    vec4 sAlb = unpackUnorm4x8(pg.w);
+    aDiff     = albR.rgb;
+    roughness = albR.a;
+    aSpec     = sAlb.rgb;
+    matClass  = sAlb.a;
+}
+
+bool isCompactPrimaryTransmissive(uvec4 pg) {
+    return ((pg.y >> 16u) & 1u) != 0u;
+}
+
+vec3 unpackCompactSkip(uint skipPack) {
+    return (skipPack != 0u) ? unpackRGB9E5(skipPack) : vec3(0.0);
+}
+
+void unpackCompactMotionAndSpec(
+    uint surfMvPack,
+    uvec2 specVmvRaw,
+    float linDepth,
+    bool isPrimaryTrans,
+    out vec2 surfaceMv,
+    out vec2 specMv,
+    out float specInvDepthSigned,
+    out float specHitDist
+) {
+    surfaceMv = unpackHalf2x16(surfMvPack);
+    if (specVmvRaw.y != 0u) {
+        specMv = unpackHalf2x16(specVmvRaw.x);
+        vec2 zDist = unpackHalf2x16(specVmvRaw.y);
+        specInvDepthSigned = zDist.x;
+        specHitDist        = zDist.y;
+    } else {
+        specMv = surfaceMv;
+        float dSpec = (linDepth >= 9999.0)
+            ? (isPrimaryTrans ? 1e-4 : 0.0)
+            : (1.0 / (1.0 + max(linDepth, 0.0)));
+        specInvDepthSigned = isPrimaryTrans ? -dSpec : dSpec;
+        specHitDist        = 0.0;
+    }
 }

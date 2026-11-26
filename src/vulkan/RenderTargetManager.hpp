@@ -77,6 +77,12 @@ public:
     [[nodiscard]] Image* getMlSpecularImage() const { return m_mlSpecularImage.get(); }
     [[nodiscard]] Image* getMlSkipImage() const { return m_mlSkipImage.get(); }
     [[nodiscard]] Image* getMlSpecAlbedoImage() const { return m_mlSpecAlbedoImage.get(); }
+    [[nodiscard]] Image* getMlIrradianceImage() const { return m_mlIrradianceImage.get(); }
+    [[nodiscard]] Image* getMlPrimaryGuideImage() const { return m_mlPrimaryGuideImage.get(); }
+    [[nodiscard]] Image* getMlSurfaceMvImage() const { return m_mlSurfaceMvImage.get(); }
+    [[nodiscard]] Image* getMlDiffHitDistImage() const { return m_mlDiffHitDistImage.get(); }
+    [[nodiscard]] Image* getMlSpecVmvImage() const { return m_mlSpecVmvImage.get(); }
+    [[nodiscard]] Image* getMlSkipCompactImage() const { return m_mlSkipCompactImage.get(); }
     [[nodiscard]] Image* getMlDirectDiffuseImage() const { return m_mlDirectDiffuseImage.get(); }
     [[nodiscard]] Image* getMlIndirectDiffuseImage() const { return m_mlIndirectDiffuseImage.get(); }
     [[nodiscard]] Image* getMlDirectSpecularImage() const { return m_mlDirectSpecularImage.get(); }
@@ -105,6 +111,12 @@ private:
     std::unique_ptr<Image> m_mlSpecularImage;
     std::unique_ptr<Image> m_mlSkipImage;
     std::unique_ptr<Image> m_mlSpecAlbedoImage;
+    std::unique_ptr<Image> m_mlIrradianceImage;
+    std::unique_ptr<Image> m_mlPrimaryGuideImage;
+    std::unique_ptr<Image> m_mlSurfaceMvImage;
+    std::unique_ptr<Image> m_mlDiffHitDistImage;
+    std::unique_ptr<Image> m_mlSpecVmvImage;
+    std::unique_ptr<Image> m_mlSkipCompactImage;
     std::unique_ptr<Image> m_mlDirectDiffuseImage;
     std::unique_ptr<Image> m_mlIndirectDiffuseImage;
     std::unique_ptr<Image> m_mlDirectSpecularImage;

@@ -10,6 +10,7 @@
 #include "scene/SceneManager.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/ReSTIRManager.hpp"
+#include "rt/NRCManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
 
 #include <filesystem>
@@ -61,9 +62,47 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         return;
     }
 
+    const uint32_t outChannels = m_engine->m_config.capture_channels;
+    const bool useCaptureRestir = (!isReference && m_engine->isRestirActive() && outChannels >= 23u);
+    const bool useCaptureNrc = (!isReference && m_engine->m_config.enable_nrc);
+    const bool useCompactCapture = (!isReference && outChannels == 32u &&
+                                    m_engine->m_mlIrradianceImage &&
+                                    m_engine->m_mlPrimaryGuideImage &&
+                                    m_engine->m_mlSurfaceMvImage &&
+                                    m_engine->m_mlDiffHitDistImage &&
+                                    m_engine->m_mlSpecVmvImage &&
+                                    m_engine->m_mlSkipCompactImage);
+
+    bool needDescUpdate = false;
     uint32_t requiredCapacity = width * height;
     if (m_engine->m_wavefrontPipeline->getMaxCapacity() < requiredCapacity) {
         m_engine->m_wavefrontPipeline->resize(width, height, requiredCapacity);
+        needDescUpdate = true;
+    }
+    if (useCaptureRestir && m_engine->m_restirManager) {
+        if (!m_engine->m_restirManager->isInitialized() ||
+            m_engine->m_restirManager->getWidth() != width ||
+            m_engine->m_restirManager->getHeight() != height) {
+            vkDeviceWaitIdle(device);
+            m_engine->m_restirManager->resize(width, height);
+            needDescUpdate = true;
+        }
+    }
+    if (useCaptureNrc) {
+        if (!m_engine->m_nrcManager) {
+            vkDeviceWaitIdle(device);
+            m_engine->ensureNrcInitialized();
+            needDescUpdate = true;
+        }
+        if (m_engine->m_nrcManager &&
+            (m_engine->m_nrcManager->getWidth() != width ||
+             m_engine->m_nrcManager->getHeight() != height)) {
+            vkDeviceWaitIdle(device);
+            m_engine->m_nrcManager->resize(width, height);
+            needDescUpdate = true;
+        }
+    }
+    if (needDescUpdate) {
         m_engine->updateWavefrontSceneDescriptors();
     }
     if (!isReference && m_engine->m_config.capture_channels >= 44u &&
@@ -80,10 +119,11 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_sceneHasNonOpaque)             flags |= (1 << 5);
     if (m_engine->m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_engine->m_config.inline_primary_shadows) flags |= (1 << 6);
-    const bool useCaptureRestir = (!isReference && m_engine->isRestirActive() && m_engine->m_config.capture_channels >= 23);
     if ((m_engine->m_config.enable_light_tree || useCaptureRestir) && !m_engine->m_sceneData.lightTreeNodes.empty()) flags |= (1 << 7);
     if (useCaptureRestir) flags |= (1 << 9);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
+    if (m_engine->m_videoBillboard && m_engine->m_videoBillboard->hasNewFrame()) flags |= (1u << 12);
+    if (m_engine->m_config.animate_objects && (m_engine->m_config.animation_speed > 0.0001f)) flags |= (1u << 13);
     if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
 
     VkClearColorValue clearZero{};
@@ -101,7 +141,6 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
     };
 
-    const uint32_t outChannels = m_engine->m_config.capture_channels;
     Image* targetAccumImg = m_engine->m_frameImages[0];
     const VkFormat targetFmt = targetAccumImg ? targetAccumImg->getFormat() : VK_FORMAT_R32G32B32A32_SFLOAT;
     const bool isTargetFp16 = (targetFmt == VK_FORMAT_R16G16B16A16_SFLOAT);
@@ -165,6 +204,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
             wfSceneData.numOpaqueTriangles = m_engine->m_numOpaqueTriangles;
             wfSceneData.secondarySortMode = static_cast<uint32_t>(m_engine->m_config.secondary_sort_mode);
+            if (m_engine->m_config.secondary_sort_mode == SecondarySortMode::DirectionalDGC && m_engine->m_wavefrontPipeline) {
+                m_engine->m_wavefrontPipeline->ensureSecondaryIndexQueue();
+            }
             wfSceneData.cameraFlags = flags;
             wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
             wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
@@ -177,6 +219,12 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
             wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
             wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
+            wfSceneData.deltaUnroll = m_engine->m_config.delta_unroll;
+            wfSceneData.restirMCap = m_engine->m_config.restir_m_cap;
+            wfSceneData.earlyBounceCutoff = m_engine->m_config.early_bounce_cutoff;
+            wfSceneData.earlyBounceCutoffThreshold = m_engine->m_config.early_bounce_cutoff_threshold;
+            wfSceneData.fullWidth = width;
+            wfSceneData.fullHeight = height;
             wfSceneData.captureMlData = 0;
 
             uint32_t activeOfflineBounces = m_engine->m_config.max_bounces;
@@ -334,7 +382,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
     } else {
         // --- NOISY INPUT + ML FEATURE EXTRACTION PASS (PTTD v3 / v4) ---
-        // 1. Clear targetAccumImg and ML images to zero
+        const uint32_t captureSlot = useCaptureRestir ? (frameIdx & 1u) : 0u;
+        Image* captureAccumImg = m_engine->m_frameImages[captureSlot] ? m_engine->m_frameImages[captureSlot] : targetAccumImg;
+
+        // 1. Clear captureAccumImg and ML images to zero
         VkCommandBuffer cmd = m_engine->m_commandBuffers[0];
         vkResetCommandBuffer(cmd, 0);
 
@@ -342,25 +393,47 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        clearImage(cmd, targetAccumImg);
-        clearImage(cmd, m_engine->m_mlDiffuseImage);
-        clearImage(cmd, m_engine->m_mlSpecularImage);
-        clearImage(cmd, m_engine->m_mlAlbedoRoughnessImage);
-        clearImage(cmd, m_engine->m_mlSpecularMotionImage);
-        if (outChannels >= 32u) {
-            clearImage(cmd, m_engine->m_mlSkipImage);
-            clearImage(cmd, m_engine->m_mlSpecAlbedoImage);
+        clearImage(cmd, captureAccumImg);
+        if (useCompactCapture) {
+            clearImage(cmd, m_engine->m_mlIrradianceImage);
+            clearImage(cmd, m_engine->m_mlPrimaryGuideImage);
+            clearImage(cmd, m_engine->m_mlSurfaceMvImage);
+            clearImage(cmd, m_engine->m_mlDiffHitDistImage);
+            clearImage(cmd, m_engine->m_mlSpecVmvImage);
+            clearImage(cmd, m_engine->m_mlSkipCompactImage);
+            if (useCaptureRestir) {
+                clearImage(cmd, m_engine->m_normalDepthImage);
+                if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
+                    clearImage(cmd, m_engine->m_prevNormalDepthImage);
+                }
+            }
+        } else {
+            clearImage(cmd, m_engine->m_mlDiffuseImage);
+            clearImage(cmd, m_engine->m_mlSpecularImage);
+            clearImage(cmd, m_engine->m_mlAlbedoRoughnessImage);
+            clearImage(cmd, m_engine->m_mlSpecularMotionImage);
+            if (outChannels >= 32u) {
+                clearImage(cmd, m_engine->m_mlSkipImage);
+                clearImage(cmd, m_engine->m_mlSpecAlbedoImage);
+            }
+            if (outChannels >= 44u) {
+                clearImage(cmd, m_engine->m_mlDirectDiffuseImage);
+                clearImage(cmd, m_engine->m_mlIndirectDiffuseImage);
+                clearImage(cmd, m_engine->m_mlDirectSpecularImage);
+                clearImage(cmd, m_engine->m_mlIndirectSpecularImage);
+            }
+            clearImage(cmd, m_engine->m_motionVectorImage);
+            clearImage(cmd, m_engine->m_normalDepthImage);
+            if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
+                clearImage(cmd, m_engine->m_prevNormalDepthImage);
+            }
         }
-        if (outChannels >= 44u) {
-            clearImage(cmd, m_engine->m_mlDirectDiffuseImage);
-            clearImage(cmd, m_engine->m_mlIndirectDiffuseImage);
-            clearImage(cmd, m_engine->m_mlDirectSpecularImage);
-            clearImage(cmd, m_engine->m_mlIndirectSpecularImage);
+
+        if (useCaptureRestir && m_engine->m_restirManager) {
+            m_engine->m_restirManager->recordClearIfNeeded(cmd);
         }
-        clearImage(cmd, m_engine->m_motionVectorImage);
-        clearImage(cmd, m_engine->m_normalDepthImage);
-        if (frameIdx == 0 && m_engine->m_prevNormalDepthImage) {
-            clearImage(cmd, m_engine->m_prevNormalDepthImage);
+        if (useCaptureNrc && m_engine->m_nrcManager) {
+            m_engine->m_nrcManager->resetCounters(cmd);
         }
 
         // 2. Set camera UBO (advances m_prevViewProj to track true velocity; enables Halton subpixel jitter for SR / V4)
@@ -370,7 +443,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         CameraUniform ubo = m_engine->m_camera->getUniformData(frameIdx, inputSpp, m_engine->m_config.max_bounces, flags,
                                                      enableInputJitter, width, height, 0, /*updatePrev=*/true,
                                                      m_engine->m_config.capture_halton_length);
-        m_engine->m_cameraUBOs[0]->copyFrom(&ubo, sizeof(CameraUniform));
+        m_engine->m_cameraUBOs[captureSlot]->copyFrom(&ubo, sizeof(CameraUniform));
 
         // 3. Dispatch inputSpp with captureMlData
         WavefrontSceneData wfSceneData{};
@@ -388,11 +461,23 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
         wfSceneData.numOpaqueTriangles = m_engine->m_numOpaqueTriangles;
         wfSceneData.secondarySortMode = static_cast<uint32_t>(m_engine->m_config.secondary_sort_mode);
+        if (m_engine->m_config.secondary_sort_mode == SecondarySortMode::DirectionalDGC && m_engine->m_wavefrontPipeline) {
+            m_engine->m_wavefrontPipeline->ensureSecondaryIndexQueue();
+        }
         wfSceneData.cameraFlags = flags;
-        wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
-        wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
+        const bool hasFocalBounds =
+            (m_engine->m_sceneData.focalBoundsMin.x < m_engine->m_sceneData.focalBoundsMax.x) &&
+            (m_engine->m_sceneData.focalBoundsMin.y < m_engine->m_sceneData.focalBoundsMax.y) &&
+            (m_engine->m_sceneData.focalBoundsMin.z < m_engine->m_sceneData.focalBoundsMax.z);
+        const glm::vec3 nrcBMin = hasFocalBounds ? m_engine->m_sceneData.focalBoundsMin : m_engine->m_sceneData.boundsMin;
+        const glm::vec3 nrcBMax = hasFocalBounds ? m_engine->m_sceneData.focalBoundsMax : m_engine->m_sceneData.boundsMax;
+        wfSceneData.boundsMin = nrcBMin;
+        wfSceneData.boundsMax = nrcBMax;
         wfSceneData.sceneBoundsMin = m_engine->m_sceneData.boundsMin;
         wfSceneData.sceneBoundsMax = m_engine->m_sceneData.boundsMax;
+        wfSceneData.enableNrc = useCaptureNrc && (m_engine->m_nrcManager != nullptr);
+        wfSceneData.nrcBounce = m_engine->m_config.nrc_bounce;
+        wfSceneData.nrcTrainRatio = m_engine->m_config.nrc_train_ratio;
         wfSceneData.streamlineSecondaryShading = m_engine->m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_engine->m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_engine->m_config.max_secondary_distance;
@@ -400,52 +485,103 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.enableTailMegakernel = m_engine->m_config.enable_tail_megakernel;
         wfSceneData.tailMegakernelBounce = m_engine->m_config.tail_megakernel_bounce;
         wfSceneData.inlineShadows = m_engine->m_config.inline_primary_shadows;
-        wfSceneData.captureMlData = (outChannels >= 44u) ? (1u | 4u | 8u)
-                                  : ((outChannels >= 32u) ? (1u | 4u) : 1u);
-
-        m_engine->m_wavefrontPipeline->recordFrame(cmd, 0, width, height, inputSpp, m_engine->m_config.max_bounces, wfSceneData);
-
-        // 4. Staging copy for 6 (or 8 for V4, or 12 for V5) ML images
-        VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
-        VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
-
-        VkDeviceSize offsetDiff = 0;
-        VkDeviceSize offsetSpec = offsetDiff + rgba16Size;
-        VkDeviceSize offsetAR   = offsetSpec + rgba16Size;
-        VkDeviceSize offsetND   = offsetAR   + rgba16Size;
-        VkDeviceSize offsetSM   = offsetND   + rgba16Size;
-        VkDeviceSize offsetMV   = offsetSM   + rgba16Size;
-        VkDeviceSize totalInputStagingSize = offsetMV + rgba16Size;
-
-        VkDeviceSize offsetSkip = 0;
-        VkDeviceSize offsetSA   = 0;
-        if (outChannels >= 32u) {
-            offsetSkip = totalInputStagingSize;
-            offsetSA   = offsetSkip + rgba16Size;
-            totalInputStagingSize = offsetSA + rgba16Size;
+        wfSceneData.deltaUnroll = m_engine->m_config.delta_unroll;
+        wfSceneData.restirMCap = m_engine->m_config.restir_m_cap;
+        wfSceneData.earlyBounceCutoff = m_engine->m_config.early_bounce_cutoff;
+        wfSceneData.earlyBounceCutoffThreshold = m_engine->m_config.early_bounce_cutoff_threshold;
+        wfSceneData.fullWidth = width;
+        wfSceneData.fullHeight = height;
+        if (useCompactCapture) {
+            wfSceneData.captureMlData = (1u | 4u | 16u) | (useCaptureRestir ? 32u : 0u);
+            wfSceneData.gbufferFlags = (1u << 31) | 1u | (useCaptureRestir ? 2u : 0u);
+        } else {
+            wfSceneData.captureMlData = (outChannels >= 44u) ? (1u | 4u | 8u)
+                                      : ((outChannels >= 32u) ? (1u | 4u) : 1u);
         }
 
+        m_engine->m_wavefrontPipeline->recordFrame(cmd, captureSlot, width, height, inputSpp, m_engine->m_config.max_bounces, wfSceneData);
+
+        if (wfSceneData.enableNrc && m_engine->m_nrcManager) {
+            m_engine->m_nrcManager->setBackend(m_engine->m_config.nrc_backend);
+            const uint32_t adamStep = m_engine->m_nrcManager->getAdamStep();
+            const float nrcLr = (adamStep < 20u) ? 5.8e-3f : 2.8e-3f;
+            const uint32_t nrcBatch = (adamStep < 20u) ? 64u : 32u;
+            m_engine->m_nrcManager->recordInferenceAndTraining(
+                cmd, width, height, nrcBMin, nrcBMax,
+                0, captureSlot, wfSceneData.captureMlData,
+                std::min(m_engine->m_config.indirect_clamp, 35.0f),
+                frameIdx, nrcLr, nrcBatch,
+                inputSpp == 1u
+            );
+        }
+
+        // 4. Staging copy for compact (6 attachments = 41 B/px) or legacy ML images
+        VkDeviceSize numPixels = static_cast<VkDeviceSize>(width) * height;
+        VkDeviceSize rgba16Size = numPixels * 4 * sizeof(uint16_t);
+        auto align16 = [](VkDeviceSize v) -> VkDeviceSize { return (v + 15u) & ~VkDeviceSize(15u); };
+
+        VkDeviceSize totalInputStagingSize = 0;
+        VkDeviceSize offsetCompactIrr = 0;
+        VkDeviceSize offsetCompactPg = 0;
+        VkDeviceSize offsetCompactSurfMv = 0;
+        VkDeviceSize offsetCompactDiffHd = 0;
+        VkDeviceSize offsetCompactSpecVmv = 0;
+        VkDeviceSize offsetCompactSkip = 0;
+
+        VkDeviceSize offsetDiff = 0;
+        VkDeviceSize offsetSpec = 0;
+        VkDeviceSize offsetAR   = 0;
+        VkDeviceSize offsetND   = 0;
+        VkDeviceSize offsetSM   = 0;
+        VkDeviceSize offsetMV   = 0;
+        VkDeviceSize offsetSkip = 0;
+        VkDeviceSize offsetSA   = 0;
         VkDeviceSize offsetDD = 0;
         VkDeviceSize offsetID = 0;
         VkDeviceSize offsetDS = 0;
         VkDeviceSize offsetIS = 0;
-        if (outChannels >= 44u) {
-            offsetDD = totalInputStagingSize;
-            offsetID = offsetDD + rgba16Size;
-            offsetDS = offsetID + rgba16Size;
-            offsetIS = offsetDS + rgba16Size;
-            totalInputStagingSize = offsetIS + rgba16Size;
-        }
-
         VkDeviceSize offsetRes = 0;
         VkDeviceSize resSize = 0;
         Buffer* resBuffer = nullptr;
-        if (outChannels >= 23u && outChannels < 32u && m_engine->m_restirManager && m_engine->isRestirActive()) {
-            resBuffer = m_engine->m_restirManager->getReservoirBuffer(0);
-            if (resBuffer) {
-                offsetRes = totalInputStagingSize;
-                resSize = numPixels * sizeof(DiReservoirGPU);
-                totalInputStagingSize += resSize;
+
+        if (useCompactCapture) {
+            offsetCompactIrr     = 0;
+            offsetCompactPg      = align16(offsetCompactIrr + numPixels * 8u);
+            offsetCompactSurfMv  = align16(offsetCompactPg + numPixels * 16u);
+            offsetCompactDiffHd  = align16(offsetCompactSurfMv + numPixels * 4u);
+            offsetCompactSpecVmv = align16(offsetCompactDiffHd + numPixels * 1u);
+            offsetCompactSkip    = align16(offsetCompactSpecVmv + numPixels * 8u);
+            totalInputStagingSize = align16(offsetCompactSkip + numPixels * 4u);
+        } else {
+            offsetDiff = 0;
+            offsetSpec = offsetDiff + rgba16Size;
+            offsetAR   = offsetSpec + rgba16Size;
+            offsetND   = offsetAR   + rgba16Size;
+            offsetSM   = offsetND   + rgba16Size;
+            offsetMV   = offsetSM   + rgba16Size;
+            totalInputStagingSize = offsetMV + rgba16Size;
+
+            if (outChannels >= 32u) {
+                offsetSkip = totalInputStagingSize;
+                offsetSA   = offsetSkip + rgba16Size;
+                totalInputStagingSize = offsetSA + rgba16Size;
+            }
+
+            if (outChannels >= 44u) {
+                offsetDD = totalInputStagingSize;
+                offsetID = offsetDD + rgba16Size;
+                offsetDS = offsetID + rgba16Size;
+                offsetIS = offsetDS + rgba16Size;
+                totalInputStagingSize = offsetIS + rgba16Size;
+            }
+
+            if (outChannels >= 23u && outChannels < 32u && m_engine->m_restirManager && m_engine->isRestirActive()) {
+                resBuffer = m_engine->m_restirManager->getReservoirBuffer(captureSlot);
+                if (resBuffer) {
+                    offsetRes = totalInputStagingSize;
+                    resSize = numPixels * sizeof(DiReservoirGPU);
+                    totalInputStagingSize += resSize;
+                }
             }
         }
 
@@ -473,21 +609,30 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                 VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         };
 
-        copyImgToBuffer(m_engine->m_mlDiffuseImage, offsetDiff);
-        copyImgToBuffer(m_engine->m_mlSpecularImage, offsetSpec);
-        copyImgToBuffer(m_engine->m_mlAlbedoRoughnessImage, offsetAR);
-        copyImgToBuffer(m_engine->m_normalDepthImage, offsetND);
-        copyImgToBuffer(m_engine->m_mlSpecularMotionImage, offsetSM);
-        copyImgToBuffer(m_engine->m_motionVectorImage, offsetMV);
-        if (outChannels >= 32u) {
-            copyImgToBuffer(m_engine->m_mlSkipImage, offsetSkip);
-            copyImgToBuffer(m_engine->m_mlSpecAlbedoImage, offsetSA);
-        }
-        if (outChannels >= 44u) {
-            copyImgToBuffer(m_engine->m_mlDirectDiffuseImage, offsetDD);
-            copyImgToBuffer(m_engine->m_mlIndirectDiffuseImage, offsetID);
-            copyImgToBuffer(m_engine->m_mlDirectSpecularImage, offsetDS);
-            copyImgToBuffer(m_engine->m_mlIndirectSpecularImage, offsetIS);
+        if (useCompactCapture) {
+            copyImgToBuffer(m_engine->m_mlIrradianceImage, offsetCompactIrr);
+            copyImgToBuffer(m_engine->m_mlPrimaryGuideImage, offsetCompactPg);
+            copyImgToBuffer(m_engine->m_mlSurfaceMvImage, offsetCompactSurfMv);
+            copyImgToBuffer(m_engine->m_mlDiffHitDistImage, offsetCompactDiffHd);
+            copyImgToBuffer(m_engine->m_mlSpecVmvImage, offsetCompactSpecVmv);
+            copyImgToBuffer(m_engine->m_mlSkipCompactImage, offsetCompactSkip);
+        } else {
+            copyImgToBuffer(m_engine->m_mlDiffuseImage, offsetDiff);
+            copyImgToBuffer(m_engine->m_mlSpecularImage, offsetSpec);
+            copyImgToBuffer(m_engine->m_mlAlbedoRoughnessImage, offsetAR);
+            copyImgToBuffer(m_engine->m_normalDepthImage, offsetND);
+            copyImgToBuffer(m_engine->m_mlSpecularMotionImage, offsetSM);
+            copyImgToBuffer(m_engine->m_motionVectorImage, offsetMV);
+            if (outChannels >= 32u) {
+                copyImgToBuffer(m_engine->m_mlSkipImage, offsetSkip);
+                copyImgToBuffer(m_engine->m_mlSpecAlbedoImage, offsetSA);
+            }
+            if (outChannels >= 44u) {
+                copyImgToBuffer(m_engine->m_mlDirectDiffuseImage, offsetDD);
+                copyImgToBuffer(m_engine->m_mlIndirectDiffuseImage, offsetID);
+                copyImgToBuffer(m_engine->m_mlDirectSpecularImage, offsetDS);
+                copyImgToBuffer(m_engine->m_mlIndirectSpecularImage, offsetIS);
+            }
         }
 
         if (useCaptureRestir && m_engine->m_normalDepthImage && m_engine->m_prevNormalDepthImage) {
@@ -557,25 +702,132 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
         stagingInput.invalidate();
         const uint8_t* basePtr = static_cast<const uint8_t*>(stagingInput.map());
-        const uint16_t* diffPixels = reinterpret_cast<const uint16_t*>(basePtr + offsetDiff);
-        const uint16_t* specPixels = reinterpret_cast<const uint16_t*>(basePtr + offsetSpec);
-        const uint16_t* arPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetAR);
-        const uint16_t* ndPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetND);
-        const uint16_t* smPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetSM);
-        const uint16_t* mvPixels   = reinterpret_cast<const uint16_t*>(basePtr + offsetMV);
-        const uint16_t* skipPixels = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSkip) : nullptr;
-        const uint16_t* saPixels   = (outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSA)   : nullptr;
-        const uint16_t* ddPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDD)   : nullptr;
-        const uint16_t* idPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetID)   : nullptr;
-        const uint16_t* dsPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDS)   : nullptr;
-        const uint16_t* isPixels   = (outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetIS)   : nullptr;
+        const uint32_t* cIrrPtr     = useCompactCapture ? reinterpret_cast<const uint32_t*>(basePtr + offsetCompactIrr) : nullptr;
+        const uint32_t* cPgPtr      = useCompactCapture ? reinterpret_cast<const uint32_t*>(basePtr + offsetCompactPg) : nullptr;
+        const uint32_t* cSurfMvPtr  = useCompactCapture ? reinterpret_cast<const uint32_t*>(basePtr + offsetCompactSurfMv) : nullptr;
+        const uint8_t*  cDiffHdPtr  = useCompactCapture ? reinterpret_cast<const uint8_t*>(basePtr + offsetCompactDiffHd) : nullptr;
+        const uint32_t* cSpecVmvPtr = useCompactCapture ? reinterpret_cast<const uint32_t*>(basePtr + offsetCompactSpecVmv) : nullptr;
+        const uint32_t* cSkipPtr    = useCompactCapture ? reinterpret_cast<const uint32_t*>(basePtr + offsetCompactSkip) : nullptr;
+
+        const uint16_t* diffPixels = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetDiff) : nullptr;
+        const uint16_t* specPixels = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetSpec) : nullptr;
+        const uint16_t* arPixels   = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetAR) : nullptr;
+        const uint16_t* ndPixels   = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetND) : nullptr;
+        const uint16_t* smPixels   = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetSM) : nullptr;
+        const uint16_t* mvPixels   = !useCompactCapture ? reinterpret_cast<const uint16_t*>(basePtr + offsetMV) : nullptr;
+        const uint16_t* skipPixels = (!useCompactCapture && outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSkip) : nullptr;
+        const uint16_t* saPixels   = (!useCompactCapture && outChannels >= 32u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetSA)   : nullptr;
+        const uint16_t* ddPixels   = (!useCompactCapture && outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDD)   : nullptr;
+        const uint16_t* idPixels   = (!useCompactCapture && outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetID)   : nullptr;
+        const uint16_t* dsPixels   = (!useCompactCapture && outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetDS)   : nullptr;
+        const uint16_t* isPixels   = (!useCompactCapture && outChannels >= 44u) ? reinterpret_cast<const uint16_t*>(basePtr + offsetIS)   : nullptr;
         const DiReservoirGPU* resPixels = resBuffer ? reinterpret_cast<const DiReservoirGPU*>(basePtr + offsetRes) : nullptr;
+
+        auto unpackRGB9E5Cpu = [](uint32_t p) -> glm::vec3 {
+            if (p == 0u) return glm::vec3(0.0f);
+            const int e = static_cast<int>((p >> 27u) & 31u) - 24;
+            const float scale = std::ldexp(1.0f, e);
+            return glm::vec3(
+                static_cast<float>(p & 511u),
+                static_cast<float>((p >> 9u) & 511u),
+                static_cast<float>((p >> 18u) & 511u)
+            ) * scale;
+        };
+        auto unpackOct32Cpu = [](uint32_t p) -> glm::vec3 {
+            glm::vec2 f = glm::clamp(glm::unpackSnorm2x16(p), glm::vec2(-1.0f), glm::vec2(1.0f));
+            glm::vec3 n(f.x, f.y, 1.0f - std::abs(f.x) - std::abs(f.y));
+            const float t = std::max(-n.z, 0.0f);
+            n.x += (n.x >= 0.0f) ? -t : t;
+            n.y += (n.y >= 0.0f) ? -t : t;
+            const float l2 = glm::dot(n, n);
+            return (l2 > 1e-12f) ? (n / std::sqrt(l2)) : glm::vec3(0.0f, 0.0f, 1.0f);
+        };
+        auto demodulateSafeCpu = [](const glm::vec3& rad, const glm::vec3& denom) -> glm::vec3 {
+            const bool valid = (denom.r > 1e-4f) || (denom.g > 1e-4f) || (denom.b > 1e-4f);
+            const glm::vec3 safe = valid ? glm::max(denom, glm::vec3(0.02f)) : glm::vec3(1.0f);
+            return glm::min(rad / safe, glm::vec3(65000.0f));
+        };
 
         std::vector<uint16_t> inputPayload(static_cast<size_t>(numPixels) * outChannels);
         const uint16_t zeroHalf = glm::packHalf1x16(0.0f);
 
         for (size_t p = 0; p < static_cast<size_t>(numPixels); ++p) {
-            if (outChannels >= 32u) {
+            if (useCompactCapture) {
+                const uint32_t pg0 = cPgPtr[p * 4u + 0u];
+                const uint32_t pg1 = cPgPtr[p * 4u + 1u];
+                const uint32_t pg2 = cPgPtr[p * 4u + 2u];
+                const uint32_t pg3 = cPgPtr[p * 4u + 3u];
+                const glm::vec3 viewNrm = unpackOct32Cpu(pg0);
+                const float rawDepth = glm::unpackHalf2x16(pg1).x;
+                const float linDepth = std::isfinite(rawDepth) ? std::clamp(rawDepth, 0.0f, 10000.0f) : 10000.0f;
+                const bool isPrimaryTrans = ((pg1 >> 16u) & 1u) != 0u;
+                const float reactiveMask = static_cast<float>((pg1 >> 24u) & 0xFFu) * (1.0f / 255.0f);
+
+                const glm::vec4 albR = glm::unpackUnorm4x8(pg2);
+                const glm::vec4 sAlb = glm::unpackUnorm4x8(pg3);
+                const glm::vec3 aDiff(albR);
+                const float roughness = albR.a;
+                const glm::vec3 aSpec(sAlb);
+                const float matClass = sAlb.a;
+
+                const glm::vec3 rawDiff = unpackRGB9E5Cpu(cIrrPtr[p * 2u + 0u]);
+                const glm::vec3 rawSpec = unpackRGB9E5Cpu(cIrrPtr[p * 2u + 1u]);
+                const glm::vec3 eDiff = demodulateSafeCpu(rawDiff, aDiff);
+                const glm::vec3 eSpec = demodulateSafeCpu(rawSpec, aSpec);
+                const float diffHitDist = static_cast<float>(cDiffHdPtr[p]) * (1.0f / 255.0f);
+                const glm::vec3 skipRgb = unpackRGB9E5Cpu(cSkipPtr[p]);
+
+                const glm::vec2 surfMv = glm::unpackHalf2x16(cSurfMvPtr[p]);
+                const uint32_t specVmv0 = cSpecVmvPtr[p * 2u + 0u];
+                const uint32_t specVmv1 = cSpecVmvPtr[p * 2u + 1u];
+                glm::vec2 specMv = surfMv;
+                float specInvDepthSigned = 0.0f;
+                float specHitDist = 0.0f;
+                if (specVmv1 != 0u) {
+                    specMv = glm::unpackHalf2x16(specVmv0);
+                    const glm::vec2 zDist = glm::unpackHalf2x16(specVmv1);
+                    specInvDepthSigned = zDist.x;
+                    specHitDist = zDist.y;
+                } else {
+                    const float dSpec = (linDepth >= 9999.0f)
+                        ? (isPrimaryTrans ? 1e-4f : 0.0f)
+                        : (1.0f / (1.0f + std::max(linDepth, 0.0f)));
+                    specInvDepthSigned = isPrimaryTrans ? -dSpec : dSpec;
+                }
+
+                inputPayload[p * outChannels + 0]  = safeToFp16(eDiff.r);
+                inputPayload[p * outChannels + 1]  = safeToFp16(eDiff.g);
+                inputPayload[p * outChannels + 2]  = safeToFp16(eDiff.b);
+                inputPayload[p * outChannels + 3]  = safeToFp16(diffHitDist);
+                inputPayload[p * outChannels + 4]  = safeToFp16(eSpec.r);
+                inputPayload[p * outChannels + 5]  = safeToFp16(eSpec.g);
+                inputPayload[p * outChannels + 6]  = safeToFp16(eSpec.b);
+                inputPayload[p * outChannels + 7]  = safeToFp16(reactiveMask);
+                inputPayload[p * outChannels + 8]  = safeToFp16(aDiff.r);
+                inputPayload[p * outChannels + 9]  = safeToFp16(aDiff.g);
+                inputPayload[p * outChannels + 10] = safeToFp16(aDiff.b);
+                inputPayload[p * outChannels + 11] = safeToFp16(roughness);
+                inputPayload[p * outChannels + 12] = safeToFp16(aSpec.r);
+                inputPayload[p * outChannels + 13] = safeToFp16(aSpec.g);
+                inputPayload[p * outChannels + 14] = safeToFp16(aSpec.b);
+                inputPayload[p * outChannels + 15] = zeroHalf; // ReSTIR_M_Norm omitted in live compact guides
+                inputPayload[p * outChannels + 16] = safeToFp16(skipRgb.r);
+                inputPayload[p * outChannels + 17] = safeToFp16(skipRgb.g);
+                inputPayload[p * outChannels + 18] = safeToFp16(skipRgb.b);
+                inputPayload[p * outChannels + 19] = safeToFp16(matClass);
+                inputPayload[p * outChannels + 20] = safeToFp16(viewNrm.x);
+                inputPayload[p * outChannels + 21] = safeToFp16(viewNrm.y);
+                inputPayload[p * outChannels + 22] = safeToFp16(viewNrm.z);
+                inputPayload[p * outChannels + 23] = safeToFp16(linDepth);
+                inputPayload[p * outChannels + 24] = safeToFp16(surfMv.x);
+                inputPayload[p * outChannels + 25] = safeToFp16(surfMv.y);
+                inputPayload[p * outChannels + 26] = safeToFp16(specMv.x);
+                inputPayload[p * outChannels + 27] = safeToFp16(specMv.y);
+                inputPayload[p * outChannels + 28] = zeroHalf; // linDepthDelta omitted in live compact guides
+                inputPayload[p * outChannels + 29] = safeToFp16(specInvDepthSigned);
+                inputPayload[p * outChannels + 30] = safeToFp16(specHitDist);
+                inputPayload[p * outChannels + 31] = zeroHalf;
+            } else if (outChannels >= 32u) {
                 // Upways 4.0 (PTTD v4, 32 channels) and 4-signal un-demodulated extension (PTTD v5, 44 channels)
                 // Group 0 (0..3): Demodulated Diffuse Irradiance RGB + DiffHitDist
                 inputPayload[p * outChannels + 0]  = diffPixels[p * 4 + 0];
@@ -742,9 +994,9 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                      inpPath, outChannels, inputSpp, jitterArr[0], jitterArr[1]);
 
         if (outChannels >= 32u) {
-            // Unbiased dual-seed LR demodulated target (ReSTIR OFF, exact same Halton jitter & resolution)
+            // Unbiased dual-seed LR demodulated target (ReSTIR/NRC OFF, exact same Halton jitter & resolution)
             const uint32_t lrFlags = flags & ~((1u << 9) | (1u << 24));
-            const uint32_t lrSppPerSeed = std::clamp(m_engine->m_config.capture_reference_spp / 4u, 8u, 64u);
+            const uint32_t lrSppPerSeed = std::max(8u, m_engine->m_config.capture_reference_spp / 4u);
             Buffer stagingLr(allocator, rgba16Size * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                              VMA_MEMORY_USAGE_AUTO_PREFER_HOST, VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
 
@@ -758,6 +1010,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
 
                 WavefrontSceneData lrScene = wfSceneData;
                 lrScene.cameraFlags = lrFlags;
+                lrScene.enableNrc = false;
+                lrScene.gbufferFlags = 0u;
                 lrScene.accumulateHistory = 0u;
                 lrScene.captureMlData = (1u | 4u);
 

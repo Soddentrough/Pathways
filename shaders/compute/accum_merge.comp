@@ -1,5 +1,6 @@
 #version 460
 #extension GL_EXT_shader_image_load_formatted : require
+#include "rgb9e5.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -45,6 +46,7 @@ layout(binding = 10) uniform image2D uPrimaryMlAlbedoRoughness;
 layout(binding = 11) uniform image2D uPrimaryMlSpecularMotion;
 layout(binding = 12) uniform image2D uPrimaryMlSkip;
 layout(binding = 13) uniform image2D uPrimaryMlSpecAlbedo;
+layout(binding = 14, rg32ui) uniform uimage2D uPrimaryMlIrradiance;
 
 layout(push_constant) uniform PushConstants {
     uint width;
@@ -206,6 +208,17 @@ void main() {
         }
 
         uint linearIndex = uint(pixelCoord.y) * pc.width + uint(pixelCoord.x);
+
+        if ((pc.mergeGbuffers & 32u) != 0u) {
+            uvec2 secRaw = secondaryWords16[linearIndex];
+            uvec2 primRaw = imageLoad(uPrimaryMlIrradiance, pixelCoord).xy;
+            vec3 combDiff = ((primRaw.x != 0u) ? unpackRGB9E5(primRaw.x) : vec3(0.0))
+                          + ((secRaw.x != 0u) ? unpackRGB9E5(secRaw.x) : vec3(0.0));
+            vec3 combSpec = ((primRaw.y != 0u) ? unpackRGB9E5(primRaw.y) : vec3(0.0))
+                          + ((secRaw.y != 0u) ? unpackRGB9E5(secRaw.y) : vec3(0.0));
+            imageStore(uPrimaryMlIrradiance, pixelCoord, uvec4(packRGB9E5(combDiff), packRGB9E5(combSpec), 0u, 0u));
+            return;
+        }
 
         vec4 secVal;
         if (pc.formatMode == 0u) {

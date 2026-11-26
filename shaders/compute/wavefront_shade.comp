@@ -133,6 +133,8 @@ void main() {
         uint dispersionChannel = 0u;
         unpackRayState(state, throughputHalf, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel);
         uint inPdfCode = unpackRayPdfCode(state);
+        bool inNrcSkip = unpackRayNrcSkip(state);
+        bool inPrimaryTrans = unpackRayPrimaryTransmissive(state);
         vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
         bool sampledSpecularLobe = false;
@@ -162,31 +164,45 @@ void main() {
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
             }
             if (pc.captureMlData != 0u) {
-                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
-                if (isMlDenoiser && bounce == 0u) {
-                    vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
-                    imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
-                } else {
-                    if (bounce > 0u) {
-                        wfAddSplitIndirect(pixelCoord,
-                                           isSpecularPath ? vec3(0.0) : skyContrib,
-                                           isSpecularPath ? skyContrib : vec3(0.0),
-                                           pc.captureMlData, seed);
-                    }
-                    if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
-                        if (isSpecularPath) {
-                            vec3 outSpec = isV4
-                                ? demodulateMlSafe(skyContrib, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
-                                : skyContrib;
-                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                    if (bounce == 0u) {
+                        if (pc.sppSampleIndex == 0u) {
+                            wfStoreCompactMlSkip(pixelCoord, skyContrib);
                         } else {
-                            vec3 outDiff = isV4
-                                ? demodulateMlSafe(skyContrib, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
-                                : skyContrib;
-                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                            wfAddCompactMlSkip(pixelCoord, skyContrib);
+                        }
+                    } else {
+                        wfAddCompactMlIrradiance(pixelCoord,
+                                                 isSpecularPath ? vec3(0.0) : skyContrib,
+                                                 isSpecularPath ? skyContrib : vec3(0.0));
+                    }
+                } else {
+                    bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                    bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
+                    if (isMlDenoiser && bounce == 0u) {
+                        vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
+                        imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
+                    } else {
+                        if (bounce > 0u) {
+                            wfAddSplitIndirect(pixelCoord,
+                                               isSpecularPath ? vec3(0.0) : skyContrib,
+                                               isSpecularPath ? skyContrib : vec3(0.0),
+                                               pc.captureMlData, seed);
+                        }
+                        if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                            if (isSpecularPath) {
+                                vec3 outSpec = isV4
+                                    ? demodulateMlSafe(skyContrib, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                    : skyContrib;
+                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                            } else {
+                                vec3 outDiff = isV4
+                                    ? demodulateMlSafe(skyContrib, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                    : skyContrib;
+                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                            }
                         }
                     }
                 }
@@ -235,7 +251,7 @@ void main() {
                 survivesToNext = true;
                 nextDirection = rayDir;
                 nextGeom.originPackedDir = vec4(hitPoint + rayDir * EPSILON, uintBitsToFloat(packOct32(rayDir)));
-                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, inPdfCode);
+                nextState = packRayState(f16vec3(throughput), seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, inPdfCode, inNrcSkip, inPrimaryTrans);
             } else {
                 bool routeAllToSpec = (bounce > 0u) && isSpecularPath;
 
@@ -287,31 +303,45 @@ void main() {
                         imageStore(uAccumImage, pCoord, vec4(addFp16Stochastic(prev.rgb, emissiveContrib, seed), isDynamicVideo));
                     }
                     if (pc.captureMlData != 0u) {
-                        bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                        bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
-                        if (isMlDenoiser && bounce == 0u) {
-                            vec4 prevSkip = imageLoad(uMlSkipImage, pCoord);
-                            imageStore(uMlSkipImage, pCoord, vec4(addFp16Stochastic(prevSkip.rgb, emissiveContrib, seed), prevSkip.a));
-                        } else {
-                            if (bounce > 0u) {
-                                wfAddSplitIndirect(pCoord,
-                                                   routeAllToSpec ? vec3(0.0) : emissiveContrib,
-                                                   routeAllToSpec ? emissiveContrib : vec3(0.0),
-                                                   pc.captureMlData, seed);
-                            }
-                            if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
-                                if (routeAllToSpec) {
-                                    vec3 outSpec = isV4
-                                        ? demodulateMlSafe(emissiveContrib, imageLoad(uMlSpecAlbedoImage, pCoord).rgb)
-                                        : emissiveContrib;
-                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
-                                    imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                        if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                            if (bounce == 0u) {
+                                if (pc.sppSampleIndex == 0u) {
+                                    wfStoreCompactMlSkip(pCoord, emissiveContrib);
                                 } else {
-                                    vec3 outDiff = isV4
-                                        ? demodulateMlSafe(emissiveContrib, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
-                                        : emissiveContrib;
-                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                                    imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                    wfAddCompactMlSkip(pCoord, emissiveContrib);
+                                }
+                            } else {
+                                wfAddCompactMlIrradiance(pCoord,
+                                                         routeAllToSpec ? vec3(0.0) : emissiveContrib,
+                                                         routeAllToSpec ? emissiveContrib : vec3(0.0));
+                            }
+                        } else {
+                            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                            bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
+                            if (isMlDenoiser && bounce == 0u) {
+                                vec4 prevSkip = imageLoad(uMlSkipImage, pCoord);
+                                imageStore(uMlSkipImage, pCoord, vec4(addFp16Stochastic(prevSkip.rgb, emissiveContrib, seed), prevSkip.a));
+                            } else {
+                                if (bounce > 0u) {
+                                    wfAddSplitIndirect(pCoord,
+                                                       routeAllToSpec ? vec3(0.0) : emissiveContrib,
+                                                       routeAllToSpec ? emissiveContrib : vec3(0.0),
+                                                       pc.captureMlData, seed);
+                                }
+                                if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                    if (routeAllToSpec) {
+                                        vec3 outSpec = isV4
+                                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlSpecAlbedoImage, pCoord).rgb)
+                                            : emissiveContrib;
+                                        vec4 prevSpec = imageLoad(uMlSpecularImage, pCoord);
+                                        imageStore(uMlSpecularImage, pCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                    } else {
+                                        vec3 outDiff = isV4
+                                            ? demodulateMlSafe(emissiveContrib, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
+                                            : emissiveContrib;
+                                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
+                                        imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                    }
                                 }
                             }
                         }
@@ -436,13 +466,17 @@ void main() {
                             }
                             causticApplied = true;
                             if (pc.captureMlData != 0u) {
-                                wfAddSplitIndirect(pCoord, causticRad, vec3(0.0), pc.captureMlData, seed);
-                                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                                vec3 outDiff = isV4
-                                    ? demodulateMlSafe(causticRad, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
-                                    : causticRad;
-                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
-                                imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                                    wfAddCompactMlIrradiance(pCoord, causticRad, vec3(0.0));
+                                } else {
+                                    wfAddSplitIndirect(pCoord, causticRad, vec3(0.0), pc.captureMlData, seed);
+                                    bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                                    vec3 outDiff = isV4
+                                        ? demodulateMlSafe(causticRad, imageLoad(uMlAlbedoRoughnessImage, pCoord).rgb)
+                                        : causticRad;
+                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pCoord);
+                                    imageStore(uMlDiffuseImage, pCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                }
                             }
                         }
                     }
@@ -492,32 +526,44 @@ void main() {
                                                 vec3 diffScaled = diffUnshadowed * invSpp;
                                                 vec3 specScaled = specUnshadowed * invSpp;
                                                 vec3 unshScaled = unshadowed * invSpp;
-                                                vec3 splitDiffOut = routeAllToSpec ? vec3(0.0) : diffScaled;
-                                                vec3 splitSpecOut = routeAllToSpec ? unshScaled : specScaled;
-                                                if (bounce == 0u) {
-                                                    wfAddSplitDirect(pixelCoord, splitDiffOut, splitSpecOut, pc.captureMlData, seed);
+                                                if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                                                    if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                                        vec3 cmpDiff = routeAllToSpec ? vec3(0.0) : diffScaled;
+                                                        vec3 cmpSpec = routeAllToSpec ? unshScaled : specScaled;
+                                                        if (bounce == 0u && pc.sppSampleIndex == 0u && !causticApplied) {
+                                                            wfStoreCompactMlIrradiance(pixelCoord, cmpDiff, cmpSpec);
+                                                        } else {
+                                                            wfAddCompactMlIrradiance(pixelCoord, cmpDiff, cmpSpec);
+                                                        }
+                                                    }
                                                 } else {
-                                                    wfAddSplitIndirect(pixelCoord, splitDiffOut, splitSpecOut, pc.captureMlData, seed);
-                                                }
-                                                if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
-                                                    bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                                                    if (routeAllToSpec) {
-                                                        vec3 outSpec = isV4
-                                                            ? demodulateMlSafe(unshScaled, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
-                                                            : unshScaled;
-                                                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                                    vec3 splitDiffOut = routeAllToSpec ? vec3(0.0) : diffScaled;
+                                                    vec3 splitSpecOut = routeAllToSpec ? unshScaled : specScaled;
+                                                    if (bounce == 0u) {
+                                                        wfAddSplitDirect(pixelCoord, splitDiffOut, splitSpecOut, pc.captureMlData, seed);
                                                     } else {
-                                                        vec3 outDiff = isV4
-                                                            ? demodulateMlSafe(diffScaled, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
-                                                            : diffScaled;
-                                                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                                        imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
-                                                        vec3 outSpec = isV4
-                                                            ? demodulateMlSafe(specScaled, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
-                                                            : specScaled;
-                                                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                                        wfAddSplitIndirect(pixelCoord, splitDiffOut, splitSpecOut, pc.captureMlData, seed);
+                                                    }
+                                                    if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                                        bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                                                        if (routeAllToSpec) {
+                                                            vec3 outSpec = isV4
+                                                                ? demodulateMlSafe(unshScaled, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                                                : unshScaled;
+                                                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                                        } else {
+                                                            vec3 outDiff = isV4
+                                                                ? demodulateMlSafe(diffScaled, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                                                : diffScaled;
+                                                            vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                                            imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                                                            vec3 outSpec = isV4
+                                                                ? demodulateMlSafe(specScaled, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                                                : specScaled;
+                                                            vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                                            imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -540,7 +586,15 @@ void main() {
                                     }
                                     vec3 unshDiffOut = (routeAllToSpec ? vec3(0.0) : diffUnshadowed) * invSpp;
                                     vec3 unshSpecOut = (routeAllToSpec ? unshadowed : specUnshadowed) * invSpp;
-                                    if (bounce == 0u) {
+                                    if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                                        if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                                            if (bounce == 0u && pc.sppSampleIndex == 0u && !causticApplied) {
+                                                wfStoreCompactMlIrradiance(pCoord, unshDiffOut, unshSpecOut);
+                                            } else {
+                                                wfAddCompactMlIrradiance(pCoord, unshDiffOut, unshSpecOut);
+                                            }
+                                        }
+                                    } else if (bounce == 0u) {
                                         wfAddSplitDirect(pCoord, unshDiffOut, unshSpecOut, pc.captureMlData, seed);
                                     } else {
                                         wfAddSplitIndirect(pCoord, unshDiffOut, unshSpecOut, pc.captureMlData, seed);
@@ -692,7 +746,7 @@ void main() {
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
                         bool mergeMatteIndirectSpec = (roughness >= 0.70 && metallic < 0.05 && clearcoat <= 0.01);
                         bool outIsSpecularPath = (bounce == 0u) ? (sampledSpecularLobe && !mergeMatteIndirectSpec) : isSpecularPath;
-                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode);
+                        nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode, outIsSpecularPath, inPrimaryTrans);
                     }
                 }
             }

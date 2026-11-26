@@ -114,6 +114,12 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             params.mlIndirectDiffuseImage ? params.mlIndirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
             params.mlDirectSpecularImage ? params.mlDirectSpecularImage->getImageView() : VK_NULL_HANDLE,
             params.mlIndirectSpecularImage ? params.mlIndirectSpecularImage->getImageView() : VK_NULL_HANDLE,
+            params.mlIrradianceImage ? params.mlIrradianceImage->getImageView() : VK_NULL_HANDLE,
+            params.mlPrimaryGuideImage ? params.mlPrimaryGuideImage->getImageView() : VK_NULL_HANDLE,
+            params.mlSurfaceMvImage ? params.mlSurfaceMvImage->getImageView() : VK_NULL_HANDLE,
+            params.mlDiffHitDistImage ? params.mlDiffHitDistImage->getImageView() : VK_NULL_HANDLE,
+            params.mlSpecVmvImage ? params.mlSpecVmvImage->getImageView() : VK_NULL_HANDLE,
+            params.mlSkipCompactImage ? params.mlSkipCompactImage->getImageView() : VK_NULL_HANDLE,
             params.envImportanceBuffer ? params.envImportanceBuffer->getBuffer() : VK_NULL_HANDLE,
             params.envImportanceBuffer ? params.envImportanceBuffer->getSize() : 0
         );
@@ -126,6 +132,7 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
         VkImageView mlSaView = params.mlSpecAlbedoImage ? params.mlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
         VkImageView mlIndDiffView = params.mlIndirectDiffuseImage ? params.mlIndirectDiffuseImage->getImageView() : VK_NULL_HANDLE;
         VkImageView mlIndSpecView = params.mlIndirectSpecularImage ? params.mlIndirectSpecularImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView mlIrrView = params.mlIrradianceImage ? params.mlIrradianceImage->getImageView() : VK_NULL_HANDLE;
         for (uint32_t slot = 0; slot < 2; ++slot) {
             if (params.frameImages[slot]) {
                 params.nrcManager->updateDescriptors(
@@ -133,7 +140,8 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
                     params.frameImages[slot]->getImageView(),
                     mlDiffView, mlSpecView,
                     mlArView, mlSaView,
-                    mlIndDiffView, mlIndSpecView
+                    mlIndDiffView, mlIndSpecView,
+                    mlIrrView
                 );
             }
         }
@@ -191,7 +199,8 @@ void EngineDescriptorManager::updateMergeDescriptors(const MergeDescriptorParams
             params.mlAlbedoRoughnessImage,
             params.mlSpecularMotionImage,
             params.mlSkipImage,
-            params.mlSpecAlbedoImage
+            params.mlSpecAlbedoImage,
+            params.mlIrradianceImage
         );
     }
 }

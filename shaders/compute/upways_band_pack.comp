@@ -1,0 +1,26 @@
+#version 460
+#include "rgb9e5.glsl"
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D uSrcColor;
+layout(std430, set = 0, binding = 1) writeonly buffer DstPacked {
+    uint dst[];
+} uDstPacked;
+
+layout(push_constant) uniform BandPackPC {
+    uint width;
+    uint srcYStart;
+    uint rowCount;
+    uint pad;
+} pc;
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.width || y >= pc.rowCount) {
+        return;
+    }
+    vec4 c = imageLoad(uSrcColor, ivec2(int(x), int(pc.srcYStart + y)));
+    uDstPacked.dst[y * pc.width + x] = packRGB9E5(c.rgb);
+}

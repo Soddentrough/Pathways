@@ -19,13 +19,18 @@ namespace pathways {
 
 class Buffer;
 class Image;
+class UpwaysV5Engine;
 
 inline constexpr uint32_t UPWAYS_FLAG_RESET_HISTORY      = 1u;
 inline constexpr uint32_t UPWAYS_FLAG_ENABLE_SUPERRES    = 2u;
 inline constexpr uint32_t UPWAYS_FLAG_ZERO_RESIDUAL_MODE = 4u;
+inline constexpr uint32_t UPWAYS_FLAG_FUSED_BAND_PACK    = 8u;
+
+inline constexpr uint32_t UPWAYS_DEFAULT_BAND_HALO_LR     = 24u;
+inline constexpr float    UPWAYS_DEFAULT_BAND_TOP_FRACTION = 0.50f;
 
 /**
- * Exact 56-byte push constant layout shared across all four Upways 4.0 compute shaders:
+ * Exact 80-byte push constant layout shared across all four Upways 4.0 compute shaders:
  *   upways_denoise_prep.comp, upways_denoiser_wmma.comp,
  *   upways_upscaler_wmma.comp, upways_upscale_resolve.comp.
  */
@@ -44,9 +49,78 @@ struct UpwaysPushConstants {
     uint32_t offB1;
     uint32_t offB2;
     float    exposureScale;
+    uint32_t bandLrY0;
+    uint32_t bandHrY0;
+    uint32_t fullLrHeight;
+    uint32_t fullHrHeight;
+    uint32_t keepHrYStart;
+    uint32_t keepHrYEnd;
 };
 
-static_assert(sizeof(UpwaysPushConstants) == 56, "UpwaysPushConstants must be exactly 56 bytes");
+static_assert(sizeof(UpwaysPushConstants) == 80, "UpwaysPushConstants must be exactly 80 bytes");
+
+struct UpwaysBandSplit {
+    uint32_t fullLrH = 0u;
+    uint32_t fullHrH = 0u;
+    uint32_t haloLr = UPWAYS_DEFAULT_BAND_HALO_LR;
+    uint32_t splitLrY = 0u;
+    uint32_t topLrH = 0u;
+    uint32_t botLrY0 = 0u;
+    uint32_t botLrH = 0u;
+    uint32_t splitHrY = 0u;
+    uint32_t topHrH = 0u;
+    uint32_t botHrY0 = 0u;
+    uint32_t botHrH = 0u;
+};
+
+struct UpwaysBandParams {
+    uint32_t bandLrY0 = 0u;
+    uint32_t bandHrY0 = 0u;
+    uint32_t fullLrHeight = 0u;
+    uint32_t fullHrHeight = 0u;
+    uint32_t keepHrYStart = 0u;
+    uint32_t keepHrYEnd = 0u;
+    bool fusedBandPack = false;
+    uint32_t bandPackSlot = 0u;
+};
+
+inline UpwaysBandSplit computeUpwaysBandSplit(
+    uint32_t fullLrH,
+    uint32_t fullHrH,
+    uint32_t haloLr = UPWAYS_DEFAULT_BAND_HALO_LR,
+    float topFraction = UPWAYS_DEFAULT_BAND_TOP_FRACTION
+) noexcept {
+    UpwaysBandSplit s{};
+    s.fullLrH = std::max(1u, fullLrH);
+    s.fullHrH = std::max(1u, fullHrH);
+    const uint32_t effHalo = (haloLr > 0u) ? std::clamp((haloLr + 2u) & ~3u, 8u, 64u) : 0u;
+    if (s.fullLrH <= std::max(effHalo * 4u, 32u)) {
+        s.haloLr = 0u;
+        s.splitLrY = s.fullLrH / 2u;
+        s.topLrH = s.fullLrH;
+        s.botLrY0 = 0u;
+        s.botLrH = s.fullLrH;
+        s.splitHrY = (s.splitLrY * s.fullHrH) / s.fullLrH;
+        s.topHrH = s.fullHrH;
+        s.botHrY0 = 0u;
+        s.botHrH = s.fullHrH;
+        return s;
+    }
+    s.haloLr = effHalo;
+    const double frac = std::clamp(static_cast<double>(topFraction), 0.25, 0.75);
+    const uint32_t targetTop = static_cast<uint32_t>(std::llround(static_cast<double>(s.fullLrH) * frac));
+    const uint32_t alignedHalf = (targetTop + 8u) & ~15u;
+    s.splitLrY = std::clamp(alignedHalf, effHalo + 16u, s.fullLrH - (effHalo + 16u));
+    s.topLrH = std::min(s.fullLrH, s.splitLrY + effHalo);
+    s.botLrY0 = (s.splitLrY > effHalo) ? (s.splitLrY - effHalo) : 0u;
+    s.botLrH = s.fullLrH - s.botLrY0;
+
+    s.splitHrY = std::clamp((s.splitLrY * s.fullHrH + s.fullLrH / 2u) / s.fullLrH, 1u, s.fullHrH - 1u);
+    s.topHrH = std::clamp((s.topLrH * s.fullHrH) / s.fullLrH, s.splitHrY, s.fullHrH);
+    s.botHrY0 = std::min((s.botLrY0 * s.fullHrH + s.fullLrH - 1u) / s.fullLrH, s.splitHrY);
+    s.botHrH = s.fullHrH - s.botHrY0;
+    return s;
+}
 
 struct UpwaysPyramidDims {
     uint32_t     w0 = 1u, h0 = 1u;
@@ -134,6 +208,19 @@ enum class UpwaysComputePrecision : uint8_t {
     Fp16 = 2
 };
 
+enum class UpwaysRuntimeVersion : uint8_t {
+    V4 = 4,
+    V5 = 5
+};
+
+inline constexpr const char* upwaysVersionName(UpwaysRuntimeVersion version) noexcept {
+    return (version == UpwaysRuntimeVersion::V5) ? "5.0" : "4.0";
+}
+
+inline constexpr const char* upwaysVersionDisplayName(UpwaysRuntimeVersion version) noexcept {
+    return (version == UpwaysRuntimeVersion::V5) ? "Upways 5.0 Pure-ML" : "Upways 4.0";
+}
+
 inline constexpr const char* upwaysPrecisionName(UpwaysComputePrecision precision) noexcept {
     switch (precision) {
         case UpwaysComputePrecision::Fp8:  return "fp8";
@@ -172,12 +259,18 @@ public:
     static bool supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
     static bool supportsInt8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
     static bool supportsFp16CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance = VK_NULL_HANDLE);
+    static UpwaysRuntimeVersion resolveVersion(
+        UpwaysVersion requested,
+        const std::string& weightsPath = ""
+    );
     static UpwaysComputePrecision selectPrecision(
         VkPhysicalDevice physicalDevice,
         UpwaysPrecision requested = UpwaysPrecision::Auto,
-        VkInstance instance = VK_NULL_HANDLE
+        VkInstance instance = VK_NULL_HANDLE,
+        UpwaysRuntimeVersion version = UpwaysRuntimeVersion::V4
     );
 
+    // Upways 4.0 (24,064 B compact U-Net + KPN, 4 compute shaders)
     UpwaysPipeline(
         VkDevice device,
         VkPhysicalDevice physicalDevice,
@@ -193,7 +286,29 @@ public:
         const std::string& weightsPath = "",
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
-        UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8
+        UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8,
+        uint32_t outputFullHeight = 0u
+    );
+
+    // Upways 5.0 Pure-ML (158,400 params / 190,208 B FP8 & INT8, 5 compute shaders)
+    UpwaysPipeline(
+        VkDevice device,
+        VkPhysicalDevice physicalDevice,
+        VmaAllocator allocator,
+        uint32_t inputWidth,
+        uint32_t inputHeight,
+        uint32_t outputWidth,
+        uint32_t outputHeight,
+        const std::vector<char>& v5PrepSpv,
+        const std::vector<char>& v5UnetWmmaSpv,
+        const std::vector<char>& v5AffinitySpv,
+        const std::vector<char>& v5UpscalerWmmaSpv,
+        const std::vector<char>& v5ResolveSpv,
+        const std::string& weightsPath = "",
+        bool enableSuperRes = false,
+        VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
+        UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8,
+        uint32_t outputFullHeight = 0u
     );
     ~UpwaysPipeline();
 
@@ -207,18 +322,24 @@ public:
         uint32_t inputHeight,
         uint32_t outputWidth,
         uint32_t outputHeight,
-        bool enableSuperRes
+        bool enableSuperRes,
+        uint32_t outputFullHeight = 0u
     );
 
     void updateDescriptors(
-        VkImageView mlDiffuseView,
-        VkImageView mlSpecularView,
-        VkImageView albedoRoughnessView,
-        VkImageView specAlbedoView,
-        VkImageView skipView,
-        VkImageView normalDepthView,
-        VkImageView motionVectorView,
-        VkImageView specularMotionView = VK_NULL_HANDLE
+        VkImageView mlIrradianceView,
+        VkImageView mlPrimaryGuideView,
+        VkImageView mlSurfaceMvView,
+        VkImageView mlDiffHitDistView = VK_NULL_HANDLE,
+        VkImageView mlSpecVmvView = VK_NULL_HANDLE,
+        VkImageView mlSkipCompactView = VK_NULL_HANDLE
+    );
+
+    void setBandPackTargets(
+        VkBuffer slot0Buffer,
+        VkDeviceSize slot0Size,
+        VkBuffer slot1Buffer = VK_NULL_HANDLE,
+        VkDeviceSize slot1Size = 0u
     );
 
     void recordFrame(
@@ -228,32 +349,32 @@ public:
         glm::vec2 jitter,
         bool coupledWithExternalUpscaler = false,
         bool zeroResidualMode = false,
-        float exposureScale = 1.0f
+        float exposureScale = 1.0f,
+        const UpwaysBandParams& band = {}
     );
 
-    [[nodiscard]] Image* getOutputImage() const { return m_outputImage.get(); }
-    [[nodiscard]] Image* getCleanRadLrImage() const { return m_cleanRadLr.get(); }
-    [[nodiscard]] uint32_t getInputWidth() const { return m_inputWidth; }
-    [[nodiscard]] uint32_t getInputHeight() const { return m_inputHeight; }
-    [[nodiscard]] uint32_t getOutputWidth() const { return m_outputWidth; }
-    [[nodiscard]] uint32_t getOutputHeight() const { return m_outputHeight; }
-    [[nodiscard]] bool isSuperResEnabled() const { return m_enableSuperRes; }
-    [[nodiscard]] bool isHistoryValid() const { return m_historyValid; }
-    [[nodiscard]] UpwaysComputePrecision getPrecision() const { return m_precision; }
-    [[nodiscard]] bool usesFp8CoopMatrix() const { return m_precision == UpwaysComputePrecision::Fp8; }
-    [[nodiscard]] bool isInitialized() const {
-        return m_prepPipeline != VK_NULL_HANDLE &&
-               m_resolvePipeline != VK_NULL_HANDLE &&
-               m_denoiserPipelines[0] != VK_NULL_HANDLE;
-    }
+    [[nodiscard]] Image* getOutputImage() const;
+    [[nodiscard]] Image* getCleanRadLrImage() const;
+    [[nodiscard]] uint32_t getInputWidth() const;
+    [[nodiscard]] uint32_t getInputHeight() const;
+    [[nodiscard]] uint32_t getOutputWidth() const;
+    [[nodiscard]] uint32_t getOutputHeight() const;
+    [[nodiscard]] uint32_t getOutputFullHeight() const;
+    [[nodiscard]] bool isSuperResEnabled() const;
+    [[nodiscard]] bool isHistoryValid() const;
+    [[nodiscard]] UpwaysComputePrecision getPrecision() const;
+    [[nodiscard]] UpwaysRuntimeVersion getVersion() const { return m_version; }
+    [[nodiscard]] bool usesFp8CoopMatrix() const { return getPrecision() == UpwaysComputePrecision::Fp8; }
+    [[nodiscard]] bool isInitialized() const;
 
-    [[nodiscard]] const UpwaysPassTimings& getLastPassTimings() const { return m_lastTimings; }
+    [[nodiscard]] const UpwaysPassTimings& getLastPassTimings() const;
     [[nodiscard]] std::array<float, 4> getPassTimingsMs() const {
+        const UpwaysPassTimings& t = getLastPassTimings();
         return {
-            static_cast<float>(m_lastTimings.prepMs),
-            static_cast<float>(m_lastTimings.denoiserMs),
-            static_cast<float>(m_lastTimings.upscalerMs),
-            static_cast<float>(m_lastTimings.resolveMs)
+            static_cast<float>(t.prepMs),
+            static_cast<float>(t.denoiserMs),
+            static_cast<float>(t.upscalerMs),
+            static_cast<float>(t.resolveMs)
         };
     }
 
@@ -288,6 +409,9 @@ private:
 
     void collectQueryResults(uint32_t targetSlot, bool waitForResult);
 
+    UpwaysRuntimeVersion   m_version = UpwaysRuntimeVersion::V4;
+    std::unique_ptr<UpwaysV5Engine> m_v5Engine;
+
     VkDevice         m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator     m_allocator = VK_NULL_HANDLE;
@@ -296,6 +420,7 @@ private:
     uint32_t         m_inputHeight = 0;
     uint32_t         m_outputWidth = 0;
     uint32_t               m_outputHeight = 0;
+    uint32_t               m_outputFullHeight = 0;
     bool                   m_enableSuperRes = false;
     UpwaysComputePrecision m_precision = UpwaysComputePrecision::Fp8;
     VkDeviceSize           m_weightQuantBytes = 15616u;
@@ -318,7 +443,14 @@ private:
     std::unique_ptr<Buffer> m_weightBuffer;
     std::unique_ptr<Buffer> m_actBuffer;
     std::unique_ptr<Buffer> m_srSubpixelBuffer;
+    std::unique_ptr<Buffer> m_dummyBandPackBuffer;
+    std::array<VkBuffer, 2>     m_bandPackBuf  = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDeviceSize, 2> m_bandPackSize = { 0u, 0u };
     std::unique_ptr<Image>  m_dummyBlackImage;
+    std::unique_ptr<Image>  m_dummyR32uiImage;
+    std::unique_ptr<Image>  m_dummyRg32uiImage;
+    std::unique_ptr<Image>  m_dummyRgba32uiImage;
+    std::unique_ptr<Image>  m_dummyR8Image;
 
     // Ping-pong LR history (indexed by [prev] / [curr])
     std::unique_ptr<Image> m_diffHist[2];    // RGBA16F
@@ -334,15 +466,13 @@ private:
     std::unique_ptr<Image> m_colorHr[2];     // RGBA16F
     std::unique_ptr<Image> m_outputImage;    // RGBA16F
 
-    // Cached external render-space views (8 G-buffer planes)
-    VkImageView m_cachedMlDiffView = VK_NULL_HANDLE;
-    VkImageView m_cachedMlSpecView = VK_NULL_HANDLE;
-    VkImageView m_cachedAlbRoughView = VK_NULL_HANDLE;
-    VkImageView m_cachedSpecAlbView = VK_NULL_HANDLE;
-    VkImageView m_cachedSkipView = VK_NULL_HANDLE;
-    VkImageView m_cachedNormalDepthView = VK_NULL_HANDLE;
-    VkImageView m_cachedMotionVectorView = VK_NULL_HANDLE;
-    VkImageView m_cachedSpecularMotionView = VK_NULL_HANDLE;
+    // Cached compact live G-buffer views (6 attachments: 41 B/px)
+    VkImageView m_cachedMlIrradianceView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlPrimaryGuideView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlSurfaceMvView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlDiffHitDistView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlSpecVmvView = VK_NULL_HANDLE;
+    VkImageView m_cachedMlSkipCompactView = VK_NULL_HANDLE;
 
     // Descriptors & compute pipelines
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -353,9 +483,15 @@ private:
     VkDescriptorSetLayout m_resolveDescLayout = VK_NULL_HANDLE;
 
     std::array<VkDescriptorSet, 2> m_prepDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    std::array<VkDescriptorSet, 2> m_denoiserDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<std::array<VkDescriptorSet, 2>, 2> m_denoiserDescSets = {{
+        { VK_NULL_HANDLE, VK_NULL_HANDLE },
+        { VK_NULL_HANDLE, VK_NULL_HANDLE }
+    }};
     VkDescriptorSet m_upscalerDescSet = VK_NULL_HANDLE;
-    std::array<VkDescriptorSet, 2> m_resolveDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<std::array<VkDescriptorSet, 2>, 2> m_resolveDescSets = {{
+        { VK_NULL_HANDLE, VK_NULL_HANDLE },
+        { VK_NULL_HANDLE, VK_NULL_HANDLE }
+    }};
 
     VkPipelineCache  m_pipelineCache = VK_NULL_HANDLE;
     VkPipelineLayout m_prepPipeLayout = VK_NULL_HANDLE;

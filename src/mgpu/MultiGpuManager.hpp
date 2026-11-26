@@ -13,6 +13,7 @@
 #include "rt/NRCManager.hpp"
 #include "rt/GpuTlasUpdatePipeline.hpp"
 #include "rt/CausticsPipeline.hpp"
+#include "rt/UpwaysPipeline.hpp"
 #include "vulkan/Texture.hpp"
 #include <memory>
 #include <vector>
@@ -98,6 +99,34 @@ struct GpuDeviceNode {
     std::unique_ptr<Image> mlSpecularMotionImage;
     std::unique_ptr<Image> mlSkipImage;
     std::unique_ptr<Image> mlSpecAlbedoImage;
+    std::unique_ptr<Image> mlIrradianceImage;
+    std::unique_ptr<Image> mlPrimaryGuideImage;
+    std::unique_ptr<Image> mlSurfaceMvImage;
+    std::unique_ptr<Image> mlDiffHitDistImage;
+    std::unique_ptr<Image> mlSpecVmvImage;
+    std::unique_ptr<Image> mlSkipCompactImage;
+
+    // Secondary GPU Upways Pipeline & Fused Band-Parallel Pack Binding Cache
+    std::unique_ptr<UpwaysPipeline> upwaysPipeline;
+    VkImageView upwaysBoundIrrView = VK_NULL_HANDLE;
+    VkImageView upwaysBoundPrimView = VK_NULL_HANDLE;
+    VkImageView upwaysBoundSurfaceMvView = VK_NULL_HANDLE;
+    VkImageView upwaysBoundDiffHitDistView = VK_NULL_HANDLE;
+    VkImageView upwaysBoundSpecVmvView = VK_NULL_HANDLE;
+    VkImageView upwaysBoundSkipCompactView = VK_NULL_HANDLE;
+    std::array<VkBuffer, NUM_IN_FLIGHT> upwaysBoundPackBuf = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkDeviceSize upwaysBoundPackSize = 0;
+
+    void resetUpwaysBindingCache() {
+        upwaysBoundIrrView = VK_NULL_HANDLE;
+        upwaysBoundPrimView = VK_NULL_HANDLE;
+        upwaysBoundSurfaceMvView = VK_NULL_HANDLE;
+        upwaysBoundDiffHitDistView = VK_NULL_HANDLE;
+        upwaysBoundSpecVmvView = VK_NULL_HANDLE;
+        upwaysBoundSkipCompactView = VK_NULL_HANDLE;
+        upwaysBoundPackBuf.fill(VK_NULL_HANDLE);
+        upwaysBoundPackSize = 0;
+    }
 
     // Secondary GPU Dynamic Scene & Caustics Subsystems
     std::unique_ptr<GpuTlasUpdatePipeline> tlasUpdatePipeline;
@@ -144,6 +173,8 @@ public:
     void setConfig(const Config& config);
     void collectSecondaryTimestamps(uint32_t bufferSlot);
     void setWarmupSppOverride(uint32_t spp);
+    void resetNrcWeights();
+    void resetCausticsHistory();
     double getSecondaryGpuTimeMs() const;
     double getSecondaryTransferTimeMs() const;
     const std::string& getSecondaryDeviceName() const;
@@ -188,7 +219,11 @@ public:
                              bool enableSharpening = false,
                              float sharpness = 0.0f,
                              uint32_t totalSamples = 1u,
-                             uint32_t sortMode = 0);
+                             uint32_t sortMode = 0,
+                             bool isUpwaysBandParallel = false,
+                             UpwaysBandSplit upwaysBand = {},
+                             bool upwaysResetHistory = false,
+                             float upwaysExposureScale = 1.0f);
 
     // Wait for secondary GPU completion and copy data to destination host buffer
     void syncAndTransfer(uint32_t slot = 0, void* dstHostPtr = nullptr, size_t byteSize = 0);
@@ -284,6 +319,10 @@ private:
         float sharpness = 0.0f;
         uint32_t totalSamples = 1u;
         uint32_t sortMode = 0;
+        bool isUpwaysBandParallel = false;
+        UpwaysBandSplit upwaysBand{};
+        bool upwaysResetHistory = false;
+        float upwaysExposureScale = 1.0f;
         uint64_t timelineValue = 0;
         bool valid = false;
     };

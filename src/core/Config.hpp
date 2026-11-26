@@ -77,6 +77,12 @@ enum class UpwaysPrecision : uint8_t {
     Fp16 = 3  // IEEE FP16 WMMA fallback
 };
 
+enum class UpwaysVersion : uint8_t {
+    Auto = 0, // Resolve from weight file (190,208 B -> V5), else default V4
+    V4   = 4, // Upways 4.0 (24,064 B compact U-Net + KPN)
+    V5   = 5  // Upways 5.0 Pure-ML (190,208 B, 158,400 params)
+};
+
 // Post-mortem visualization overlays written directly over the output image
 // (bypass accumulation & tonemap). ReSTIR views require --restir.
 enum class DebugViewMode {
@@ -162,6 +168,20 @@ struct Config {
         return height;
     }
 
+    bool isUpwaysSuperResActive() const {
+        if (upscaler_mode == UpscalerMode::FSR) {
+            return false;
+        }
+        const bool upwaysActive = (denoiser_mode == DenoiserMode::Upways ||
+                                   upscaler_mode == UpscalerMode::Upways ||
+                                   upways_superres);
+        if (!upwaysActive) {
+            return false;
+        }
+        return (getRenderWidth() < width || getRenderHeight() < height ||
+                (upscaler_mode == UpscalerMode::Upways && upways_superres));
+    }
+
     // Dynamic Quality Governor & Target Frame Rate Limiter
     uint32_t target_fps = 0;          // 0 = uncapped [Default]
     float target_frame_time_ms = 8.3f; // Target frame time budget in milliseconds [Default: 8.3 ms]
@@ -204,6 +224,9 @@ struct Config {
     bool upways_heuristic_fallback = false; // Debug bypass: force analytical temporal/spatial heuristic instead of WMMA U-Net + KPN
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
     UpwaysPrecision upways_precision = UpwaysPrecision::Auto; // WMMA precision tier: Auto (FP8->INT8->FP16), Fp8, Int8, Fp16
+    UpwaysVersion upways_version = UpwaysVersion::Auto; // Runtime model version: Auto (4.0 unless 5.0 weights), V4, V5
+    uint32_t upways_band_halo = 24u;         // LR halo overlap rows per side in mGPU Upways Band-Parallel (8..64, multiple of 4; default: 24)
+    bool upways_dynamic_band_balance = true; // Dynamic topFraction load balancing in mGPU Upways Band-Parallel [Default: true]
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
     FsrVersion fsr_version = FsrVersion::Auto;       // Target FSR version when UpscalerMode::FSR is active [Default: Auto]
     bool upscaler_sharpening = false;                // Enable RCAS sharpening pass [default: false]

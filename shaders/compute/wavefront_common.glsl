@@ -167,7 +167,7 @@ vec2 octSign(vec2 v) {
 }
 
 vec2 octEncode(vec3 v) {
-    float invL1 = 1.0 / (abs(v.x) + abs(v.y) + abs(v.z));
+    float invL1 = 1.0 / max(abs(v.x) + abs(v.y) + abs(v.z), 1e-6);
     vec2 p = v.xy * invL1;
     vec2 wrapped = (vec2(1.0) - abs(p.yx)) * octSign(p);
     return mix(wrapped, p, greaterThanEqual(vec2(v.z), vec2(0.0)));
@@ -180,8 +180,12 @@ vec3 octDecode(vec2 f) {
     return normalize(vec3(xy, z));
 }
 
+#include "rgb9e5.glsl"
+
 uint packOct32(vec3 v) {
-    return packSnorm2x16(octEncode(normalize(v)));
+    float l2 = dot(v, v);
+    vec3 n = (l2 > 1e-12) ? (v * inversesqrt(l2)) : vec3(0.0, 0.0, 1.0);
+    return packSnorm2x16(octEncode(n));
 }
 
 vec3 unpackOct32(uint p) {
@@ -607,10 +611,10 @@ Hit getRayHitAtom(in RayHit hit) {
 struct RayState {
     uvec4 stateData;
     // x: packHalf2x16(throughput.rg)
-    // y: [15:0] half(throughput.b), [19:16] flags, [31:20] BSDF pdf code of the
-    //    vertex that spawned this ray (mis_common.glsl; 0 = no MIS, full weight)
+    // y: [15:0] half(throughput.b), [16] nrcSkip, [17] primaryTransmissive, [19:18] dispersionChannel,
+    //    [31:20] BSDF pdf code of the vertex that spawned this ray (mis_common.glsl; 0 = no MIS, full weight)
     // z: seed
-    // w: pixelIndex | specularFlag
+    // w: pixelIndex | specularFlag | causticApplied
 };
 
 // Ping-pong RayState and RayGeometry queues indexed via uniform scalar bounce parity (single descriptor set)
@@ -639,26 +643,30 @@ struct RayState {
 #define CAUSTIC_APPLIED_BIT           (1u << 30)
 #define PIXEL_INDEX_MASK              (0x3FFFFFFFu)
 
-RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode, bool nrcSkip) {
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode, bool nrcSkip, bool primaryTransmissive) {
     RayState s;
     s.stateData.x = packHalf2x16(vec2(throughput.rg));
-    uint flags = (nrcSkip ? 1u : 0u) | (causticApplied ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
+    uint flags = (nrcSkip ? 1u : 0u) | (primaryTransmissive ? 2u : 0u) | ((dispersionChannel & 3u) << 2u);
     s.stateData.y = (packHalf2x16(vec2(throughput.b, 0.0)) & 0xFFFFu) | (flags << 16u) | ((pdfCode & 0xFFFu) << 20u);
     s.stateData.z = seed;
     s.stateData.w = (pixelIndex & PIXEL_INDEX_MASK) | (isSpecularPath ? SPECULAR_FLAG_BIT : 0u) | (causticApplied ? CAUSTIC_APPLIED_BIT : 0u);
     return s;
 }
 
+RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode, bool nrcSkip) {
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, pdfCode, nrcSkip, false);
+}
+
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel, uint pdfCode) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, pdfCode, isSpecularPath);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, pdfCode, isSpecularPath, false);
 }
 
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied, uint dispersionChannel) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, 0u, isSpecularPath);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, dispersionChannel, 0u, isSpecularPath, false);
 }
 
 RayState packRayState(f16vec3 throughput, uint seed, uint pixelIndex, bool isSpecularPath, bool causticApplied) {
-    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u, 0u, isSpecularPath);
+    return packRayState(throughput, seed, pixelIndex, isSpecularPath, causticApplied, 0u, 0u, isSpecularPath, false);
 }
 
 uint unpackRayPdfCode(RayState s) {
@@ -667,6 +675,10 @@ uint unpackRayPdfCode(RayState s) {
 
 bool unpackRayNrcSkip(RayState s) {
     return ((s.stateData.y >> 16u) & 1u) != 0u;
+}
+
+bool unpackRayPrimaryTransmissive(RayState s) {
+    return ((s.stateData.y >> 17u) & 1u) != 0u;
 }
 
 void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint pixelIndex, out bool isSpecularPath, out bool causticApplied, out uint dispersionChannel) {
@@ -683,59 +695,83 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
 }
 
 // Record First-Bounce Specular Virtual Motion Vector & Disparity (VMV)
-// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage for E-SVGF/Upways.
+// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage (legacy)
+// or write-only uMlSpecVmvImage (compact live) for E-SVGF/Upways.
 // Projects the planar virtual image point x_virt = x_primary + d_refl * r_primary along the primary viewing ray.
 #define RECORD_SPECULAR_VMV(pixelIdx, pt, hitDist, isMiss) \
     do { \
         if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
             wfStoreIndirectSpecularHitDist(pCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
-            vec4 smPrev_ = imageLoad(uMlSpecularMotionImage, pCoord_); if (smPrev_.z >= 0.0) { vec2 vSurf_ = smPrev_.xy; \
-            float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
-            vec3 toSurf_ = origin - ubo.position.xyz; \
-            float surfDist_ = length(toSurf_); \
-            vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
-            vec3 xVirt_ = origin + primDir_ * reflDist_; \
-            vec3 prevXVirt_ = xVirt_; \
-            InstanceGPU rInst_; if (!(isMiss) && hit.hitData.z != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData.y]).transform != rInst_.invTransform)) { \
-                vec3 rLocalPos_ = (inverse(rInst_.transform) * vec4((pt), 1.0)).xyz; \
-                vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
-                vec3 rDeltaWorld_ = (pt) - rPrevWorld_; \
-                vec3 reflAxis_ = rayDir - primDir_; \
-                float axisLenSq_ = dot(reflAxis_, reflAxis_); \
-                vec3 nMirror_ = (axisLenSq_ > 1e-6) ? (reflAxis_ * inversesqrt(axisLenSq_)) : vec3(0.0, 1.0, 0.0); \
-                vec3 virtDelta_ = rDeltaWorld_ - 2.0 * dot(rDeltaWorld_, nMirror_) * nMirror_; \
-                prevXVirt_ = xVirt_ - virtDelta_; \
+            const bool isCompact_ = (pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u; \
+            bool skipVmv_ = false; \
+            vec2 vSurf_ = vec2(0.0); \
+            if (isCompact_) { \
+                skipVmv_ = unpackRayPrimaryTransmissive(state); \
+            } else { \
+                vec4 smPrev_ = imageLoad(uMlSpecularMotionImage, pCoord_); \
+                skipVmv_ = (smPrev_.z < 0.0); \
+                vSurf_ = smPrev_.xy; \
             } \
-            vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
-            vec4 pClip_ = ubo.prevViewProj * vec4(prevXVirt_, 1.0); \
-            vec2 vS_ = vSurf_; \
-            if (cClip_.w > 1e-4) { \
-                if (pClip_.w > 1e-2) { \
-                    vS_ = clamp((cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5, vec2(-2.0), vec2(2.0)); \
+            if (!skipVmv_) { \
+                float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
+                vec3 toSurf_ = origin - ubo.position.xyz; \
+                float surfDist_ = length(toSurf_); \
+                vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
+                vec3 xVirt_ = origin + primDir_ * reflDist_; \
+                vec3 prevXVirt_ = xVirt_; \
+                InstanceGPU rInst_; if (!(isMiss) && hit.hitData.z != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData.y]).transform != rInst_.invTransform)) { \
+                    vec3 rLocalPos_ = (inverse(rInst_.transform) * vec4((pt), 1.0)).xyz; \
+                    vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
+                    vec3 rDeltaWorld_ = (pt) - rPrevWorld_; \
+                    vec3 reflAxis_ = rayDir - primDir_; \
+                    float axisLenSq_ = dot(reflAxis_, reflAxis_); \
+                    vec3 nMirror_ = (axisLenSq_ > 1e-6) ? (reflAxis_ * inversesqrt(axisLenSq_)) : vec3(0.0, 1.0, 0.0); \
+                    vec3 virtDelta_ = rDeltaWorld_ - 2.0 * dot(rDeltaWorld_, nMirror_) * nMirror_; \
+                    prevXVirt_ = xVirt_ - virtDelta_; \
+                } \
+                vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
+                vec4 pClip_ = ubo.prevViewProj * vec4(prevXVirt_, 1.0); \
+                vec2 vS_ = vSurf_; \
+                if (cClip_.w > 1e-4) { \
+                    if (pClip_.w > 1e-2) { \
+                        vS_ = clamp((cClip_.xy / cClip_.w - pClip_.xy / pClip_.w) * 0.5, vec2(-2.0), vec2(2.0)); \
+                    } else { \
+                        vS_ = vec2(2.0); \
+                    } \
+                } \
+                float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
+                if (isCompact_) { \
+                    if (cClip_.w > 1e-4) { \
+                        float storedDist_ = (isMiss) ? 1000.0 : clamp(reflDist_, 0.0, 65504.0); \
+                        imageStore(uMlSpecVmvImage, pCoord_, uvec4(packHalf2x16(vS_), packHalf2x16(vec2(dS_, storedDist_)), 0u, 0u)); \
+                    } \
                 } else { \
-                    vS_ = vec2(2.0); \
+                    imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); \
                 } \
             } \
-            float dS_ = (isMiss) ? 0.0 : (1.0 / (1.0 + reflDist_)); \
-            imageStore(uMlSpecularMotionImage, pCoord_, vec4(vS_, dS_, reflDist_)); } \
         } \
     } while(false)
 
-// Records normalized first-bounce diffuse indirect hit distance into uMlDiffuseImage.a for Upways 4.0
-// and raw world hit distance into uIndirectDiffuseImage.a for 4-signal Ray Regeneration.
+// Records normalized first-bounce diffuse indirect hit distance into uMlDiffuseImage.a (legacy)
+// or write-only uMlDiffHitDistImage (compact live r8, avoiding RMW on rgba32ui) for Upways and raw hit distance into uIndirectDiffuseImage.a for 4-signal.
 #define RECORD_DIFFUSE_HIT_DIST(pixelIdx, hitDist, isMiss) \
     do { \
         if (pc.currentBounce == 1u && !isSpecularPath && \
             ((pc.captureMlData & (ML_CAPTURE_UPWAYS_V4_BIT | ML_CAPTURE_SPLIT_4SIG_BIT)) != 0u) && \
             pc.sppSampleIndex == 0u) { \
             ivec2 dCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
-            if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) { \
-                vec4 dPrev_ = imageLoad(uMlDiffuseImage, dCoord_); \
+            if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) { \
                 float normDist_ = (isMiss) ? 1.0 : clamp(float(hitDist) / (1.0 + max(float(hitDist), 0.0)), 0.0, 1.0); \
-                imageStore(uMlDiffuseImage, dCoord_, vec4(dPrev_.rgb, normDist_)); \
+                imageStore(uMlDiffHitDistImage, dCoord_, vec4(normDist_, 0.0, 0.0, 0.0)); \
+            } else { \
+                if ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) { \
+                    vec4 dPrev_ = imageLoad(uMlDiffuseImage, dCoord_); \
+                    float normDist_ = (isMiss) ? 1.0 : clamp(float(hitDist) / (1.0 + max(float(hitDist), 0.0)), 0.0, 1.0); \
+                    imageStore(uMlDiffuseImage, dCoord_, vec4(dPrev_.rgb, normDist_)); \
+                } \
+                wfStoreIndirectDiffuseHitDist(dCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
             } \
-            wfStoreIndirectDiffuseHitDist(dCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
         } \
     } while(false)
 
@@ -779,6 +815,26 @@ uint getMaterialArchetype(Material mat) {
     }
     // 4. Standard PBR (Dielectric diffuse base + GGX specular dual-lobe reflection, and Metallic conductors)
     return MATERIAL_ARCHETYPE_STANDARD;
+}
+
+// Dynamic reactivity mask for temporal denoisers (Upways):
+// Non-zero ONLY for unrepresented / non-rigid temporal invalidators
+// (active video billboards, animated procedural holograms/water).
+// Static rigid PBR materials return 0.0 so temporal history is preserved.
+float computeDynamicReactiveMask(in Material mat, uint uboFlags) {
+    bool dynamicVideoActive = (uboFlags & (1u << 12)) != 0u;
+    bool sceneAnimActive = (uboFlags & (1u << 13)) != 0u;
+    if (dynamicVideoActive && (((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u) || (mat.emissiveTex == 1u))) {
+        return 1.0;
+    }
+    if (sceneAnimActive && ((mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u)) {
+        return 0.75;
+    }
+    bool isWater = ((mat.type & MATERIAL_FLAG_PROCEDURAL_WATER) != 0u) || (mat.normalTex == 0xFFFFFF03u);
+    if (sceneAnimActive && isWater) {
+        return 0.6;
+    }
+    return 0.0;
 }
 
 // 32-byte clean aligned packed shadow ray

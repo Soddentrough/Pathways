@@ -332,6 +332,7 @@ bool ImageDumper::saveStatsJSON(const std::string& filepath, const FrameStats& s
         << std::format("    \"denoiser_mode\": \"{}\",\n", stats.denoiser_mode_str)
         << std::format("    \"enable_nrc\": {},\n", stats.enable_nrc ? "true" : "false")
         << std::format("    \"upscaler_mode\": \"{}\",\n", stats.upscaler_mode_str)
+        << std::format("    \"upways_version\": \"{}\",\n", stats.upways_version_str)
         << std::format("    \"upways_precision\": \"{}\",\n", stats.upways_precision_str)
         << std::format("    \"render_scale\": {:.2f},\n", stats.render_scale)
         << std::format("    \"spp\": {},\n", stats.spp)

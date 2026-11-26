@@ -163,6 +163,13 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/upways_denoiser_wmma.comp
     ${SHADER_DIR}/compute/upways_upscaler_wmma.comp
     ${SHADER_DIR}/compute/upways_upscale_resolve.comp
+    ${SHADER_DIR}/compute/upways_band_pack.comp
+    ${SHADER_DIR}/compute/upways_band_stitch.comp
+    ${SHADER_DIR}/compute/upways_v5_prep.comp
+    ${SHADER_DIR}/compute/upways_v5_unet_wmma.comp
+    ${SHADER_DIR}/compute/upways_v5_affinity.comp
+    ${SHADER_DIR}/compute/upways_v5_upscaler_wmma.comp
+    ${SHADER_DIR}/compute/upways_v5_resolve.comp
     ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
     ${SHADER_DIR}/compute/ffx_rr_prep.comp
@@ -274,6 +281,13 @@ add_specialized_wf_shader(upways_denoise_prep.fp16.comp upways_denoise_prep.comp
 add_specialized_wf_shader(upways_denoiser_wmma.fp16.comp upways_denoiser_wmma.comp -DUPWAYS_PRECISION_MODE=2)
 add_specialized_wf_shader(upways_upscaler_wmma.fp16.comp upways_upscaler_wmma.comp -DUPWAYS_PRECISION_MODE=2)
 add_specialized_wf_shader(upways_upscale_resolve.fp16.comp upways_upscale_resolve.comp -DUPWAYS_PRECISION_MODE=2)
+
+# Upways 5.0 Pure-ML INT8 QAT variants (FP8 E4M3fn is default UPWAYS_PRECISION_MODE=0)
+add_specialized_wf_shader(upways_v5_prep.int8.comp upways_v5_prep.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_v5_unet_wmma.int8.comp upways_v5_unet_wmma.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_v5_affinity.int8.comp upways_v5_affinity.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_v5_upscaler_wmma.int8.comp upways_v5_upscaler_wmma.comp -DUPWAYS_PRECISION_MODE=1)
+add_specialized_wf_shader(upways_v5_resolve.int8.comp upways_v5_resolve.comp -DUPWAYS_PRECISION_MODE=1)
 
 add_custom_target(compile_shaders ALL DEPENDS ${SPV_FILES})
 
@@ -590,6 +604,12 @@ add_custom_target(package_upways_weights
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
         "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_v5_weights.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights_int8.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_v5_weights_int8.bin"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/bin/data/models"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
@@ -597,63 +617,58 @@ add_custom_target(package_upways_weights
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
         "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights_int8.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_v5_weights.bin"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights_int8.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_v5_weights_int8.bin"
     BYPRODUCTS
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
         "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_weights.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_default_int8_weights.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights.bin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_v5_weights_int8.bin"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_v5_default_weights.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/upways_v5_default_int8_weights.hpp"
         "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
         "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_v5_weights.bin"
+        "${CMAKE_BINARY_DIR}/data/models/upways_v5_weights_int8.bin"
         "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights.bin"
         "${CMAKE_BINARY_DIR}/bin/data/models/upways_weights_int8.bin"
-    COMMENT "Checking and packaging updated Upways neural weights"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_v5_weights.bin"
+        "${CMAKE_BINARY_DIR}/bin/data/models/upways_v5_weights_int8.bin"
+    COMMENT "Checking and packaging updated Upways 4.0 and 5.0 neural weights"
 )
 
 add_dependencies(pathways_engine_core package_upways_weights)
 
-# Deploy default neural reconstruction weights to build tree
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
-    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
-         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
-    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
-        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
-        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
-             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
+# Deploy default neural reconstruction weights (4.0 & 5.0) to build tree
+foreach(UPWAYS_WEIGHT_FILE upways_weights.bin upways_weights_int8.bin upways_v5_weights.bin upways_v5_weights_int8.bin)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/${UPWAYS_WEIGHT_FILE}")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
+        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/${UPWAYS_WEIGHT_FILE}"
+             DESTINATION "${CMAKE_BINARY_DIR}/data/models")
+        if(EXISTS "${CMAKE_BINARY_DIR}/bin")
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
+            file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/${UPWAYS_WEIGHT_FILE}"
+                 DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
+        endif()
+        add_custom_command(TARGET pathways POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/data/models/${UPWAYS_WEIGHT_FILE}"
+                "${CMAKE_BINARY_DIR}/data/models/${UPWAYS_WEIGHT_FILE}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/data/models/${UPWAYS_WEIGHT_FILE}"
+                "$<TARGET_FILE_DIR:pathways>/data/models/${UPWAYS_WEIGHT_FILE}"
+            COMMENT "Deploying ${UPWAYS_WEIGHT_FILE} to build tree"
+        )
     endif()
-    add_custom_command(TARGET pathways POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
-            "${CMAKE_BINARY_DIR}/data/models/upways_weights.bin"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights.bin"
-            "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights.bin"
-        COMMENT "Deploying Upways FP8 neural weights to build tree"
-    )
-endif()
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin")
-    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/data/models")
-    file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
-         DESTINATION "${CMAKE_BINARY_DIR}/data/models")
-    if(EXISTS "${CMAKE_BINARY_DIR}/bin")
-        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/bin/data/models")
-        file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
-             DESTINATION "${CMAKE_BINARY_DIR}/bin/data/models")
-    endif()
-    add_custom_command(TARGET pathways POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/data/models"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
-            "${CMAKE_BINARY_DIR}/data/models/upways_weights_int8.bin"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:pathways>/data/models"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/data/models/upways_weights_int8.bin"
-            "$<TARGET_FILE_DIR:pathways>/data/models/upways_weights_int8.bin"
-        COMMENT "Deploying Upways INT8 QAT neural weights to build tree"
-    )
-endif()
+endforeach()
 
 # Testing
 option(BUILD_TESTING "Build unit test executables" ON)

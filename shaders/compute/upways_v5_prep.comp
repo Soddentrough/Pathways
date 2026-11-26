@@ -1,0 +1,273 @@
+#version 460
+#include "upways_v5_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0,  rg32ui)   readonly  uniform uimage2D uMlIrradiance;
+layout(set = 0, binding = 1,  rgba32ui) readonly  uniform uimage2D uMlPrimaryGuide;
+layout(set = 0, binding = 2,  r32ui)    readonly  uniform uimage2D uMlSurfaceMv;
+layout(set = 0, binding = 3,  r8)       readonly  uniform image2D  uMlDiffHitDist;
+layout(set = 0, binding = 4,  rg32ui)   readonly  uniform uimage2D uMlSpecVmv;
+layout(set = 0, binding = 5,  r32ui)    readonly  uniform uimage2D uMlSkipCompact;
+
+layout(set = 0, binding = 6,  rgba16f)  readonly  uniform image2D  uPrevDiffLr;
+layout(set = 0, binding = 7,  rgba16f)  readonly  uniform image2D  uPrevSpecLr;
+layout(set = 0, binding = 8,  rgba16f)  readonly  uniform image2D  uPrevGeomLr;
+layout(set = 0, binding = 9,  rg16f)    readonly  uniform image2D  uPrevHiddenLr;
+
+layout(set = 0, binding = 10, rgba16f)  writeonly uniform image2D  uCurrGeomLr;
+layout(set = 0, binding = 11)           writeonly buffer  OutX1Buf { uvec2 act2[]; } g_x1;
+
+// 18x10 cooperative L0 halo: 180 * 5 uint32 = 900 dwords = 3,600 B
+shared uint s_halo[900];
+
+#define SAMPLE_IMG_BILINEAR(img, coord, dims, tapsOut) \
+    do { \
+        BilinearTaps _bt = computeBilinearTaps((coord), (dims)); \
+        (tapsOut) = _bt.w.x * imageLoad((img), _bt.i00) \
+                  + _bt.w.y * imageLoad((img), _bt.i10) \
+                  + _bt.w.z * imageLoad((img), _bt.i01) \
+                  + _bt.w.w * imageLoad((img), _bt.i11); \
+    } while (false)
+
+void storeHalo(uint ap, float dep, float specDist, vec3 nrm, vec3 albEff, vec3 logWd) {
+    uint b = ap * 5u;
+    s_halo[b + 0u] = packHalf2x16(vec2(dep, specDist));
+    s_halo[b + 1u] = packHalf2x16(nrm.xy);
+    s_halo[b + 2u] = packHalf2x16(vec2(nrm.z, logWd.b));
+    s_halo[b + 3u] = packUnorm4x8(vec4(clamp(albEff, vec3(0.0), vec3(1.0)), 0.0));
+    s_halo[b + 4u] = packHalf2x16(logWd.rg);
+}
+
+void loadHalo(uint ap, out float dep, out float specDist, out vec3 nrm, out vec3 albEff, out vec3 logWd) {
+    uint b = ap * 5u;
+    vec2 h0 = unpackHalf2x16(s_halo[b + 0u]);
+    vec2 h1 = unpackHalf2x16(s_halo[b + 1u]);
+    vec2 h2 = unpackHalf2x16(s_halo[b + 2u]);
+    vec4 u3 = unpackUnorm4x8(s_halo[b + 3u]);
+    vec2 h4 = unpackHalf2x16(s_halo[b + 4u]);
+    dep      = h0.x;
+    specDist = h0.y;
+    nrm      = vec3(h1, h2.x);
+    albEff   = u3.rgb;
+    logWd    = vec3(h4, h2.y);
+}
+
+uint encodeX0Vec4(vec4 v, vec4 int8Max) {
+#if UPWAYS_IS_FP8
+    return packFp8Vec4(v);
+#else
+    return packInt8Vec4(v, int8Max);
+#endif
+}
+
+void main() {
+    int  W     = int(pc.lrWidth);
+    int  H     = int(pc.lrHeight);
+    int  wgX   = int(gl_WorkGroupID.x * 16u);
+    int  wgY   = int(gl_WorkGroupID.y * 8u);
+    uint t     = gl_LocalInvocationIndex; // 0..127
+    bool reset = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+
+    // 1. Cooperatively populate 18x10 L0 halo (180 entries across 128 threads)
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        uint ap = pass * 128u + t;
+        if (ap < 180u) {
+            uint ay = ap / 18u;
+            uint ax = ap - ay * 18u;
+            ivec2 q = clamp(ivec2(wgX + int(ax) - 1, wgY + int(ay) - 1), ivec2(0), ivec2(W - 1, H - 1));
+
+            uvec4 pg         = imageLoad(uMlPrimaryGuide, q);
+            vec2  surfMvH    = unpackHalf2x16(imageLoad(uMlSurfaceMv, q).x);
+            vec2  surfMv     = vec2(sanitizeFloat(surfMvH.x, 0.0), sanitizeFloat(surfMvH.y, 0.0));
+            uvec2 specVmvRaw = imageLoad(uMlSpecVmv, q).xy;
+
+            vec3  viewNormal, aDiff, aSpec;
+            float linDepth, reactiveMask, roughness, matClass;
+            bool  transBit;
+            unpackCompactPrimary(pg, viewNormal, linDepth, reactiveMask, aDiff, roughness, aSpec, matClass, transBit);
+
+            bool isSky = isSkyOrEmissiveOnly(linDepth, matClass, aDiff, aSpec);
+            vec2  specMv;
+            float specInvZ, specDist;
+            unpackCompactSpecVmv(specVmvRaw, surfMv, linDepth, transBit, isSky, specMv, specInvZ, specDist);
+
+            bool isDiel = (!isSky) && (transBit || (specInvZ < -1e-5) || ((matClass > 0.55) && (matClass < 0.79)));
+            vec3 albEff = isDiel ? vec3(1.0) : clamp(aDiff + aSpec, vec3(0.0), vec3(1.0));
+
+            ivec2 prevDims = imageSize(uPrevDiffLr);
+            vec2 coordD;
+            bool inD = computeBandWarpCoord(q, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
+            vec3 logWd = vec3(0.0);
+            if (inD) {
+                vec4 wd4;
+                SAMPLE_IMG_BILINEAR(uPrevDiffLr, coordD, prevDims, wd4);
+                vec3 wDiff = clampFp16Rgb(sanitizeRgb(wd4.rgb));
+                logWd = safeLog1p(wDiff);
+            }
+            storeHalo(ap, linDepth, specDist, viewNormal, albEff, logWd);
+        }
+    }
+    barrier();
+
+    ivec2 p = ivec2(wgX + int(gl_LocalInvocationID.x), wgY + int(gl_LocalInvocationID.y));
+    if (p.x >= W || p.y >= H) {
+        return;
+    }
+
+    // 2. Center G-buffer unpack & dielectric folding
+    uvec2 irr        = imageLoad(uMlIrradiance, p).xy;
+    uvec4 pg         = imageLoad(uMlPrimaryGuide, p);
+    vec2  surfMvRaw  = unpackHalf2x16(imageLoad(uMlSurfaceMv, p).x);
+    float dhd        = clamp(sanitizeFloat(imageLoad(uMlDiffHitDist, p).r, 0.0), 0.0, 1.0);
+    uvec2 specVmvRaw = imageLoad(uMlSpecVmv, p).xy;
+    vec3  skipRad    = unpackCompactSkip(imageLoad(uMlSkipCompact, p).r);
+
+    vec3  viewNormal, aDiff, aSpec;
+    float linDepth, reactiveMask, roughness, matClass;
+    bool  transBit;
+    unpackCompactPrimary(pg, viewNormal, linDepth, reactiveMask, aDiff, roughness, aSpec, matClass, transBit);
+    imageStore(uCurrGeomLr, p, vec4(viewNormal, linDepth));
+
+    vec2 surfMv = vec2(sanitizeFloat(surfMvRaw.x, 0.0), sanitizeFloat(surfMvRaw.y, 0.0));
+    bool isSkyPre = isSkyOrEmissiveOnly(linDepth, matClass, aDiff, aSpec);
+    vec2  specMv;
+    float specInvZ, specDist;
+    unpackCompactSpecVmv(specVmvRaw, surfMv, linDepth, transBit, isSkyPre, specMv, specInvZ, specDist);
+
+    vec3 rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff;
+    bool isSky, isDiel;
+    demodulateAndFoldV5(
+        irr, aDiff, aSpec, skipRad, linDepth, matClass, transBit, specInvZ,
+        rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, isSky, isDiel
+    );
+
+    // 3. Reconstruct warped history & cardinal edge features
+    uint lx  = gl_LocalInvocationID.x;
+    uint ly  = gl_LocalInvocationID.y;
+    uint cAp = (ly + 1u) * 18u + (lx + 1u);
+
+    float depHalo, sdHalo;
+    vec3  nrmHalo, albC, logWdC;
+    loadHalo(cAp, depHalo, sdHalo, nrmHalo, albC, logWdC);
+
+    ivec2 prevDims = imageSize(uPrevDiffLr);
+    vec2 coordD, coordS;
+    bool inD = computeBandWarpCoord(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
+    bool inS = computeBandWarpCoord(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordS);
+    float validSurf = inD ? 1.0 : 0.0;
+    float validVirt = inS ? 1.0 : 0.0;
+
+    vec3  wSpecSurf = vec3(0.0), wSpecVirt = vec3(0.0);
+    vec3  wNrm      = viewNormal;
+    float wDepth    = linDepth;
+    vec2  wHid      = vec2(0.0);
+
+    if (inD) {
+        vec4 ws4, wg, wh4;
+        SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordD, prevDims, ws4);
+        SAMPLE_IMG_BILINEAR(uPrevGeomLr, coordD, prevDims, wg);
+        SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
+        wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
+        wNrm      = normalizeNormalV5(vec3(sanitizeFloat(wg.r, 0.0), sanitizeFloat(wg.g, 0.0), sanitizeFloat(wg.b, 1.0)));
+        wDepth    = clamp(sanitizeFloat(wg.a, 10000.0), 0.0, 10000.0);
+        wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
+    }
+    if (inS) {
+        vec4 wsv4;
+        SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
+        wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+    }
+
+    float maxRelDz = 0.0;
+    float maxDn    = 0.0;
+    float maxDsd   = 0.0;
+    float maxDalb  = 0.0;
+    float maxDwd   = 0.0;
+    if (!isSky) {
+        int offH[4] = int[4](-1, 1, -18, 18);
+        float safeZ  = max(linDepth, 1e-2);
+        float safeSd = max(specDist + 0.1, 0.1);
+        for (uint k = 0u; k < 4u; ++k) {
+            float nZ, nSd;
+            vec3  nN, nAlb, nLwd;
+            loadHalo(uint(int(cAp) + offH[k]), nZ, nSd, nN, nAlb, nLwd);
+            maxRelDz = max(maxRelDz, abs(nZ - linDepth) / safeZ);
+            maxDn    = max(maxDn, max(1.0 - dot(nN, viewNormal), 0.0));
+            maxDsd   = max(maxDsd, abs(nSd - specDist) / safeSd);
+            vec3 da  = abs(nAlb - albC);
+            maxDalb  = max(maxDalb, max(da.r, max(da.g, da.b)));
+            vec3 dw  = abs(nLwd - logWdC);
+            maxDwd   = max(maxDwd, max(dw.r, max(dw.g, dw.b)));
+        }
+    }
+    float dzEdge     = isSky ? 0.0 : clamp(safeLog1pF(maxRelDz * 32.0), 0.0, 4.0);
+    float structEdge = isSky ? 0.0 : clamp(safeLog1pF(maxDn * 16.0 + maxDsd * 8.0 + maxDalb * 4.0 + validSurf * maxDwd * 3.0), 0.0, 4.0);
+
+    float depthRelDiff = clamp((linDepth - wDepth) / max(linDepth, 1e-2), -1.0, 1.0);
+    float nrmDot       = clamp(dot(viewNormal, wNrm), -1.0, 1.0);
+    float effMv        = max(sqrt(dot(surfMv, surfMv) + 1e-12), sqrt(dot(specMv, specMv) + 1e-12));
+    float specInvEnc   = (abs(specInvZ) > 1e-5) ? (specInvZ * 4.0) : (4.0 / (1.0 + linDepth));
+    float specDistEnc  = (2.0 * validVirt - 1.0) * clamp(safeLog1pF(specDist) * 0.5, 0.0, 4.0);
+    float srSign       = ((pc.flags & UPWAYS_V5_FLAG_ENABLE_SUPERRES) != 0u) ? 1.0 : -1.0;
+    float mvSrEnc      = srSign * (0.25 + clamp(safeLog1pF(effMv * 1024.0), 0.0, 3.75));
+
+    vec4 c0 = vec4(safeLog1p(rawDiff), logWdC.r);
+    vec4 c1 = vec4(logWdC.gb, safeLog1p(rawSpec).rg);
+    vec4 c2 = vec4(safeLog1pF(rawSpec.b), validSurf * safeLog1p(wSpecSurf));
+    vec4 c3 = vec4(validVirt * safeLog1p(wSpecVirt), viewNormal.x * 4.0);
+    vec4 c4 = vec4(viewNormal.yz * 4.0, safeLog1pF(linDepth), validSurf * depthRelDiff * 4.0);
+    vec4 c5 = vec4(validSurf * nrmDot * 4.0, (roughness - 0.35) * 4.0, (matClass - 0.5) * 4.0, reactiveMask * 4.0);
+    vec4 c6 = vec4(dhd * 4.0, specInvEnc, specDistEnc, mvSrEnc);
+    vec4 c7 = vec4(validSurf * wHid, dzEdge, structEdge);
+
+    uvec4 p03 = uvec4(
+        encodeX0Vec4(c0, V5_X0_INT8_MAX_0),
+        encodeX0Vec4(c1, V5_X0_INT8_MAX_1),
+        encodeX0Vec4(c2, V5_X0_INT8_MAX_2),
+        encodeX0Vec4(c3, V5_X0_INT8_MAX_3)
+    );
+    uvec4 p47 = uvec4(
+        encodeX0Vec4(c4, V5_X0_INT8_MAX_4),
+        encodeX0Vec4(c5, V5_X0_INT8_MAX_5),
+        encodeX0Vec4(c6, V5_X0_INT8_MAX_6),
+        encodeX0Vec4(c7, V5_X0_INT8_MAX_7)
+    );
+
+    // 4. Space-to-depth 2x2 L1 write (128 ch/L1px) + odd-edge replicate padding
+    int  W1     = (W + 1) >> 1;
+    int  qx     = p.x >> 1;
+    int  qy     = p.y >> 1;
+    uint corner = uint(((p.y & 1) << 1) | (p.x & 1));
+    uint l1Base = (pc.off0 >> 1u) + uint(qy * W1 + qx) * 16u;
+
+    uint bC = l1Base + corner * 4u;
+    g_x1.act2[bC + 0u] = p03.xy;
+    g_x1.act2[bC + 1u] = p03.zw;
+    g_x1.act2[bC + 2u] = p47.xy;
+    g_x1.act2[bC + 3u] = p47.zw;
+
+    bool repX = (p.x == W - 1) && ((W & 1) != 0);
+    bool repY = (p.y == H - 1) && ((H & 1) != 0);
+    if (repX) {
+        uint bX = l1Base + (corner | 1u) * 4u;
+        g_x1.act2[bX + 0u] = p03.xy;
+        g_x1.act2[bX + 1u] = p03.zw;
+        g_x1.act2[bX + 2u] = p47.xy;
+        g_x1.act2[bX + 3u] = p47.zw;
+    }
+    if (repY) {
+        uint bY = l1Base + (corner | 2u) * 4u;
+        g_x1.act2[bY + 0u] = p03.xy;
+        g_x1.act2[bY + 1u] = p03.zw;
+        g_x1.act2[bY + 2u] = p47.xy;
+        g_x1.act2[bY + 3u] = p47.zw;
+    }
+    if (repX && repY) {
+        uint bXY = l1Base + 3u * 4u;
+        g_x1.act2[bXY + 0u] = p03.xy;
+        g_x1.act2[bXY + 1u] = p03.zw;
+        g_x1.act2[bXY + 2u] = p47.xy;
+        g_x1.act2[bXY + 3u] = p47.zw;
+    }
+}

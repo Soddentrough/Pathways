@@ -176,6 +176,12 @@ public:
         Image* mlIndirectDiffuseImage = nullptr,
         Image* mlDirectSpecularImage = nullptr,
         Image* mlIndirectSpecularImage = nullptr,
+        Image* mlIrradianceImage = nullptr,
+        Image* mlPrimaryGuideImage = nullptr,
+        Image* mlSurfaceMvImage = nullptr,
+        Image* mlDiffHitDistImage = nullptr,
+        Image* mlSpecVmvImage = nullptr,
+        Image* mlSkipCompactImage = nullptr,
         Image* motionVectorImage = nullptr
     );
 

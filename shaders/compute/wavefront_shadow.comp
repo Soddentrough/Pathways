@@ -169,26 +169,32 @@ void main() {
             vec3 specRadRaw = radiance * specFrac;
             vec3 diffRad = diffRadRaw * invSpp;
             vec3 specRad = specRadRaw * invSpp;
-            if (pc.currentBounce == 0u) {
-                wfAddSplitDirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
-            } else {
-                wfAddSplitIndirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
-            }
-            bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-            if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
-                if (dot(diffRad, diffRad) > 1e-12) {
-                    vec3 outDiff = isV4
-                        ? demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
-                        : diffRad;
-                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+            if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
+                if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                    wfAddCompactMlIrradiance(pixelCoord, diffRad, specRad);
                 }
-                if (dot(specRad, specRad) > 1e-12) {
-                    vec3 outSpec = isV4
-                        ? demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
-                        : specRad;
-                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+            } else {
+                if (pc.currentBounce == 0u) {
+                    wfAddSplitDirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
+                } else {
+                    wfAddSplitIndirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
+                }
+                bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
+                    if (dot(diffRad, diffRad) > 1e-12) {
+                        vec3 outDiff = isV4
+                            ? demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                            : diffRad;
+                        vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                        imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
+                    }
+                    if (dot(specRad, specRad) > 1e-12) {
+                        vec3 outSpec = isV4
+                            ? demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                            : specRad;
+                        vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                        imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
+                    }
                 }
             }
         }

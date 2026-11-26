@@ -335,14 +335,23 @@ int main() {
         check_true(mgpu.getPrimaryImportedTimelineSemaphore() != VK_NULL_HANDLE,
                    "Primary imported timeline semaphore must be valid");
 
-        // Verify shared buffer reserves space for GPU 1's compacted checkerboard grid (radiance + 8x RGBA16F guide planes)
-        const uint32_t tileSize = (cfgOn.tile_size == 0u) ? 64u : cfgOn.tile_size;
-        const uint32_t numTilesX = (cfgOn.width + tileSize - 1u) / tileSize;
+        // Verify shared buffer reserves space for worst-case dynamic bottom band (topFraction = 0.25)
+        const UpwaysBandSplit maxBotSplit = computeUpwaysBandSplit(cfgOn.height, cfgOn.height, cfgOn.upways_band_halo, 0.25f);
+        const VkDeviceSize minBandBytes = static_cast<VkDeviceSize>(cfgOn.width) * (cfgOn.height - maxBotSplit.splitHrY) * 4u;
+        check_true(mgpu.getSharedBufferSize() >= minBandBytes,
+                   "Shared inter-GPU buffer must fit worst-case dynamic bottom band 4 B/px RGB9E5 output");
+
+        // Verify legacy 8-plane CheckerboardTile buffer sizing remains intact when training capture is enabled
+        Config cfgLegacy = cfgOn;
+        cfgLegacy.capture_training_data_dir = "tmp_cap";
+        mgpu.setConfig(cfgLegacy);
+        const uint32_t tileSize = (cfgLegacy.tile_size == 0u) ? 64u : cfgLegacy.tile_size;
+        const uint32_t numTilesX = (cfgLegacy.width + tileSize - 1u) / tileSize;
         const uint32_t secTileCols = (numTilesX + 1u) / 2u;
-        const VkDeviceSize secPixelCount = static_cast<VkDeviceSize>(secTileCols * tileSize) * cfgOn.height;
+        const VkDeviceSize secPixelCount = static_cast<VkDeviceSize>(secTileCols * tileSize) * cfgLegacy.height;
         const VkDeviceSize minExpectedBytes = secPixelCount * 8u + 8u * secPixelCount * 8u; // FP16 radiance + 8x RGBA16F planes
         check_true(mgpu.getSharedBufferSize() >= minExpectedBytes,
-                   "Shared inter-GPU buffer must fit radiance + all 8 demodulated denoiser/ML guide planes");
+                   "Shared inter-GPU buffer must fit radiance + all 8 demodulated denoiser/ML guide planes in legacy capture mode");
 
         VulkanContext* secCtx = mgpu.getSecondaryContext();
         check_true(secCtx != nullptr && secCtx->getValidationErrors() == 0,
@@ -350,7 +359,83 @@ int main() {
         check_true(primaryCtx.getValidationErrors() == 0,
                    "Primary GPU context must have zero Vulkan validation errors");
         std::cout << "  -> Real MultiGpuManager lazy init, timeline sync, and "
-                  << (mgpu.getSharedBufferSize() / 1024) << " KiB 8-plane buffer verified (0 validation errors)." << std::endl;
+                  << (mgpu.getSharedBufferSize() / 1024) << " KiB Band-Parallel + legacy buffer verified (0 validation errors)." << std::endl;
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Dynamic Upways Band-Parallel Load Balancer (EMA + Deadband + Hysteresis + Cooldown)
+    // -------------------------------------------------------------------------
+    std::cout << "[TEST 4] Dynamic Upways Band-Parallel Load Balancer..." << std::endl;
+    {
+        MultiGpuCoordinator coord;
+        constexpr uint32_t kLrH = 1080u;
+        constexpr uint32_t kHrH = 2160u;
+        constexpr uint32_t kHalo = 24u;
+
+        coord.resetUpwaysBandBalance();
+        check_true(std::abs(coord.getUpwaysBandTopFraction() - UPWAYS_DEFAULT_BAND_TOP_FRACTION) < 1e-5f,
+                   "Default topFraction starts at 0.50");
+        check_true(coord.getUpwaysBandAdjustmentCount() == 0u, "Initial adjustmentCount == 0");
+
+        // Balanced timings remain inside deadband (0 adjustments)
+        for (int f = 0; f < 16; ++f) {
+            bool adj = coord.updateUpwaysBandBalance(5.0, 5.1, kLrH, kHrH, kHalo, true);
+            check_true(!adj, "Balanced GPU timings must stay inside deadband");
+        }
+        check_true(coord.getUpwaysBandAdjustmentCount() == 0u, "No adjustments under balanced timings");
+
+        // Single-frame spike must not trigger adjustment
+        bool spikeAdj = coord.updateUpwaysBandBalance(2.0, 9.0, kLrH, kHrH, kHalo, true);
+        check_true(!spikeAdj, "Single-frame spike rejected by hysteresis");
+        for (int f = 0; f < 6; ++f) {
+            coord.updateUpwaysBandBalance(5.0, 5.0, kLrH, kHrH, kHalo, true);
+        }
+        check_true(coord.getUpwaysBandAdjustmentCount() == 0u, "Recovery after spike leaves topFraction unchanged");
+
+        // Sustained bottom-heavy imbalance (GPU 1 slower) shifts topFraction upward and respects cooldown
+        bool shiftedUp = false;
+        for (int f = 0; f < 16; ++f) {
+            if (coord.updateUpwaysBandBalance(3.5, 6.5, kLrH, kHrH, kHalo, true)) {
+                shiftedUp = true;
+                break;
+            }
+        }
+        check_true(shiftedUp, "Sustained bottom-heavy imbalance must increase topFraction");
+        check_true(coord.getUpwaysBandTopFraction() > 0.50f && coord.getUpwaysBandTopFraction() <= 0.70f,
+                   "Shifted topFraction moves above 0.50 within [0.30, 0.70]");
+        const uint32_t adjAfterShift = coord.getUpwaysBandAdjustmentCount();
+
+        // Next 20 frames are inside cooldown window -> 0 adjustments even with extreme imbalance
+        for (int f = 0; f < 20; ++f) {
+            bool adj = coord.updateUpwaysBandBalance(2.0, 8.0, kLrH, kHrH, kHalo, true);
+            check_true(!adj, "Cooldown window must suppress back-to-back resizes");
+        }
+        check_true(coord.getUpwaysBandAdjustmentCount() == adjAfterShift, "No adjustment during 20-frame cooldown");
+
+        // Top-heavy imbalance shifts topFraction downward and stays >= 0.30
+        bool shiftedDown = false;
+        for (int f = 0; f < 64; ++f) {
+            if (coord.updateUpwaysBandBalance(7.0, 3.0, kLrH, kHrH, kHalo, true)) {
+                shiftedDown = true;
+            }
+        }
+        check_true(shiftedDown, "Sustained top-heavy imbalance shifts topFraction downward");
+        check_true(coord.getUpwaysBandTopFraction() >= 0.30f && coord.getUpwaysBandTopFraction() <= 0.70f,
+                   "topFraction stays clamped inside [0.30, 0.70]");
+
+        // Disabled balancer never mutates state
+        const float frozenFrac = coord.getUpwaysBandTopFraction();
+        for (int f = 0; f < 12; ++f) {
+            bool adj = coord.updateUpwaysBandBalance(1.0, 10.0, kLrH, kHrH, kHalo, false);
+            check_true(!adj, "Disabled balancer returns false");
+        }
+        check_true(coord.getUpwaysBandTopFraction() == frozenFrac, "Disabled balancer never alters topFraction");
+
+        // Reset restores 0.50
+        coord.resetUpwaysBandBalance();
+        check_true(std::abs(coord.getUpwaysBandTopFraction() - UPWAYS_DEFAULT_BAND_TOP_FRACTION) < 1e-5f,
+                   "resetUpwaysBandBalance restores 0.50");
+        std::cout << "  -> Dynamic Band-Parallel load balancer EMA/deadband/hysteresis/cooldown verified." << std::endl;
     }
 
     std::cout << "==========================================================" << std::endl;

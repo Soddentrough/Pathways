@@ -48,7 +48,9 @@ public:
                 bool upwaysSuperres, AccumFormat accumFormat,
                 PostProcessPipeline* postProcess, VkCommandBuffer cmd,
                 FsrVersion fsrVersion = FsrVersion::Auto,
-                UpwaysPrecision upwaysPrecision = UpwaysPrecision::Auto);
+                UpwaysPrecision upwaysPrecision = UpwaysPrecision::Auto,
+                UpwaysVersion upwaysVersion = UpwaysVersion::Auto,
+                const std::string& upwaysWeightsPath = "");
 
     void updateDescriptors(PostProcessPipeline* postProcess,
                            Image* accumImage, Image* outputImage,
@@ -57,14 +59,31 @@ public:
                            Image* mlDiffuseImage, Image* mlSpecularImage,
                            Image* frameImage0,
                            Image* mlSkipImage = nullptr,
-                           Image* mlSpecAlbedoImage = nullptr);
+                           Image* mlSpecAlbedoImage = nullptr,
+                           Image* mlIrradianceImage = nullptr,
+                           Image* mlPrimaryGuideImage = nullptr,
+                           Image* mlSurfaceMvImage = nullptr,
+                           Image* mlDiffHitDistImage = nullptr,
+                           Image* mlSpecVmvImage = nullptr,
+                           Image* mlSkipCompactImage = nullptr);
 
     bool dispatchUpways(VkCommandBuffer cmd, bool resetHistory,
                         const Config& config, Camera* camera,
                         uint32_t frameIndex, bool cameraMovedLastFrame,
                         uint32_t accumulatedSamples,
                         Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
-                        PostProcessPipeline* postProcess, Image* outputImage);
+                        PostProcessPipeline* postProcess, Image* outputImage,
+                        const UpwaysBandSplit* bandSplit = nullptr);
+
+    void dispatchUpwaysBandStitch(VkCommandBuffer cmd, uint32_t frameSlot,
+                                  VkBuffer secPackedBuf, VkDeviceSize bufSize,
+                                  uint32_t width, uint32_t dstYStart, uint32_t rowCount);
+
+    void updateTonemapUpwaysBandDescriptor(uint32_t frameSlot,
+                                           PostProcessPipeline* postProcess,
+                                           Image* outputImage,
+                                           VkBuffer stitchBuf,
+                                           VkDeviceSize stitchSize);
 
     bool dispatchFsr(VkCommandBuffer cmd, bool resetHistory,
                      const Config& config, uint32_t frameIndex,
@@ -103,7 +122,7 @@ public:
     [[nodiscard]] Image* getDisplayAlbedoImage() const { return m_displayAlbedoImage.get(); }
     [[nodiscard]] Image* getDisplayNormalsImage() const { return m_displayNormalsImage.get(); }
     [[nodiscard]] Image* getSecAccumImage() const { return m_secAccumImage.get(); }
-    [[nodiscard]] VkDescriptorSet getTonemapUpwaysDescSet() const { return m_tonemapUpwaysDescSet; }
+    [[nodiscard]] VkDescriptorSet getTonemapUpwaysDescSet(uint32_t slot = 0) const { return m_tonemapUpwaysDescSets[slot % 2u]; }
     [[nodiscard]] VkDescriptorSet getTonemapFsrDescSet() const { return m_tonemapFsrDescSet; }
     [[nodiscard]] VkDescriptorSet getTonemapFsr3DescSet() const { return m_tonemapFsrDescSet; }
     [[nodiscard]] VkDescriptorPool getPostProcessDescPool() const { return m_postProcessDescPool; }
@@ -137,7 +156,19 @@ private:
     VkDescriptorPool m_postProcessDescPool = VK_NULL_HANDLE;
 
     std::unique_ptr<UpwaysPipeline> m_upwaysPipeline;
-    VkDescriptorSet m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_tonemapUpwaysDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkImageView, 2> m_tonemapUpwaysBoundInView = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkImageView, 2> m_tonemapUpwaysBoundOutView = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, 2> m_tonemapUpwaysBoundStitchBuf = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDeviceSize, 2> m_tonemapUpwaysBoundStitchSize = { 0, 0 };
+    VkDescriptorSetLayout m_bandStitchDescLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_bandStitchPipeLayout = VK_NULL_HANDLE;
+    VkPipeline m_bandStitchPipeline = VK_NULL_HANDLE;
+    VkDescriptorPool m_bandStitchDescPool = VK_NULL_HANDLE;
+    std::array<VkDescriptorSet, 2> m_bandStitchDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkBuffer, 2> m_bandStitchBoundBuf = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkImageView, 2> m_bandStitchBoundImg = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::array<VkDeviceSize, 2> m_bandStitchBoundSize = { 0, 0 };
     std::unique_ptr<Image> m_displayAlbedoImage;
     std::unique_ptr<Image> m_displayNormalsImage;
 
@@ -160,6 +191,12 @@ private:
     Image* m_cachedFrameImage0 = nullptr;
     Image* m_cachedMlSkipImage = nullptr;
     Image* m_cachedMlSpecAlbedoImage = nullptr;
+    Image* m_cachedMlIrradianceImage = nullptr;
+    Image* m_cachedMlPrimaryGuideImage = nullptr;
+    Image* m_cachedMlSurfaceMvImage = nullptr;
+    Image* m_cachedMlDiffHitDistImage = nullptr;
+    Image* m_cachedMlSpecVmvImage = nullptr;
+    Image* m_cachedMlSkipCompactImage = nullptr;
 };
 
 } // namespace pathways

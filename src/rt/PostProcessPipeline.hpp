@@ -27,8 +27,10 @@ public:
         uint32_t displayMode = 0;
         float peakNits = 1000.0f;
         float paperWhiteNits = 200.0f;
+        uint32_t stitchYStart = 0;
+        uint32_t stitchRowCount = 0;
     };
-    static_assert(sizeof(TonemapPushConstants) == 32, "TonemapPushConstants must be 32 bytes");
+    static_assert(sizeof(TonemapPushConstants) == 40, "TonemapPushConstants must be 40 bytes");
 
     struct FusedAccumTonemapPushConstants {
         uint32_t width = 0;
@@ -105,7 +107,13 @@ public:
     PostProcessPipeline& operator=(const PostProcessPipeline&) = delete;
 
     // Descriptors updates
-    void updateTonemapDescriptors(VkDescriptorSet descSet, Image* inImage, Image* outImage);
+    void updateTonemapDescriptors(
+        VkDescriptorSet descSet,
+        Image* inImage,
+        Image* outImage,
+        VkBuffer bandStitchBuf = VK_NULL_HANDLE,
+        VkDeviceSize bandStitchSize = 0
+    );
     void updateRunningAvgDescriptors(const std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT>& frameImages, Image* accumImage);
     void updateFusedAccumTonemapDescriptors(const std::array<std::unique_ptr<Image>, MAX_FRAMES_IN_FLIGHT>& frameImages, Image* accumImage, Image* outputImage);
     void updateBlendDescriptors(Image* dstImage, Image* srcImage);
@@ -113,7 +121,7 @@ public:
     // grid (null buffers fall back to a dummy — callers should skip the
     // dispatch when ReSTIR is inactive) and the output image to overwrite.
     void updateDebugViewDescriptors(uint32_t slot, Buffer* diReservoirs, Buffer* giReservoirs, Buffer* x1Contexts, Image* outputImage);
-    void updateMergeDescriptors(uint32_t slot, VkBuffer secBuffer, VkDeviceSize curSize, Image* frameImage, Image* mvImage, Image* normDepthImage, uint32_t width, uint32_t height, AccumFormat format, Image* mlDiffuseImage = nullptr, Image* mlSpecularImage = nullptr, Image* mlAlbedoRoughnessImage = nullptr, Image* mlSpecularMotionImage = nullptr, Image* mlSkipImage = nullptr, Image* mlSpecAlbedoImage = nullptr);
+    void updateMergeDescriptors(uint32_t slot, VkBuffer secBuffer, VkDeviceSize curSize, Image* frameImage, Image* mvImage, Image* normDepthImage, uint32_t width, uint32_t height, AccumFormat format, Image* mlDiffuseImage = nullptr, Image* mlSpecularImage = nullptr, Image* mlAlbedoRoughnessImage = nullptr, Image* mlSpecularMotionImage = nullptr, Image* mlSkipImage = nullptr, Image* mlSpecAlbedoImage = nullptr, Image* mlIrradianceImage = nullptr);
 
     // Recording commands
     void recordTonemap(VkCommandBuffer cmd, VkDescriptorSet descSet, uint32_t width, uint32_t height, const TonemapPushConstants& pc);
@@ -190,6 +198,8 @@ private:
     VkDescriptorPool m_restirDebugDescPool = VK_NULL_HANDLE;
     std::array<VkDescriptorSet, MAX_FRAMES_IN_FLIGHT> m_restirDebugDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     std::unique_ptr<Buffer> m_debugDummyBuffer;
+    std::unique_ptr<Buffer> m_dummyTonemapStitchBuffer;
+    std::unique_ptr<Image> m_dummyRg32uiImage;
 
     // Pipeline Layouts
     VkPipelineLayout m_tonemapPipelineLayout = VK_NULL_HANDLE;

@@ -336,7 +336,11 @@ void Config::printUsage(const char* progName) {
               << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
               << "  --upways                Shortcut to enable Upways real-time denoiser\n"
               << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n"
-              << "  --upways-precision <m>  Upways WMMA compute precision: 'auto' [default] (fp8->int8->fp16), 'fp8', 'int8', or 'fp16'\n\n"
+              << "  --upways-version <v>    Upways runtime version: 'auto' [default] (4.0 unless 5.0 weights), '4'/'v4', or '5'/'v5'\n"
+              << "  --upways-precision <m>  Upways WMMA compute precision: 'auto' [default] (fp8->int8->fp16), 'fp8', 'int8', or 'fp16'\n"
+              << "  --upways-band-halo <n>  mGPU Upways Band-Parallel LR halo rows per side (8..64, multiple of 4; default: 24)\n"
+              << "  --upways-band-balance   Enable dynamic top/bottom band load balancing for mGPU Upways [default: enabled]\n"
+              << "  --no-upways-band-balance Disable dynamic band load balancing (fixed 50/50 split)\n\n"
               << "Frame Pacing & Dynamic Governor:\n"
               << "  --target-fps <int>      Target frame rate limit (e.g. 30, 60, 90, 120, 240; 0 = uncapped [default])\n"
               << "  --target-frame-time <float> Target frame time budget in ms (default: 8.3)\n"
@@ -1043,6 +1047,48 @@ Config Config::parse(int argc, char* argv[]) {
         }
         if (arg.starts_with("--upways-precision=")) {
             cfg.upways_precision = parseUpwaysPrecision(arg.substr(arg.find('=') + 1));
+            continue;
+        }
+        auto parseUpwaysVersion = [](const std::string& raw) -> UpwaysVersion {
+            std::string v = raw;
+            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (v == "4" || v == "v4" || v == "4.0") return UpwaysVersion::V4;
+            if (v == "5" || v == "v5" || v == "5.0") return UpwaysVersion::V5;
+            return UpwaysVersion::Auto;
+        };
+        if (arg == "--upways-version" && i + 1 < argc) {
+            cfg.upways_version = parseUpwaysVersion(argv[++i]);
+            continue;
+        }
+        if (arg.starts_with("--upways-version=")) {
+            cfg.upways_version = parseUpwaysVersion(arg.substr(arg.find('=') + 1));
+            continue;
+        }
+        auto parseUpwaysBandHalo = [](const std::string& raw, uint32_t fallback) -> uint32_t {
+            try {
+                int parsed = std::stoi(raw);
+                uint32_t clamped = static_cast<uint32_t>(std::clamp(parsed, 8, 64));
+                return std::clamp((clamped + 2u) & ~3u, 8u, 64u);
+            } catch (...) {
+                return fallback;
+            }
+        };
+        if (arg == "--upways-band-halo" && i + 1 < argc) {
+            cfg.upways_band_halo = parseUpwaysBandHalo(argv[++i], cfg.upways_band_halo);
+            continue;
+        }
+        if (arg.starts_with("--upways-band-halo=")) {
+            cfg.upways_band_halo = parseUpwaysBandHalo(arg.substr(arg.find('=') + 1), cfg.upways_band_halo);
+            continue;
+        }
+        if (arg == "--upways-band-balance") {
+            cfg.upways_dynamic_band_balance = true;
+            continue;
+        }
+        if (arg == "--no-upways-band-balance") {
+            cfg.upways_dynamic_band_balance = false;
             continue;
         }
         if (arg == "--light-tree") {

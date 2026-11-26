@@ -32,6 +32,7 @@ struct ImageDescriptorParams {
     Image* mlSpecularImage = nullptr;
     Image* mlSkipImage = nullptr;
     Image* mlSpecAlbedoImage = nullptr;
+    Image* mlIrradianceImage = nullptr;
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
 };
 
@@ -77,6 +78,12 @@ struct WavefrontDescriptorParams {
     Image* mlSpecularImage = nullptr;
     Image* mlSkipImage = nullptr;
     Image* mlSpecAlbedoImage = nullptr;
+    Image* mlIrradianceImage = nullptr;
+    Image* mlPrimaryGuideImage = nullptr;
+    Image* mlSurfaceMvImage = nullptr;
+    Image* mlDiffHitDistImage = nullptr;
+    Image* mlSpecVmvImage = nullptr;
+    Image* mlSkipCompactImage = nullptr;
     Image* mlDirectDiffuseImage = nullptr;
     Image* mlIndirectDiffuseImage = nullptr;
     Image* mlDirectSpecularImage = nullptr;
@@ -95,6 +102,7 @@ struct MergeDescriptorParams {
     Image* mlSpecularMotionImage = nullptr;
     Image* mlSkipImage = nullptr;
     Image* mlSpecAlbedoImage = nullptr;
+    Image* mlIrradianceImage = nullptr;
     std::array<Image*, 2> frameImages = { nullptr, nullptr };
     uint32_t width = 0;
     uint32_t height = 0;

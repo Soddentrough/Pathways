@@ -4,25 +4,23 @@
 
 layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0,  rgba16f)  readonly  uniform image2D      uMlDiffuse;
-layout(set = 0, binding = 1,  rgba16f)  readonly  uniform image2D      uMlSpecular;
-layout(set = 0, binding = 2,  rgba16f)  readonly  uniform image2D      uMlAlbedoRoughness;
-layout(set = 0, binding = 3,  rgba16f)  readonly  uniform image2D      uMlSpecAlbedo;
-layout(set = 0, binding = 4,  rgba16f)  readonly  uniform image2D      uMlSkip;
-layout(set = 0, binding = 5,  rgba16f)  readonly  uniform image2D      uNormalDepth;
-layout(set = 0, binding = 6,  rgba16f)  readonly  uniform image2D      uMotionVectors;
-layout(set = 0, binding = 7,  rgba16f)  readonly  uniform image2D      uSpecularMotion;
-layout(set = 0, binding = 8,  rgba16f)  readonly  uniform image2D      uPrevDiffLr;
-layout(set = 0, binding = 9,  rgba16f)  readonly  uniform image2D      uPrevSpecLr;
-layout(set = 0, binding = 10, rgba16f)  readonly  uniform image2D      uPrevGeomLr;
-layout(set = 0, binding = 11, r32ui)    readonly  uniform uimage2D     uPrevHiddenLr;
-layout(set = 0, binding = 12, rgba16f)  writeonly uniform image2DArray tBaseAnchorLr;
-layout(set = 0, binding = 13, rgba16f)  writeonly uniform image2D      uCurrGeomLr;
+layout(set = 0, binding = 0,  rg32ui)   readonly  uniform uimage2D     uMlIrradiance;
+layout(set = 0, binding = 1,  rgba32ui) readonly  uniform uimage2D     uMlPrimaryGuide;
+layout(set = 0, binding = 2,  r32ui)    readonly  uniform uimage2D     uMlSurfaceMv;
+layout(set = 0, binding = 3,  r8)       readonly  uniform image2D      uMlDiffHitDist;
+layout(set = 0, binding = 4,  rgba16f)  readonly  uniform image2D      uPrevDiffLr;
+layout(set = 0, binding = 5,  rgba16f)  readonly  uniform image2D      uPrevSpecLr;
+layout(set = 0, binding = 6,  rgba16f)  readonly  uniform image2D      uPrevGeomLr;
+layout(set = 0, binding = 7,  r32ui)    readonly  uniform uimage2D     uPrevHiddenLr;
+layout(set = 0, binding = 8,  rgba16f)  writeonly uniform image2DArray tBaseAnchorLr;
+layout(set = 0, binding = 9,  rgba16f)  writeonly uniform image2D      uCurrGeomLr;
 #if !UPWAYS_IS_FP16
-layout(set = 0, binding = 14)           writeonly buffer  DenoiseActBuf { uvec2 act2[]; } g_act;
+layout(set = 0, binding = 10)           writeonly buffer  DenoiseActBuf { uvec2 act2[]; } g_act;
 #else
-layout(set = 0, binding = 14)           writeonly buffer  DenoiseActBuf { uvec4 act4[]; } g_act;
+layout(set = 0, binding = 10)           writeonly buffer  DenoiseActBuf { uvec4 act4[]; } g_act;
 #endif
+layout(set = 0, binding = 11, rg32ui)   readonly  uniform uimage2D     uMlSpecVmv;
+layout(set = 0, binding = 12, r32ui)    readonly  uniform uimage2D     uMlSkipCompact;
 
 // 18x10 cooperative G-buffer tile: 180 * 40 B = 7,200 B (< 8 KB -> 16 waves/SIMD)
 shared uvec2 s_diff[180];       // packHalf2x16(eD.rg), packHalf2x16(vec2(eD.b, dHD))
@@ -170,18 +168,23 @@ void accumPrep3x3Tap(
     validHits   += vTap;
 }
 
-void storePrepTilePixel(uint ap, vec4 mlD, vec4 mlS, vec4 ndq) {
-    vec3  eD  = clampFp16Rgb(sanitizeRgb(mlD.rgb));
-    float dHD = clamp(sanitizeFloat(mlD.a, 0.0), 0.0, 1.0);
-    vec3  eS  = clampFp16Rgb(sanitizeRgb(mlS.rgb));
-    float rM  = clamp(sanitizeFloat(mlS.a, 0.0), 0.0, 1.0);
+void storePrepTilePixel(uint ap, uvec2 irr, uvec4 pg, float dHD) {
+    vec3  nrm;
+    float dep;
+    float dHdUnused;
+    float rM;
+    vec3  aDiff;
+    float roughUnused;
+    vec3  aSpec;
+    float matUnused;
+    unpackCompactPrimary(pg, nrm, dep, dHdUnused, rM, aDiff, roughUnused, aSpec, matUnused);
 
-    vec3  nR   = vec3(sanitizeFloat(ndq.r, 0.0), sanitizeFloat(ndq.g, 0.0), sanitizeFloat(ndq.b, 1.0));
-    float len2 = dot(nR, nR);
-    vec3  nrm  = (len2 > 1e-10) ? (nR * inversesqrt(len2)) : vec3(0.0, 0.0, 1.0);
-    float dep  = clamp(sanitizeFloat(ndq.a, 10000.0), 0.0, 10000.0);
-    uvec2 pND  = uvec2(packHalf2x16(nrm.xy), packHalf2x16(vec2(nrm.z, dep)));
+    vec3  rawDiff = (irr.x != 0u) ? unpackRGB9E5(irr.x) : vec3(0.0);
+    vec3  rawSpec = (irr.y != 0u) ? unpackRGB9E5(irr.y) : vec3(0.0);
+    vec3  eD  = clampFp16Rgb(demodulateMlSafe(rawDiff, aDiff));
+    vec3  eS  = clampFp16Rgb(demodulateMlSafe(rawSpec, aSpec));
 
+    uvec2 pND   = uvec2(packHalf2x16(nrm.xy), packHalf2x16(vec2(nrm.z, dep)));
     uvec2 pDiff = uvec2(packHalf2x16(eD.rg), packHalf2x16(vec2(eD.b, dHD)));
     uvec2 pSpec = uvec2(packHalf2x16(eS.rg), packHalf2x16(vec2(eS.b, rM)));
     vec3  eDq   = vec3(unpackHalf2x16(pDiff.x), unpackHalf2x16(pDiff.y).x);
@@ -205,29 +208,29 @@ void main() {
 
     // 1. Cooperatively populate 18x10 G-buffer tile across all 128 workgroup threads
     {
-        uint  ay0  = uint(float(t) * (1.0 / 18.0 + 1e-6));
-        uint  ax0  = t - ay0 * 18u;
-        ivec2 q0   = clamp(ivec2(wgX + int(ax0) - 1, wgY + int(ay0) - 1), ivec2(0), ivec2(W - 1, H - 1));
-        vec4  mlD0 = imageLoad(uMlDiffuse, q0);
-        vec4  mlS0 = imageLoad(uMlSpecular, q0);
-        vec4  ndq0 = imageLoad(uNormalDepth, q0);
+        uint  ay0   = uint(float(t) * (1.0 / 18.0 + 1e-6));
+        uint  ax0   = t - ay0 * 18u;
+        ivec2 q0    = clamp(ivec2(wgX + int(ax0) - 1, wgY + int(ay0) - 1), ivec2(0), ivec2(W - 1, H - 1));
+        uvec2 irr0  = imageLoad(uMlIrradiance, q0).xy;
+        uvec4 pg0_t = imageLoad(uMlPrimaryGuide, q0);
+        float dhd0  = imageLoad(uMlDiffHitDist, q0).r;
 
-        vec4  mlD1 = vec4(0.0);
-        vec4  mlS1 = vec4(0.0);
-        vec4  ndq1 = vec4(0.0);
-        uint  ap1  = t + 128u;
+        uvec2 irr1  = uvec2(0u);
+        uvec4 pg1_t = uvec4(0u);
+        float dhd1  = 0.0;
+        uint  ap1   = t + 128u;
         if (t < 52u) {
             uint  ay1 = uint(float(ap1) * (1.0 / 18.0 + 1e-6));
             uint  ax1 = ap1 - ay1 * 18u;
             ivec2 q1  = clamp(ivec2(wgX + int(ax1) - 1, wgY + int(ay1) - 1), ivec2(0), ivec2(W - 1, H - 1));
-            mlD1 = imageLoad(uMlDiffuse, q1);
-            mlS1 = imageLoad(uMlSpecular, q1);
-            ndq1 = imageLoad(uNormalDepth, q1);
+            irr1  = imageLoad(uMlIrradiance, q1).xy;
+            pg1_t = imageLoad(uMlPrimaryGuide, q1);
+            dhd1  = imageLoad(uMlDiffHitDist, q1).r;
         }
 
-        storePrepTilePixel(t, mlD0, mlS0, ndq0);
+        storePrepTilePixel(t, irr0, pg0_t, dhd0);
         if (t < 52u) {
-            storePrepTilePixel(ap1, mlD1, mlS1, ndq1);
+            storePrepTilePixel(ap1, irr1, pg1_t, dhd1);
         }
     }
     barrier();
@@ -247,26 +250,32 @@ void main() {
     vec3  viewNormal   = vec3(cND0, cND1.x);
     float linDepth     = cND1.y;
 
-    vec2 mvSurfRaw = imageLoad(uMotionVectors, p).rg;
-    vec2 mvSpecRaw = imageLoad(uSpecularMotion, p).rg;
-    vec4 mlAlb     = imageLoad(uMlAlbedoRoughness, p);
-    vec4 mlSAlb    = imageLoad(uMlSpecAlbedo, p);
-    vec4 mlSkipP   = imageLoad(uMlSkip, p);
+    uvec4 pgCenter = imageLoad(uMlPrimaryGuide, p);
+    uint  surfMvPack = imageLoad(uMlSurfaceMv, p).x;
+    vec3  nUnused;
+    float dUnused, hdUnused, rmUnused;
+    vec3  aDiffInit, aSpecInit;
+    float roughInit, matRaw;
+    unpackCompactPrimary(pgCenter, nUnused, dUnused, hdUnused, rmUnused, aDiffInit, roughInit, aSpecInit, matRaw);
+    vec2  mvSurfRaw = unpackHalf2x16(surfMvPack);
+    vec2  mvSpecRaw = mvSurfRaw;
 
-    vec3  aDiffInit = clamp(mlAlb.rgb, vec3(0.0), vec3(1.0));
-    float roughInit = ((floatBitsToUint(mlAlb.a) & 0x7FFFFFFFu) < 0x7F800000u) ? clamp(mlAlb.a, 0.0, 1.0) : 1.0;
-    vec3  aSpecInit = clamp(mlSAlb.rgb, vec3(0.0), vec3(1.0));
-    float matRaw    = clamp(mlSkipP.a, 0.0, 1.0);
     float matInit   = unpackHalf2x16(packHalf2x16(vec2(matRaw, 0.0))).x;
 
     bool  isSky     = isSkyOrEmissiveOnly(linDepth, matInit, aDiffInit, aSpecInit);
     bool  isDielMat = abs(matInit - 0.6667) < 0.12;
+    if (!isSky && roughInit < 0.40) {
+        uvec2 specVmvRaw = imageLoad(uMlSpecVmv, p).xy;
+        if (specVmvRaw.y != 0u) {
+            mvSpecRaw = unpackHalf2x16(specVmvRaw.x);
+        }
+    }
 
     // Pack center G-buffer values into 6 VGPRs before issuing cold-DRAM backward warps
     uvec2 cD01_pre  = s_diff[cAp];
     vec3  eDiffFold = vec3(unpackHalf2x16(cD01_pre.x), unpackHalf2x16(cD01_pre.y).x);
     if (isDielMat && !isSky) {
-        vec3  skipClean = sanitizeRgb(mlSkipP.rgb);
+        vec3  skipClean = sanitizeRgb(unpackCompactSkip(imageLoad(uMlSkipCompact, p).x));
         vec3  eFold     = clampFp16Rgb(eDiffFold + skipClean / max(aDiffInit, vec3(0.04)));
         uvec2 pFold     = uvec2(packHalf2x16(eFold.rg), packHalf2x16(vec2(eFold.b, 0.0)));
         eDiffFold       = vec3(unpackHalf2x16(pFold.x), unpackHalf2x16(pFold.y).x);
@@ -280,26 +289,31 @@ void main() {
     vec2  surfaceMv = vec2(sanitizeFloat(mvSurfRaw.x, 0.0), sanitizeFloat(mvSurfRaw.y, 0.0));
     vec2  specMv    = vec2(sanitizeFloat(mvSpecRaw.x, 0.0), sanitizeFloat(mvSpecRaw.y, 0.0));
 
-    bool  reset    = (pc.flags & UPWAYS_FLAG_RESET_HISTORY) != 0u;
-    bool  enableSR = (pc.flags & UPWAYS_FLAG_ENABLE_SUPERRES) != 0u;
-    vec2  lrSizeF  = vec2(float(W), float(H));
-    vec2  currUV   = (vec2(p) + vec2(0.5)) / lrSizeF;
+    bool  reset       = (pc.flags & UPWAYS_FLAG_RESET_HISTORY) != 0u;
+    bool  enableSR    = (pc.flags & UPWAYS_FLAG_ENABLE_SUPERRES) != 0u;
+    int   fullLrH     = int(max(pc.fullLrHeight, pc.lrHeight));
+    vec2  fullLrSizeF = vec2(float(W), float(fullLrH));
+    vec2  currUV      = (vec2(float(p.x), float(p.y + int(pc.bandLrY0))) + vec2(0.5)) / fullLrSizeF;
 
     vec2  prevUV_d       = currUV - surfaceMv;
+    vec2  pCoord         = vec2(prevUV_d.x * float(W), prevUV_d.y * float(fullLrH) - float(pc.bandLrY0)) - vec2(0.5);
     bool  inBndD         = (!reset && !isSky)
                          && all(greaterThanEqual(prevUV_d, vec2(0.0)))
-                         && all(lessThan(prevUV_d, vec2(1.0)));
-    float mvPx           = length(surfaceMv * lrSizeF);
+                         && all(lessThan(prevUV_d, vec2(1.0)))
+                         && (pCoord.y >= -1.0) && (pCoord.y < float(H));
+    float mvPx           = length(surfaceMv * fullLrSizeF);
 
-    float rawSpecDeltaPx = length((specMv - surfaceMv) * lrSizeF);
+    float rawSpecDeltaPx = length((specMv - surfaceMv) * fullLrSizeF);
     float specMvBlend    = 1.0 - smoothstep(0.15, 0.40, unpackHalf2x16(pAlbRough.y).y);
     vec2  effSpecMv      = (rawSpecDeltaPx < 1e-3) ? surfaceMv : mix(surfaceMv, specMv, specMvBlend);
-    float specMvPx       = length(effSpecMv * lrSizeF);
-    float specDeltaPx    = length((effSpecMv - surfaceMv) * lrSizeF);
+    float specMvPx       = length(effSpecMv * fullLrSizeF);
+    float specDeltaPx    = length((effSpecMv - surfaceMv) * fullLrSizeF);
     vec2  prevUV_s       = currUV - effSpecMv;
+    vec2  sCoord         = vec2(prevUV_s.x * float(W), prevUV_s.y * float(fullLrH) - float(pc.bandLrY0)) - vec2(0.5);
     bool  inBndS         = (!reset && !isSky)
                          && all(greaterThanEqual(prevUV_s, vec2(0.0)))
-                         && all(lessThan(prevUV_s, vec2(1.0)));
+                         && all(lessThan(prevUV_s, vec2(1.0)))
+                         && (sCoord.y >= -1.0) && (sCoord.y < float(H));
     bool  sameMv         = inBndD && inBndS && all(equal(effSpecMv, surfaceMv));
     float relThreshS     = 0.06 + 0.05 * min(specDeltaPx, 6.0);
 
@@ -312,7 +326,6 @@ void main() {
     float specConf    = 0.0;
 
     if (inBndD) {
-        vec2  pCoord = prevUV_d * lrSizeF - vec2(0.5);
         vec2  fCoord = floor(pCoord);
         vec2  fracD  = clamp(pCoord - fCoord, vec2(0.0), vec2(1.0));
         int   x0D    = int(fCoord.x);
@@ -389,7 +402,6 @@ void main() {
     }
 
     if (inBndS && !sameMv) {
-        vec2  sCoord = prevUV_s * lrSizeF - vec2(0.5);
         vec2  fCoord = floor(sCoord);
         vec2  frac   = clamp(sCoord - fCoord, vec2(0.0), vec2(1.0));
         int   x0     = int(fCoord.x);

@@ -829,8 +829,11 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (stats.has_fallback_sun) {
                 ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Lighting:     Fallback Synthetic Sun (0 lights in asset)");
             }
+            const char* verStr = (stats.upways_version_str.empty() || stats.upways_version_str == "none")
+                ? "4.0"
+                : stats.upways_version_str.c_str();
             if (config.denoiser_mode == DenoiserMode::Upways) {
-                ImGui::Text("Denoising:    Upways 4.0 WMMA (%s)", stats.upways_precision_str.c_str());
+                ImGui::Text("Denoising:    Upways %s WMMA (%s)", verStr, stats.upways_precision_str.c_str());
             } else if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::Text("Denoising:    AMD FSR Ray Regeneration (4-Signal)");
             } else {
@@ -839,7 +842,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             if (config.upscaler_mode == UpscalerMode::FSR) {
                 ImGui::Text("Upscaling:    AMD %s Temporal Upscaler (%.2fx)", stats.upscaler_mode_str.c_str(), config.render_scale);
             } else if (config.upscaler_mode == UpscalerMode::Upways) {
-                ImGui::Text("Upscaling:    Upways 4.0 WMMA SR (%s, %.2fx)", stats.upways_precision_str.c_str(), config.render_scale);
+                ImGui::Text("Upscaling:    Upways %s WMMA SR (%s, %.2fx)", verStr, stats.upways_precision_str.c_str(), config.render_scale);
             }
             if (config.progressive_accumulation) {
                 uint32_t activeSpp = (stats.dynamic_spp > 0) ? stats.dynamic_spp : config.spp;
@@ -1316,23 +1319,26 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                                       : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active).");
             ImGui::SameLine();
             drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.supports_upways_wmma,
-                "Upways 4.0 WMMA Spatiotemporal Backbone (FP8 E4M3 / INT8 QAT / FP16): runs standalone at render-res alongside FSR 3.1 / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
+                "Upways 4.0 / 5.0 Pure-ML WMMA Spatiotemporal Backbone (FP8 E4M3 / INT8 QAT): runs standalone at render-res alongside FSR / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
 
             if (config.denoiser_mode != DenoiserMode::None || config.upscaler_mode == UpscalerMode::Upways) {
                 uint32_t rW = config.getRenderWidth();
                 uint32_t rH = config.getRenderHeight();
+                const char* activeVer = (stats.upways_version_str.empty() || stats.upways_version_str == "none")
+                    ? "4.0"
+                    : stats.upways_version_str.c_str();
                 if (config.upscaler_mode == UpscalerMode::Upways) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 4.0 WMMA [%s] Coupled Neural SR + Denoiser (%ux%u -> %ux%u)",
-                                       stats.upways_precision_str.c_str(), rW, rH, config.width, config.height);
+                                       "Active Denoiser: Upways %s WMMA [%s] Coupled Neural SR + Denoiser (%ux%u -> %ux%u)",
+                                       activeVer, stats.upways_precision_str.c_str(), rW, rH, config.width, config.height);
                 } else if (config.denoiser_mode == DenoiserMode::Upways && config.upscaler_mode == UpscalerMode::FSR) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 4.0 WMMA [%s] Neural Denoiser (%ux%u, Jitter-Preserving -> %s)",
-                                       stats.upways_precision_str.c_str(), rW, rH, isFsr4Selected ? "FSR 4.1.2 ML" : "FSR 3.1.6");
+                                       "Active Denoiser: Upways %s WMMA [%s] Neural Denoiser (%ux%u, Jitter-Preserving -> %s)",
+                                       activeVer, stats.upways_precision_str.c_str(), rW, rH, isFsr4Selected ? "FSR 4.1.2 ML" : "FSR 3.1.6");
                 } else if (config.denoiser_mode == DenoiserMode::Upways) {
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
-                                       "Active Denoiser: Upways 4.0 WMMA [%s] Neural Denoiser (Native %ux%u)",
-                                       stats.upways_precision_str.c_str(), rW, rH);
+                                       "Active Denoiser: Upways %s WMMA [%s] Neural Denoiser (Native %ux%u)",
+                                       activeVer, stats.upways_precision_str.c_str(), rW, rH);
                 }
             }
 
@@ -2302,6 +2308,41 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             }
 
             if (config.denoiser_mode == DenoiserMode::Upways || config.upscaler_mode == UpscalerMode::Upways) {
+                struct VersionOption {
+                    UpwaysVersion ver;
+                    const char* label;
+                    const char* tooltip;
+                };
+                const VersionOption verOptions[] = {
+                    { UpwaysVersion::Auto, "Auto (Weight-Detected -> 4.0 / 5.0)",
+                      "Uses Upways 5.0 Pure-ML if a 190,208 B weights file is selected, otherwise defaults to Upways 4.0." },
+                    { UpwaysVersion::V4, "4.0 Compact (24,064 B)",
+                      "Upways 4.0 compact U-Net + KPN + bicubic/neural SR." },
+                    { UpwaysVersion::V5, "5.0 Pure-ML (190,208 B / 158,400 params)",
+                      "Upways 5.0 Pure-ML U-Net + multi-scale affinity + cooperative HR attention SR (FP8 / INT8)." },
+                };
+                const char* verPreview = verOptions[0].label;
+                for (const auto& vo : verOptions) {
+                    if (vo.ver == config.upways_version) {
+                        verPreview = vo.label;
+                        break;
+                    }
+                }
+                if (ImGui::BeginCombo("Upways Model Version", verPreview)) {
+                    for (const auto& vo : verOptions) {
+                        const bool isSelected = (config.upways_version == vo.ver);
+                        if (ImGui::Selectable(vo.label, isSelected)) {
+                            config.upways_version = vo.ver;
+                        }
+                        if (isSelected) ImGui::SetItemDefaultFocus();
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("%s", vo.tooltip);
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+
+                const bool isV5Active = (stats.upways_version_str == "5.0" || config.upways_version == UpwaysVersion::V5);
                 struct PrecisionOption {
                     UpwaysPrecision mode;
                     const char* label;
@@ -2310,13 +2351,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 };
                 const PrecisionOption options[] = {
                     { UpwaysPrecision::Auto, "Auto (FP8 -> INT8 -> FP16)", stats.supports_upways_wmma,
-                      "Automatically selects the best supported WMMA tier: FP8 E4M3 -> INT8 QAT -> FP16." },
+                      "Automatically selects the best supported WMMA tier: FP8 E4M3 -> INT8 QAT (and FP16 on 4.0)." },
                     { UpwaysPrecision::Fp8, "FP8 E4M3fn", stats.has_fp8_coop_matrix,
                       "Native FP8 E4M3 cooperative matrix WMMA (RDNA 4 / gfx12+)." },
                     { UpwaysPrecision::Int8, "INT8 QAT", stats.has_int8_coop_matrix,
                       "Dedicated QAT-trained INT8 cooperative matrix WMMA (primary RDNA 3/3.5 & RDNA 4 tier)." },
-                    { UpwaysPrecision::Fp16, "FP16", stats.has_fp16_coop_matrix,
-                      "FP16 cooperative matrix WMMA fallback with host-expanded weights." },
+                    { UpwaysPrecision::Fp16, "FP16 (Upways 4.0 only)", stats.has_fp16_coop_matrix && !isV5Active,
+                      "FP16 cooperative matrix WMMA fallback with host-expanded weights (Upways 4.0 only)." },
                 };
                 const char* previewLabel = options[0].label;
                 for (const auto& opt : options) {
@@ -2336,7 +2377,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         if (!opt.supported) {
                             ImGui::EndDisabled();
                             if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
-                                ImGui::SetTooltip("Unavailable on this GPU.");
+                                ImGui::SetTooltip("%s", (opt.mode == UpwaysPrecision::Fp16 && isV5Active)
+                                    ? "Unavailable in Upways 5.0 (supports FP8/INT8 only)."
+                                    : "Unavailable on this GPU.");
                             }
                         } else if (ImGui::IsItemHovered()) {
                             ImGui::SetTooltip("%s", opt.tooltip);
@@ -2344,7 +2387,9 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     }
                     ImGui::EndCombo();
                 }
-                ImGui::TextDisabled("Active WMMA tier: %s", stats.upways_precision_str.c_str());
+                ImGui::TextDisabled("Active model: Upways %s [%s]",
+                                    (stats.upways_version_str.empty() || stats.upways_version_str == "none") ? "4.0" : stats.upways_version_str.c_str(),
+                                    stats.upways_precision_str.c_str());
             }
 
             if (ImGui::Checkbox("ACES Filmic Tonemapping", &config.aces_tonemap)) {

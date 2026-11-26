@@ -15,6 +15,14 @@ bool isUpwaysRequested(const Config& config) {
            config.upscaler_mode == UpscalerMode::Upways ||
            config.upways_superres;
 }
+
+struct BandStitchPushConstants {
+    uint32_t width;
+    uint32_t dstYStart;
+    uint32_t rowCount;
+    uint32_t pad;
+};
+static_assert(sizeof(BandStitchPushConstants) == 16, "BandStitchPushConstants must be 16 bytes");
 } // namespace
 
 SuperResolutionManager::SuperResolutionManager(VkDevice device,
@@ -50,7 +58,8 @@ void SuperResolutionManager::createDescPool() {
         return;
     }
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 }
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 64 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
@@ -67,7 +76,11 @@ void SuperResolutionManager::destroyDescPool() {
         vkDestroyDescriptorPool(m_device, m_postProcessDescPool, nullptr);
         m_postProcessDescPool = VK_NULL_HANDLE;
     }
-    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    m_tonemapUpwaysDescSets.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundInView.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundOutView.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundStitchBuf.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundStitchSize.fill(0);
     m_tonemapFsrDescSet = VK_NULL_HANDLE;
 }
 
@@ -103,8 +116,11 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         return;
     }
     try {
+        const UpwaysRuntimeVersion ver = UpwaysPipeline::resolveVersion(
+            config.upways_version, config.upways_weights_path
+        );
         const UpwaysComputePrecision prec = UpwaysPipeline::selectPrecision(
-            m_physicalDevice, config.upways_precision, m_instance
+            m_physicalDevice, config.upways_precision, m_instance, ver
         );
         const char* ext = ".comp.spv";
         if (prec == UpwaysComputePrecision::Int8) {
@@ -112,10 +128,6 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         } else if (prec == UpwaysComputePrecision::Fp16) {
             ext = ".fp16.comp.spv";
         }
-        auto denoisePrepCode    = m_shaderLoader(std::string("upways_denoise_prep") + ext);
-        auto denoiserWmmaCode   = m_shaderLoader(std::string("upways_denoiser_wmma") + ext);
-        auto upscalerWmmaCode   = m_shaderLoader(std::string("upways_upscaler_wmma") + ext);
-        auto upscaleResolveCode = m_shaderLoader(std::string("upways_upscale_resolve") + ext);
 
         VkFormat format = (config.accum_format == AccumFormat::RGBA32_SFLOAT) ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R16G16B16A16_SFLOAT;
         uint32_t inW = config.getRenderWidth();
@@ -124,25 +136,121 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         uint32_t outH = (config.upscaler_mode == UpscalerMode::FSR) ? inH : config.height;
         bool isSuperRes = (inW < outW || inH < outH);
 
-        m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
-            m_device,
-            m_physicalDevice,
-            m_allocator,
-            inW,
-            inH,
-            outW,
-            outH,
-            denoisePrepCode,
-            denoiserWmmaCode,
-            upscalerWmmaCode,
-            upscaleResolveCode,
-            config.upways_weights_path,
-            isSuperRes,
-            format,
-            prec
-        );
+        if (ver == UpwaysRuntimeVersion::V5) {
+            auto prepCode     = m_shaderLoader(std::string("upways_v5_prep") + ext);
+            auto unetCode     = m_shaderLoader(std::string("upways_v5_unet_wmma") + ext);
+            auto affinityCode = m_shaderLoader(std::string("upways_v5_affinity") + ext);
+            auto upscalerCode = m_shaderLoader(std::string("upways_v5_upscaler_wmma") + ext);
+            auto resolveCode  = m_shaderLoader(std::string("upways_v5_resolve") + ext);
+
+            m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
+                m_device,
+                m_physicalDevice,
+                m_allocator,
+                inW,
+                inH,
+                outW,
+                outH,
+                prepCode,
+                unetCode,
+                affinityCode,
+                upscalerCode,
+                resolveCode,
+                config.upways_weights_path,
+                isSuperRes,
+                format,
+                prec,
+                outH
+            );
+        } else {
+            auto denoisePrepCode    = m_shaderLoader(std::string("upways_denoise_prep") + ext);
+            auto denoiserWmmaCode   = m_shaderLoader(std::string("upways_denoiser_wmma") + ext);
+            auto upscalerWmmaCode   = m_shaderLoader(std::string("upways_upscaler_wmma") + ext);
+            auto upscaleResolveCode = m_shaderLoader(std::string("upways_upscale_resolve") + ext);
+
+            m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
+                m_device,
+                m_physicalDevice,
+                m_allocator,
+                inW,
+                inH,
+                outW,
+                outH,
+                denoisePrepCode,
+                denoiserWmmaCode,
+                upscalerWmmaCode,
+                upscaleResolveCode,
+                config.upways_weights_path,
+                isSuperRes,
+                format,
+                prec,
+                outH
+            );
+        }
+
+        if (m_bandStitchPipeline == VK_NULL_HANDLE) {
+            std::array<VkDescriptorSetLayoutBinding, 2> stitchBindings{};
+            stitchBindings[0] = { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            stitchBindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            VkDescriptorSetLayoutCreateInfo dslInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            dslInfo.bindingCount = static_cast<uint32_t>(stitchBindings.size());
+            dslInfo.pBindings = stitchBindings.data();
+            if (vkCreateDescriptorSetLayout(m_device, &dslInfo, nullptr, &m_bandStitchDescLayout) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to create Upways band stitch descriptor set layout");
+            }
+
+            std::array<VkDescriptorPoolSize, 2> poolSizes{};
+            poolSizes[0] = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u };
+            poolSizes[1] = { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2u };
+            VkDescriptorPoolCreateInfo dpInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+            dpInfo.maxSets = 2u;
+            dpInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+            dpInfo.pPoolSizes = poolSizes.data();
+            if (vkCreateDescriptorPool(m_device, &dpInfo, nullptr, &m_bandStitchDescPool) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to create Upways band stitch descriptor pool");
+            }
+
+            std::array<VkDescriptorSetLayout, 2> setLayouts{ m_bandStitchDescLayout, m_bandStitchDescLayout };
+            VkDescriptorSetAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            allocInfo.descriptorPool = m_bandStitchDescPool;
+            allocInfo.descriptorSetCount = 2u;
+            allocInfo.pSetLayouts = setLayouts.data();
+            if (vkAllocateDescriptorSets(m_device, &allocInfo, m_bandStitchDescSets.data()) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to allocate Upways band stitch descriptor sets");
+            }
+
+            VkPushConstantRange pcRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BandStitchPushConstants) };
+            VkPipelineLayoutCreateInfo plInfo{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            plInfo.setLayoutCount = 1u;
+            plInfo.pSetLayouts = &m_bandStitchDescLayout;
+            plInfo.pushConstantRangeCount = 1u;
+            plInfo.pPushConstantRanges = &pcRange;
+            if (vkCreatePipelineLayout(m_device, &plInfo, nullptr, &m_bandStitchPipeLayout) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to create Upways band stitch pipeline layout");
+            }
+
+            auto stitchCode = m_shaderLoader("upways_band_stitch.comp.spv");
+            VkShaderModuleCreateInfo smInfo{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+            smInfo.codeSize = stitchCode.size();
+            smInfo.pCode = reinterpret_cast<const uint32_t*>(stitchCode.data());
+            VkShaderModule sm = VK_NULL_HANDLE;
+            if (vkCreateShaderModule(m_device, &smInfo, nullptr, &sm) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to create Upways band stitch shader module");
+            }
+
+            VkComputePipelineCreateInfo cpInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            cpInfo.layout = m_bandStitchPipeLayout;
+            cpInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, sm, "main", nullptr };
+            if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1u, &cpInfo, nullptr, &m_bandStitchPipeline) != VK_SUCCESS) {
+                vkDestroyShaderModule(m_device, sm, nullptr);
+                throw std::runtime_error("Failed to create Upways band stitch compute pipeline");
+            }
+            vkDestroyShaderModule(m_device, sm, nullptr);
+        }
+
         Logger::info(
-            "Upways 4.0 ({}) Neural Denoiser & Super-Resolution Pipeline initialized on demand.",
+            "{} ({}) Neural Denoiser & Super-Resolution Pipeline initialized on demand.",
+            upwaysVersionDisplayName(ver),
             upwaysPrecisionDisplayName(prec)
         );
     } catch (const std::exception& e) {
@@ -151,26 +259,61 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
 }
 
 void SuperResolutionManager::destroyUpwaysPipelines() {
-    m_upwaysPipeline.reset();
-    if (m_postProcessDescPool != VK_NULL_HANDLE && m_tonemapUpwaysDescSet != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(m_device, m_postProcessDescPool, 1, &m_tonemapUpwaysDescSet);
+    if (m_bandStitchPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(m_device, m_bandStitchPipeline, nullptr);
+        m_bandStitchPipeline = VK_NULL_HANDLE;
     }
-    m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+    if (m_bandStitchPipeLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device, m_bandStitchPipeLayout, nullptr);
+        m_bandStitchPipeLayout = VK_NULL_HANDLE;
+    }
+    if (m_bandStitchDescPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(m_device, m_bandStitchDescPool, nullptr);
+        m_bandStitchDescPool = VK_NULL_HANDLE;
+    }
+    m_bandStitchDescSets = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    m_bandStitchBoundBuf.fill(VK_NULL_HANDLE);
+    m_bandStitchBoundImg.fill(VK_NULL_HANDLE);
+    m_bandStitchBoundSize.fill(0);
+    if (m_bandStitchDescLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(m_device, m_bandStitchDescLayout, nullptr);
+        m_bandStitchDescLayout = VK_NULL_HANDLE;
+    }
+    m_upwaysPipeline.reset();
+    if (m_postProcessDescPool != VK_NULL_HANDLE) {
+        for (VkDescriptorSet& tmSet : m_tonemapUpwaysDescSets) {
+            if (tmSet != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(m_device, m_postProcessDescPool, 1, &tmSet);
+            }
+            tmSet = VK_NULL_HANDLE;
+        }
+    } else {
+        m_tonemapUpwaysDescSets.fill(VK_NULL_HANDLE);
+    }
+    m_tonemapUpwaysBoundInView.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundOutView.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundStitchBuf.fill(VK_NULL_HANDLE);
+    m_tonemapUpwaysBoundStitchSize.fill(0);
 }
 
 void SuperResolutionManager::createUpwaysResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
     if (!isUpwaysRequested(config)) {
         return;
     }
-    if (m_postProcessDescPool && postProcess && m_tonemapUpwaysDescSet == VK_NULL_HANDLE) {
-        VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-        tmAllocInfo.descriptorPool = m_postProcessDescPool;
-        tmAllocInfo.descriptorSetCount = 1;
+    if (m_postProcessDescPool && postProcess) {
         VkDescriptorSetLayout layout = postProcess->getTonemapDescLayout();
-        tmAllocInfo.pSetLayouts = &layout;
-        if (vkAllocateDescriptorSets(m_device, &tmAllocInfo, &m_tonemapUpwaysDescSet) != VK_SUCCESS) {
-            Logger::warn("Failed to allocate Tonemap Upways descriptor set");
-            m_tonemapUpwaysDescSet = VK_NULL_HANDLE;
+        for (VkDescriptorSet& tmSet : m_tonemapUpwaysDescSets) {
+            if (tmSet != VK_NULL_HANDLE) {
+                continue;
+            }
+            VkDescriptorSetAllocateInfo tmAllocInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+            tmAllocInfo.descriptorPool = m_postProcessDescPool;
+            tmAllocInfo.descriptorSetCount = 1;
+            tmAllocInfo.pSetLayouts = &layout;
+            if (vkAllocateDescriptorSets(m_device, &tmAllocInfo, &tmSet) != VK_SUCCESS) {
+                Logger::warn("Failed to allocate Tonemap Upways descriptor set");
+                tmSet = VK_NULL_HANDLE;
+            }
         }
     }
 
@@ -283,7 +426,9 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
                                     bool upwaysSuperres, AccumFormat accumFormat,
                                     PostProcessPipeline* postProcess, VkCommandBuffer cmd,
                                     FsrVersion fsrVersion,
-                                    UpwaysPrecision upwaysPrecision) {
+                                    UpwaysPrecision upwaysPrecision,
+                                    UpwaysVersion upwaysVersion,
+                                    const std::string& upwaysWeightsPath) {
     Config cfgStub{};
     cfgStub.width = width;
     cfgStub.height = height;
@@ -294,6 +439,8 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
     cfgStub.accum_format = accumFormat;
     cfgStub.fsr_version = fsrVersion;
     cfgStub.upways_precision = upwaysPrecision;
+    cfgStub.upways_version = upwaysVersion;
+    cfgStub.upways_weights_path = upwaysWeightsPath;
 
     releaseInactivePipelines(cfgStub);
 
@@ -305,11 +452,15 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
 
     destroyUpwaysResources();
     if (isUpwaysRequested(cfgStub)) {
+        const UpwaysRuntimeVersion targetVer = UpwaysPipeline::resolveVersion(
+            cfgStub.upways_version, cfgStub.upways_weights_path
+        );
         const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
-            m_physicalDevice, cfgStub.upways_precision, m_instance
+            m_physicalDevice, cfgStub.upways_precision, m_instance, targetVer
         );
         bool recreated = false;
-        if (m_upwaysPipeline && m_upwaysPipeline->getPrecision() != targetPrec) {
+        if (m_upwaysPipeline &&
+            (m_upwaysPipeline->getVersion() != targetVer || m_upwaysPipeline->getPrecision() != targetPrec)) {
             vkDeviceWaitIdle(m_device);
             destroyUpwaysPipelines();
             recreated = true;
@@ -318,7 +469,7 @@ void SuperResolutionManager::resize(uint32_t width, uint32_t height, float rende
             createUpwaysPipelines(cfgStub);
             recreated = true;
         } else {
-            m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+            m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes, outH);
         }
         createUpwaysResources(cfgStub, postProcess, cmd);
         if (recreated) {
@@ -347,7 +498,13 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
                                               Image* mlDiffuseImage, Image* mlSpecularImage,
                                               Image* frameImage0,
                                               Image* mlSkipImage,
-                                              Image* mlSpecAlbedoImage) {
+                                              Image* mlSpecAlbedoImage,
+                                              Image* mlIrradianceImage,
+                                              Image* mlPrimaryGuideImage,
+                                              Image* mlSurfaceMvImage,
+                                              Image* mlDiffHitDistImage,
+                                              Image* mlSpecVmvImage,
+                                              Image* mlSkipCompactImage) {
     m_cachedPostProcess = postProcess;
     m_cachedAccumImage = accumImage;
     m_cachedOutputImage = outputImage;
@@ -360,35 +517,48 @@ void SuperResolutionManager::updateDescriptors(PostProcessPipeline* postProcess,
     m_cachedFrameImage0 = frameImage0;
     m_cachedMlSkipImage = mlSkipImage;
     m_cachedMlSpecAlbedoImage = mlSpecAlbedoImage;
+    m_cachedMlIrradianceImage = mlIrradianceImage;
+    m_cachedMlPrimaryGuideImage = mlPrimaryGuideImage;
+    m_cachedMlSurfaceMvImage = mlSurfaceMvImage;
+    m_cachedMlDiffHitDistImage = mlDiffHitDistImage;
+    m_cachedMlSpecVmvImage = mlSpecVmvImage;
+    m_cachedMlSkipCompactImage = mlSkipCompactImage;
 
     refreshCachedDescriptors();
 }
 
 void SuperResolutionManager::refreshCachedDescriptors() {
+    m_bandStitchBoundBuf.fill(VK_NULL_HANDLE);
+    m_bandStitchBoundImg.fill(VK_NULL_HANDLE);
+    m_bandStitchBoundSize.fill(0);
+
     if (m_upwaysPipeline && m_cachedAccumImage && m_cachedOutputImage) {
-        VkImageView normDepthView = m_cachedNormalDepthImage ? m_cachedNormalDepthImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView motionView = m_cachedMotionVectorImage ? m_cachedMotionVectorImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView albedoView = m_cachedMlAlbedoRoughnessImage ? m_cachedMlAlbedoRoughnessImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView specMotionView = m_cachedMlSpecularMotionImage ? m_cachedMlSpecularMotionImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView diffView = m_cachedMlDiffuseImage ? m_cachedMlDiffuseImage->getImageView()
-                             : (m_cachedFrameImage0 ? m_cachedFrameImage0->getImageView() : VK_NULL_HANDLE);
-        VkImageView specView = m_cachedMlSpecularImage ? m_cachedMlSpecularImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView specAlbView = m_cachedMlSpecAlbedoImage ? m_cachedMlSpecAlbedoImage->getImageView() : VK_NULL_HANDLE;
-        VkImageView skipView = m_cachedMlSkipImage ? m_cachedMlSkipImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView irrView = m_cachedMlIrradianceImage ? m_cachedMlIrradianceImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView primGuideView = m_cachedMlPrimaryGuideImage ? m_cachedMlPrimaryGuideImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView surfaceMvView = m_cachedMlSurfaceMvImage ? m_cachedMlSurfaceMvImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView diffHitDistView = m_cachedMlDiffHitDistImage ? m_cachedMlDiffHitDistImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView specVmvView = m_cachedMlSpecVmvImage ? m_cachedMlSpecVmvImage->getImageView() : VK_NULL_HANDLE;
+        VkImageView skipCompactView = m_cachedMlSkipCompactImage ? m_cachedMlSkipCompactImage->getImageView() : VK_NULL_HANDLE;
 
         m_upwaysPipeline->updateDescriptors(
-            diffView,
-            specView,
-            albedoView,
-            specAlbView,
-            skipView,
-            normDepthView,
-            motionView,
-            specMotionView
+            irrView,
+            primGuideView,
+            surfaceMvView,
+            diffHitDistView,
+            specVmvView,
+            skipCompactView
         );
 
-        if (m_tonemapUpwaysDescSet != VK_NULL_HANDLE && m_upwaysPipeline->getOutputImage() && m_cachedPostProcess) {
-            m_cachedPostProcess->updateTonemapDescriptors(m_tonemapUpwaysDescSet, m_upwaysPipeline->getOutputImage(), m_cachedOutputImage);
+        m_tonemapUpwaysBoundInView.fill(VK_NULL_HANDLE);
+        m_tonemapUpwaysBoundOutView.fill(VK_NULL_HANDLE);
+        m_tonemapUpwaysBoundStitchBuf.fill(VK_NULL_HANDLE);
+        m_tonemapUpwaysBoundStitchSize.fill(0);
+        if (m_upwaysPipeline->getOutputImage() && m_cachedPostProcess) {
+            for (VkDescriptorSet tmSet : m_tonemapUpwaysDescSets) {
+                if (tmSet != VK_NULL_HANDLE) {
+                    m_cachedPostProcess->updateTonemapDescriptors(tmSet, m_upwaysPipeline->getOutputImage(), m_cachedOutputImage);
+                }
+            }
         }
     }
 
@@ -407,15 +577,20 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
                                             uint32_t frameIndex, bool cameraMovedLastFrame,
                                             uint32_t accumulatedSamples,
                                             Image* mlAlbedoRoughnessImage, Image* normalDepthImage,
-                                            PostProcessPipeline* postProcess, Image* outputImage) {
+                                            PostProcessPipeline* postProcess, Image* outputImage,
+                                            const UpwaysBandSplit* bandSplit) {
     if (config.denoiser_mode != DenoiserMode::Upways && config.upscaler_mode != UpscalerMode::Upways) {
         return false;
     }
 
-    const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
-        m_physicalDevice, config.upways_precision, m_instance
+    const UpwaysRuntimeVersion targetVer = UpwaysPipeline::resolveVersion(
+        config.upways_version, config.upways_weights_path
     );
-    if (m_upwaysPipeline && m_upwaysPipeline->getPrecision() != targetPrec) {
+    const UpwaysComputePrecision targetPrec = UpwaysPipeline::selectPrecision(
+        m_physicalDevice, config.upways_precision, m_instance, targetVer
+    );
+    if (m_upwaysPipeline &&
+        (m_upwaysPipeline->getVersion() != targetVer || m_upwaysPipeline->getPrecision() != targetPrec)) {
         vkDeviceWaitIdle(m_device);
         destroyUpwaysPipelines();
     }
@@ -434,18 +609,22 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         return false;
     }
 
-    uint32_t inW = config.getRenderWidth();
-    uint32_t inH = config.getRenderHeight();
+    uint32_t fullInW = config.getRenderWidth();
+    uint32_t fullInH = config.getRenderHeight();
     bool coupledWithExternalUpscaler = (config.upscaler_mode == UpscalerMode::FSR);
-    uint32_t outW = coupledWithExternalUpscaler ? inW : config.width;
-    uint32_t outH = coupledWithExternalUpscaler ? inH : config.height;
-    bool isSuperRes = (inW < outW || inH < outH);
+    uint32_t fullOutW = coupledWithExternalUpscaler ? fullInW : config.width;
+    uint32_t fullOutH = coupledWithExternalUpscaler ? fullInH : config.height;
+    bool isSuperRes = !coupledWithExternalUpscaler && ((fullInW < fullOutW || fullInH < fullOutH) || config.isUpwaysSuperResActive());
 
-    if (m_upwaysPipeline->getInputWidth() != inW || m_upwaysPipeline->getInputHeight() != inH ||
-        m_upwaysPipeline->getOutputWidth() != outW || m_upwaysPipeline->getOutputHeight() != outH ||
+    uint32_t targetInH = bandSplit ? bandSplit->topLrH : fullInH;
+    uint32_t targetOutH = bandSplit ? bandSplit->topHrH : fullOutH;
+
+    if (m_upwaysPipeline->getInputWidth() != fullInW || m_upwaysPipeline->getInputHeight() != targetInH ||
+        m_upwaysPipeline->getOutputWidth() != fullOutW || m_upwaysPipeline->getOutputHeight() != targetOutH ||
+        m_upwaysPipeline->getOutputFullHeight() != fullOutH ||
         m_upwaysPipeline->isSuperResEnabled() != isSuperRes) {
         vkDeviceWaitIdle(m_device);
-        m_upwaysPipeline->resize(inW, inH, outW, outH, isSuperRes);
+        m_upwaysPipeline->resize(fullInW, targetInH, fullOutW, targetOutH, isSuperRes, fullOutH);
         refreshCachedDescriptors();
     }
 
@@ -458,21 +637,133 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         if (resetHistory) {
             camera->resetPrevViewProj();
         }
-        bool enableJitter = isSuperRes || coupledWithExternalUpscaler ||
-                            (config.upscaler_mode == UpscalerMode::Upways && config.upways_superres);
-        uint32_t jitterSeqLen = coupledWithExternalUpscaler ? getFsrJitterPhaseCount(inW, config.width) : 32u;
+        bool enableJitter = isSuperRes || coupledWithExternalUpscaler;
+        uint32_t jitterSeqLen = coupledWithExternalUpscaler ? getFsrJitterPhaseCount(fullInW, config.width) : 32u;
         CameraUniform ubo = camera->getUniformData(
             frameIndex, 1, config.max_bounces, 0,
-            enableJitter, inW, inH, 0, false, jitterSeqLen
+            enableJitter, fullInW, fullInH, 0, false, jitterSeqLen
         );
         jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
     }
 
+    UpwaysBandParams bandParams{};
+    if (bandSplit) {
+        bandParams.bandLrY0 = 0u;
+        bandParams.bandHrY0 = 0u;
+        bandParams.fullLrHeight = fullInH;
+        bandParams.fullHrHeight = fullOutH;
+        bandParams.keepHrYStart = 0u;
+        bandParams.keepHrYEnd = bandSplit->splitHrY;
+    }
+
     m_upwaysPipeline->recordFrame(
         cmd, frameIndex, resetHistory, jitter,
-        coupledWithExternalUpscaler, config.upways_heuristic_fallback, 1.0f
+        coupledWithExternalUpscaler, config.upways_heuristic_fallback, 1.0f, bandParams
     );
     return true;
+}
+
+void SuperResolutionManager::dispatchUpwaysBandStitch(VkCommandBuffer cmd, uint32_t frameSlot,
+                                                      VkBuffer secPackedBuf, VkDeviceSize bufSize,
+                                                      uint32_t width, uint32_t dstYStart, uint32_t rowCount) {
+    if (!m_upwaysPipeline || !m_upwaysPipeline->getOutputImage() || m_bandStitchPipeline == VK_NULL_HANDLE ||
+        secPackedBuf == VK_NULL_HANDLE || width == 0u || rowCount == 0u) {
+        return;
+    }
+
+    const uint32_t setIdx = frameSlot % 2u;
+    VkDescriptorSet dstSet = m_bandStitchDescSets[setIdx];
+    if (dstSet == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const VkImageView outView = m_upwaysPipeline->getOutputImage()->getImageView();
+    const VkDeviceSize clampedSize = std::max<VkDeviceSize>(bufSize, 256ull);
+    if (m_bandStitchBoundBuf[setIdx] != secPackedBuf ||
+        m_bandStitchBoundImg[setIdx] != outView ||
+        m_bandStitchBoundSize[setIdx] != clampedSize) {
+        VkDescriptorBufferInfo srcBufInfo{
+            secPackedBuf,
+            0,
+            clampedSize
+        };
+        VkDescriptorImageInfo dstImgInfo{
+            VK_NULL_HANDLE,
+            outView,
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+        std::array<VkWriteDescriptorSet, 2> writes{};
+        writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &srcBufInfo, nullptr };
+        writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dstSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dstImgInfo, nullptr, nullptr };
+        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        m_bandStitchBoundBuf[setIdx] = secPackedBuf;
+        m_bandStitchBoundImg[setIdx] = outView;
+        m_bandStitchBoundSize[setIdx] = clampedSize;
+    }
+
+    VkMemoryBarrier2 preBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    preBarrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    preBarrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    preBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    preBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+
+    VkDependencyInfo preDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    preDep.memoryBarrierCount = 1u;
+    preDep.pMemoryBarriers = &preBarrier;
+    vkCmdPipelineBarrier2(cmd, &preDep);
+
+    BandStitchPushConstants stitchPC{};
+    stitchPC.width = width;
+    stitchPC.dstYStart = dstYStart;
+    stitchPC.rowCount = rowCount;
+    stitchPC.pad = 0u;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bandStitchPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_bandStitchPipeLayout, 0, 1u, &dstSet, 0, nullptr);
+    vkCmdPushConstants(cmd, m_bandStitchPipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(BandStitchPushConstants), &stitchPC);
+    vkCmdDispatch(cmd, (width + 15u) / 16u, (rowCount + 15u) / 16u, 1u);
+
+    VkMemoryBarrier2 postBarrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    postBarrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    postBarrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    postBarrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    postBarrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+    VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    postDep.memoryBarrierCount = 1u;
+    postDep.pMemoryBarriers = &postBarrier;
+    vkCmdPipelineBarrier2(cmd, &postDep);
+}
+
+void SuperResolutionManager::updateTonemapUpwaysBandDescriptor(uint32_t frameSlot,
+                                                               PostProcessPipeline* postProcess,
+                                                               Image* outputImage,
+                                                               VkBuffer stitchBuf,
+                                                               VkDeviceSize stitchSize) {
+    if (!postProcess || !m_upwaysPipeline || !m_upwaysPipeline->getOutputImage()) {
+        return;
+    }
+    const uint32_t s = frameSlot % 2u;
+    VkDescriptorSet dstSet = m_tonemapUpwaysDescSets[s];
+    Image* outImg = outputImage ? outputImage : m_cachedOutputImage;
+    if (dstSet == VK_NULL_HANDLE || !outImg) {
+        return;
+    }
+    Image* inImg = m_upwaysPipeline->getOutputImage();
+    const VkImageView inView = inImg->getImageView();
+    const VkImageView outView = outImg->getImageView();
+    const VkDeviceSize clampedSize = (stitchBuf != VK_NULL_HANDLE) ? std::max<VkDeviceSize>(stitchSize, 256ull) : 0ull;
+    if (m_tonemapUpwaysBoundInView[s] == inView &&
+        m_tonemapUpwaysBoundOutView[s] == outView &&
+        m_tonemapUpwaysBoundStitchBuf[s] == stitchBuf &&
+        m_tonemapUpwaysBoundStitchSize[s] == clampedSize) {
+        return;
+    }
+    postProcess->updateTonemapDescriptors(dstSet, inImg, outImg, stitchBuf, clampedSize);
+    m_tonemapUpwaysBoundInView[s] = inView;
+    m_tonemapUpwaysBoundOutView[s] = outView;
+    m_tonemapUpwaysBoundStitchBuf[s] = stitchBuf;
+    m_tonemapUpwaysBoundStitchSize[s] = clampedSize;
 }
 
 bool SuperResolutionManager::dispatchFsr(VkCommandBuffer cmd, bool resetHistory,

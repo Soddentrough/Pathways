@@ -1,0 +1,584 @@
+#version 460
+#include "upways_v5_common.glsl"
+
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
+
+// SPEC_STAGE_ID:
+//   0 = Phase 2A L0 temporal + card4 pre-filter -> Pyr0 + CurrDiff/Spec/Hid
+//   1 = Phase 2B bottom-up 2x2 quad pool (L0->L1, L1->L2, L2->L3)
+//   2 = Phase 2C top-down 13-tap affinity recon (L3 dil=3, L2/L1 dil=1)
+//   3 = Phase 2C L0 9-tap affinity + remod + CleanRadLr + SrIn (or 1x Output / Fused Band Pack)
+layout(constant_id = 0) const uint SPEC_STAGE_ID = 0u;
+layout(constant_id = 1) const uint SPEC_DIL      = 1u;
+
+layout(set = 0, binding = 0)  readonly  buffer InPy0Buf      { uvec4 p4[]; }   g_in0;
+layout(set = 0, binding = 1)  readonly  buffer InPy1Buf      { uvec4 p4[]; }   g_in1;
+layout(set = 0, binding = 2)  readonly  buffer KHeadBuf      { uvec2 k2[]; }   g_khead;
+layout(set = 0, binding = 3)  writeonly buffer OutPyBuf      { uvec4 p4[]; }   g_out;
+layout(set = 0, binding = 4)  writeonly buffer OutSrInBuf    { uvec2 act2[]; } g_srIn;
+
+layout(set = 0, binding = 5,  rg32ui)   readonly  uniform uimage2D uMlIrradiance;
+layout(set = 0, binding = 6,  rgba32ui) readonly  uniform uimage2D uMlPrimaryGuide;
+layout(set = 0, binding = 7,  r32ui)    readonly  uniform uimage2D uMlSurfaceMv;
+layout(set = 0, binding = 8,  rg32ui)   readonly  uniform uimage2D uMlSpecVmv;
+layout(set = 0, binding = 9,  r32ui)    readonly  uniform uimage2D uMlSkipCompact;
+
+layout(set = 0, binding = 10, rgba16f)  readonly  uniform image2D  uPrevDiffLr;
+layout(set = 0, binding = 11, rgba16f)  readonly  uniform image2D  uPrevSpecLr;
+layout(set = 0, binding = 12, rg16f)    readonly  uniform image2D  uPrevHiddenLr;
+
+layout(set = 0, binding = 13, rgba16f)  writeonly uniform image2D  uCurrDiffLr;
+layout(set = 0, binding = 14, rgba16f)  writeonly uniform image2D  uCurrSpecLr;
+layout(set = 0, binding = 15, rg16f)    writeonly uniform image2D  uCurrHiddenLr;
+layout(set = 0, binding = 16, rgba16f)  writeonly uniform image2D  uCleanRadLr;
+layout(set = 0, binding = 17, rgba16f)  writeonly uniform image2D  uOutputColor;
+layout(set = 0, binding = 18)           writeonly buffer  BandPackOut { uint rgb9e5[]; } g_bandPackOut;
+
+// Max apron = 22x14 = 308 pixels (when SPEC_DIL == 3); 8 u32/px = 2,464 dwords = 9,856 B
+shared uint s_tile[2560];
+
+#define SAMPLE_IMG_BILINEAR(img, coord, dims, tapsOut) \
+    do { \
+        BilinearTaps _bt = computeBilinearTaps((coord), (dims)); \
+        (tapsOut) = _bt.w.x * imageLoad((img), _bt.i00) \
+                  + _bt.w.y * imageLoad((img), _bt.i10) \
+                  + _bt.w.z * imageLoad((img), _bt.i01) \
+                  + _bt.w.w * imageLoad((img), _bt.i11); \
+    } while (false)
+
+void loadPyPixel(uint basePxIdx, bool fromIn1, out vec3 dRgb, out vec4 eD, out vec3 sRgb, out vec4 eS) {
+    uint idx2 = basePxIdx * 2u;
+    uvec4 v0 = fromIn1 ? g_in1.p4[idx2 + 0u] : g_in0.p4[idx2 + 0u];
+    uvec4 v1 = fromIn1 ? g_in1.p4[idx2 + 1u] : g_in0.p4[idx2 + 1u];
+    vec4 a0 = vec4(unpackHalf2x16(v0.x), unpackHalf2x16(v0.y));
+    vec4 a1 = vec4(unpackHalf2x16(v0.z), unpackHalf2x16(v0.w));
+    vec4 b0 = vec4(unpackHalf2x16(v1.x), unpackHalf2x16(v1.y));
+    vec4 b1 = vec4(unpackHalf2x16(v1.z), unpackHalf2x16(v1.w));
+    dRgb = a0.rgb;
+    eD   = vec4(a0.w, a1.xyz);
+    sRgb = vec3(a1.w, b0.xy);
+    eS   = vec4(b0.zw, b1.xy);
+}
+
+void storePyPixel(uint basePxIdx, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS) {
+    uint idx2 = basePxIdx * 2u;
+    vec4 a0 = vec4(dRgb, eD.x);
+    vec4 a1 = vec4(eD.yzw, sRgb.x);
+    vec4 b0 = vec4(sRgb.yz, eS.xy);
+    vec4 b1 = vec4(eS.zw, 0.0, 0.0);
+    g_out.p4[idx2 + 0u] = uvec4(packHalf2x16(a0.xy), packHalf2x16(a0.zw), packHalf2x16(a1.xy), packHalf2x16(a1.zw));
+    g_out.p4[idx2 + 1u] = uvec4(packHalf2x16(b0.xy), packHalf2x16(b0.zw), packHalf2x16(b1.xy), packHalf2x16(b1.zw));
+}
+
+void storeTileEntry(uint ap, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS) {
+    uint b = ap * 8u;
+    s_tile[b + 0u] = packHalf2x16(dRgb.rg);
+    s_tile[b + 1u] = packHalf2x16(vec2(dRgb.b, sRgb.r));
+    s_tile[b + 2u] = packHalf2x16(sRgb.gb);
+    s_tile[b + 3u] = packHalf2x16(eD.xy);
+    s_tile[b + 4u] = packHalf2x16(eD.zw);
+    s_tile[b + 5u] = packHalf2x16(eS.xy);
+    s_tile[b + 6u] = packHalf2x16(eS.zw);
+}
+
+void loadTileEntry(uint ap, out vec3 dRgb, out vec4 eD, out vec3 sRgb, out vec4 eS) {
+    uint b  = ap * 8u;
+    vec2 t0 = unpackHalf2x16(s_tile[b + 0u]);
+    vec2 t1 = unpackHalf2x16(s_tile[b + 1u]);
+    vec2 t2 = unpackHalf2x16(s_tile[b + 2u]);
+    dRgb = vec3(t0, t1.x);
+    sRgb = vec3(t1.y, t2);
+    eD   = vec4(unpackHalf2x16(s_tile[b + 3u]), unpackHalf2x16(s_tile[b + 4u]));
+    eS   = vec4(unpackHalf2x16(s_tile[b + 5u]), unpackHalf2x16(s_tile[b + 6u]));
+}
+
+void softmax13AndAccum(float rawLogits[13], vec3 vals[13], out vec3 outWeighted) {
+    float meanL = 0.0;
+    for (uint i = 0u; i < 13u; ++i) {
+        meanL += rawLogits[i];
+    }
+    meanL *= (1.0 / 13.0);
+    float maxL = -16.0;
+    float cL[13];
+    for (uint i = 0u; i < 13u; ++i) {
+        cL[i] = clamp(rawLogits[i] - meanL, -16.0, 16.0);
+        maxL  = max(maxL, cL[i]);
+    }
+    float sumExp = 0.0;
+    vec3  acc    = vec3(0.0);
+    for (uint i = 0u; i < 13u; ++i) {
+        float w = exp(cL[i] - maxL);
+        sumExp += w;
+        acc    += w * vals[i];
+    }
+    outWeighted = acc / max(sumExp, 1e-8);
+}
+
+void softmax9AndAccum(float rawLogits[9], vec3 vals[9], out vec3 outWeighted) {
+    float meanL = 0.0;
+    for (uint i = 0u; i < 9u; ++i) {
+        meanL += rawLogits[i];
+    }
+    meanL *= (1.0 / 9.0);
+    float maxL = -16.0;
+    float cL[9];
+    for (uint i = 0u; i < 9u; ++i) {
+        cL[i] = clamp(rawLogits[i] - meanL, -16.0, 16.0);
+        maxL  = max(maxL, cL[i]);
+    }
+    float sumExp = 0.0;
+    vec3  acc    = vec3(0.0);
+    for (uint i = 0u; i < 9u; ++i) {
+        float w = exp(cL[i] - maxL);
+        sumExp += w;
+        acc    += w * vals[i];
+    }
+    outWeighted = acc / max(sumExp, 1e-8);
+}
+
+uint encodeSrInVec4(vec4 v, vec4 int8Max) {
+#if UPWAYS_IS_FP8
+    return packFp8Vec4(v);
+#else
+    return packInt8Vec4(v, int8Max);
+#endif
+}
+
+void readCompactDemodFolded(
+    ivec2 q,
+    out vec3 rawDiff,
+    out vec3 rawSpec,
+    out vec3 aDiffEff,
+    out vec3 aSpecEff,
+    out vec3 skipEff,
+    out vec3 viewNormal,
+    out float linDepth,
+    out float roughness,
+    out vec2 surfMv,
+    out vec2 specMv,
+    out bool isSky
+) {
+    uvec2 irr        = imageLoad(uMlIrradiance, q).xy;
+    uvec4 pg         = imageLoad(uMlPrimaryGuide, q);
+    vec2  surfMvRaw  = unpackHalf2x16(imageLoad(uMlSurfaceMv, q).x);
+    uvec2 specVmvRaw = imageLoad(uMlSpecVmv, q).xy;
+    vec3  skipRad    = unpackCompactSkip(imageLoad(uMlSkipCompact, q).r);
+
+    vec3  aDiff, aSpec;
+    float reactiveMask, matClass;
+    bool  transBit;
+    unpackCompactPrimary(pg, viewNormal, linDepth, reactiveMask, aDiff, roughness, aSpec, matClass, transBit);
+
+    surfMv = vec2(sanitizeFloat(surfMvRaw.x, 0.0), sanitizeFloat(surfMvRaw.y, 0.0));
+    bool  isSkyPre = isSkyOrEmissiveOnly(linDepth, matClass, aDiff, aSpec);
+    float specInvZ, specDist;
+    unpackCompactSpecVmv(specVmvRaw, surfMv, linDepth, transBit, isSkyPre, specMv, specInvZ, specDist);
+
+    bool isDiel;
+    demodulateAndFoldV5(
+        irr, aDiff, aSpec, skipRad, linDepth, matClass, transBit, specInvZ,
+        rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, isSky, isDiel
+    );
+}
+
+void main() {
+    uint t  = gl_LocalInvocationIndex; // 0..127
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    int  gx = int(gl_GlobalInvocationID.x);
+    int  gy = int(gl_GlobalInvocationID.y);
+    int  W  = int(pc.outW);
+    int  H  = int(pc.outH);
+
+    // -------------------------------------------------------------------------
+    // STAGE 0: Phase 2A L0 Temporal Update + Card4 Pre-filter -> Pyr0
+    // -------------------------------------------------------------------------
+    if (SPEC_STAGE_ID == 0u) {
+        int wgX = int(gl_WorkGroupID.x * 16u);
+        int wgY = int(gl_WorkGroupID.y * 8u);
+        for (uint pass = 0u; pass < 2u; ++pass) {
+            uint ap = pass * 128u + t;
+            if (ap < 180u) {
+                uint ay = ap / 18u;
+                uint ax = ap - ay * 18u;
+                ivec2 q = clamp(ivec2(wgX + int(ax) - 1, wgY + int(ay) - 1), ivec2(0), ivec2(W - 1, H - 1));
+                vec3 rD, rS, aDe, aSe, skE, nrm;
+                float dep, rough;
+                vec2 sMv, spMv;
+                bool isSkyQ;
+                readCompactDemodFolded(q, rD, rS, aDe, aSe, skE, nrm, dep, rough, sMv, spMv, isSkyQ);
+                storeTileEntry(ap, rD, vec4(0.0), rS, vec4(0.0));
+            }
+        }
+        barrier();
+
+        if (gx >= W || gy >= H) {
+            return;
+        }
+
+        uint cAp = (ly + 1u) * 18u + (lx + 1u);
+        vec3 rawDiff, rawSpec, dDummy, sDummy;
+        vec4 edUnused, esUnused;
+        loadTileEntry(cAp, rawDiff, edUnused, rawSpec, esUnused);
+
+        int cOffs[4] = int[4](-1, 1, -18, 18);
+        vec3 card4D = vec3(0.0), card4S = vec3(0.0);
+        for (uint k = 0u; k < 4u; ++k) {
+            vec3 nD, nS;
+            loadTileEntry(uint(int(cAp) + cOffs[k]), nD, edUnused, nS, esUnused);
+            card4D += nD;
+            card4S += nS;
+        }
+        card4D *= 0.25;
+        card4S *= 0.25;
+
+        ivec2 p = ivec2(gx, gy);
+        vec3 rD_c, rS_c, aDe, aSe, skE, nrm;
+        float dep, rough;
+        vec2 surfMv, specMv;
+        bool isSky;
+        readCompactDemodFolded(p, rD_c, rS_c, aDe, aSe, skE, nrm, dep, rough, surfMv, specMv, isSky);
+
+        bool reset = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+        ivec2 prevDims = imageSize(uPrevDiffLr);
+        vec2 coordD, coordS;
+        bool inD = computeBandWarpCoord(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
+        bool inS = computeBandWarpCoord(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordS);
+        float validSurf = inD ? 1.0 : 0.0;
+        float validVirt = inS ? 1.0 : 0.0;
+
+        vec3 wDiff = vec3(0.0), wSpecSurf = vec3(0.0), wSpecVirt = vec3(0.0);
+        vec2 wHid  = vec2(0.0);
+        if (inD) {
+            vec4 wd4, ws4, wh4;
+            SAMPLE_IMG_BILINEAR(uPrevDiffLr,   coordD, prevDims, wd4);
+            SAMPLE_IMG_BILINEAR(uPrevSpecLr,   coordD, prevDims, ws4);
+            SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
+            wDiff     = clampFp16Rgb(sanitizeRgb(wd4.rgb));
+            wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
+            wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
+        }
+        if (inS) {
+            vec4 wsv4;
+            SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
+            wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+        }
+
+        // Read 32-ch DEN_HEAD @ L0 (8 uvec2 FP16/px)
+        uint zb = uint(gy * W + gx) * 8u;
+        vec4 z0 = unpackHalf4(g_khead.k2[zb + 0u]); // z[0..3]: u_h(2), c_h(2)
+        vec4 z1 = unpackHalf4(g_khead.k2[zb + 1u]); // z[4..7]: gamma_d, gamma_s, beta_virt, pre_d
+        vec4 z2 = unpackHalf4(g_khead.k2[zb + 2u]); // z[8..11]: pre_s, gate_d0, gate_s0, e0_d.x
+        vec4 z3 = unpackHalf4(g_khead.k2[zb + 3u]); // z[12..15]: e0_d.yzw, e0_s.x
+        vec4 z4 = unpackHalf4(g_khead.k2[zb + 4u]); // z[16..19]: e0_s.yzw, p_d0[0]
+
+        vec2  uH       = zeroCenteredGate2(z0.xy);
+        vec2  cH       = 4.0 * tanh(z0.zw * 0.5);
+        vec2  hGru     = validSurf * (vec2(1.0) - uH) * wHid + uH * cH;
+        vec2  hNext    = isSky ? vec2(0.0) : hGru;
+        imageStore(uCurrHiddenLr, p, vec4(hNext, 0.0, 0.0));
+
+        float gammaD    = validSurf * 0.985 * zeroCenteredGate(1.5 * z1.x);
+        float betaVirt  = validVirt * zeroCenteredGate(z1.z);
+        float effValidS = (1.0 - betaVirt) * validSurf + betaVirt * validVirt;
+        float gammaS    = effValidS * 0.980 * zeroCenteredGate(1.5 * z1.y);
+        vec3  wSpecMix  = mix(wSpecSurf, wSpecVirt, betaVirt);
+
+        float preD      = 0.5 * zeroCenteredGate(z1.w);
+        float preS      = 0.5 * zeroCenteredGate(z2.x);
+        vec3  rawDIn    = mix(rawDiff, card4D, preD);
+        vec3  rawSIn    = mix(rawSpec, card4S, preS);
+        vec3  mDiff     = mix(rawDIn, wDiff, gammaD);
+        vec3  mSpec     = mix(rawSIn, wSpecMix, gammaS);
+
+        imageStore(uCurrDiffLr, p, vec4(isSky ? rawDiff : clampFp16Rgb(mDiff), 1.0));
+        imageStore(uCurrSpecLr, p, vec4(isSky ? rawSpec : clampFp16Rgb(mSpec), 1.0));
+
+        vec4 e0D = 3.0 * tanh(vec4(z2.w, z3.xyz) * 0.5);
+        vec4 e0S = 3.0 * tanh(vec4(z3.w, z4.xyz) * 0.5);
+        storePyPixel(uint(gy * W + gx), clampFp16Rgb(mDiff), e0D, clampFp16Rgb(mSpec), e0S);
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // STAGE 1: Phase 2B Bottom-Up 2x2 Quad Pool (L0->L1, L1->L2, L2->L3)
+    // -------------------------------------------------------------------------
+    if (SPEC_STAGE_ID == 1u) {
+        if (gx >= W || gy >= H) {
+            return;
+        }
+        int Wf = int(pc.inW);
+        int Hf = int(pc.inH);
+        int x0 = min(gx * 2,     Wf - 1);
+        int x1 = min(gx * 2 + 1, Wf - 1);
+        int y0 = min(gy * 2,     Hf - 1);
+        int y1 = min(gy * 2 + 1, Hf - 1);
+
+        // Read khead[28..31] from FP16 32-ch khead (8 uvec2/px, slot + 7)
+        uint kBase = uint(gy * W + gx) * 8u + 7u;
+        vec4 kv    = unpackHalf4(g_khead.k2[kBase]);
+        float mL   = 0.25 * (kv.x + kv.y + kv.z + kv.w);
+        vec4 w     = exp(clamp(3.0 * (kv - vec4(mL)), vec4(-16.0), vec4(16.0)));
+        w         /= max(dot(w, vec4(1.0)), 1e-8);
+
+        vec3 d0, d1, d2, d3, s0, s1, s2, s3;
+        vec4 ed0, ed1, ed2, ed3, es0, es1, es2, es3;
+        loadPyPixel(uint(y0 * Wf + x0), false, d0, ed0, s0, es0);
+        loadPyPixel(uint(y0 * Wf + x1), false, d1, ed1, s1, es1);
+        loadPyPixel(uint(y1 * Wf + x0), false, d2, ed2, s2, es2);
+        loadPyPixel(uint(y1 * Wf + x1), false, d3, ed3, s3, es3);
+
+        vec3 pD  = w.x * d0  + w.y * d1  + w.z * d2  + w.w * d3;
+        vec4 pED = w.x * ed0 + w.y * ed1 + w.z * ed2 + w.w * ed3;
+        vec3 pS  = w.x * s0  + w.y * s1  + w.z * s2  + w.w * s3;
+        vec4 pES = w.x * es0 + w.y * es1 + w.z * es2 + w.w * es3;
+        storePyPixel(uint(gy * W + gx), clampFp16Rgb(pD), pED, clampFp16Rgb(pS), pES);
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // STAGE 2: Phase 2C Top-Down 13-Tap Affinity Reconstruction (L3/L2/L1)
+    // -------------------------------------------------------------------------
+    if (SPEC_STAGE_ID == 2u) {
+        int  wgX    = int(gl_WorkGroupID.x * 16u);
+        int  wgY    = int(gl_WorkGroupID.y * 8u);
+        int  dil    = int(SPEC_DIL);
+        uint apW    = 16u + 2u * SPEC_DIL;
+        uint apH    = 8u  + 2u * SPEC_DIL;
+        uint numAp  = apW * apH;
+        uint passes = (numAp + 127u) >> 7u;
+
+        for (uint pass = 0u; pass < passes; ++pass) {
+            uint ap = pass * 128u + t;
+            if (ap < numAp) {
+                uint ay  = ap / apW;
+                uint ax  = ap - ay * apW;
+                ivec2 gp = clamp(ivec2(wgX + int(ax) - dil, wgY + int(ay) - dil), ivec2(0), ivec2(W - 1, H - 1));
+                vec3 d, s; vec4 ed, es;
+                loadPyPixel(uint(gp.y * W + gp.x), false, d, ed, s, es);
+                storeTileEntry(ap, d, ed, s, es);
+            }
+        }
+        barrier();
+
+        if (gx >= W || gy >= H) {
+            return;
+        }
+
+        // Read 32-ch FP16 khead (8 uvec2/px): priorD[0..12], gd[13], priorS[14..26], gs[27]
+        uint kBase = uint(gy * W + gx) * 8u;
+        vec4 kv0   = unpackHalf4(g_khead.k2[kBase + 0u]);
+        vec4 kv1   = unpackHalf4(g_khead.k2[kBase + 1u]);
+        vec4 kv2   = unpackHalf4(g_khead.k2[kBase + 2u]);
+        vec4 kv3   = unpackHalf4(g_khead.k2[kBase + 3u]);
+        vec4 kv4   = unpackHalf4(g_khead.k2[kBase + 4u]);
+        vec4 kv5   = unpackHalf4(g_khead.k2[kBase + 5u]);
+        vec4 kv6   = unpackHalf4(g_khead.k2[kBase + 6u]);
+
+        float priorD[13], priorS[13];
+        priorD[0]=kv0.x; priorD[1]=kv0.y; priorD[2]=kv0.z; priorD[3]=kv0.w;
+        priorD[4]=kv1.x; priorD[5]=kv1.y; priorD[6]=kv1.z; priorD[7]=kv1.w;
+        priorD[8]=kv2.x; priorD[9]=kv2.y; priorD[10]=kv2.z; priorD[11]=kv2.w;
+        priorD[12]=kv3.x;
+        float gd = zeroCenteredGate(kv3.y);
+        priorS[0]=kv3.z; priorS[1]=kv3.w;
+        priorS[2]=kv4.x; priorS[3]=kv4.y; priorS[4]=kv4.z; priorS[5]=kv4.w;
+        priorS[6]=kv5.x; priorS[7]=kv5.y; priorS[8]=kv5.z; priorS[9]=kv5.w;
+        priorS[10]=kv6.x; priorS[11]=kv6.y; priorS[12]=kv6.z;
+        float gs = zeroCenteredGate(kv6.w);
+
+        vec3  dTaps[13], sTaps[13];
+        float lD[13], lS[13];
+        uint  cAp = (ly + SPEC_DIL) * apW + (lx + SPEC_DIL);
+        vec3  cD, cS; vec4 cED, cES;
+        loadTileEntry(cAp, cD, cED, cS, cES);
+
+        uint tap = 0u;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                uint nAp = uint(int(cAp) + dy * int(apW) + dx);
+                vec3 nD, nS; vec4 nED, nES;
+                loadTileEntry(nAp, nD, nED, nS, nES);
+                dTaps[tap] = nD; sTaps[tap] = nS;
+                vec4 dd = nED - cED; vec4 ds = nES - cES;
+                lD[tap] = 3.5 * priorD[tap] - 2.0 * dot(dd, dd);
+                lS[tap] = 3.5 * priorS[tap] - 2.0 * dot(ds, ds);
+                ++tap;
+            }
+        }
+
+        if (SPEC_DIL == 3u) {
+            // L3: 4 cardinal dilated taps [L, R, U, D]
+            int ddx[4] = int[4](-3, 3, 0, 0);
+            int ddy[4] = int[4](0, 0, -3, 3);
+            for (uint k = 0u; k < 4u; ++k) {
+                uint nAp = uint(int(cAp) + ddy[k] * int(apW) + ddx[k]);
+                vec3 nD, nS; vec4 nED, nES;
+                loadTileEntry(nAp, nD, nED, nS, nES);
+                dTaps[9u + k] = nD; sTaps[9u + k] = nS;
+                vec4 dd = nED - cED; vec4 ds = nES - cES;
+                lD[9u + k] = 3.5 * priorD[9u + k] - 2.0 * dot(dd, dd);
+                lS[9u + k] = 3.5 * priorS[9u + k] - 2.0 * dot(ds, ds);
+            }
+        } else {
+            // L2 / L1: 4 bilinear parent taps from coarse reconstruction g_in1 (inW x inH)
+            int Wc = int(pc.inW);
+            int Hc = int(pc.inH);
+            vec2 scale = vec2(float(Wc), float(Hc)) / vec2(float(W), float(H));
+            BilinearTaps bt = computeBilinearTaps((vec2(gx, gy) + vec2(0.5)) * scale - vec2(0.5), ivec2(Wc, Hc));
+            ivec2 coords[4] = ivec2[4](bt.i00, bt.i10, bt.i01, bt.i11);
+            for (uint k = 0u; k < 4u; ++k) {
+                vec3 pD, pS; vec4 pED, pES;
+                loadPyPixel(uint(coords[k].y * Wc + coords[k].x), true, pD, pED, pS, pES);
+                dTaps[9u + k] = pD; sTaps[9u + k] = pS;
+                vec4 dd = pED - cED; vec4 ds = pES - cES;
+                lD[9u + k] = 3.5 * priorD[9u + k] - 2.0 * dot(dd, dd);
+                lS[9u + k] = 3.5 * priorS[9u + k] - 2.0 * dot(ds, ds);
+            }
+        }
+
+        vec3 wD, wS;
+        softmax13AndAccum(lD, dTaps, wD);
+        softmax13AndAccum(lS, sTaps, wS);
+        vec3 iHatD = clampFp16Rgb(mix(cD, wD, gd));
+        vec3 iHatS = clampFp16Rgb(mix(cS, wS, gs));
+        storePyPixel(uint(gy * W + gx), iHatD, cED, iHatS, cES);
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // STAGE 3: Phase 2C L0 9-Tap Affinity + Remodulation + CleanRadLr / SrIn / 1x
+    // -------------------------------------------------------------------------
+    int wgX = int(gl_WorkGroupID.x * 16u);
+    int wgY = int(gl_WorkGroupID.y * 8u);
+    for (uint pass = 0u; pass < 2u; ++pass) {
+        uint ap = pass * 128u + t;
+        if (ap < 180u) {
+            uint ay = ap / 18u;
+            uint ax = ap - ay * 18u;
+            ivec2 q = clamp(ivec2(wgX + int(ax) - 1, wgY + int(ay) - 1), ivec2(0), ivec2(W - 1, H - 1));
+            vec3 d, s; vec4 ed, es;
+            loadPyPixel(uint(q.y * W + q.x), false, d, ed, s, es);
+            storeTileEntry(ap, d, ed, s, es);
+        }
+    }
+    barrier();
+
+    if (gx >= W || gy >= H) {
+        return;
+    }
+
+    uint cAp = (ly + 1u) * 18u + (lx + 1u);
+    vec3 cD, cS; vec4 cED, cES;
+    loadTileEntry(cAp, cD, cED, cS, cES);
+
+    uint zb = uint(gy * W + gx) * 8u;
+    vec4 z2 = unpackHalf4(g_khead.k2[zb + 2u]); // z[8..11]: pre_s, gate_d0, gate_s0, e0_d.x
+    vec4 z4 = unpackHalf4(g_khead.k2[zb + 4u]); // z[16..19]: e0_s.yzw, p_d0[0]
+    vec4 z5 = unpackHalf4(g_khead.k2[zb + 5u]); // z[20..23]: p_d0[1..4]
+    vec4 z6 = unpackHalf4(g_khead.k2[zb + 6u]); // z[24..27]: p_s0[0..3]
+    vec4 z7 = unpackHalf4(g_khead.k2[zb + 7u]); // z[28..31]: p_s0[4], sr_feat[0..2]
+
+    float gateD0 = zeroCenteredGate(z2.y);
+    float gateS0 = zeroCenteredGate(z2.z);
+    float pD9[9] = float[9](z4.w, z5.x, z5.x, z5.y, z5.y, z5.z, z5.z, z5.w, z5.w);
+    float pS9[9] = float[9](z6.x, z6.y, z6.y, z6.z, z6.z, z6.w, z6.w, z7.x, z7.x);
+
+    vec3  dTaps[9], sTaps[9];
+    float lD[9], lS[9];
+    int cOffs[5] = int[5](0, -1, 1, -18, 18); // exact C, L, R, U, D
+    for (uint k = 0u; k < 5u; ++k) {
+        vec3 nD, nS; vec4 nED, nES;
+        loadTileEntry(uint(int(cAp) + cOffs[k]), nD, nED, nS, nES);
+        dTaps[k] = nD; sTaps[k] = nS;
+        vec4 dd = nED - cED; vec4 ds = nES - cES;
+        lD[k] = 3.5 * pD9[k] - 2.0 * dot(dd, dd);
+        lS[k] = 3.5 * pS9[k] - 2.0 * dot(ds, ds);
+    }
+
+    int W1 = int(pc.inW);
+    int H1 = int(pc.inH);
+    vec2 upScale = vec2(float(W1), float(H1)) / vec2(float(W), float(H));
+    BilinearTaps bt = computeBilinearTaps((vec2(gx, gy) + vec2(0.5)) * upScale - vec2(0.5), ivec2(W1, H1));
+    ivec2 cCoords[4] = ivec2[4](bt.i00, bt.i10, bt.i01, bt.i11);
+    for (uint k = 0u; k < 4u; ++k) {
+        vec3 pD, pS; vec4 pED, pES;
+        loadPyPixel(uint(cCoords[k].y * W1 + cCoords[k].x), true, pD, pED, pS, pES);
+        dTaps[5u + k] = pD; sTaps[5u + k] = pS;
+        vec4 dd = pED - cED; vec4 ds = pES - cES;
+        lD[5u + k] = 3.5 * pD9[5u + k] - 2.0 * dot(dd, dd);
+        lS[5u + k] = 3.5 * pS9[5u + k] - 2.0 * dot(ds, ds);
+    }
+
+    vec3 wD, wS;
+    softmax9AndAccum(lD, dTaps, wD);
+    softmax9AndAccum(lS, sTaps, wS);
+    vec3 i0D = clampFp16Rgb(mix(cD, wD, gateD0));
+    vec3 i0S = clampFp16Rgb(mix(cS, wS, gateS0));
+
+    ivec2 p = ivec2(gx, gy);
+    vec3 rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal;
+    float linDepth, roughness;
+    vec2 surfMv, specMv;
+    bool isSky;
+    readCompactDemodFolded(p, rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal, linDepth, roughness, surfMv, specMv, isSky);
+
+    vec3 eDiffClean = isSky ? rawDiff : i0D;
+    vec3 eSpecClean = isSky ? rawSpec : i0S;
+    vec3 cleanRad   = clampFp16Rgb(aDiffEff * eDiffClean + aSpecEff * eSpecClean + skipEff);
+    imageStore(uCleanRadLr, p, vec4(cleanRad, 1.0));
+
+    if ((pc.flags & UPWAYS_V5_FLAG_ENABLE_SUPERRES) != 0u) {
+        vec3 srFeat = tanh(z7.yzw);
+        vec2 jit    = clamp(vec2(pc.jitterX, pc.jitterY), vec2(-1.0), vec2(1.0));
+        vec3 albEff = clamp(aDiffEff + aSpecEff, vec3(0.0), vec3(1.0));
+
+        vec4 s0 = vec4(safeLog1p(cleanRad), viewNormal.x * 4.0);
+        vec4 s1 = vec4(viewNormal.yz * 4.0, safeLog1pF(linDepth), albEff.r * 4.0);
+        vec4 s2 = vec4(albEff.gb * 4.0, (roughness - 0.5) * 4.0, srFeat.x * 4.0);
+        vec4 s3 = vec4(srFeat.yz * 4.0, (jit + vec2(0.5)) * 2.0);
+
+        uvec4 srPacked = uvec4(
+            encodeSrInVec4(s0, V5_SRIN_INT8_MAX_0),
+            encodeSrInVec4(s1, V5_SRIN_INT8_MAX_1),
+            encodeSrInVec4(s2, V5_SRIN_INT8_MAX_2),
+            encodeSrInVec4(s3, V5_SRIN_INT8_MAX_3)
+        );
+
+        // Space-to-depth 2x2 L1 write (64 ch/L1px = 8 uvec2/L1px) + odd-edge replication
+        int  qx     = gx >> 1;
+        int  qy     = gy >> 1;
+        uint corner = uint(((gy & 1) << 1) | (gx & 1));
+        uint l1Base = uint(qy * W1 + qx) * 8u;
+
+        uint bC = l1Base + corner * 2u;
+        g_srIn.act2[bC + 0u] = srPacked.xy;
+        g_srIn.act2[bC + 1u] = srPacked.zw;
+
+        bool repX = (gx == W - 1) && ((W & 1) != 0);
+        bool repY = (gy == H - 1) && ((H & 1) != 0);
+        if (repX) {
+            uint bX = l1Base + (corner | 1u) * 2u;
+            g_srIn.act2[bX + 0u] = srPacked.xy;
+            g_srIn.act2[bX + 1u] = srPacked.zw;
+        }
+        if (repY) {
+            uint bY = l1Base + (corner | 2u) * 2u;
+            g_srIn.act2[bY + 0u] = srPacked.xy;
+            g_srIn.act2[bY + 1u] = srPacked.zw;
+        }
+        if (repX && repY) {
+            uint bXY = l1Base + 3u * 2u;
+            g_srIn.act2[bXY + 0u] = srPacked.xy;
+            g_srIn.act2[bXY + 1u] = srPacked.zw;
+        }
+    } else {
+        imageStore(uOutputColor, p, vec4(cleanRad, 1.0));
+        if ((pc.flags & UPWAYS_V5_FLAG_FUSED_BAND_PACK) != 0u
+            && uint(gy) >= pc.keepHrYStart
+            && uint(gy) < pc.keepHrYEnd) {
+            uint packIdx = (uint(gy) - pc.keepHrYStart) * pc.hrWidth + uint(gx);
+            g_bandPackOut.rgb9e5[packIdx] = packRGB9E5(cleanRad);
+        }
+    }
+}

@@ -104,6 +104,7 @@ struct FrameStats {
     std::string denoiser_mode_str = "None";
     bool enable_nrc = false;
     std::string upscaler_mode_str = "None";
+    std::string upways_version_str = "none";
     std::string upways_precision_str = "none";
     float render_scale = 1.0f;
     uint32_t spp = 0;

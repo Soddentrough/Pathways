@@ -24,6 +24,15 @@ PostProcessPipeline::PostProcessPipeline(
       m_globalPool(globalPool),
       m_pipelineCache(pipelineCache)
 {
+    m_dummyRg32uiImage = std::make_unique<Image>(
+        m_device, m_allocator, 1u, 1u, VK_FORMAT_R32G32_UINT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_dummyTonemapStitchBuffer = std::make_unique<Buffer>(
+        m_allocator, 256,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_GPU_ONLY
+    );
     createDescriptorLayouts();
     allocateDescriptorSets();
     createPipelines(tonemapSpv, fusedAccumTonemapSpv, runningAvgSpv, blendSpv, mergeSpv);
@@ -41,6 +50,8 @@ PostProcessPipeline::~PostProcessPipeline() {
     if (m_restirDebugPipeline)      { vkDestroyPipeline(m_device, m_restirDebugPipeline, nullptr); m_restirDebugPipeline = VK_NULL_HANDLE; }
 
     m_debugDummyBuffer.reset();
+    m_dummyTonemapStitchBuffer.reset();
+    m_dummyRg32uiImage.reset();
 
     if (m_tonemapPipelineLayout)          { vkDestroyPipelineLayout(m_device, m_tonemapPipelineLayout, nullptr); m_tonemapPipelineLayout = VK_NULL_HANDLE; }
     if (m_accumRunningAvgPipelineLayout)  { vkDestroyPipelineLayout(m_device, m_accumRunningAvgPipelineLayout, nullptr); m_accumRunningAvgPipelineLayout = VK_NULL_HANDLE; }
@@ -75,10 +86,11 @@ VkShaderModule PostProcessPipeline::createShaderModule(const std::vector<char>& 
 }
 
 void PostProcessPipeline::createDescriptorLayouts() {
-    // 1. Tonemap Layout: (0: inStorageImage, 1: outStorageImage)
+    // 1. Tonemap Layout: (0: inStorageImage, 1: outStorageImage, 2: bandStitchSSBO)
     std::vector<VkDescriptorSetLayoutBinding> tonemapBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo tonemapLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     tonemapLayoutInfo.bindingCount = static_cast<uint32_t>(tonemapBindings.size());
@@ -124,7 +136,7 @@ void PostProcessPipeline::createDescriptorLayouts() {
         throw std::runtime_error("Failed to create FSR3 blend descriptor set layout");
     }
 
-    // 5. Multi-GPU Merge Layout: (0: img, 1..2: buf, 3..4: img, 5..7: buf, 8..13: ML guide imgs)
+    // 5. Multi-GPU Merge Layout: (0: img, 1..2: buf, 3..4: img, 5..7: buf, 8..13: ML guide imgs, 14: compact ML irradiance rg32ui)
     std::vector<VkDescriptorSetLayoutBinding> mergeBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -139,7 +151,8 @@ void PostProcessPipeline::createDescriptorLayouts() {
         { 10, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 11, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 12, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 13, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 14, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo mergeLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     mergeLayoutInfo.bindingCount = static_cast<uint32_t>(mergeBindings.size());
@@ -342,15 +355,32 @@ void PostProcessPipeline::createPipelines(
     }
 }
 
-void PostProcessPipeline::updateTonemapDescriptors(VkDescriptorSet descSet, Image* inImage, Image* outImage) {
-    if (descSet == VK_NULL_HANDLE || !inImage || !outImage) return;
+void PostProcessPipeline::updateTonemapDescriptors(
+    VkDescriptorSet descSet,
+    Image* inImage,
+    Image* outImage,
+    VkBuffer bandStitchBuf,
+    VkDeviceSize bandStitchSize
+) {
+    if (descSet == VK_NULL_HANDLE || !inImage || !outImage || !m_dummyTonemapStitchBuffer) return;
 
     VkDescriptorImageInfo inInfo{ VK_NULL_HANDLE, inImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo outInfo{ VK_NULL_HANDLE, outImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorBufferInfo stitchInfo{};
+    if (bandStitchBuf != VK_NULL_HANDLE) {
+        stitchInfo.buffer = bandStitchBuf;
+        stitchInfo.offset = 0;
+        stitchInfo.range = std::max<VkDeviceSize>(bandStitchSize, 256ull);
+    } else {
+        stitchInfo.buffer = m_dummyTonemapStitchBuffer->getBuffer();
+        stitchInfo.offset = 0;
+        stitchInfo.range = m_dummyTonemapStitchBuffer->getSize();
+    }
 
-    std::array<VkWriteDescriptorSet, 2> writes{};
+    std::array<VkWriteDescriptorSet, 3> writes{};
     writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &inInfo, nullptr, nullptr };
     writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &outInfo, nullptr, nullptr };
+    writes[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, descSet, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &stitchInfo, nullptr };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -539,7 +569,8 @@ void PostProcessPipeline::updateMergeDescriptors(
     Image* mlAlbedoRoughnessImage,
     Image* mlSpecularMotionImage,
     Image* mlSkipImage,
-    Image* mlSpecAlbedoImage)
+    Image* mlSpecAlbedoImage,
+    Image* mlIrradianceImage)
 {
     if (slot >= 2 || m_mergeDescSets[slot] == VK_NULL_HANDLE || secBuffer == VK_NULL_HANDLE) return;
     (void)width;
@@ -586,6 +617,12 @@ void PostProcessPipeline::updateMergeDescriptors(
     VkDescriptorImageInfo mlSmvInfo  = makeImgInfo(mlSpecularMotionImage);
     VkDescriptorImageInfo mlSkipInfo = makeImgInfo(mlSkipImage);
     VkDescriptorImageInfo mlSalbInfo = makeImgInfo(mlSpecAlbedoImage);
+    VkDescriptorImageInfo mlIrrInfo{};
+    if (Image* irrImg = mlIrradianceImage ? mlIrradianceImage : m_dummyRg32uiImage.get()) {
+        mlIrrInfo.sampler = VK_NULL_HANDLE;
+        mlIrrInfo.imageView = irrImg->getImageView();
+        mlIrrInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
 
     std::vector<VkWriteDescriptorSet> mergeWrites = {
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &frameInfo, nullptr, nullptr },
@@ -601,7 +638,8 @@ void PostProcessPipeline::updateMergeDescriptors(
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 10, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlAlbInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 11, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSmvInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 12, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSkipInfo, nullptr, nullptr },
-        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSalbInfo, nullptr, nullptr }
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 13, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSalbInfo, nullptr, nullptr },
+        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_mergeDescSets[slot], 14, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIrrInfo, nullptr, nullptr }
     };
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(mergeWrites.size()), mergeWrites.data(), 0, nullptr);
 }
@@ -662,6 +700,21 @@ void PostProcessPipeline::recordBlend4K(VkCommandBuffer cmd, const Blend4KPushCo
 
 void PostProcessPipeline::recordMerge(VkCommandBuffer cmd, uint32_t slot, const MergePushConstants& pc, uint32_t groupCountX, uint32_t groupCountY) {
     if (!m_mergePipeline || slot >= 2 || m_mergeDescSets[slot] == VK_NULL_HANDLE) return;
+    if (m_dummyRg32uiImage && m_dummyRg32uiImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+        m_dummyRg32uiImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+        VkClearColorValue zeroUint{};
+        VkImageSubresourceRange clrRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, m_dummyRg32uiImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroUint, 1, &clrRange);
+        m_dummyRg32uiImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+        );
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipeline);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_mergePipelineLayout, 0, 1, &m_mergeDescSets[slot], 0, nullptr);
     vkCmdPushConstants(cmd, m_mergePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(MergePushConstants), &pc);

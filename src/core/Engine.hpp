@@ -291,6 +291,12 @@ private:
     Image* m_mlSpecularImage = nullptr;
     Image* m_mlSkipImage = nullptr;
     Image* m_mlSpecAlbedoImage = nullptr;
+    Image* m_mlIrradianceImage = nullptr;
+    Image* m_mlPrimaryGuideImage = nullptr;
+    Image* m_mlSurfaceMvImage = nullptr;
+    Image* m_mlDiffHitDistImage = nullptr;
+    Image* m_mlSpecVmvImage = nullptr;
+    Image* m_mlSkipCompactImage = nullptr;
     Image* m_mlDirectDiffuseImage = nullptr;
     Image* m_mlIndirectDiffuseImage = nullptr;
     Image* m_mlDirectSpecularImage = nullptr;
@@ -416,6 +422,11 @@ private:
     double m_lastTonemapMs = 0.0;
     double m_lastUpwaysMs = 0.0;
     std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotSkippedRayTracing = {false, false};
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> m_slotWasUpwaysBandParallel = {false, false};
+    bool m_lastFrameWasUpwaysBandParallel = false;
+    UpwaysBandSplit m_lastUpwaysBandSplit{};
+    uint32_t m_lastUpwaysBandSlot = 0u;
+    size_t m_lastUpwaysBandBytes = 0u;
     std::chrono::high_resolution_clock::time_point m_startTime;
     std::chrono::high_resolution_clock::time_point m_lastFrameTime;
     std::chrono::steady_clock::time_point m_lastLogTime;

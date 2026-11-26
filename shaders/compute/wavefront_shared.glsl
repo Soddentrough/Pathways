@@ -47,6 +47,8 @@ struct QueueCountersBuffer {
 #define ML_CAPTURE_KEEP_ACCUM_BIT  2u
 #define ML_CAPTURE_UPWAYS_V4_BIT   4u
 #define ML_CAPTURE_SPLIT_4SIG_BIT  8u
+#define ML_CAPTURE_COMPACT_LIVE_BIT 16u
+#define ML_CAPTURE_WRITE_LEGACY_GBUF_BIT 32u
 #define ML_CAPTURE_ML_DENOISER_MASK (ML_CAPTURE_UPWAYS_V4_BIT | ML_CAPTURE_SPLIT_4SIG_BIT)
 
 struct WavefrontClassifyPC {
@@ -95,6 +97,7 @@ struct WavefrontShadePC {
     wf_uint deltaUnroll;
     wf_uint restirMCap;
     wf_uint minRayThreshold;
+    wf_uint pixelOffsetY;
 };
 
 struct WavefrontShadowPC {
@@ -157,7 +160,7 @@ struct WavefrontTailPC {
 static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
 static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
 static_assert(sizeof(WavefrontClassifyPC) == 80, "WavefrontClassifyPC must be 80 bytes");
-static_assert(sizeof(WavefrontShadePC) == 88, "WavefrontShadePC must be 88 bytes");
+static_assert(sizeof(WavefrontShadePC) == 92, "WavefrontShadePC must be 92 bytes");
 static_assert(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
 static_assert(sizeof(WavefrontIntersectPC) == 68, "WavefrontIntersectPC must be 68 bytes");
 static_assert(sizeof(WavefrontTailPC) == 80, "WavefrontTailPC must be 80 bytes");

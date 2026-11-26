@@ -226,7 +226,7 @@ void nrcEmitSelfTrainingRecord(
     }
     trainWaveBase = subgroupBroadcastFirst(trainWaveBase);
     uint trainIdx = trainWaveBase + subgroupBallotExclusiveBitCount(trainBallot);
-    uint maxTrainRecords = max(16384u, (pc.width * pc.height) >> 4u);
+    uint maxTrainRecords = nrcTrainRecords.length();
     if (trainIdx >= maxTrainRecords) {
         return;
     }

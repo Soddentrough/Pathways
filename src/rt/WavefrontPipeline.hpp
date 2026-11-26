@@ -126,6 +126,12 @@ public:
                                 VkImageView mlIndirectDiffuseImageView = VK_NULL_HANDLE,
                                 VkImageView mlDirectSpecularImageView = VK_NULL_HANDLE,
                                 VkImageView mlIndirectSpecularImageView = VK_NULL_HANDLE,
+                                VkImageView mlIrradianceImageView = VK_NULL_HANDLE,
+                                VkImageView mlPrimaryGuideImageView = VK_NULL_HANDLE,
+                                VkImageView mlSurfaceMvImageView = VK_NULL_HANDLE,
+                                VkImageView mlDiffHitDistImageView = VK_NULL_HANDLE,
+                                VkImageView mlSpecVmvImageView = VK_NULL_HANDLE,
+                                VkImageView mlSkipCompactImageView = VK_NULL_HANDLE,
                                 VkBuffer envImportanceBuffer = VK_NULL_HANDLE,
                                 VkDeviceSize envImportanceSize = 0);
 
@@ -365,7 +371,11 @@ private:
         void reset(uint32_t numBatches, uint32_t maxBounces) {
             frameStart = 0;
             frameEnd = 0;
-            batches.assign(numBatches, BatchTimestamps{0, 0, std::vector<BatchBounceTimestamps>(maxBounces)});
+            batches.clear();
+            batches.resize(numBatches);
+            for (auto& batch : batches) {
+                batch.bounces.resize(maxBounces);
+            }
             destPtrs.clear();
         }
     };
@@ -382,6 +392,10 @@ private:
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;
+    std::unique_ptr<Image> m_dummyR32uiImage;
+    std::unique_ptr<Image> m_dummyRg32uiImage;
+    std::unique_ptr<Image> m_dummyRgba32uiImage;
+    std::unique_ptr<Image> m_dummyR8Image;
     std::unique_ptr<Buffer> m_dummyReservoir; // 128B fallback target for ReSTIR reservoir bindings 32/36 & inactive binding 19
     bool m_dummyImageTransitioned = false;
     bool m_supportsSubgroupSizeControl = true;

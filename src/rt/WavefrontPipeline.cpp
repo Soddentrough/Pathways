@@ -34,15 +34,39 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
 
     m_maxCapacity = (maxBatchPixels > 0) ? std::min(m_width * m_height, maxBatchPixels) : (m_width * m_height);
 
-    // Allocate fallback dummy storage image and 128B dummy buffer BEFORE
-    // updateQueueDescriptors() so inactive optional bindings (19, 32, 36) have a valid target.
+    // Allocate fallback dummy storage images and 128B dummy buffer BEFORE
+    // updateQueueDescriptors() so inactive optional bindings (19, 32, 36, compact ML images) have valid targets.
     m_dummyStorageImage = std::make_unique<Image>(
         m_device, m_allocator, 16, 16,
         VK_FORMAT_R16G16B16A16_SFLOAT,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
     );
+    m_dummyR32uiImage = std::make_unique<Image>(
+        m_device, m_allocator, 1, 1,
+        VK_FORMAT_R32_UINT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_dummyRg32uiImage = std::make_unique<Image>(
+        m_device, m_allocator, 1, 1,
+        VK_FORMAT_R32G32_UINT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_dummyRgba32uiImage = std::make_unique<Image>(
+        m_device, m_allocator, 1, 1,
+        VK_FORMAT_R32G32B32A32_UINT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
+    m_dummyR8Image = std::make_unique<Image>(
+        m_device, m_allocator, 1, 1,
+        VK_FORMAT_R8_UNORM,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+    );
     m_dummyImageTransitioned = false;
 
+    // Dedicated fallback target for ReSTIR reservoir bindings (32/36) & inactive binding 19.
+    // Previously these aliased the queue-counters buffer —
+    // one refactor away from reservoir writes corrupting dispatch bookkeeping
+    // (review 2026-10-10 §7).
     m_dummyReservoir = std::make_unique<Buffer>(
         m_allocator, 128,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -77,6 +101,10 @@ WavefrontPipeline::~WavefrontPipeline() {
         vkDeviceWaitIdle(m_device);
     }
     m_dummyStorageImage.reset();
+    m_dummyR32uiImage.reset();
+    m_dummyRg32uiImage.reset();
+    m_dummyRgba32uiImage.reset();
+    m_dummyR8Image.reset();
     m_dgcManager.reset();
 
     for (int i = 0; i < 2; ++i) {
@@ -178,7 +206,13 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 43, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uIndirectDiffuseImage
         { 44, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uDirectSpecularImage
         { 45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uIndirectSpecularImage
-        { 46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // EnvImportanceBuffer
+        { 46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // EnvImportanceBuffer
+        { 47, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlIrradianceImage (rg32ui)
+        { 48, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlPrimaryGuideImage (rgba32ui)
+        { 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSurfaceMvImage (r32ui)
+        { 50, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlDiffHitDistImage (r8)
+        { 51, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSpecVmvImage (rg32ui)
+        { 52, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uMlSkipCompactImage (r32ui)
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -193,7 +227,7 @@ void WavefrontPipeline::createDescriptorLayout() {
 
 void WavefrontPipeline::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 128 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 224 },
         { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 16 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512 },
         { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 16 },
@@ -364,6 +398,12 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                VkImageView mlIndirectDiffuseImageView,
                                                VkImageView mlDirectSpecularImageView,
                                                VkImageView mlIndirectSpecularImageView,
+                                               VkImageView mlIrradianceImageView,
+                                               VkImageView mlPrimaryGuideImageView,
+                                               VkImageView mlSurfaceMvImageView,
+                                               VkImageView mlDiffHitDistImageView,
+                                               VkImageView mlSpecVmvImageView,
+                                               VkImageView mlSkipCompactImageView,
                                                VkBuffer envImportanceBuffer,
                                                VkDeviceSize envImportanceSize) {
     if (frameSlot >= 2) frameSlot = 0;
@@ -371,6 +411,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
 
     VkDescriptorImageInfo accumImageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView defaultStorageView = m_dummyStorageImage ? m_dummyStorageImage->getImageView() : accumImageView;
+    VkImageView dummyR32uiView = m_dummyR32uiImage ? m_dummyR32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView dummyRg32uiView = m_dummyRg32uiImage ? m_dummyRg32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView dummyRgba32uiView = m_dummyRgba32uiImage ? m_dummyRgba32uiImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView dummyR8View = m_dummyR8Image ? m_dummyR8Image->getImageView() : VK_NULL_HANDLE;
     VkImageView mvView = (motionVectorImageView != VK_NULL_HANDLE) ? motionVectorImageView : defaultStorageView;
     VkDescriptorImageInfo mvImageInfo{ VK_NULL_HANDLE, mvView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView ndView = (normalDepthImageView != VK_NULL_HANDLE) ? normalDepthImageView : defaultStorageView;
@@ -397,6 +441,18 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkDescriptorImageInfo directSpecImageInfo{ VK_NULL_HANDLE, directSpecView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView indirectSpecView = (mlIndirectSpecularImageView != VK_NULL_HANDLE) ? mlIndirectSpecularImageView : defaultStorageView;
     VkDescriptorImageInfo indirectSpecImageInfo{ VK_NULL_HANDLE, indirectSpecView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlIrrView = (mlIrradianceImageView != VK_NULL_HANDLE) ? mlIrradianceImageView : dummyRg32uiView;
+    VkDescriptorImageInfo mlIrrImageInfo{ VK_NULL_HANDLE, mlIrrView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlPrimView = (mlPrimaryGuideImageView != VK_NULL_HANDLE) ? mlPrimaryGuideImageView : dummyRgba32uiView;
+    VkDescriptorImageInfo mlPrimImageInfo{ VK_NULL_HANDLE, mlPrimView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlSurfaceMvView = (mlSurfaceMvImageView != VK_NULL_HANDLE) ? mlSurfaceMvImageView : dummyR32uiView;
+    VkDescriptorImageInfo mlSurfaceMvImageInfo{ VK_NULL_HANDLE, mlSurfaceMvView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlDiffHitDistView = (mlDiffHitDistImageView != VK_NULL_HANDLE) ? mlDiffHitDistImageView : dummyR8View;
+    VkDescriptorImageInfo mlDiffHitDistImageInfo{ VK_NULL_HANDLE, mlDiffHitDistView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlSpecVmvView = (mlSpecVmvImageView != VK_NULL_HANDLE) ? mlSpecVmvImageView : dummyRg32uiView;
+    VkDescriptorImageInfo mlSpecVmvImageInfo{ VK_NULL_HANDLE, mlSpecVmvView, VK_IMAGE_LAYOUT_GENERAL };
+    VkImageView mlSkipCompactView = (mlSkipCompactImageView != VK_NULL_HANDLE) ? mlSkipCompactImageView : dummyR32uiView;
+    VkDescriptorImageInfo mlSkipCompactImageInfo{ VK_NULL_HANDLE, mlSkipCompactView, VK_IMAGE_LAYOUT_GENERAL };
     VkImageView causticView = (causticImageView != VK_NULL_HANDLE) ? causticImageView : defaultStorageView;
     VkDescriptorImageInfo causticImageInfo{ VK_NULL_HANDLE, causticView, VK_IMAGE_LAYOUT_GENERAL };
 
@@ -508,6 +564,24 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 44, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directSpecImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 45, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &indirectSpecImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 46, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &envImpInfo, nullptr });
+        if (mlIrrView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 47, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIrrImageInfo, nullptr, nullptr });
+        }
+        if (mlPrimView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 48, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlPrimImageInfo, nullptr, nullptr });
+        }
+        if (mlSurfaceMvView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 49, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSurfaceMvImageInfo, nullptr, nullptr });
+        }
+        if (mlDiffHitDistView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 50, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlDiffHitDistImageInfo, nullptr, nullptr });
+        }
+        if (mlSpecVmvView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 51, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSpecVmvImageInfo, nullptr, nullptr });
+        }
+        if (mlSkipCompactView != VK_NULL_HANDLE) {
+            writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 52, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlSkipCompactImageInfo, nullptr, nullptr });
+        }
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -916,7 +990,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     m_secondarySortMode = sceneData.secondarySortMode;
     uint32_t fw = (sceneData.fullWidth > 0) ? sceneData.fullWidth : width;
     uint32_t fh = (sceneData.fullHeight > 0) ? sceneData.fullHeight : height;
-    uint32_t storeWidth = (sceneData.tileOffsetX == 2u) ? width : fw;
+    uint32_t storeWidth = (sceneData.tileOffsetX == 2u || sceneData.tileOffsetX == 3u) ? width : fw;
 
     VkDeviceSize indirectClearBytes = std::clamp<VkDeviceSize>(
         static_cast<VkDeviceSize>(maxBounces) * (sceneData.sortMode != 0 ? 256 : 48),
@@ -939,6 +1013,13 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         m_dummyStorageImage->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
             VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        for (Image* intDummy : { m_dummyR32uiImage.get(), m_dummyRg32uiImage.get(), m_dummyRgba32uiImage.get(), m_dummyR8Image.get() }) {
+            if (intDummy) {
+                intDummy->transitionLayout(cmd, VK_IMAGE_LAYOUT_GENERAL,
+                    VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+            }
+        }
         m_dummyImageTransitioned = true;
     }
 
@@ -1094,7 +1175,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .indirectClamp = sceneData.indirectClamp,
                 .deltaUnroll = sceneData.deltaUnroll,
                 .restirMCap = sceneData.restirMCap,
-                .minRayThreshold = minRayThreshold
+                .minRayThreshold = minRayThreshold,
+                .pixelOffsetY = (sceneData.tileOffsetX == 3u) ? sceneData.tileOffsetY : 0u
             };
             vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), &shadePC);
 
@@ -1256,7 +1338,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 VkPipeline intersectPipe = (((sceneData.cameraFlags & (1u << 10)) != 0u) && m_intersectAlphaPipeline != VK_NULL_HANDLE)
                     ? m_intersectAlphaPipeline
                     : m_intersectPipeline;
-                if (sceneData.secondarySortMode == 1 && useMaterialSort) {
+                if (effectiveSecondarySortMode == 1u && useMaterialSort) {
                     // Option 1: On-Chip Directional Multi-Queue Binning (8 directional octants)
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipe);
 
@@ -1299,10 +1381,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
                 }
 
+                const uint32_t reuseDispatchH = (sceneData.tileOffsetX == 3u) ? curBatchH : fh;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirDiReusePipeline);
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), &shadePC);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseStart);
-                vkCmdDispatch(cmd, (storeWidth + 15) / 16, (fh + 7) / 8, 1);
+                vkCmdDispatch(cmd, (storeWidth + 15) / 16, (reuseDispatchH + 7) / 8, 1);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseEnd);
 
                 recordMemoryBarrier2(cmd,
@@ -1336,12 +1419,13 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
                 }
 
+                const uint32_t reuseDispatchH = (sceneData.tileOffsetX == 3u) ? curBatchH : fh;
                 WavefrontShadePC reusePC = shadePC;
                 reusePC.currentBounce = (b + 1 < cutoffBounce) ? 1u : 0u;
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirGiReusePipeline);
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(reusePC), &reusePC);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseStart);
-                vkCmdDispatch(cmd, (storeWidth + 7) / 8, (fh + 3) / 4, 1);
+                vkCmdDispatch(cmd, (storeWidth + 7) / 8, (reuseDispatchH + 3) / 4, 1);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseEnd);
 
                 recordMemoryBarrier2(cmd,

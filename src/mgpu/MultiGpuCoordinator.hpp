@@ -5,6 +5,7 @@
 #include "scene/ProceduralScene.hpp"
 #include "rt/RayTracingOrchestrator.hpp"
 #include "rt/PostProcessPipeline.hpp"
+#include "rt/UpwaysPipeline.hpp"
 #include "mgpu/MultiGpuManager.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Image.hpp"
@@ -42,6 +43,8 @@ struct MultiGpuFramePlan {
     void* dstHost = nullptr;
     bool isSampleBlendFsr3 = false;
     bool isCheckerboard = false;
+    bool isUpwaysBandParallel = false;
+    UpwaysBandSplit upwaysBand{};
     CameraUniform uboPrim{};
     CameraUniform uboSec{};
     uint32_t slot = 0;
@@ -103,6 +106,19 @@ public:
         bool& inOutAccumReset
     );
 
+    /// Updates Upways Band-Parallel topFraction split from measured GPU timings with EMA, deadband, hysteresis, and cooldown.
+    bool updateUpwaysBandBalance(
+        double primTotalMs,
+        double secTotalMs,
+        uint32_t fullLrH,
+        uint32_t fullHrH,
+        uint32_t haloLr,
+        bool enabled = true
+    );
+    void resetUpwaysBandBalance(float initialTopFraction = UPWAYS_DEFAULT_BAND_TOP_FRACTION);
+    [[nodiscard]] float getUpwaysBandTopFraction() const noexcept { return m_upwaysBandBalance.topFraction; }
+    [[nodiscard]] uint32_t getUpwaysBandAdjustmentCount() const noexcept { return m_upwaysBandBalance.adjustmentCount; }
+
     /// Records primary ray tracing passes into cmd and submits to graphics queue signaling rtCompleteSemaphore.
     void recordPrimaryRayTracing(
         VkCommandBuffer cmd,
@@ -128,7 +144,14 @@ public:
         Image* mlDirectDiffuseImage = nullptr,
         Image* mlIndirectDiffuseImage = nullptr,
         Image* mlDirectSpecularImage = nullptr,
-        Image* mlIndirectSpecularImage = nullptr
+        Image* mlIndirectSpecularImage = nullptr,
+        Image* mlIrradianceImage = nullptr,
+        Image* mlPrimaryGuideImage = nullptr,
+        Image* mlSurfaceMvImage = nullptr,
+        Image* mlDiffHitDistImage = nullptr,
+        Image* mlSpecVmvImage = nullptr,
+        Image* mlSkipCompactImage = nullptr,
+        const std::function<void(VkCommandBuffer)>& onPostRecord = {}
     );
 
     /// Records merge compute pass, memory barriers, G-Buffer history update, and running avg into activeCmd.
@@ -190,6 +213,19 @@ private:
     size_t m_lastSecToPrimBytes = 0;
 
     MultiGpuMode m_lastActiveMgpuMode = MultiGpuMode::Off;
+
+    struct UpwaysBandBalanceState {
+        float topFraction = UPWAYS_DEFAULT_BAND_TOP_FRACTION;
+        double emaPrimMs = 0.0;
+        double emaSecMs = 0.0;
+        uint32_t samplesInWindow = 0u;
+        uint32_t cooldownFrames = 2u;
+        uint32_t consecutiveImbalanceFrames = 0u;
+        uint32_t lastFullLrH = 0u;
+        uint32_t lastHaloLr = 0u;
+        uint32_t adjustmentCount = 0u;
+    };
+    UpwaysBandBalanceState m_upwaysBandBalance{};
 };
 
 } // namespace pathways

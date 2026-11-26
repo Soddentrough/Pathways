@@ -3,15 +3,14 @@
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
-layout(set = 0, binding = 0, rgba16f) readonly  uniform image2D tCleanRadLr;
-layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D uNormalDepth;
-layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D uMotionVectors;
-layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uMlSpecular;
-layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D uMlSkip;
-layout(set = 0, binding = 5)          readonly  buffer  SrSubpixelBuf { uvec2 sub[]; } g_srSub;
-layout(set = 0, binding = 6, rgba16f) readonly  uniform image2D uPrevColorHr;
-layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D uCurrColorHr;
-layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutputColor;
+layout(set = 0, binding = 0, rgba16f)  readonly  uniform image2D  tCleanRadLr;
+layout(set = 0, binding = 1, rgba32ui) readonly  uniform uimage2D uMlPrimaryGuide;
+layout(set = 0, binding = 2, r32ui)    readonly  uniform uimage2D uMlSurfaceMv;
+layout(set = 0, binding = 3)           readonly  buffer  SrSubpixelBuf { uvec2 sub[]; } g_srSub;
+layout(set = 0, binding = 4, rgba16f)  readonly  uniform image2D  uPrevColorHr;
+layout(set = 0, binding = 5, rgba16f)  writeonly uniform image2D  uCurrColorHr;
+layout(set = 0, binding = 6, rgba16f)  writeonly uniform image2D  uOutputColor;
+layout(std430, set = 0, binding = 7)   writeonly buffer BandPackOutBuf { uint packed[]; } g_bandPackOut;
 
 vec4 fetchSubpixel(ivec2 sp, int lrW) {
     ivec2 lp = sp >> 1;
@@ -30,21 +29,23 @@ void main() {
 
     int lrW = int(pc.lrWidth);
     int lrH = int(pc.lrHeight);
-    vec2 hrSizeF = vec2(float(hrW), float(hrH));
-    vec2 lrSizeF = vec2(float(lrW), float(lrH));
+    int fullLrH = int(max(pc.fullLrHeight, pc.lrHeight));
+    int fullHrH = int(max(pc.fullHrHeight, pc.hrHeight));
+    vec2 fullHrSizeF = vec2(float(hrW), float(fullHrH));
+    vec2 fullLrSizeF = vec2(float(lrW), float(fullLrH));
 
-    vec2 currUV  = (vec2(hrPos) + vec2(0.5)) / hrSizeF;
-    vec2 lrCoord = (vec2(hrPos) + vec2(0.5)) * lrSizeF / hrSizeF; // Unjittered continuous LR coordinate
+    vec2 hrFullPos = vec2(float(hrPos.x), float(hrPos.y + int(pc.bandHrY0)));
+    vec2 currUV    = (hrFullPos + vec2(0.5)) / fullHrSizeF;
+    vec2 lrCoord   = (hrFullPos + vec2(0.5)) * fullLrSizeF / fullHrSizeF - vec2(0.0, float(pc.bandLrY0)); // Unjittered band-local LR coordinate
 
     // Primary ray at LR texel (lx, ly) samples (lx + 0.5 + jitter.x, ly + 0.5 + jitter.y)
     ivec2 lrCenter = clamp(ivec2(floor(lrCoord - vec2(pc.jitterX, pc.jitterY) + vec2(1e-5))), ivec2(0), ivec2(lrW - 1, lrH - 1));
 
     vec4  cRadInfo       = imageLoad(tCleanRadLr, lrCenter);
-    vec4  ndCenter       = imageLoad(uNormalDepth, lrCenter);
-    vec3  cNrmR          = vec3(sanitizeFloat(ndCenter.r, 0.0), sanitizeFloat(ndCenter.g, 0.0), sanitizeFloat(ndCenter.b, 1.0));
-    float cNLen          = length(cNrmR);
-    vec3  centerNrm      = (cNLen > 1e-5) ? (cNrmR / cNLen) : vec3(0.0, 0.0, 1.0);
-    float centerDepth    = clamp(sanitizeFloat(ndCenter.a, 10000.0), 0.0, 10000.0);
+    uvec4 pgCenter       = imageLoad(uMlPrimaryGuide, lrCenter);
+    vec3  centerNrm;
+    float centerDepth;
+    unpackCompactNormalDepth(pgCenter, centerNrm, centerDepth);
     float centerDiffConf = clamp(sanitizeFloat(cRadInfo.a, 0.0), 0.0, 1.0);
     float centerLogL     = safeLog1pF(upwaysLuma(sanitizeRgb(cRadInfo.rgb)));
     bool  isSky          = (centerDepth >= 9999.0);
@@ -63,19 +64,18 @@ void main() {
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {
             ivec2 q = clamp(lrCenter + ivec2(dx, dy), ivec2(0), ivec2(lrW - 1, lrH - 1));
-            vec3  qRad  = sanitizeRgb(imageLoad(tCleanRadLr, q).rgb);
-            vec4  qNd   = imageLoad(uNormalDepth, q);
-            vec3  qNrmR = vec3(sanitizeFloat(qNd.r, 0.0), sanitizeFloat(qNd.g, 0.0), sanitizeFloat(qNd.b, 1.0));
-            float qNL   = length(qNrmR);
-            vec3  qNrm  = (qNL > 1e-5) ? (qNrmR / qNL) : vec3(0.0, 0.0, 1.0);
-            float qD    = clamp(sanitizeFloat(qNd.a, 10000.0), 0.0, 10000.0);
-            bool  qSky  = (qD >= 9999.0);
+            vec3  qRad = sanitizeRgb(imageLoad(tCleanRadLr, q).rgb);
+            uvec4 pgQ  = imageLoad(uMlPrimaryGuide, q);
+            vec3  qNrm;
+            float qD;
+            unpackCompactNormalDepth(pgQ, qNrm, qD);
+            bool  qSky = (qD >= 9999.0);
 
             // Closest-depth dilated MV
             if (qD < minDepth) {
                 minDepth = qD;
-                vec4 qMv = imageLoad(uMotionVectors, q);
-                dilatedMv = vec2(sanitizeFloat(qMv.r, 0.0), sanitizeFloat(qMv.g, 0.0));
+                vec2 qMvRaw = unpackHalf2x16(imageLoad(uMlSurfaceMv, q).x);
+                dilatedMv = vec2(sanitizeFloat(qMvRaw.x, 0.0), sanitizeFloat(qMvRaw.y, 0.0));
             }
 
             // Distance from LR sample position to HR target
@@ -123,7 +123,7 @@ void main() {
     float wLogit  = 0.0;
 
     if (!zeroResidual && !isSky) {
-        vec2 spCoord = currUV * vec2(float(lrW * 2), float(lrH * 2)) - vec2(0.5);
+        vec2 spCoord = lrCoord * 2.0 - vec2(0.5);
         BilinearTaps spt = computeBilinearTaps(spCoord, ivec2(lrW * 2, lrH * 2));
         vec4 sp = spt.w.x * fetchSubpixel(spt.i00, lrW)
                 + spt.w.y * fetchSubpixel(spt.i10, lrW)
@@ -138,13 +138,14 @@ void main() {
     // 3. Explicit imageLoad warp of HR color history along dilatedMv (ring-free 12-tap Catmull-Rom when moving)
     bool reset    = (pc.flags & UPWAYS_FLAG_RESET_HISTORY) != 0u;
     vec2 prevUVHr = currUV - dilatedMv;
+    vec2 hrCoord  = vec2(prevUVHr.x * float(hrW), prevUVHr.y * float(fullHrH) - float(pc.bandHrY0)) - vec2(0.5);
     bool inBndHr  = !reset
                  && all(greaterThanEqual(prevUVHr, vec2(0.0)))
-                 && all(lessThan(prevUVHr, vec2(1.0)));
+                 && all(lessThan(prevUVHr, vec2(1.0)))
+                 && (hrCoord.y >= -1.0) && (hrCoord.y < float(hrH));
 
     vec3 hrOut = iSr;
     if (inBndHr) {
-        vec2  hrCoord = prevUVHr * hrSizeF - vec2(0.5);
         vec2  fHr     = floor(hrCoord);
         vec2  tHr     = clamp(hrCoord - fHr, vec2(0.0), vec2(1.0));
         int   x0      = int(fHr.x);
@@ -179,7 +180,7 @@ void main() {
 
         if (validSum > 1e-4) {
             vec3  prevHr    = prevAcc / validSum;
-            float hrMvPx    = length(dilatedMv * hrSizeF);
+            float hrMvPx    = length(dilatedMv * fullHrSizeF);
             float hrMotionT = clamp(hrMvPx * 0.5, 0.0, 1.0);
 
             bool inner4Valid  = (p00.a > 0.5) && (p10.a > 0.5) && (p01.a > 0.5) && (p11.a > 0.5);
@@ -239,5 +240,13 @@ void main() {
 
     vec3 hrStore = clampFp16Rgb(hrOut);
     imageStore(uCurrColorHr, hrPos, vec4(hrStore, 1.0));
-    imageStore(uOutputColor, hrPos, vec4(hrStore, 1.0));
+    int keepEnd = (pc.keepHrYEnd > 0u) ? min(int(pc.keepHrYEnd), hrH) : hrH;
+    if (hrPos.y >= int(pc.keepHrYStart) && hrPos.y < keepEnd) {
+        if ((pc.flags & UPWAYS_FLAG_FUSED_BAND_PACK) != 0u) {
+            uint outIdx = uint(hrPos.y - int(pc.keepHrYStart)) * pc.hrWidth + uint(hrPos.x);
+            g_bandPackOut.packed[outIdx] = packRGB9E5(hrStore);
+        } else {
+            imageStore(uOutputColor, hrPos, vec4(hrStore, 1.0));
+        }
+    }
 }

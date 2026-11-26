@@ -150,11 +150,18 @@ void NRCManager::initBuffers() {
                                                   VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     m_atomicAccumNeedsClear = true;
 
-    // 7. 1x1 RGBA16F fallback storage image for optional resolve bindings 2..7
+    // 7. 1x1 RGBA16F / RG32UI fallback storage images for optional resolve bindings 2..8
     if (!m_dummyStorageImage) {
         m_dummyStorageImage = std::make_unique<Image>(
             m_device, m_allocator, 1, 1,
             VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        );
+    }
+    if (!m_dummyRg32uiImage) {
+        m_dummyRg32uiImage = std::make_unique<Image>(
+            m_device, m_allocator, 1, 1,
+            VK_FORMAT_R32G32_UINT,
             VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
         );
     }
@@ -236,7 +243,8 @@ void NRCManager::createDescriptorSetLayouts() {
     }
 
     // Resolve Layout: uAccumImage(0), AtomicBuffer(1), uMlDiffuseImage(2), uMlSpecularImage(3),
-    // uMlAlbedoRoughnessImage(4), uMlSpecAlbedoImage(5), uIndirectDiffuseImage(6), uIndirectSpecularImage(7)
+    // uMlAlbedoRoughnessImage(4), uMlSpecAlbedoImage(5), uIndirectDiffuseImage(6), uIndirectSpecularImage(7),
+    // uMlIrradianceImage(8)
     std::vector<VkDescriptorSetLayoutBinding> resolveBindings = {
         { 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
@@ -245,7 +253,8 @@ void NRCManager::createDescriptorSetLayouts() {
         { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
         { 6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
-        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
+        { 7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+        { 8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }
     };
     VkDescriptorSetLayoutCreateInfo resolveLayoutInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     resolveLayoutInfo.bindingCount = static_cast<uint32_t>(resolveBindings.size());
@@ -257,7 +266,7 @@ void NRCManager::createDescriptorSetLayouts() {
 
 void NRCManager::allocateDescriptorSets() {
     std::vector<VkDescriptorPoolSize> poolSizes = {
-        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16 },
+        { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 24 },
         { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 }
     };
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
@@ -344,13 +353,16 @@ void NRCManager::updateDescriptors(VkImageView accumImageView,
                                    VkImageView mlAlbedoRoughnessView,
                                    VkImageView mlSpecAlbedoView,
                                    VkImageView mlIndirectDiffuseView,
-                                   VkImageView mlIndirectSpecularView) {
+                                   VkImageView mlIndirectSpecularView,
+                                   VkImageView mlIrradianceView) {
     updateDescriptors(0, accumImageView, mlDiffuseImageView, mlSpecularImageView,
                       mlAlbedoRoughnessView, mlSpecAlbedoView,
-                      mlIndirectDiffuseView, mlIndirectSpecularView);
+                      mlIndirectDiffuseView, mlIndirectSpecularView,
+                      mlIrradianceView);
     updateDescriptors(1, accumImageView, mlDiffuseImageView, mlSpecularImageView,
                       mlAlbedoRoughnessView, mlSpecAlbedoView,
-                      mlIndirectDiffuseView, mlIndirectSpecularView);
+                      mlIndirectDiffuseView, mlIndirectSpecularView,
+                      mlIrradianceView);
 }
 
 void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView,
@@ -359,12 +371,15 @@ void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView,
                                    VkImageView mlAlbedoRoughnessView,
                                    VkImageView mlSpecAlbedoView,
                                    VkImageView mlIndirectDiffuseView,
-                                   VkImageView mlIndirectSpecularView) {
+                                   VkImageView mlIndirectSpecularView,
+                                   VkImageView mlIrradianceView) {
     if (accumImageView == VK_NULL_HANDLE || !m_atomicAccumBuffer || slot >= m_resolveDescSets.size()) return;
     VkImageView dummyView = m_dummyStorageImage ? m_dummyStorageImage->getImageView() : VK_NULL_HANDLE;
+    VkImageView dummyRg32uiView = m_dummyRg32uiImage ? m_dummyRg32uiImage->getImageView() : VK_NULL_HANDLE;
     auto orDummy = [dummyView](VkImageView view) {
         return (view != VK_NULL_HANDLE) ? view : dummyView;
     };
+    VkImageView irrView = (mlIrradianceView != VK_NULL_HANDLE) ? mlIrradianceView : dummyRg32uiView;
 
     VkDescriptorImageInfo imageInfo{ VK_NULL_HANDLE, accumImageView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mlDiffInfo{ VK_NULL_HANDLE, orDummy(mlDiffuseImageView), VK_IMAGE_LAYOUT_GENERAL };
@@ -373,6 +388,7 @@ void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView,
     VkDescriptorImageInfo mlSaInfo{ VK_NULL_HANDLE, orDummy(mlSpecAlbedoView), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mlIndDiffInfo{ VK_NULL_HANDLE, orDummy(mlIndirectDiffuseView), VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorImageInfo mlIndSpecInfo{ VK_NULL_HANDLE, orDummy(mlIndirectSpecularView), VK_IMAGE_LAYOUT_GENERAL };
+    VkDescriptorImageInfo mlIrrInfo{ VK_NULL_HANDLE, irrView, VK_IMAGE_LAYOUT_GENERAL };
     VkDescriptorBufferInfo atomicAccumInfo{ m_atomicAccumBuffer->getBuffer(), 0, VK_WHOLE_SIZE };
 
     std::vector<VkWriteDescriptorSet> writes = {
@@ -385,6 +401,9 @@ void NRCManager::updateDescriptors(uint32_t slot, VkImageView accumImageView,
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIndDiffInfo, nullptr, nullptr },
         { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 7, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIndSpecInfo, nullptr, nullptr }
     };
+    if (irrView != VK_NULL_HANDLE) {
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_resolveDescSets[slot], 8, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &mlIrrInfo, nullptr, nullptr });
+    }
     vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -626,6 +645,16 @@ void NRCManager::resetCounters(VkCommandBuffer cmd) {
         VkImageSubresourceRange clrRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         vkCmdClearColorImage(cmd, m_dummyStorageImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &clrRange);
     }
+    if (m_dummyRg32uiImage && m_dummyRg32uiImage->getLayout() != VK_IMAGE_LAYOUT_GENERAL) {
+        m_dummyRg32uiImage->transitionLayout(
+            cmd, VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
+            VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+        );
+        VkClearColorValue zeroUintClear{};
+        VkImageSubresourceRange clrRange{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdClearColorImage(cmd, m_dummyRg32uiImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroUintClear, 1, &clrRange);
+    }
 
     // Initialize NRCCountersBuffer + VkDispatchIndirectCommand at offset 8:
     // [0]=queryCount(0), [1]=trainCount(0), [2]=dispatchX(0), [3]=dispatchY(1), [4]=dispatchZ(1)
@@ -704,8 +733,11 @@ void NRCManager::recordInference(VkCommandBuffer cmd, uint32_t width, uint32_t h
     pc.height = height;
     pc.queryCount = queryCount;
     pc.maxRadiance = (maxRadiance > 0.0f) ? maxRadiance : 10.0f;
+    uint32_t resolveFlags = (captureMlData & 0xFFu);
+    float resolveFlagsFloat = 0.0f;
+    std::memcpy(&resolveFlagsFloat, &resolveFlags, sizeof(resolveFlagsFloat));
     pc.worldMin = glm::vec4(worldMin, (captureMlData != 0u) ? 1.0f : 0.0f);
-    pc.invWorldExtent = glm::vec4(invExtent, 0.0f);
+    pc.invWorldExtent = glm::vec4(invExtent, resolveFlagsFloat);
 
     vkCmdPushConstants(cmd, m_inferPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
@@ -973,7 +1005,7 @@ void NRCManager::recordInferenceAndTraining(VkCommandBuffer cmd, uint32_t width,
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_inferPipelineLayout, 0,
                             static_cast<uint32_t>(inferSets.size()), inferSets.data(), 0, nullptr);
 
-    uint32_t resolveFlags = useDirectResolve ? (0x80000000u | (captureMlData & 0xFFu)) : 0u;
+    uint32_t resolveFlags = (useDirectResolve ? 0x80000000u : 0u) | (captureMlData & 0xFFu);
     float resolveFlagsFloat = 0.0f;
     std::memcpy(&resolveFlagsFloat, &resolveFlags, sizeof(resolveFlagsFloat));
 

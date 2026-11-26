@@ -1,0 +1,406 @@
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#include "upways_v5_common.glsl"
+
+layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly  buffer Weight8Buf    { uint w8[]; }     g_w8;
+layout(set = 0, binding = 1) readonly  buffer WeightFp32Buf { vec4 w32v[]; }   g_w32;
+layout(set = 0, binding = 2) readonly  buffer InSrFieldBuf  { uvec2 f2[]; }    g_srField;
+
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uCleanRadLr;
+layout(set = 0, binding = 4, rgba32ui) readonly uniform uimage2D uMlPrimaryGuide;
+layout(set = 0, binding = 5, r32ui)    readonly  uniform uimage2D uMlSurfaceMv;
+layout(set = 0, binding = 6, rgba16f) readonly  uniform image2D uPrevColorHr;
+
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D uCurrColorHr;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutputColor;
+layout(set = 0, binding = 9)          writeonly buffer  BandPackOut { uint rgb9e5[]; } g_bandPackOut;
+
+// 512*4 + 2304*4 = 11,264 B <= 32 KiB
+shared uint s_buf[512];
+#if UPWAYS_IS_INT8
+shared int  s_acc[2304];
+#else
+shared float s_acc[2304];
+#endif
+
+void evalMlp16(
+    uint wBaseU32,
+    uint sOff4,
+    uint bOff4,
+    bool applyLrelu,
+    bool activeThread,
+    vec4 x0, vec4 x1, vec4 x2, vec4 x3,
+    out vec4 o0, out vec4 o1, out vec4 o2, out vec4 o3
+) {
+    uint t    = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+
+    float actScale = 1.0;
+#if UPWAYS_IS_FP8
+    if (activeThread) {
+        s_buf[t * 4u + 0u] = packFp8Vec4(x0);
+        s_buf[t * 4u + 1u] = packFp8Vec4(x1);
+        s_buf[t * 4u + 2u] = packFp8Vec4(x2);
+        s_buf[t * 4u + 3u] = packFp8Vec4(x3);
+    } else {
+        s_buf[t * 4u + 0u] = 0u;
+        s_buf[t * 4u + 1u] = 0u;
+        s_buf[t * 4u + 2u] = 0u;
+        s_buf[t * 4u + 3u] = 0u;
+    }
+#else
+    if (activeThread) {
+        float m = max(max(dynInt8AbsMax4(x0), dynInt8AbsMax4(x1)), max(dynInt8AbsMax4(x2), dynInt8AbsMax4(x3)));
+        m = max(m, UPWAYS_V5_INT8_DYN_FLOOR);
+        actScale = m * (1.0 / 127.0);
+        vec4 invS = vec4(127.0 / m);
+        s_buf[t * 4u + 0u] = packInt8Vec4Inv(x0, invS);
+        s_buf[t * 4u + 1u] = packInt8Vec4Inv(x1, invS);
+        s_buf[t * 4u + 2u] = packInt8Vec4Inv(x2, invS);
+        s_buf[t * 4u + 3u] = packInt8Vec4Inv(x3, invS);
+    } else {
+        s_buf[t * 4u + 0u] = 0u;
+        s_buf[t * 4u + 1u] = 0u;
+        s_buf[t * 4u + 2u] = 0u;
+        s_buf[t * 4u + 3u] = 0u;
+    }
+#endif
+    barrier();
+
+#if UPWAYS_IS_FP8
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    coopMatLoad(matA0, s_buf, (sg * 32u) * 4u,         4u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matA1, s_buf, (sg * 32u + 16u) * 4u,   4u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB,  g_w8.w8, wBaseU32,              4u, gl_CooperativeMatrixLayoutColumnMajor);
+    acc0 = coopMatMulAdd(matA0, matB, acc0);
+    acc1 = coopMatMulAdd(matA1, matB, acc1);
+#else
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
+    coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+    coopMatLoad(matA0, s_buf, (sg * 32u) * 4u,         4u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matA1, s_buf, (sg * 32u + 16u) * 4u,   4u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB,  g_w8.w8, wBaseU32,              4u, gl_CooperativeMatrixLayoutColumnMajor);
+    acc0 = coopMatMulAdd(matA0, matB, acc0);
+    acc1 = coopMatMulAdd(matA1, matB, acc1);
+#endif
+
+    coopMatStore(acc0, s_acc, sg * 576u,        18u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(acc1, s_acc, sg * 576u + 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    uint baseAcc = sg * 576u + lane * 18u;
+    vec4 a0 = vec4(s_acc[baseAcc + 0u],  s_acc[baseAcc + 1u],  s_acc[baseAcc + 2u],  s_acc[baseAcc + 3u]);
+    vec4 a1 = vec4(s_acc[baseAcc + 4u],  s_acc[baseAcc + 5u],  s_acc[baseAcc + 6u],  s_acc[baseAcc + 7u]);
+    vec4 a2 = vec4(s_acc[baseAcc + 8u],  s_acc[baseAcc + 9u],  s_acc[baseAcc + 10u], s_acc[baseAcc + 11u]);
+    vec4 a3 = vec4(s_acc[baseAcc + 12u], s_acc[baseAcc + 13u], s_acc[baseAcc + 14u], s_acc[baseAcc + 15u]);
+
+    o0 = a0 * (g_w32.w32v[sOff4 + 0u] * actScale) + g_w32.w32v[bOff4 + 0u];
+    o1 = a1 * (g_w32.w32v[sOff4 + 1u] * actScale) + g_w32.w32v[bOff4 + 1u];
+    o2 = a2 * (g_w32.w32v[sOff4 + 2u] * actScale) + g_w32.w32v[bOff4 + 2u];
+    o3 = a3 * (g_w32.w32v[sOff4 + 3u] * actScale) + g_w32.w32v[bOff4 + 3u];
+    if (applyLrelu) {
+        o0 = upwaysLrelu4(o0);
+        o1 = upwaysLrelu4(o1);
+        o2 = upwaysLrelu4(o2);
+        o3 = upwaysLrelu4(o3);
+    }
+    barrier();
+}
+
+void main() {
+    uint t   = gl_SubgroupID * 32u + gl_SubgroupInvocationID; // 0..127
+    uint lx  = t & 15u;
+    uint ly  = t >> 4u;
+    ivec2 hrPos = ivec2(int(gl_WorkGroupID.x * 16u + lx), int(gl_WorkGroupID.y * 8u + ly));
+
+    int hrW     = int(pc.hrWidth);
+    int hrH     = int(pc.hrHeight);
+    int lrW     = int(pc.lrWidth);
+    int lrH     = int(pc.lrHeight);
+    int fullLrH = int(max(pc.fullLrHeight, pc.lrHeight));
+    int fullHrH = int(max(pc.fullHrHeight, pc.hrHeight));
+    bool inImg  = (hrPos.x < hrW && hrPos.y < hrH);
+
+    ivec2 safeHrPos = clamp(hrPos, ivec2(0), ivec2(hrW - 1, hrH - 1));
+    vec2  hrFullPos = vec2(float(safeHrPos.x), float(safeHrPos.y + int(pc.bandHrY0)));
+    vec2  lrCoord   = (hrFullPos + vec2(0.5)) * vec2(float(lrW), float(fullLrH)) / vec2(float(hrW), float(fullHrH))
+                    - vec2(0.0, float(pc.bandLrY0));
+
+    float jx = pc.jitterX;
+    float jy = pc.jitterY;
+    int lxC  = clamp(int(floor(lrCoord.x - jx + 1e-5)), 0, lrW - 1);
+    int lyC  = clamp(int(floor(lrCoord.y - jy + 1e-5)), 0, lrH - 1);
+
+    vec3  centerRad = sanitizeRgb(imageLoad(uCleanRadLr, ivec2(lxC, lyC)).rgb);
+    uvec4 pgC       = imageLoad(uMlPrimaryGuide, ivec2(lxC, lyC));
+    vec3  centerNrm;
+    float centerDepth;
+    unpackCompactNormalDepth(pgC, centerNrm, centerDepth);
+    float centerRough = clamp(unpackUnorm4x8(pgC.z).a, 0.0, 1.0);
+    vec3  logC        = safeLog1p(centerRad);
+    bool  isSky       = (centerDepth >= 9999.0);
+
+    uint  cb  = uint(lyC * lrW + lxC) * 6u;
+    vec4  q0  = unpackHalf4(g_srField.f2[cb + 0u]);
+    vec4  q1  = unpackHalf4(g_srField.f2[cb + 1u]);
+    vec4  p_c = unpackHalf4(g_srField.f2[cb + 4u]);
+
+    BilinearTaps btT = computeBilinearTaps(lrCoord - vec2(jx, jy) - vec2(0.5), ivec2(lrW, lrH));
+    vec4 t_hr = btT.w.x * unpackHalf4(g_srField.f2[uint(btT.i00.y * lrW + btT.i00.x) * 6u + 5u])
+              + btT.w.y * unpackHalf4(g_srField.f2[uint(btT.i10.y * lrW + btT.i10.x) * 6u + 5u])
+              + btT.w.z * unpackHalf4(g_srField.f2[uint(btT.i01.y * lrW + btT.i01.x) * 6u + 5u])
+              + btT.w.w * unpackHalf4(g_srField.f2[uint(btT.i11.y * lrW + btT.i11.x) * 6u + 5u]);
+
+    float minDepth   = 1e30;
+    vec2  dilatedMv  = vec2(0.0);
+    float minR       = 10.0;
+    float attnLogits[9];
+    vec3  tapRads[9];
+    const float invSqrt8 = inversesqrt(8.0);
+
+    uint tap = 0u;
+    for (int dy = -1; dy <= 1; ++dy) {
+        int qy = clamp(lyC + dy, 0, lrH - 1);
+        for (int dx = -1; dx <= 1; ++dx) {
+            int qx = clamp(lxC + dx, 0, lrW - 1);
+            vec3  qRad   = sanitizeRgb(imageLoad(uCleanRadLr, ivec2(qx, qy)).rgb);
+            uvec4 pgQ    = imageLoad(uMlPrimaryGuide, ivec2(qx, qy));
+            vec3  qNrm;
+            float qD;
+            unpackCompactNormalDepth(pgQ, qNrm, qD);
+            float qRough = clamp(unpackUnorm4x8(pgQ.z).a, 0.0, 1.0);
+            vec2  qMvRaw = unpackHalf2x16(imageLoad(uMlSurfaceMv, ivec2(qx, qy)).x);
+            vec2  qMv    = vec2(sanitizeFloat(qMvRaw.x, 0.0), sanitizeFloat(qMvRaw.y, 0.0));
+            if (qD < minDepth) {
+                minDepth  = qD;
+                dilatedMv = qMv;
+            }
+
+            float dxo = lrCoord.x - (float(qx) + 0.5 + jx);
+            float dyo = lrCoord.y - (float(qy) + 0.5 + jy);
+            float dx2 = dxo * dxo;
+            float dy2 = dyo * dyo;
+            float dxy = dxo * dyo;
+            float r2  = dx2 + dy2;
+            float r   = sqrt(r2 + 1e-6);
+            minR      = min(minR, r);
+
+            vec3  logQ     = safeLog1p(qRad);
+            vec3  dlog     = clamp(logQ - logC, vec3(-4.0), vec3(4.0));
+            float relZ     = clamp((qD - centerDepth) / max(centerDepth, 1e-2), -2.0, 2.0);
+            float signRelZ = (relZ > 0.0) ? 1.0 : ((relZ < 0.0) ? -1.0 : 0.0);
+
+            vec4 x0 = vec4(dxo, dyo, dx2, dy2);
+            vec4 x1 = vec4(dxy, r, r2, abs(dxo) + abs(dyo));
+            vec4 x2 = vec4(dlog, clamp(dot(abs(dlog), vec3(1.0 / 3.0)) * 2.0, 0.0, 4.0));
+            vec4 x3 = vec4(
+                signRelZ * clamp(safeLog1pF(abs(relZ) * 24.0), 0.0, 4.0),
+                clamp(safeLog1pF(abs(relZ) * 32.0), 0.0, 4.0),
+                clamp((1.0 - dot(qNrm, centerNrm)) * 4.0, 0.0, 4.0),
+                clamp((qRough - centerRough) * 4.0, -4.0, 4.0)
+            );
+
+            vec4 po0, po1, po2, po3;
+            evalMlp16(U32_W5_HR_POS_MLP, V4_S5_HR_POS_MLP, V4_B5_OFFSET + V4_S5_HR_POS_MLP, false, inImg, x0, x1, x2, x3, po0, po1, po2, po3);
+
+            uint kb = uint(qy * lrW + qx) * 6u;
+            vec4 k0 = unpackHalf4(g_srField.f2[kb + 2u]);
+            vec4 k1 = unpackHalf4(g_srField.f2[kb + 3u]);
+
+            float logitK = (dot(q0 + po0, k0) + dot(q1 + po1, k1)) * (3.0 * invSqrt8)
+                         + dot(po2, p_c) * 1.5
+                         + dot(po3, vec4(0.25)) * 3.5;
+
+            attnLogits[tap] = logitK;
+            tapRads[tap]    = qRad;
+            ++tap;
+        }
+    }
+
+    float meanRaw = 0.0;
+    for (uint i = 0u; i < 9u; ++i) {
+        meanRaw += attnLogits[i];
+    }
+    meanRaw *= (1.0 / 9.0);
+
+    float catLogits[9];
+    float maxL = -16.0;
+    for (uint i = 0u; i < 9u; ++i) {
+        catLogits[i] = clamp(attnLogits[i] - meanRaw, -16.0, 16.0);
+        maxL = max(maxL, catLogits[i]);
+    }
+    float sumExp = 0.0;
+    vec3  iSpatialAtt = vec3(0.0);
+    for (uint i = 0u; i < 9u; ++i) {
+        float w = exp(catLogits[i] - maxL);
+        sumExp += w;
+        iSpatialAtt += w * tapRads[i];
+    }
+    iSpatialAtt /= max(sumExp, 1e-8);
+
+    vec3 logAtt       = safeLog1p(iSpatialAtt);
+    vec3 mean3x3Diff  = vec3(0.0);
+    for (uint i = 0u; i < 9u; ++i) {
+        mean3x3Diff += abs(safeLog1p(tapRads[i]) - logAtt);
+    }
+    mean3x3Diff *= (1.0 / 9.0);
+
+    // Explicit closest-depth dilatedMv backward warp of HR temporal history (uPrevColorHr = color + valid)
+    bool  reset        = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+    vec2  fullHrSizeF  = vec2(float(hrW), float(fullHrH));
+    vec2  currFullUvHr = (hrFullPos + vec2(0.5)) / fullHrSizeF;
+    vec2  prevFullUvHr = currFullUvHr - dilatedMv;
+    vec2  hrCoord      = vec2(prevFullUvHr.x * float(hrW), prevFullUvHr.y * float(fullHrH) - float(pc.bandHrY0)) - vec2(0.5);
+    bool  inBndHr      = (!reset)
+                      && all(greaterThanEqual(prevFullUvHr, vec2(0.0)))
+                      && all(lessThan(prevFullUvHr, vec2(1.0)))
+                      && (hrCoord.y >= -0.5)
+                      && (hrCoord.y < float(hrH) - 0.5);
+
+    vec3  cTaps[4];
+    bool  cOk[4];
+    float cW[4];
+    vec3  wPrevInit = vec3(0.0);
+    float validHr   = 0.0;
+
+    if (inBndHr) {
+        vec2  f   = floor(hrCoord);
+        vec2  fr  = clamp(hrCoord - f, vec2(0.0), vec2(1.0));
+        int   x0h = int(f.x);
+        int   y0h = int(f.y);
+        int   x1h = x0h + 1;
+        int   y1h = y0h + 1;
+        int   xs[4] = int[4](x0h, x1h, x0h, x1h);
+        int   ys[4] = int[4](y0h, y0h, y1h, y1h);
+        cW[0] = (1.0 - fr.x) * (1.0 - fr.y);
+        cW[1] = fr.x         * (1.0 - fr.y);
+        cW[2] = (1.0 - fr.x) * fr.y;
+        cW[3] = fr.x         * fr.y;
+
+        vec3  wPrevNum = vec3(0.0);
+        float vPrevNum = 0.0;
+        float wSum     = 0.0;
+        for (uint k = 0u; k < 4u; ++k) {
+            cOk[k] = (xs[k] >= 0 && xs[k] < hrW && ys[k] >= 0 && ys[k] < hrH);
+            ivec2 tc = clamp(ivec2(xs[k], ys[k]), ivec2(0), ivec2(hrW - 1, hrH - 1));
+            vec4 prevSample = imageLoad(uPrevColorHr, tc);
+            cTaps[k] = sanitizeRgb(prevSample.rgb);
+            float vK = clamp(sanitizeFloat(prevSample.a, 0.0), 0.0, 1.0);
+            float wk = cOk[k] ? cW[k] : 0.0;
+            wPrevNum += wk * cTaps[k];
+            vPrevNum += wk * vK;
+            wSum     += wk;
+        }
+        bool hasOk = (wSum > 1e-4);
+        wPrevInit  = hasOk ? (wPrevNum / max(wSum, 1e-4)) : vec3(0.0);
+        validHr    = (hasOk && !isSky) ? clamp(vPrevNum / max(wSum, 1e-4), 0.0, 1.0) : 0.0;
+    }
+
+    float hrMvPx = sqrt(
+        pow(dilatedMv.x * float(hrW), 2.0) +
+        pow(dilatedMv.y * float(fullHrH), 2.0) +
+        1e-12
+    );
+
+    vec3 diffPrevLog = validHr * clamp(safeLog1p(wPrevInit) - logAtt, vec3(-4.0), vec3(4.0));
+    vec4 tx0 = vec4(logAtt, diffPrevLog.r);
+    vec4 tx1 = vec4(diffPrevLog.gb, clamp(mean3x3Diff.rg * 2.0, vec2(0.0), vec2(4.0)));
+    vec4 tx2 = vec4(clamp(mean3x3Diff.b * 2.0, 0.0, 4.0), (minR - 0.35) * 4.0, (validHr - 0.5) * 2.0, clamp(safeLog1pF(hrMvPx), 0.0, 4.0) - 1.0);
+    vec4 tx3 = t_hr;
+
+    vec4 th0, th1, th2, th3;
+    evalMlp16(U32_W5_HR_TEMP_MLP1, V4_S5_HR_TEMP_MLP1, V4_B5_OFFSET + V4_S5_HR_TEMP_MLP1, true, inImg, tx0, tx1, tx2, tx3, th0, th1, th2, th3);
+
+    vec4 to0, to1, to2, to3;
+    evalMlp16(U32_W5_HR_TEMP_MLP2, V4_S5_HR_TEMP_MLP2, V4_B5_OFFSET + V4_S5_HR_TEMP_MLP2, false, inImg, th0, th1, th2, th3, to0, to1, to2, to3);
+
+    if ((pc.flags & UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE) != 0u) {
+        to0 = vec4(0.0);
+        to1 = vec4(0.0);
+        to2 = vec4(0.0);
+        to3 = vec4(0.0);
+    }
+
+    vec3 wPrevHr = wPrevInit;
+    if (inBndHr) {
+        vec4  tRaw  = vec4(to0.w, to1.x, to1.y, to1.z);
+        float tMean = 0.25 * (tRaw.x + tRaw.y + tRaw.z + tRaw.w);
+        vec4  tMod  = exp(clamp(2.0 * (tRaw - vec4(tMean)), vec4(-16.0), vec4(16.0)));
+        tMod       /= max(dot(tMod, vec4(1.0)), 1e-8);
+
+        vec3  wRefNum = vec3(0.0);
+        float wRefSum = 0.0;
+        for (uint k = 0u; k < 4u; ++k) {
+            float wkRef = (cOk[k] ? cW[k] : 0.0) * (4.0 * tMod[k]);
+            wRefNum += wkRef * cTaps[k];
+            wRefSum += wkRef;
+        }
+        wPrevHr = (wRefSum > 1e-6) ? (wRefNum / max(wRefSum, 1e-6)) : vec3(0.0);
+    }
+
+    float gateSr   = zeroCenteredGate(to0.x);
+    float alphaHr  = (isSky || validHr <= 1e-4) ? 0.0 : (0.97 * zeroCenteredGate(to0.y));
+    float gateConf = zeroCenteredGate(to0.z);
+
+    float rLog[9];
+    rLog[0] = catLogits[0] + to1.w;
+    rLog[1] = catLogits[1] + to2.x;
+    rLog[2] = catLogits[2] + to2.y;
+    rLog[3] = catLogits[3] + to2.z;
+    rLog[4] = catLogits[4] + to2.w;
+    rLog[5] = catLogits[5] + to3.x;
+    rLog[6] = catLogits[6] + to3.y;
+    rLog[7] = catLogits[7] + to3.z;
+    rLog[8] = catLogits[8] + to3.w;
+
+    float rMean = 0.0;
+    for (uint i = 0u; i < 9u; ++i) {
+        rMean += rLog[i];
+    }
+    rMean *= (1.0 / 9.0);
+    float rMax = -16.0;
+    float rC[9];
+    for (uint i = 0u; i < 9u; ++i) {
+        rC[i] = clamp(rLog[i] - rMean, -16.0, 16.0);
+        rMax  = max(rMax, rC[i]);
+    }
+    float rSumExp = 0.0;
+    vec3  iRef9   = vec3(0.0);
+    for (uint i = 0u; i < 9u; ++i) {
+        float w = exp(rC[i] - rMax);
+        rSumExp += w;
+        iRef9   += w * tapRads[i];
+    }
+    iRef9 /= max(rSumExp, 1e-8);
+
+    vec3  iAttBlend  = mix(iSpatialAtt, iRef9, gateConf);
+    vec3  iSr        = isSky ? centerRad : clampFp16Rgb(mix(centerRad, iAttBlend, gateSr));
+    vec3  hrOut      = isSky ? centerRad : clampFp16Rgb(mix(iSr, wPrevHr, alphaHr));
+    float confHrNext = isSky ? 0.0 : clamp(validHr * 0.82 + 0.22 * gateConf, 0.0, 1.0);
+
+    if (inImg) {
+        imageStore(uCurrColorHr, hrPos, vec4(hrOut, confHrNext));
+        imageStore(uOutputColor, hrPos, vec4(hrOut, 1.0));
+        if ((pc.flags & UPWAYS_V5_FLAG_FUSED_BAND_PACK) != 0u
+            && uint(hrPos.y) >= pc.keepHrYStart
+            && uint(hrPos.y) < pc.keepHrYEnd) {
+            uint packIdx = (uint(hrPos.y) - pc.keepHrYStart) * uint(hrW) + uint(hrPos.x);
+            g_bandPackOut.rgb9e5[packIdx] = packRGB9E5(hrOut);
+        }
+    }
+}

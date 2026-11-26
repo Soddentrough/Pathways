@@ -1,20 +1,26 @@
 #version 460
 #extension GL_EXT_shader_image_load_formatted : require
+#include "rgb9e5.glsl"
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(binding = 0) readonly uniform image2D uAccumImage;
 layout(binding = 1) writeonly uniform image2D uOutputImage;
+layout(std430, binding = 2) readonly buffer BandStitchBuf {
+    uint packed[];
+} uBandStitch;
 
 layout(push_constant) uniform PushConstants {
     float exposure;
     uint totalSamples;
     uint applyACES;
-    uint visualizeSplit; // 0 = off, 1 = Checkerboard Tile Overlay
+    uint visualizeSplit; // 0 = off, 1 = Checkerboard Tile Overlay, 2 = Upways Band-Parallel Split
     uint tileSize;       // Checkerboard tile size (16, 32, 64, or 128; defaults to 64 if 0)
     uint displayMode;    // 0 = SDR (sRGB 2.2), 1 = HDR scRGB Linear, 2 = HDR10 (Rec.2020 ST 2084 PQ)
     float peakNits;      // Display peak luminance in cd/m^2 (e.g. 1000.0)
     float paperWhiteNits;// Reference paper white luminance in cd/m^2 (e.g. 200.0)
+    uint stitchYStart;   // First HR row read from uBandStitch (0 when inactive)
+    uint stitchRowCount; // Number of HR rows read from uBandStitch (0 = disabled)
 } pc;
 
 // ACES Filmic Tone Mapping Curve (Narkowicz / Stephen Hill fit)
@@ -102,8 +108,15 @@ void main() {
         return;
     }
 
-    vec4 accumColor = imageLoad(uAccumImage, pixelCoord);
-    vec3 linearColor = accumColor.rgb;
+    vec3 linearColor;
+    if (pc.stitchRowCount > 0u &&
+        uint(pixelCoord.y) >= pc.stitchYStart &&
+        uint(pixelCoord.y) < (pc.stitchYStart + pc.stitchRowCount)) {
+        uint stitchRow = uint(pixelCoord.y) - pc.stitchYStart;
+        linearColor = unpackRGB9E5(uBandStitch.packed[stitchRow * uint(imageSize.x) + uint(pixelCoord.x)]);
+    } else {
+        linearColor = imageLoad(uAccumImage, pixelCoord).rgb;
+    }
 
     if (pc.totalSamples > 0) {
         linearColor /= float(pc.totalSamples);
@@ -163,6 +176,15 @@ void main() {
         }
         vec3 tint = (check == 0u) ? (vec3(0.1, 0.55, 1.0) * tintScale) : (vec3(1.0, 0.45, 0.1) * tintScale);
         finalColor = mix(finalColor, tint, 0.25);
+    } else if (pc.visualizeSplit == 2u && pc.stitchRowCount > 0u) {
+        float tintScale = (pc.displayMode == 1u) ? (pc.paperWhiteNits / 80.0) : 1.0;
+        bool isBotBand = (uint(pixelCoord.y) >= pc.stitchYStart) &&
+                         (uint(pixelCoord.y) < (pc.stitchYStart + pc.stitchRowCount));
+        vec3 tint = isBotBand ? (vec3(1.0, 0.45, 0.1) * tintScale) : (vec3(0.1, 0.55, 1.0) * tintScale);
+        finalColor = mix(finalColor, tint, 0.22);
+        if (uint(pixelCoord.y) == pc.stitchYStart) {
+            finalColor = mix(finalColor, vec3(1.0) * tintScale, 0.85);
+        }
     }
 
     imageStore(uOutputImage, pixelCoord, vec4(finalColor, 1.0));

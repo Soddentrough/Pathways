@@ -48,6 +48,12 @@ void RenderTargetManager::destroy() {
     m_mlSpecularImage.reset();
     m_mlSkipImage.reset();
     m_mlSpecAlbedoImage.reset();
+    m_mlIrradianceImage.reset();
+    m_mlPrimaryGuideImage.reset();
+    m_mlSurfaceMvImage.reset();
+    m_mlDiffHitDistImage.reset();
+    m_mlSpecVmvImage.reset();
+    m_mlSkipCompactImage.reset();
 }
 
 void RenderTargetManager::destroyGBufferResources() {
@@ -213,6 +219,16 @@ void RenderTargetManager::transitionAllToGeneral(VkCommandBuffer cmd) {
             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
     }
+    for (Image* compactImg : { m_mlIrradianceImage.get(), m_mlPrimaryGuideImage.get(), m_mlSurfaceMvImage.get(), m_mlDiffHitDistImage.get(), m_mlSpecVmvImage.get(), m_mlSkipCompactImage.get() }) {
+        if (compactImg) {
+            compactImg->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
+    }
     for (Image* splitImg : { m_mlDirectDiffuseImage.get(), m_mlIndirectDiffuseImage.get(),
                              m_mlDirectSpecularImage.get(), m_mlIndirectSpecularImage.get() }) {
         if (splitImg) {
@@ -328,6 +344,32 @@ void RenderTargetManager::createRenderTargets(uint32_t width, uint32_t height, A
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
+    );
+    const VkImageUsageFlags compactMlUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    m_mlIrradianceImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R32G32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlPrimaryGuideImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R32G32B32A32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSurfaceMvImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlDiffHitDistImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R8_UNORM, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSpecVmvImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R32G32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSkipCompactImage = std::make_unique<Image>(
+        m_device, m_allocator, rw, rh, VK_FORMAT_R32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
     );
 
     if (hasSplitSignalResources()) {
@@ -454,7 +496,9 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
                                                    VkCommandBuffer cmd) {
     if (renderWidth == 0 || renderHeight == 0) return;
     if (m_renderWidth == renderWidth && m_renderHeight == renderHeight &&
-        m_motionVectorImage && m_mlDiffuseImage && m_normalDepthImage) {
+        m_motionVectorImage && m_mlDiffuseImage && m_normalDepthImage &&
+        m_mlIrradianceImage && m_mlPrimaryGuideImage && m_mlSurfaceMvImage &&
+        m_mlDiffHitDistImage && m_mlSpecVmvImage && m_mlSkipCompactImage) {
         return;
     }
     m_renderWidth = renderWidth;
@@ -510,6 +554,32 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_IMAGE_ASPECT_COLOR_BIT,
         concurrentQueues
+    );
+    const VkImageUsageFlags compactMlUsage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    m_mlIrradianceImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R32G32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlPrimaryGuideImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R32G32B32A32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSurfaceMvImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlDiffHitDistImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R8_UNORM, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSpecVmvImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R32G32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
+    );
+    m_mlSkipCompactImage = std::make_unique<Image>(
+        m_device, m_allocator, renderWidth, renderHeight, VK_FORMAT_R32_UINT, compactMlUsage,
+        VK_IMAGE_ASPECT_COLOR_BIT, concurrentQueues
     );
 
     const bool hadSplitSignals = hasSplitSignalResources();
@@ -596,6 +666,16 @@ void RenderTargetManager::resizeRenderSpaceTargets(uint32_t renderWidth, uint32_
         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
     );
+    for (Image* compactImg : { m_mlIrradianceImage.get(), m_mlPrimaryGuideImage.get(), m_mlSurfaceMvImage.get(), m_mlDiffHitDistImage.get(), m_mlSpecVmvImage.get(), m_mlSkipCompactImage.get() }) {
+        if (compactImg) {
+            compactImg->transitionLayout(
+                cmd, VK_IMAGE_LAYOUT_GENERAL,
+                VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
+            );
+        }
+    }
     m_normalDepthImage->transitionLayout(
         cmd, VK_IMAGE_LAYOUT_GENERAL,
         VK_PIPELINE_STAGE_2_NONE, 0,
