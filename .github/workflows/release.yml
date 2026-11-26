@@ -65,7 +65,7 @@ jobs:
 
       - name: Run Unit Tests (CTest)
         run: |
-          SDL_VIDEODRIVER=dummy ctest --test-dir build --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
+          SDL_VIDEODRIVER=dummy ctest --test-dir build --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|EnvImportance|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
 
       - name: Package RPM & Tarball with CPack
         run: |
@@ -132,7 +132,7 @@ jobs:
       - name: Run Unit Tests (Windows CTest)
         shell: bash
         run: |
-          SDL_VIDEODRIVER=dummy ctest --test-dir build -C Release --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
+          SDL_VIDEODRIVER=dummy ctest --test-dir build -C Release --output-on-failure -R "CameraControls|CameraPaths|GuiScroll|PipelineComparison|RestirPtMath|LightTree|EnvImportance|MeshQuantization|ProceduralCyberCity|CausticsDetection|UsdLoader"
 
       - name: Package Release (Windows)
         shell: bash
