@@ -5,6 +5,7 @@
 #include "scene/SceneRegistry.hpp"
 #include "scene/GltfLoader.hpp"
 #include "scene/UsdLoader.hpp"
+#include "scene/EnvMapImportance.hpp"
 #include "vulkan/Buffer.hpp"
 #include "vulkan/Texture.hpp"
 #include "scene/Camera.hpp"
@@ -68,7 +69,7 @@ public:
     void updateDynamicLights(SceneData& sceneData, bool immediateHostCopy = false);
     void recordDynamicLightUpload(VkCommandBuffer cmd, uint32_t frameSlot);
     void releasePositionBuffer() noexcept { m_positionBuffer.reset(); }
-    void loadTextures(const std::string& hdriPath, const std::string& scenePath);
+    void loadTextures(const std::string& hdriPath, const std::string& scenePath, bool customHdri = false);
     void updateCamera(Camera* camera, const Config& config);
 
     // Accessors for Scene Data
@@ -94,6 +95,12 @@ public:
     [[nodiscard]] Buffer* getShadeMaterialBuffer() const noexcept { return m_shadeMaterialBuffer.get(); }
     [[nodiscard]] Buffer* getLightBuffer() const noexcept { return m_lightBuffer.get(); }
     [[nodiscard]] Buffer* getLightTreeBuffer() const noexcept { return m_lightTreeBuffer.get(); }
+    [[nodiscard]] Buffer* getEnvImportanceBuffer() const noexcept { return m_envImportanceBuffer.get(); }
+    [[nodiscard]] const EnvImportanceTable& getEnvImportanceTable() const noexcept { return m_envImportanceTable; }
+    [[nodiscard]] bool isEnvNeeEnabled() const noexcept {
+        return m_envImportanceTable.header.width > 0u && m_envImportanceTable.header.envSelectProb > 0.0f;
+    }
+    [[nodiscard]] float getEffectiveEnvIntensity() const noexcept { return m_activeEnvIntensity; }
     [[nodiscard]] bool hasDynamicLightUpdate() const noexcept { return m_dynamicLightsDirty; }
     [[nodiscard]] const std::vector<LightGPU>& getCpuDynamicLights() const noexcept { return m_cpuDynamicLights; }
     [[nodiscard]] const std::vector<LightTreeNodeGPU>& getCpuDynamicLightTree() const noexcept { return m_cpuDynamicLightTree; }
@@ -160,6 +167,11 @@ private:
     std::unique_ptr<Buffer> m_shadeMaterialBuffer;
     std::unique_ptr<Buffer> m_lightBuffer;
     std::unique_ptr<Buffer> m_lightTreeBuffer;
+    std::unique_ptr<Buffer> m_envImportanceBuffer;
+    EnvImportanceTable m_envImportanceTable{};
+    bool m_envIsExplicitOrDome = false;
+    float m_activeEnvIntensity = 1.0f;
+    void uploadEnvImportanceBuffer();
     std::array<std::unique_ptr<Buffer>, 2> m_lightStaging;
     std::array<std::unique_ptr<Buffer>, 2> m_lightTreeStaging;
     std::vector<LightGPU> m_cpuDynamicLights;

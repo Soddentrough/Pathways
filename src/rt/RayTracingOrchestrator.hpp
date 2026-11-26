@@ -42,6 +42,7 @@ struct RayTracingDispatchParams {
     bool cameraMovedLastFrame = false;
     bool diagnosticHalfTiles = false;
     bool isRestirActive = false;
+    bool envNeeEnabled = false;
 };
 
 class RayTracingOrchestrator {
@@ -50,7 +51,8 @@ public:
         VkDevice device,
         VmaAllocator allocator,
         VkPhysicalDevice physicalDevice,
-        VkPhysicalDeviceType deviceType
+        VkPhysicalDeviceType deviceType,
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE
     );
     ~RayTracingOrchestrator();
 
@@ -75,7 +77,8 @@ public:
         bool enableDgcPreprocess,
         bool hasSubgroupSizeControl,
         uint32_t initialBatchPixels,
-        const std::vector<char>& tailMegakernelCode
+        const std::vector<char>& tailMegakernelCode,
+        const std::vector<char>& shadeDielectricSecCode = {}
     );
 
     void initWavefrontSpecializedVariants(
@@ -85,7 +88,32 @@ public:
         const std::vector<char>& shadeComplexRestirCode,
         const std::vector<char>& shadeComplexSecRestirCode,
         const std::vector<char>& shadeDielectricRestirCode,
-        const std::vector<char>& shadeEmissiveRestirCode
+        const std::vector<char>& shadeEmissiveRestirCode,
+        const std::vector<char>& restirGiReuseCode = {},
+        const std::vector<char>& restirDiReuseCode = {},
+        const std::vector<char>& shadeDielectricSecRestirCode = {}
+    );
+
+    void initWavefrontAlphaPipeline(const std::vector<char>& intersectAlphaCode);
+    void initWavefrontTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode);
+    void initWavefrontRestirVariants(
+        const std::vector<char>& shadeDiffuseRestirCode,
+        const std::vector<char>& shadeDiffuseSecRestirCode,
+        const std::vector<char>& shadeComplexRestirCode,
+        const std::vector<char>& shadeComplexSecRestirCode,
+        const std::vector<char>& shadeDielectricRestirCode,
+        const std::vector<char>& shadeEmissiveRestirCode,
+        const std::vector<char>& restirGiReuseCode = {},
+        const std::vector<char>& restirDiReuseCode = {},
+        const std::vector<char>& shadeDielectricSecRestirCode = {}
+    );
+    void initWavefrontNrcVariants(
+        const std::vector<char>& shadeDiffuseNrcCode,
+        const std::vector<char>& shadeDiffuseSecNrcCode,
+        const std::vector<char>& shadeComplexNrcCode,
+        const std::vector<char>& shadeComplexSecNrcCode,
+        const std::vector<char>& shadeDielectricNrcCode,
+        const std::vector<char>& shadeDielectricSecNrcCode
     );
 
     /// Initializes NRCManager.
@@ -147,7 +175,8 @@ public:
         Image* mlDirectDiffuseImage = nullptr,
         Image* mlIndirectDiffuseImage = nullptr,
         Image* mlDirectSpecularImage = nullptr,
-        Image* mlIndirectSpecularImage = nullptr
+        Image* mlIndirectSpecularImage = nullptr,
+        Image* motionVectorImage = nullptr
     );
 
     // Getters
@@ -166,6 +195,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkPhysicalDeviceType m_deviceType = VK_PHYSICAL_DEVICE_TYPE_OTHER;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     std::unique_ptr<WavefrontPipeline> m_wavefrontPipeline;
     std::unique_ptr<NRCManager> m_nrcManager;

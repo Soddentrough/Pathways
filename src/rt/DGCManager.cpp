@@ -365,8 +365,10 @@ void DGCManager::initMaterialExecutionSets(const std::vector<std::vector<VkPipel
         }
     }
 
-    static constexpr const char* kSetNames[4] = {
-        "primary material", "secondary material", "ReSTIR primary material", "ReSTIR bounce-1 material"
+    static constexpr const char* kSetNames[6] = {
+        "primary material", "secondary material",
+        "ReSTIR primary material", "ReSTIR bounce-1 material",
+        "NRC primary material", "NRC secondary material"
     };
     uint32_t createdSets = 0;
     for (size_t s = 0; s < pipelineSets.size() && s < m_materialExecutionSets.size(); ++s) {

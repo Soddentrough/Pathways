@@ -27,7 +27,8 @@ public:
                            VmaAllocator allocator,
                            VkQueue queue,
                            ShaderLoaderFunc shaderLoader,
-                           VkInstance instance = VK_NULL_HANDLE);
+                           VkInstance instance = VK_NULL_HANDLE,
+                           VkPipelineCache pipelineCache = VK_NULL_HANDLE);
     ~SuperResolutionManager();
 
     SuperResolutionManager(const SuperResolutionManager&) = delete;
@@ -131,6 +132,7 @@ private:
     VkQueue m_queue = VK_NULL_HANDLE;
     ShaderLoaderFunc m_shaderLoader;
     VkInstance m_instance = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     VkDescriptorPool m_postProcessDescPool = VK_NULL_HANDLE;
 

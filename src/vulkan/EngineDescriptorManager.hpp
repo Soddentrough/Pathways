@@ -40,6 +40,7 @@ struct SceneDescriptorParams {
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
     Buffer* lightTreeBuffer = nullptr;
+    Buffer* envImportanceBuffer = nullptr;
     Buffer* instanceBuffer = nullptr;
     VkAccelerationStructureKHR tlasHandle = VK_NULL_HANDLE;
     Texture* environmentMap = nullptr;
@@ -59,6 +60,7 @@ struct WavefrontDescriptorParams {
     Buffer* materialBuffer = nullptr;
     Buffer* lightBuffer = nullptr;
     Buffer* lightTreeBuffer = nullptr;
+    Buffer* envImportanceBuffer = nullptr;
     Buffer* instanceBuffer = nullptr;
     Buffer* materialArchetypeBuffer = nullptr;
     Buffer* shadeMaterialBuffer = nullptr;

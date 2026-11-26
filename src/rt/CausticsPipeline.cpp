@@ -16,9 +16,11 @@ CausticsPipeline::CausticsPipeline(VkDevice device,
                                    const std::vector<char>& traceSpv,
                                    const std::vector<char>& splatSpv,
                                    const std::vector<char>& filterSpv,
-                                   ImmediateSubmitFn immediateSubmit)
+                                   ImmediateSubmitFn immediateSubmit,
+                                   VkPipelineCache pipelineCache)
     : m_device(device),
       m_allocator(allocator),
+      m_pipelineCache(pipelineCache),
       m_hasSubgroupSizeControl(hasSubgroupSizeControl),
       m_width(width),
       m_height(height),
@@ -215,7 +217,7 @@ void CausticsPipeline::createPipelines(const std::vector<char>& traceSpv,
     tracePipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, traceMod, "main", nullptr };
     if (m_hasSubgroupSizeControl) tracePipeInfo.stage.pNext = &subgroupSize32;
     tracePipeInfo.layout = m_tracePipelineLayout;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &tracePipeInfo, nullptr, &m_tracePipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &tracePipeInfo, nullptr, &m_tracePipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, traceMod, nullptr);
         throw std::runtime_error("Failed to create caustic trace compute pipeline");
     }
@@ -226,7 +228,7 @@ void CausticsPipeline::createPipelines(const std::vector<char>& traceSpv,
     splatPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, splatMod, "main", nullptr };
     if (m_hasSubgroupSizeControl) splatPipeInfo.stage.pNext = &subgroupSize32;
     splatPipeInfo.layout = m_splatPipelineLayout;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &splatPipeInfo, nullptr, &m_splatPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &splatPipeInfo, nullptr, &m_splatPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, splatMod, nullptr);
         throw std::runtime_error("Failed to create caustic splat compute pipeline");
     }
@@ -237,7 +239,7 @@ void CausticsPipeline::createPipelines(const std::vector<char>& traceSpv,
     filterPipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, filterMod, "main", nullptr };
     if (m_hasSubgroupSizeControl) filterPipeInfo.stage.pNext = &subgroupSize32;
     filterPipeInfo.layout = m_filterPipelineLayout;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &filterPipeInfo, nullptr, &m_filterPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &filterPipeInfo, nullptr, &m_filterPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, filterMod, nullptr);
         throw std::runtime_error("Failed to create caustic filter compute pipeline");
     }

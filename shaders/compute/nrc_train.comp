@@ -9,20 +9,22 @@
 
 layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 
-// Shared memory staging buffers (< 32 KiB) for 4-Wave32 parallel WMMA training + LDS hash accumulation:
+// Shared memory staging buffers (~28.2 KiB < 32 KiB) for 4-Wave32 parallel WMMA training + per-level LDS hash accumulation:
 shared float16_t s_act0[32 * 64];     // 4096 B: input features x
 shared float16_t s_act1[32 * 64];     // 4096 B: hidden layer 0 activations h0
 shared float16_t s_act2[32 * 64];     // 4096 B: hidden layer 1 activations h1 (reused for delta0)
 shared float16_t s_delta[32 * 64];    // 4096 B: delta1 (reused for dx cols 0..15)
 shared float16_t s_delta2[32 * 3];    //  192 B: output layer delta2 (3 channels per sample)
-shared float16_t s_gradTiles[4 * 256];// 2048 B: per-subgroup 16x16 WMMA weight gradient tile scratch
+shared uint      s_uTileA[4 * 128];   // 2048 B: per-subgroup packed 16x16 FP16 WMMA A-tile scratch
+shared uint      s_uTileB[4 * 128];   // 2048 B: per-subgroup packed 16x16 FP16 WMMA B-tile scratch
+shared float     s_fAcc[4 * 16 * 16]; // 4096 B: per-subgroup FP32 WMMA accumulator staging
 shared vec3 s_tailPred[32];           //  512 B: clamped stop-gradient bootstrap prediction at tail vertex
 shared uint s_recIdx[32];             //  128 B: sampled training record indices for current step
-shared uint s_htKey[2048];            // 8192 B: lock-free LDS hash table keys (0xFFFFFFFFu = empty)
-shared int s_htGradX[2048];           // 8192 B: fixed-point Q16.15 accumulated hash feature grad X
-shared int s_htGradY[2048];           // 8192 B: fixed-point Q16.15 accumulated hash feature grad Y
-shared uint s_htActive[1024];         // 4096 B: compacted occupied hash-table slot indices
-shared uint s_htActiveCount;          //    4 B: count of occupied slots in s_htActive (<= 1024)
+shared uint s_htKey[256];             // 1024 B: lock-free per-level LDS hash table keys (0xFFFFFFFFu = empty)
+shared int s_htGradX[256];            // 1024 B: fixed-point Q16.15 accumulated hash feature grad X
+shared int s_htGradY[256];            // 1024 B: fixed-point Q16.15 accumulated hash feature grad Y
+shared uint s_htActive[128];          //  512 B: compacted occupied hash-table slot indices (<= 128 per level)
+shared uint s_htActiveCount;          //    4 B: count of occupied slots in s_htActive (<= 128)
 
 layout(std430, set = 0, binding = 0) readonly buffer InTrainQueue {
     NRCTrainingRecord records[];
@@ -196,74 +198,131 @@ void encodeFeaturesToAct0(uint sampleIdx, uint subLane, vec3 worldPos, vec3 norm
     }
 }
 
-vec3 runForwardPass(uint sg, uint flatTid) {
+vec3 runForwardPass(uint sg, uint tid, uint flatTid) {
+    uint sgUTileOff = sg * 128u;
+    uint sgAccOff   = sg * 256u;
+    // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32 WMMA accumulators.
+    float zAcc = float(pc.numSteps == 0xFFFFFFFFu);
     barrier();
-    // Layer 0: 64 -> 64 via two 16-row Wave32 WMMA half-batches (4 subgroups compute col 0..3 in parallel)
+    // Layer 0: 64 -> 64 via two 16-row Wave32 WMMA half-batches (4 subgroups compute col = sg in parallel; packed uint + FP32 accum)
     for (uint b = 0u; b < 2u; ++b) {
         uint rowOff = b * 1024u;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_act0, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (sg * 16u);
-            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint e = 0u; e < 4u; ++e) {
+                uint uIdx = tid * 4u + e;
+                uint r = uIdx >> 3u;
+                uint c2 = (uIdx & 7u) * 2u;
+                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(s_act0[rowOff + r * 64u + k * 16u + c2]),
+                    float(s_act0[rowOff + r * 64u + k * 16u + c2 + 1u])));
+                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(weights[wOff + r * 64u + c2]),
+                    float(weights[wOff + r * 64u + c2 + 1u])));
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
             c0 = coopMatMulAdd(aTile, bTile, c0);
+            subgroupBarrier();
         }
-        coopMatStore(c0, s_act1, rowOff + sg * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-    for (uint i = flatTid; i < 32u * 64u; i += 128u) {
-        float16_t b0 = weights[NRC_B0_OFFSET + (i & 63u)];
-        float16_t v = s_act1[i] + b0;
-        s_act1[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+        coopMatStore(c0, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = 0u; e < 8u; ++e) {
+            uint idx = tid * 8u + e;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B0_OFFSET + sg * 16u + c]);
+            s_act1[rowOff + r * 64u + sg * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
     }
     barrier();
 
-    // Layer 1: 64 -> 64 via two 16-row Wave32 WMMA half-batches (4 subgroups compute col 0..3 in parallel)
+    // Layer 1: 64 -> 64 via two 16-row Wave32 WMMA half-batches (4 subgroups compute col = sg in parallel)
     for (uint b = 0u; b < 2u; ++b) {
         uint rowOff = b * 1024u;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_act1, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (sg * 16u);
-            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint e = 0u; e < 4u; ++e) {
+                uint uIdx = tid * 4u + e;
+                uint r = uIdx >> 3u;
+                uint c2 = (uIdx & 7u) * 2u;
+                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(s_act1[rowOff + r * 64u + k * 16u + c2]),
+                    float(s_act1[rowOff + r * 64u + k * 16u + c2 + 1u])));
+                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(weights[wOff + r * 64u + c2]),
+                    float(weights[wOff + r * 64u + c2 + 1u])));
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
             c1 = coopMatMulAdd(aTile, bTile, c1);
+            subgroupBarrier();
         }
-        coopMatStore(c1, s_act2, rowOff + sg * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    barrier();
-    for (uint i = flatTid; i < 32u * 64u; i += 128u) {
-        float16_t b1 = weights[NRC_B1_OFFSET + (i & 63u)];
-        float16_t v = s_act2[i] + b1;
-        s_act2[i] = (v > float16_t(0.0)) ? v : (float16_t(0.01) * v);
+        coopMatStore(c1, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = 0u; e < 8u; ++e) {
+            uint idx = tid * 8u + e;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B1_OFFSET + sg * 16u + c]);
+            s_act2[rowOff + r * 64u + sg * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
     }
     barrier();
 
     // Layer 2: 64 -> 16 via Wave32 WMMA across subgroups 0 & 1 (samples 0..15 and 16..31)
     if (sg < 2u) {
         uint rowOff = sg * 1024u;
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 =
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_act2, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
-            coopMatLoad(bTile, weights, wOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            for (uint e = 0u; e < 4u; ++e) {
+                uint uIdx = tid * 4u + e;
+                uint r = uIdx >> 3u;
+                uint c2_col = (uIdx & 7u) * 2u;
+                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(s_act2[rowOff + r * 64u + k * 16u + c2_col]),
+                    float(s_act2[rowOff + r * 64u + k * 16u + c2_col + 1u])));
+                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(weights[wOff + uIdx * 2u]),
+                    float(weights[wOff + uIdx * 2u + 1u])));
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
             c2 = coopMatMulAdd(aTile, bTile, c2);
+            subgroupBarrier();
         }
-        coopMatStore(c2, s_gradTiles, sg * 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(c2, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
     }
     barrier();
 
@@ -271,9 +330,9 @@ vec3 runForwardPass(uint sg, uint flatTid) {
     if (flatTid < 32u) {
         uint outRow = flatTid * 16u;
         pred = vec3(
-            float(s_gradTiles[outRow + 0u]) + float(weights[NRC_B2_OFFSET + 0u]),
-            float(s_gradTiles[outRow + 1u]) + float(weights[NRC_B2_OFFSET + 1u]),
-            float(s_gradTiles[outRow + 2u]) + float(weights[NRC_B2_OFFSET + 2u])
+            s_fAcc[outRow + 0u] + float(weights[NRC_B2_OFFSET + 0u]),
+            s_fAcc[outRow + 1u] + float(weights[NRC_B2_OFFSET + 1u]),
+            s_fAcc[outRow + 2u] + float(weights[NRC_B2_OFFSET + 2u])
         );
     }
     return pred;
@@ -338,7 +397,7 @@ void main() {
 
         encodeFeaturesToAct0(sampleIdx, subLane, recS.tailPos_roughness.xyz, tailNormal, tailDir,
                              recS.tailPos_roughness.w, tailSpecRatio, hasTailS);
-        vec3 tailRawPred = runForwardPass(sg, flatTid);
+        vec3 tailRawPred = runForwardPass(sg, tid, flatTid);
         if (flatTid < 32u) {
             NRCTrainingRecord recT = (flatTid < numSamples) ? records[s_recIdx[flatTid]] : records[0];
             bool tValid = (flatTid < numSamples)
@@ -354,7 +413,7 @@ void main() {
         // 2. Forward Pass on query vertex
         encodeFeaturesToAct0(sampleIdx, subLane, recS.pos_roughness.xyz, recS.normal_flags.xyz, recS.dir_pixelIndex.xyz,
                              recS.pos_roughness.w, recS.albedo_pad.x, sampleValidS);
-        vec3 qRawPred = runForwardPass(sg, flatTid);
+        vec3 qRawPred = runForwardPass(sg, tid, flatTid);
 
         // 3. Unbiased Relative L2 Loss (no per-sample gradient clipping; max |dL_dy| <= 35.0 fits FP16 cleanly)
         if (flatTid < 32u) {
@@ -421,31 +480,59 @@ void main() {
         }
         barrier();
 
-        // Compute delta0 into s_act2 via WMMA (delta1 * W1^T, 4 subgroups compute col 0..3 in parallel) BEFORE mutating W1
+        uint sgUTileOff = sg * 128u;
+        uint sgAccOff   = sg * 256u;
+        // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32 WMMA accumulators.
+        float zAcc = float(pc.numSteps == 0xFFFFFFFFu);
+
+        // Compute delta0 into s_act2 via WMMA (delta1 * W1^T, 4 subgroups compute col = sg in parallel) BEFORE mutating W1
         for (uint b = 0u; b < 2u; ++b) {
             uint rowOff = b * 1024u;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> d0 =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> d0 =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
             for (uint k = 0u; k < 4u; ++k) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-                coopMatLoad(aTile, s_delta, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint e = 0u; e < 4u; ++e) {
+                    uint uIdx = tid * 4u + e;
+                    uint r = uIdx >> 3u;
+                    uint c2 = (uIdx & 7u) * 2u;
+                    s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_delta[rowOff + r * 64u + k * 16u + c2]),
+                        float(s_delta[rowOff + r * 64u + k * 16u + c2 + 1u])));
+                    // Transposed W1 tile: element (r, c) = W1[sg*16 + c, k*16 + r]
+                    uint wRow0 = sg * 16u + c2;
+                    uint wCol = k * 16u + r;
+                    s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(weights[NRC_W1_OFFSET + wRow0 * 64u + wCol]),
+                        float(weights[NRC_W1_OFFSET + (wRow0 + 1u) * 64u + wCol])));
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
 
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-                uint wOff = NRC_W1_OFFSET + (sg * 16u * 64u) + (k * 16u);
-                coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
                 d0 = coopMatMulAdd(aTile, bTile, d0);
+                subgroupBarrier();
             }
-            coopMatStore(d0, s_act2, rowOff + sg * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-        }
-        barrier();
-        for (uint idx = flatTid; idx < 32u * 64u; idx += 128u) {
-            uint sampleRow = idx >> 6u;
-            float h0_val = float(s_act1[idx]);
-            float sum = float(s_act2[idx]);
-            s_act2[idx] = (sampleRow < numSamples)
-                ? float16_t((h0_val > 0.0) ? sum : (0.01 * sum))
-                : float16_t(0.0);
+            coopMatStore(d0, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint e = 0u; e < 8u; ++e) {
+                uint idx = tid * 8u + e;
+                uint r = idx >> 4u;
+                uint c = idx & 15u;
+                uint actIdx = rowOff + r * 64u + sg * 16u + c;
+                uint sampleRow = b * 16u + r;
+                float h0_val = float(s_act1[actIdx]);
+                float sum = s_fAcc[sgAccOff + idx];
+                s_act2[actIdx] = (sampleRow < numSamples)
+                    ? float16_t((h0_val > 0.0) ? sum : (0.01 * sum))
+                    : float16_t(0.0);
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
         }
         barrier();
 
@@ -457,28 +544,43 @@ void main() {
             }
             adamUpdateParam(NRC_B1_OFFSET + flatTid, clamp(g_b * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
         }
-        uint gradBase = sg * 256u;
         for (uint colTile = 0u; colTile < 4u; ++colTile) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
             for (uint b = 0u; b < 2u; ++b) {
                 uint rowOff = b * 1024u;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-                coopMatLoad(aTile, s_act1, rowOff + sg * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                for (uint e = 0u; e < 4u; ++e) {
+                    uint uIdx = tid * 4u + e;
+                    uint r = uIdx >> 3u;
+                    uint c2 = (uIdx & 7u) * 2u;
+                    // Transposed s_act1 tile: element (r, c) = s_act1[b*16 + c, sg*16 + r]
+                    uint feat = sg * 16u + r;
+                    s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_act1[rowOff + c2 * 64u + feat]),
+                        float(s_act1[rowOff + (c2 + 1u) * 64u + feat])));
+                    s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_delta[rowOff + r * 64u + colTile * 16u + c2]),
+                        float(s_delta[rowOff + r * 64u + colTile * 16u + c2 + 1u])));
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
 
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-                coopMatLoad(bTile, s_delta, rowOff + colTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
                 dw = coopMatMulAdd(aTile, bTile, dw);
+                subgroupBarrier();
             }
-            coopMatStore(dw, s_gradTiles, gradBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(dw, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             for (uint idx = tid; idx < 256u; idx += 32u) {
                 uint r = idx >> 4u;
                 uint c = idx & 15u;
                 uint wIdx = NRC_W1_OFFSET + (sg * 16u + r) * 64u + (colTile * 16u + c);
-                adamUpdateParam(wIdx, clamp(float(s_gradTiles[gradBase + idx]) * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
+                adamUpdateParam(wIdx, clamp(s_fAcc[sgAccOff + idx] * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
@@ -489,19 +591,42 @@ void main() {
         // BEFORE mutating W0 in-place below. Subgroups 0 & 1 compute half-batches b = 0 & 1 for col = 0 simultaneously.
         if (sg < 2u) {
             uint rowOff = sg * 1024u;
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dxTile =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dxTile =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
             for (uint k = 0u; k < 4u; ++k) {
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-                coopMatLoad(aTile, s_act2, rowOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+                for (uint e = 0u; e < 4u; ++e) {
+                    uint uIdx = tid * 4u + e;
+                    uint r = uIdx >> 3u;
+                    uint c2 = (uIdx & 7u) * 2u;
+                    s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_act2[rowOff + r * 64u + k * 16u + c2]),
+                        float(s_act2[rowOff + r * 64u + k * 16u + c2 + 1u])));
+                    // Transposed W0 col-0 tile: element (r, c) = W0[c, k*16 + r]
+                    uint wCol = k * 16u + r;
+                    s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(weights[NRC_W0_OFFSET + c2 * 64u + wCol]),
+                        float(weights[NRC_W0_OFFSET + (c2 + 1u) * 64u + wCol])));
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
 
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-                uint wOff = NRC_W0_OFFSET + (k * 16u);
-                coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
                 dxTile = coopMatMulAdd(aTile, bTile, dxTile);
+                subgroupBarrier();
             }
-            coopMatStore(dxTile, s_delta, rowOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(dxTile, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+            for (uint e = 0u; e < 8u; ++e) {
+                uint idx = tid * 8u + e;
+                uint r = idx >> 4u;
+                uint c = idx & 15u;
+                s_delta[rowOff + r * 64u + c] = float16_t(s_fAcc[sgAccOff + idx]);
+            }
         }
         barrier();
 
@@ -514,50 +639,67 @@ void main() {
             adamUpdateParam(NRC_B0_OFFSET + flatTid, clamp(g_b * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
         }
         for (uint colTile = 0u; colTile < 4u; ++colTile) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> dw =
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
             for (uint b = 0u; b < 2u; ++b) {
                 uint rowOff = b * 1024u;
-                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-                coopMatLoad(aTile, s_act0, rowOff + sg * 16u, 64u, gl_CooperativeMatrixLayoutColumnMajor);
+                for (uint e = 0u; e < 4u; ++e) {
+                    uint uIdx = tid * 4u + e;
+                    uint r = uIdx >> 3u;
+                    uint c2 = (uIdx & 7u) * 2u;
+                    // Transposed s_act0 tile: element (r, c) = s_act0[b*16 + c, sg*16 + r]
+                    uint feat = sg * 16u + r;
+                    s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_act0[rowOff + c2 * 64u + feat]),
+                        float(s_act0[rowOff + (c2 + 1u) * 64u + feat])));
+                    s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                        float(s_act2[rowOff + r * 64u + colTile * 16u + c2]),
+                        float(s_act2[rowOff + r * 64u + colTile * 16u + c2 + 1u])));
+                }
+                subgroupMemoryBarrierShared();
+                subgroupBarrier();
 
+                coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+                coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
                 coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-                coopMatLoad(bTile, s_act2, rowOff + colTile * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
                 dw = coopMatMulAdd(aTile, bTile, dw);
+                subgroupBarrier();
             }
-            coopMatStore(dw, s_gradTiles, gradBase, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatStore(dw, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
             subgroupMemoryBarrierShared();
             subgroupBarrier();
             for (uint idx = tid; idx < 256u; idx += 32u) {
                 uint r = idx >> 4u;
                 uint c = idx & 15u;
                 uint wIdx = NRC_W0_OFFSET + (sg * 16u + r) * 64u + (colTile * 16u + c);
-                adamUpdateParam(wIdx, clamp(float(s_gradTiles[gradBase + idx]) * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
+                adamUpdateParam(wIdx, clamp(s_fAcc[sgAccOff + idx] * INV_GRAD_SCALE, -32.0, 32.0), lrStep);
             }
             subgroupMemoryBarrierShared();
             subgroupBarrier();
         }
+        barrier();
 
-        // Lock-Free Single-Pass 2048-Slot LDS Hash Accumulator (all 8 levels, 1 simplex corner per subLane)
+        // Lock-Free Per-Level 256-Slot LDS Hash Accumulator (1 simplex corner per subLane)
         vec3 queryNormPos = sampleValidS
             ? clamp((recS.pos_roughness.xyz - pc.worldMin.xyz) * pc.invWorldExtent.xyz, vec3(0.0), vec3(1.0))
             : vec3(0.0);
         float hashGradScale = INV_GRAD_SCALE * float(numSamples);
         float lrHash = lrStep * 8.0;
 
-        for (uint idx = flatTid; idx < 2048u; idx += 128u) {
-            s_htKey[idx] = 0xFFFFFFFFu;
-            s_htGradX[idx] = 0;
-            s_htGradY[idx] = 0;
-        }
-        if (flatTid == 0u) {
-            s_htActiveCount = 0u;
-        }
-        barrier();
+        for (uint l = 0u; l < NRC_ACTIVE_HASH_LEVELS; ++l) {
+            for (uint idx = flatTid; idx < 256u; idx += 128u) {
+                s_htKey[idx] = 0xFFFFFFFFu;
+                s_htGradX[idx] = 0;
+                s_htGradY[idx] = 0;
+            }
+            if (flatTid == 0u) {
+                s_htActiveCount = 0u;
+            }
+            barrier();
 
-        if (sampleValidS) {
-            for (uint l = 0u; l < NRC_ACTIVE_HASH_LEVELS; ++l) {
+            if (sampleValidS) {
                 vec2 dFeat = vec2(float(s_delta[sampleIdx * 64u + l * 2u + 0u]),
                                   float(s_delta[sampleIdx * 64u + l * 2u + 1u])) * hashGradScale;
                 if (dot(abs(dFeat), vec2(1.0)) > 1e-7) {
@@ -570,12 +712,12 @@ void main() {
                     ivec2 qGrad = ivec2(round(clamp(dFeat * wCorner, vec2(-32.0), vec2(32.0)) * 32768.0));
                     if (qGrad.x != 0 || qGrad.y != 0) {
                         uint hIdx = nrcHashCorner(c0 + cornerOff, l);
-                        uint slot = (hIdx * 2654435761u) & 2047u;
-                        for (uint probe = 0u; probe < 2048u; ++probe) {
+                        uint slot = (hIdx * 2654435761u) & 255u;
+                        for (uint probe = 0u; probe < 256u; ++probe) {
                             uint prev = atomicCompSwap(s_htKey[slot], 0xFFFFFFFFu, hIdx);
                             if (prev == 0xFFFFFFFFu) {
                                 uint aIdx = atomicAdd(s_htActiveCount, 1u);
-                                if (aIdx < 1024u) {
+                                if (aIdx < 128u) {
                                     s_htActive[aIdx] = slot;
                                 }
                             }
@@ -584,26 +726,24 @@ void main() {
                                 if (qGrad.y != 0) atomicAdd(s_htGradY[slot], qGrad.y);
                                 break;
                             }
-                            slot = (slot + 1u) & 2047u;
+                            slot = (slot + 1u) & 255u;
                         }
                     }
                 }
             }
-        }
-        barrier();
+            barrier();
 
-        uint activeCount = min(s_htActiveCount, 1024u);
-        for (uint i = flatTid; i < activeCount; i += 128u) {
-            uint slot = s_htActive[i];
-            uint key = s_htKey[slot];
-            if (key != 0xFFFFFFFFu) {
-                vec2 gSum = vec2(float(s_htGradX[slot]), float(s_htGradY[slot])) * (1.0 / 32768.0);
-                adamUpdateHash(key, clamp(gSum, vec2(-32.0), vec2(32.0)), lrHash);
+            uint activeCount = min(s_htActiveCount, 128u);
+            if (flatTid < activeCount) {
+                uint slot = s_htActive[flatTid];
+                uint key = s_htKey[slot];
+                if (key != 0xFFFFFFFFu) {
+                    vec2 gSum = vec2(float(s_htGradX[slot]), float(s_htGradY[slot])) * (1.0 / 32768.0);
+                    adamUpdateHash(key, clamp(gSum, vec2(-32.0), vec2(32.0)), lrHash);
+                }
             }
+            memoryBarrierBuffer();
+            barrier();
         }
-        barrier();
-
-        memoryBarrierBuffer();
-        barrier();
     }
 }

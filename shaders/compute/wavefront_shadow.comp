@@ -5,6 +5,7 @@
 
 #include "wavefront_common.glsl"
 #include "wavefront_radiance_output.glsl"
+#include "restir_common.glsl"
 
 layout(local_size_x = 32) in;
 
@@ -39,6 +40,14 @@ layout(std430, binding = 12) readonly buffer ShadowRayQueue {
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
 
+layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
+    DiReservoir currentReservoirs[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    uvec2 giCurrentData[];
+};
+
 layout(push_constant) uniform PushConstants {
     WavefrontShadowPC pc;
 };
@@ -57,7 +66,8 @@ void main() {
     vec3 radiance = vec3(radRG, radB_pad.x);
     float isSpecular = radB_pad.y;
 
-    if (length(radiance) <= 1e-5) return;
+    bool isDiVisTest = (pixelIndex & 0x40000000u) != 0u;
+    if (!isDiVisTest && length(radiance) <= 1e-5) return;
 
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (pc.numLights > 0u);
@@ -135,36 +145,50 @@ void main() {
     }
 
     if (!occluded) {
+        if (isDiVisTest) {
+            atomicOr(currentReservoirs[pixelIndex & 0x3FFFFFFFu].flags, DI_FLAG_FRESH_VISIBLE);
+            return;
+        }
+        if ((pixelIndex & 0x80000000u) != 0u) {
+            uint giPix = pixelIndex & 0x7FFFFFFFu;
+            vec3 prevL2 = restirUnpackRgb9e5(giCurrentData[giPix].x);
+            giCurrentData[giPix].x = restirPackRgb9e5(prevL2 + radiance);
+            return;
+        }
         ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
         uint seed = uint(pixelCoord.x * 1973 + pixelCoord.y * 9277 + (pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
+        float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
+        vec3 scaledRadiance = radiance * invSpp;
         if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
             vec4 prev = imageLoad(uAccumImage, pixelCoord);
-            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, radiance, seed), prev.a));
+            imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, scaledRadiance, seed), prev.a));
         }
 
         if (pc.captureMlData != 0u) {
-            vec3 diffRad = radiance * (1.0 - specFrac);
-            vec3 specRad = radiance * specFrac;
+            vec3 diffRadRaw = radiance * (1.0 - specFrac);
+            vec3 specRadRaw = radiance * specFrac;
+            vec3 diffRad = diffRadRaw * invSpp;
+            vec3 specRad = specRadRaw * invSpp;
             if (pc.currentBounce == 0u) {
                 wfAddSplitDirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
             } else {
                 wfAddSplitIndirect(pixelCoord, diffRad, specRad, pc.captureMlData, seed);
             }
             bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-            if ((pc.captureMlData & 1u) != 0u) {
+            if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
                 if (dot(diffRad, diffRad) > 1e-12) {
-                    if (isV4) {
-                        diffRad = demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb);
-                    }
+                    vec3 outDiff = isV4
+                        ? demodulateMlSafe(diffRad, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                        : diffRad;
                     vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, diffRad, seed), prevDiff.a));
+                    imageStore(uMlDiffuseImage, pixelCoord, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                 }
                 if (dot(specRad, specRad) > 1e-12) {
-                    if (isV4) {
-                        specRad = demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb);
-                    }
+                    vec3 outSpec = isV4
+                        ? demodulateMlSafe(specRad, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                        : specRad;
                     vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, specRad, seed), prevSpec.a));
+                    imageStore(uMlSpecularImage, pixelCoord, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                 }
             }
         }

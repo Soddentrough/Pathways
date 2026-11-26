@@ -2,22 +2,102 @@
 
 #include "scene/Light.hpp"
 #include <glm/glm.hpp>
+#include <glm/gtc/packing.hpp>
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 
 namespace pathways {
 
-// 64-byte GPU layout for hierarchical Light Tree nodes
+// 32-byte cache-line-paired GPU layout for hierarchical Light Tree nodes
+// Sibling pairs [firstChild, firstChild + 1] are stored contiguously at even
+// indices >= 2 so both children fit in one 64-byte cache line.
 struct alignas(16) LightTreeNodeGPU {
-    glm::vec4 bboxMin;   // xyz: bboxMin, w: radiant flux (Phi)
-    glm::vec4 bboxMax;   // xyz: bboxMax, w: coneAngleCos
-    glm::vec4 coneAxis;  // xyz: cone center axis, w: padding
-    glm::uvec4 children; // x: leftChild (or lightIdx if leaf), y: rightChild (0xFFFFFFFF if leaf), z: isLeaf (1 or 0), w: padding
+    glm::vec4 centerFlux;       // xyz: bbox center, w: radiant flux (Phi)
+    glm::uvec4 extentConeChild; // x: packHalf2x16(halfExt.x, halfExt.y)
+                                // y: packHalf2x16(halfExt.z, coneAngleCos)
+                                // z: packOct32(coneAxis)
+                                // w: [31] isLeaf | [30:0] lightIdx (leaf) or even firstChild (internal)
+
+    [[nodiscard]] bool isLeaf() const noexcept { return (extentConeChild.w & 0x80000000u) != 0u; }
+    [[nodiscard]] uint32_t lightIndex() const noexcept { return extentConeChild.w & 0x7FFFFFFFu; }
+    [[nodiscard]] uint32_t firstChild() const noexcept { return extentConeChild.w & 0x7FFFFFFFu; }
+    [[nodiscard]] float flux() const noexcept { return centerFlux.w; }
+    [[nodiscard]] glm::vec3 center() const noexcept { return glm::vec3(centerFlux); }
+    [[nodiscard]] glm::vec3 halfExtent() const noexcept {
+        glm::vec2 xy = glm::unpackHalf2x16(extentConeChild.x);
+        glm::vec2 zc = glm::unpackHalf2x16(extentConeChild.y);
+        return glm::vec3(xy.x, xy.y, zc.x);
+    }
+    [[nodiscard]] float coneAngleCos() const noexcept { return glm::unpackHalf2x16(extentConeChild.y).y; }
+    [[nodiscard]] glm::vec3 bboxMin() const noexcept { return center() - halfExtent(); }
+    [[nodiscard]] glm::vec3 bboxMax() const noexcept { return center() + halfExtent(); }
 };
+static_assert(sizeof(LightTreeNodeGPU) == 32, "LightTreeNodeGPU must be exactly 32 bytes");
 
 namespace detail {
+
+inline uint32_t packOct32Cone(glm::vec3 v) {
+    float len = glm::length(v);
+    if (len > 1e-6f) {
+        v /= len;
+    } else {
+        v = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+    float l1 = std::abs(v.x) + std::abs(v.y) + std::abs(v.z);
+    if (l1 > 1e-6f) {
+        v /= l1;
+    } else {
+        v = glm::vec3(0.0f, 1.0f, 0.0f);
+    }
+    glm::vec2 enc(v.x, v.y);
+    if (v.z < 0.0f) {
+        glm::vec2 s((enc.x >= 0.0f) ? 1.0f : -1.0f, (enc.y >= 0.0f) ? 1.0f : -1.0f);
+        enc = (glm::vec2(1.0f) - glm::abs(glm::vec2(v.y, v.x))) * s;
+    }
+    return glm::packSnorm2x16(enc);
+}
+
+struct MergedBounds {
+    glm::vec3 bMin = glm::vec3(0.0f);
+    glm::vec3 bMax = glm::vec3(0.0f);
+    float flux = 0.0f;
+    glm::vec3 coneAxis = glm::vec3(0.0f, 1.0f, 0.0f);
+    float coneAngleCos = -1.0f;
+};
+
+inline LightTreeNodeGPU packLightTreeNode(
+    const glm::vec3& bMin,
+    const glm::vec3& bMax,
+    float flux,
+    const glm::vec3& coneAxis,
+    float coneCos,
+    bool isLeaf,
+    uint32_t childOrLight,
+    glm::vec3* outActualMin = nullptr,
+    glm::vec3* outActualMax = nullptr)
+{
+    glm::vec3 center = 0.5f * (bMin + bMax);
+    glm::vec3 rawHalf = glm::max(bMax - center, center - bMin);
+    glm::vec3 paddedHalf = glm::clamp(rawHalf * 1.002f + glm::vec3(1e-4f), glm::vec3(0.0f), glm::vec3(65504.0f));
+    float clampedCos = std::clamp(coneCos, -1.0f, 1.0f);
+
+    LightTreeNodeGPU node{};
+    node.centerFlux = glm::vec4(center, flux);
+    node.extentConeChild.x = glm::packHalf2x16(glm::vec2(paddedHalf.x, paddedHalf.y));
+    node.extentConeChild.y = glm::packHalf2x16(glm::vec2(paddedHalf.z, clampedCos));
+    node.extentConeChild.z = packOct32Cone(coneAxis);
+    node.extentConeChild.w = (isLeaf ? 0x80000000u : 0u) | (childOrLight & 0x7FFFFFFFu);
+
+    if (outActualMin || outActualMax) {
+        glm::vec3 actualHalf = node.halfExtent();
+        if (outActualMin) *outActualMin = center - actualHalf;
+        if (outActualMax) *outActualMax = center + actualHalf;
+    }
+    return node;
+}
 
 struct LightPrimInfo {
     uint32_t lightIdx = 0;
@@ -117,25 +197,25 @@ inline void combineBoundingCones(
     outCos = std::cos(newTheta);
 }
 
-inline uint32_t buildSubtree(
+inline MergedBounds buildSubtree(
     std::vector<LightPrimInfo>& prims,
     size_t start,
     size_t end,
-    std::vector<LightTreeNodeGPU>& nodes)
+    std::vector<LightTreeNodeGPU>& nodes,
+    uint32_t dstIdx)
 {
-    uint32_t nodeIdx = static_cast<uint32_t>(nodes.size());
-    nodes.emplace_back();
-
     size_t count = end - start;
     if (count == 1) {
         const auto& p = prims[start];
-        LightTreeNodeGPU leaf{};
-        leaf.bboxMin = glm::vec4(p.bboxMin, p.flux);
-        leaf.bboxMax = glm::vec4(p.bboxMax, p.coneAngleCos);
-        leaf.coneAxis = glm::vec4(p.coneAxis, 0.0f);
-        leaf.children = glm::uvec4(p.lightIdx, 0xFFFFFFFFu, 1u, 0u);
-        nodes[nodeIdx] = leaf;
-        return nodeIdx;
+        MergedBounds out{};
+        out.flux = p.flux;
+        out.coneAxis = p.coneAxis;
+        out.coneAngleCos = p.coneAngleCos;
+        nodes[dstIdx] = packLightTreeNode(
+            p.bboxMin, p.bboxMax, p.flux, p.coneAxis, p.coneAngleCos,
+            true, p.lightIdx, &out.bMin, &out.bMax
+        );
+        return out;
     }
 
     // Determine bounding box of centroids
@@ -161,32 +241,33 @@ inline uint32_t buildSubtree(
         }
     );
 
-    uint32_t leftChild = buildSubtree(prims, start, mid, nodes);
-    uint32_t rightChild = buildSubtree(prims, mid, end, nodes);
+    uint32_t pairIdx = static_cast<uint32_t>(nodes.size());
+    nodes.resize(pairIdx + 2);
 
-    const auto& left = nodes[leftChild];
-    const auto& right = nodes[rightChild];
+    MergedBounds left = buildSubtree(prims, start, mid, nodes, pairIdx);
+    MergedBounds right = buildSubtree(prims, mid, end, nodes, pairIdx + 1u);
 
-    glm::vec3 bMin = glm::min(glm::vec3(left.bboxMin), glm::vec3(right.bboxMin));
-    glm::vec3 bMax = glm::max(glm::vec3(left.bboxMax), glm::vec3(right.bboxMax));
-    float totalFlux = left.bboxMin.w + right.bboxMin.w;
+    glm::vec3 bMin = glm::min(left.bMin, right.bMin);
+    glm::vec3 bMax = glm::max(left.bMax, right.bMax);
+    float totalFlux = left.flux + right.flux;
 
     glm::vec3 mergedAxis;
     float mergedCos;
     combineBoundingCones(
-        glm::vec3(left.coneAxis), left.bboxMax.w,
-        glm::vec3(right.coneAxis), right.bboxMax.w,
+        left.coneAxis, left.coneAngleCos,
+        right.coneAxis, right.coneAngleCos,
         mergedAxis, mergedCos
     );
 
-    LightTreeNodeGPU internalNode{};
-    internalNode.bboxMin = glm::vec4(bMin, totalFlux);
-    internalNode.bboxMax = glm::vec4(bMax, mergedCos);
-    internalNode.coneAxis = glm::vec4(mergedAxis, 0.0f);
-    internalNode.children = glm::uvec4(leftChild, rightChild, 0u, 0u);
-
-    nodes[nodeIdx] = internalNode;
-    return nodeIdx;
+    MergedBounds out{};
+    out.flux = totalFlux;
+    out.coneAxis = mergedAxis;
+    out.coneAngleCos = mergedCos;
+    nodes[dstIdx] = packLightTreeNode(
+        bMin, bMax, totalFlux, mergedAxis, mergedCos,
+        false, pairIdx, &out.bMin, &out.bMax
+    );
+    return out;
 }
 
 } // namespace detail
@@ -194,12 +275,10 @@ inline uint32_t buildSubtree(
 inline void buildLightTree(const std::vector<LightGPU>& lights, std::vector<LightTreeNodeGPU>& nodes) {
     nodes.clear();
     if (lights.empty()) {
-        LightTreeNodeGPU dummy{};
-        dummy.bboxMin = glm::vec4(-1.0f, -1.0f, -1.0f, 0.0f);
-        dummy.bboxMax = glm::vec4(1.0f, 1.0f, 1.0f, -1.0f);
-        dummy.coneAxis = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
-        dummy.children = glm::uvec4(0u, 0xFFFFFFFFu, 1u, 0u);
-        nodes.push_back(dummy);
+        nodes.push_back(detail::packLightTreeNode(
+            glm::vec3(-1.0f), glm::vec3(1.0f), 0.0f, glm::vec3(0.0f, 1.0f, 0.0f), -1.0f,
+            true, 0u
+        ));
         return;
     }
 
@@ -208,8 +287,17 @@ inline void buildLightTree(const std::vector<LightGPU>& lights, std::vector<Ligh
         prims[i] = detail::makePrimInfo(static_cast<uint32_t>(i), lights[i]);
     }
 
-    nodes.reserve(lights.size() * 2);
-    detail::buildSubtree(prims, 0, prims.size(), nodes);
+    if (lights.size() == 1) {
+        nodes.resize(1);
+        detail::buildSubtree(prims, 0, 1, nodes, 0u);
+        return;
+    }
+
+    // Reserve 2*N nodes: root at 0, padding slot at 1, and every sibling pair [pairIdx, pairIdx+1]
+    // starting at an even index >= 2 (64-byte cache-line aligned).
+    nodes.reserve(lights.size() * 2 + 2);
+    nodes.resize(2);
+    detail::buildSubtree(prims, 0, prims.size(), nodes, 0u);
 }
 
 // Writes each light's root-to-leaf descent into LightGPU::pad0:
@@ -228,8 +316,8 @@ inline bool computeLightTreePaths(const std::vector<LightTreeNodeGPU>& nodes, st
         Item it = stack.back();
         stack.pop_back();
         const auto& n = nodes[it.node];
-        if (n.children.z == 1u) {
-            uint32_t li = n.children.x;
+        if (n.isLeaf()) {
+            uint32_t li = n.lightIndex();
             if (li < lights.size()) {
                 lights[li].pad0.y = std::bit_cast<float>(it.bits);
                 lights[li].pad0.z = std::bit_cast<float>(it.depth <= 32u ? it.depth : 0xFFFFFFFFu);
@@ -239,8 +327,9 @@ inline bool computeLightTreePaths(const std::vector<LightTreeNodeGPU>& nodes, st
         }
         uint32_t d = it.depth;
         uint32_t rightBit = (d < 32u) ? (1u << d) : 0u;
-        stack.push_back({n.children.x, it.bits, d + 1u});
-        stack.push_back({n.children.y, it.bits | rightBit, d + 1u});
+        uint32_t first = n.firstChild();
+        stack.push_back({first, it.bits, d + 1u});
+        stack.push_back({first + 1u, it.bits | rightBit, d + 1u});
     }
     return ok;
 }

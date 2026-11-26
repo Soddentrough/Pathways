@@ -33,6 +33,9 @@ struct WavefrontSceneData {
     float nrcTrainRatio = 0.03f;
     glm::vec3 boundsMin = glm::vec3(-1000.0f);
     glm::vec3 boundsMax = glm::vec3(1000.0f);
+    glm::vec3 sceneBoundsMin = glm::vec3(-1000.0f);
+    glm::vec3 sceneBoundsMax = glm::vec3(1000.0f);
+    bool envNeeEnabled = false;
     bool streamlineSecondaryShading = true;
     bool enableDistanceClamping = true;
     float maxSecondaryRayDistance = 0.0f; // 0 = automatic scene bounding diameter * 1.25
@@ -76,7 +79,9 @@ public:
                       bool enableDgcPreprocess = true,
                       bool supportsSubgroupSizeControl = true,
                       uint32_t maxBatchPixels = 0,
-                      const std::vector<char>& tailMegakernelCode = {});
+                      const std::vector<char>& tailMegakernelCode = {},
+                      VkPipelineCache pipelineCache = VK_NULL_HANDLE,
+                      const std::vector<char>& shadeDielectricSecCode = {});
     ~WavefrontPipeline();
 
     WavefrontPipeline(const WavefrontPipeline&) = delete;
@@ -120,7 +125,9 @@ public:
                                 VkImageView mlDirectDiffuseImageView = VK_NULL_HANDLE,
                                 VkImageView mlIndirectDiffuseImageView = VK_NULL_HANDLE,
                                 VkImageView mlDirectSpecularImageView = VK_NULL_HANDLE,
-                                VkImageView mlIndirectSpecularImageView = VK_NULL_HANDLE);
+                                VkImageView mlIndirectSpecularImageView = VK_NULL_HANDLE,
+                                VkBuffer envImportanceBuffer = VK_NULL_HANDLE,
+                                VkDeviceSize envImportanceSize = 0);
 
     void resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels = 0);
     uint32_t getMaxCapacity() const { return m_maxCapacity; }
@@ -132,7 +139,36 @@ public:
         const std::vector<char>& shadeComplexRestirCode,
         const std::vector<char>& shadeComplexSecRestirCode,
         const std::vector<char>& shadeDielectricRestirCode,
-        const std::vector<char>& shadeEmissiveRestirCode);
+        const std::vector<char>& shadeEmissiveRestirCode,
+        const std::vector<char>& restirGiReuseCode = {},
+        const std::vector<char>& restirDiReuseCode = {},
+        const std::vector<char>& shadeDielectricSecRestirCode = {});
+
+    void initAlphaIntersectPipeline(const std::vector<char>& intersectAlphaCode);
+    void initTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode);
+    void initRestirVariants(
+        const std::vector<char>& shadeDiffuseRestirCode,
+        const std::vector<char>& shadeDiffuseSecRestirCode,
+        const std::vector<char>& shadeComplexRestirCode,
+        const std::vector<char>& shadeComplexSecRestirCode,
+        const std::vector<char>& shadeDielectricRestirCode,
+        const std::vector<char>& shadeEmissiveRestirCode,
+        const std::vector<char>& restirGiReuseCode = {},
+        const std::vector<char>& restirDiReuseCode = {},
+        const std::vector<char>& shadeDielectricSecRestirCode = {});
+
+    void initNrcVariants(
+        const std::vector<char>& shadeDiffuseNrcCode,
+        const std::vector<char>& shadeDiffuseSecNrcCode,
+        const std::vector<char>& shadeComplexNrcCode,
+        const std::vector<char>& shadeComplexSecNrcCode,
+        const std::vector<char>& shadeDielectricNrcCode,
+        const std::vector<char>& shadeDielectricSecNrcCode);
+
+    bool hasAlphaIntersectPipeline() const noexcept { return m_intersectAlphaPipeline != VK_NULL_HANDLE; }
+    bool hasTailMegakernelPipeline() const noexcept { return m_tailMegakernelPipeline != VK_NULL_HANDLE; }
+    bool hasRestirPipelines() const noexcept { return !m_restirPrimaryMatPipelines.empty(); }
+    bool hasNrcPipelines() const noexcept { return !m_nrcPrimaryMatPipelines.empty(); }
 
     void recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t width, uint32_t height,
                      uint32_t spp, uint32_t maxBounces,
@@ -168,6 +204,10 @@ public:
         double preShadeBarrierMs = 0.0;
         double totalBarriersMs = 0.0;
         double resolveMs = 0.0;
+        double diReuseMs = 0.0;
+        double diReuseShadowMs = 0.0;
+        double giReuseMs = 0.0;
+        double giReuseShadowMs = 0.0;
         double tailMegakernelMs = 0.0;
         uint32_t tailMegakernelBounce = 0;
         std::vector<BounceProfilingData> bounces;
@@ -208,13 +248,22 @@ private:
                          const std::vector<char>& shadeEmissiveCode,
                          const std::vector<char>& shadeDiffuseSecCode = {},
                          const std::vector<char>& shadeComplexSecCode = {},
-                         const std::vector<char>& tailMegakernelCode = {});
+                         const std::vector<char>& tailMegakernelCode = {},
+                         const std::vector<char>& shadeDielectricSecCode = {});
+    void rebuildMaterialExecutionSets();
 
+    struct ComputePipelineSpec {
+        const std::vector<char>* code = nullptr;
+        const char* name = "";
+        VkPipeline* outPipeline = nullptr;
+    };
+    void buildComputePipelinesBatch(const std::vector<ComputePipelineSpec>& specs);
     VkPipeline buildComputePipeline(const std::vector<char>& code, const char* name);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -256,6 +305,7 @@ private:
     VkPipeline m_shadeEmissivePipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;
     VkPipeline m_intersectAlphaPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseRestirPipeline = VK_NULL_HANDLE;
@@ -263,12 +313,23 @@ private:
     VkPipeline m_shadeComplexRestirPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexSecRestirPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDielectricRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricSecRestirPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeEmissiveRestirPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDiffuseSecNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeComplexSecNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadeDielectricSecNrcPipeline = VK_NULL_HANDLE;
+    VkPipeline m_restirDiReusePipeline = VK_NULL_HANDLE;
+    VkPipeline m_restirGiReusePipeline = VK_NULL_HANDLE;
 
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
     std::vector<VkPipeline> m_restirPrimaryMatPipelines;
     std::vector<VkPipeline> m_restirBounce1MatPipelines;
+    std::vector<VkPipeline> m_nrcPrimaryMatPipelines;
+    std::vector<VkPipeline> m_nrcSecondaryMatPipelines;
 
     struct BatchBounceTimestamps {
         uint64_t shadeStart = 0;
@@ -277,6 +338,14 @@ private:
         uint64_t shadowEnd = 0;
         uint64_t intersectStart = 0;
         uint64_t intersectEnd = 0;
+        uint64_t diReuseStart = 0;
+        uint64_t diReuseEnd = 0;
+        uint64_t diReuseShadowStart = 0;
+        uint64_t diReuseShadowEnd = 0;
+        uint64_t giReuseStart = 0;
+        uint64_t giReuseEnd = 0;
+        uint64_t giReuseShadowStart = 0;
+        uint64_t giReuseShadowEnd = 0;
     };
     struct BatchTimestamps {
         uint64_t classifyStart = 0;

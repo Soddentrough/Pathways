@@ -314,7 +314,8 @@ Window::Window(const Config& config)
     }
 
     // 2. Select Sensible Window Bounds if user did not pass explicit --width or --height
-    SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    // Create hidden so the user does not stare at an un-presented black window while shaders compile.
+    SDL_WindowFlags windowFlags = SDL_WINDOW_VULKAN | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
 
     m_isFullscreen = config.fullscreen;
 
@@ -457,16 +458,6 @@ Window::Window(const Config& config)
         SDL_SetWindowFullscreen(m_window, true);
     }
 
-    SDL_ShowWindow(m_window);
-    SDL_RaiseWindow(m_window);
-#ifdef _WIN32
-    if (config.fullscreen && !config.exclusive_fullscreen) {
-        applyWin32ComposedBorderless(true);
-    }
-#endif
-    SDL_SyncWindow(m_window);
-    SDL_PumpEvents();
-
     float actualDensity = SDL_GetWindowPixelDensity(m_window);
     float winDisplayScale = SDL_GetWindowDisplayScale(m_window);
     if (winDisplayScale > 0.0f) {
@@ -499,9 +490,27 @@ Window::Window(const Config& config)
         m_displayInfo.windowAspect = static_cast<float>(m_width) / static_cast<float>(m_height);
     }
 
-    Logger::info("SDL3 Window created and mapped successfully with pixel size {}x{} (surface: {}x{}, pixel density: {:.2f}, UI scale: {:.2f}).",
+    Logger::info("SDL3 Window created (hidden until engine ready) with pixel size {}x{} (surface: {}x{}, pixel density: {:.2f}, UI scale: {:.2f}).",
                  m_width, m_height, getSurfaceWidth(), getSurfaceHeight(),
                  actualDensity > 0.0f ? actualDensity : 1.0f, m_displayInfo.contentScale);
+}
+
+void Window::show() {
+    if (m_headless || !m_window || m_shown) {
+        return;
+    }
+    SDL_ShowWindow(m_window);
+    SDL_RaiseWindow(m_window);
+#ifdef _WIN32
+    if (m_isFullscreen && !m_exclusiveFullscreen) {
+        applyWin32ComposedBorderless(true);
+    }
+#endif
+    SDL_SyncWindow(m_window);
+    SDL_PumpEvents();
+    m_shown = true;
+    Logger::info("SDL3 Window mapped and presented ({}x{}, surface: {}x{}).",
+                 m_width, m_height, getSurfaceWidth(), getSurfaceHeight());
 }
 
 Window::~Window() {

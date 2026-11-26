@@ -1,4 +1,10 @@
 #version 460
+#ifndef IS_SECONDARY_BOUNCE
+#define IS_SECONDARY_BOUNCE 0
+#endif
+#ifndef ENABLE_NRC
+#define ENABLE_NRC 0
+#endif
 #extension GL_EXT_ray_query : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
@@ -69,40 +75,39 @@ DECLARE_SCENE_TEXTURES_BINDING(8)
 #include "restir_common.glsl"
 #include "bsdf_standard.glsl"
 
+#if !IS_SECONDARY_BOUNCE
 layout(std430, binding = 32) buffer ReSTIRCurrentReservoirsBuffer {
     DiReservoir currentReservoirs[];
 };
+#endif
 
 layout(std430, binding = 37) buffer X1ContextsBuffer {
     X1Context x1Contexts[];
 };
 
 layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
-    GiReservoir giReservoirs[];
+    uvec2 giCurrentData[];
 };
 
 layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
-    GiReservoir giHistoryReservoirs[];
+    uvec2 giHistoryData[];
 };
 
 #ifndef ENABLE_INLINE_SHADOWS
+#if IS_SECONDARY_BOUNCE
+#define ENABLE_INLINE_SHADOWS 0
+#else
 #define ENABLE_INLINE_SHADOWS 1
+#endif
 #endif
 
 #if ENABLE_INLINE_SHADOWS
 #include "wavefront_shadow_inline.glsl"
 #endif
 
-#include "restir_gi_reuse.glsl"
 #endif
 
 WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
-
-#if ENABLE_RESTIR_PT
-layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
-    PackedShadowRay shadowRays[];
-};
-#endif
 
 layout(std430, binding = 13) buffer IndirectCommand {
     DispatchCommand commands[];
@@ -124,6 +129,7 @@ layout(std430, binding = 19) writeonly buffer SecondaryIndexQueue {
     uint secondaryIndices[];
 };
 
+#if ENABLE_NRC
 layout(std430, binding = 20) writeonly buffer OutNRCQueryQueue {
     NRCQuery nrcQueries[];
 };
@@ -131,6 +137,7 @@ layout(std430, binding = 20) writeonly buffer OutNRCQueryQueue {
 layout(std430, binding = 22) buffer InOutNRCCounters {
     NRCCountersBuffer nrcCounters;
 };
+#endif
 
 layout(push_constant) uniform PushConstants {
     WavefrontShadePC pc;
@@ -138,6 +145,7 @@ layout(push_constant) uniform PushConstants {
 
 #include "shading_core.glsl"
 
+#if !IS_SECONDARY_BOUNCE
 void writeDielectricPsrSkyGuides(ivec2 pixelCoord, vec3 rayDir, uint captureMlData) {
     vec3 skyVirtPos = ubo.position.xyz + rayDir * 1000.0;
     vec4 cClip = ubo.unjitteredViewProj * vec4(skyVirtPos, 1.0);
@@ -210,17 +218,17 @@ bool writeDielectricPsrSurfaceGuides(
         Material repMat = materials[dMatId];
         vec3 repAlbedo = repMat.albedo.rgb;
         if (repMat.albedoTex > 0u && repMat.albedoTex <= 512u) {
-            repAlbedo *= SAMPLE_SCENE_TEXTURE_LOD(repMat.albedoTex, dHitUv, 0.0).rgb;
+            repAlbedo *= SAMPLE_SCENE_TEXTURE(repMat.albedoTex, dHitUv).rgb;
         }
         vec3 repEmissive = repMat.emissive.rgb;
         if (repMat.emissiveTex > 0u && repMat.emissiveTex <= 512u) {
-            repEmissive *= SAMPLE_SCENE_TEXTURE_LOD(repMat.emissiveTex, dHitUv, 0.0).rgb;
+            repEmissive *= SAMPLE_SCENE_TEXTURE(repMat.emissiveTex, dHitUv).rgb;
         }
         float repRough = repMat.roughness;
         float repMetallic = repMat.metallic;
         float repTransVal = repMat.transmission;
         if (repMat.mrTex > 0u && repMat.mrTex <= 512u) {
-            vec4 mrSample = SAMPLE_SCENE_TEXTURE_LOD(repMat.mrTex, dHitUv, 0.0);
+            vec4 mrSample = SAMPLE_SCENE_TEXTURE(repMat.mrTex, dHitUv);
             repRough *= mrSample.g;
             repMetallic *= mrSample.b;
         }
@@ -233,11 +241,11 @@ bool writeDielectricPsrSurfaceGuides(
         repMetallic = clamp(repMetallic, 0.0, 1.0);
         float repCc = clamp(repMat.clearcoat, 0.0, 1.0);
         if (repMat.clearcoatTex > 0u && repMat.clearcoatTex <= 512u) {
-            repCc *= SAMPLE_SCENE_TEXTURE_LOD(repMat.clearcoatTex, dHitUv, 0.0).r;
+            repCc *= SAMPLE_SCENE_TEXTURE(repMat.clearcoatTex, dHitUv).r;
         }
         float repCcRough = clamp(repMat.clearcoatRoughness, 0.0, 1.0);
         if (repMat.clearcoatRoughnessTex > 0u && repMat.clearcoatRoughnessTex <= 512u) {
-            repCcRough *= SAMPLE_SCENE_TEXTURE_LOD(repMat.clearcoatRoughnessTex, dHitUv, 0.0).g;
+            repCcRough *= SAMPLE_SCENE_TEXTURE(repMat.clearcoatRoughnessTex, dHitUv).g;
         }
         float physicalRough = clamp(mix(repRough, repCcRough, repCc), 0.0, 1.0);
         bool repIsEmissive = (dArchetype == MATERIAL_ARCHETYPE_EMISSIVE) || ((repMat.type & MATERIAL_TYPE_MASK) == 3u);
@@ -292,12 +300,14 @@ bool writeDielectricPsrSurfaceGuides(
     }
     return forceDiffusePath;
 }
+#endif
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint activeCount = queueCounters.currentMaterialCounts[2]; // Dielectric queue
     bool inRange = (idx < activeCount);
     bool survivesToNext = false;
+#if ENABLE_NRC
     bool emitNrcQuery = false;
     vec3 nrcQPos = vec3(0.0);
     float nrcQRough = 1.0;
@@ -307,13 +317,9 @@ void main() {
     float nrcQSpecRatio = 0.0;
     vec3 nrcQThroughput = vec3(0.0);
     uint nrcQPixelIdx = 0u;
-    vec3 nextDirection = vec3(0.0);
+#endif
     RayGeometry nextGeom;
     RayState nextState;
-#if ENABLE_RESTIR_PT
-    bool hasGiShadowRay = false;
-    PackedShadowRay giShadowCandidate;
-#endif
 
     if (inRange) {
         uint rayIdx = materialIndices[2u * pc.maxQueueCapacity + idx];
@@ -339,34 +345,38 @@ void main() {
         vec3 throughput = vec3(throughputHalf);
         uint bounce = pc.currentBounce;
         bool outIsSpecularPath = (bounce == 0u) ? true : isSpecularPath;
+        float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
 
 #if ENABLE_RESTIR_PT
         // ReSTIR PT: primary dielectric surfaces invalidate DI/X1/GI; secondary
         // dielectric hits spawned from diffuse X1 surfaces run GI reuse over
         // the complementary domain (M = 1, w_self = 0).
         if ((ubo.flags & (1u << 9)) != 0u) {
+#if !IS_SECONDARY_BOUNCE
             if (bounce == 0u) {
                 x1Contexts[pixelIndex] = invalidX1Context();
                 if (pc.sppSampleIndex == 0u) {
-                    currentReservoirs[pixelIndex] = invalidDiReservoir();
-                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                    currentReservoirs[pixelIndex].flags = 0u;
+                    giCurrentData[pixelIndex].y = 0u;
                 }
             } else if (bounce == 1u) {
-                X1Context giCtx = x1Contexts[pixelIndex];
-                if (x1ContextValid(giCtx)) {
-                    uint giReuseSeed = seed ^ 0xC2B2AE35u;
-                    pcg_hash(giReuseSeed);
-                    restirGiRunReuse(
-                        pixelIndex, pc.width, pc.height, pc.frameIndex, pc.sppSampleIndex,
-                        pc.restirMCap, pc.captureMlData, pc.indirectClamp,
-                        false, pc.numOpaqueTriangles,
-                        giCtx, origin, false, vec3(0.0), vec3(0.0, 1.0, 0.0), 0.0, 0.0, vec3(0.0),
-                        giReuseSeed, hasGiShadowRay, giShadowCandidate
-                    );
+                uvec2 x1Nw = x1Contexts[pixelIndex].data.xw;
+                if ((x1Nw.y & X1_FLAG_VALID) != 0u) {
+                    giCurrentData[pixelIndex] = giPackEmptyMeta(restirPackOct16FromOct32(x1Nw.x), 1u);
                 } else if (pc.sppSampleIndex == 0u) {
-                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                    giCurrentData[pixelIndex].y = 0u;
                 }
             }
+#else
+            if (bounce == 1u) {
+                uvec2 x1Nw = x1Contexts[pixelIndex].data.xw;
+                if ((x1Nw.y & X1_FLAG_VALID) != 0u) {
+                    giCurrentData[pixelIndex] = giPackEmptyMeta(restirPackOct16FromOct32(x1Nw.x), 1u);
+                } else if (pc.sppSampleIndex == 0u) {
+                    giCurrentData[pixelIndex].y = 0u;
+                }
+            }
+#endif
         }
 #endif
 
@@ -380,11 +390,25 @@ void main() {
                 float t = 0.5 * (rayDir.y + 1.0);
                 skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
             }
-            vec3 skyContrib = throughput * skyColor;
+            uint skyPdfCode = unpackRayPdfCode(state);
+            float skyMisW = 1.0;
+            if (bounce > 0u && pc.hasEnvMap == 1u && envNeeActive() && pc.envMapIntensity > 0.0) {
+                float skyLightScale = (bounce >= 2u)
+                    ? restirSecondaryMisLightScale(bounce - 1u, pc.numLights, pc.captureMlData, pc.enableNrc)
+                    : 1.0;
+#if ENABLE_RESTIR_PT
+                if (bounce == 1u && ((ubo.flags & (1u << 9)) != 0u) && x1ContextHasDiRestirMis(x1Contexts[pixelIndex])) {
+                    skyLightScale = restirDiMisLightScale(pc.numLights, pc.captureMlData);
+                }
+#endif
+                skyMisW = envHitMisWeightScaled(rayDir, skyPdfCode, pc.numLights, skyLightScale);
+            }
+            vec3 skyContrib = throughput * skyColor * skyMisW;
             if (bounce > 0u) {
-                float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, unpackRayPdfCode(state));
+                float effClamp = computeAdaptiveFireflyClamp(pc.indirectClamp, skyPdfCode);
                 skyContrib = clampIndirectRadiance(skyContrib, effClamp);
             }
+            skyContrib *= invSpp;
             ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
             if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -392,11 +416,14 @@ void main() {
             }
             if (pc.captureMlData != 0u) {
                 bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+#if !IS_SECONDARY_BOUNCE
                 bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
                 if (isMlDenoiser && bounce == 0u) {
                     vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
                     imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
-                } else {
+                } else
+#endif
+                {
                     if (bounce > 0u) {
                         wfAddSplitIndirect(pixelCoord,
                                            outIsSpecularPath ? vec3(0.0) : skyContrib,
@@ -440,7 +467,9 @@ void main() {
                 vec3 waveOffset;
                 vec3 waveN = evaluateWaterWaves(hitPoint, time, waveOffset);
                 hitNormal = normalize(mix(hitNormal, waveN, clamp(mat.normalScale, 0.0, 1.0)));
-            } else if (bounce == 0u && hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+            }
+#if !IS_SECONDARY_BOUNCE
+            else if (bounce == 0u && hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
@@ -457,6 +486,7 @@ void main() {
                 mat3 tbn = mat3(geomTan, geomBitangent, hitNormal);
                 hitNormal = adjustShadingNormal(normalize(tbn * normalMap), -rayDir);
             }
+#endif
             vec4 baseColor = mat.albedo;
             if (mat.albedoTex > 0u && mat.albedoTex <= 512u) {
                 baseColor *= SAMPLE_SCENE_TEXTURE(mat.albedoTex, hitUv);
@@ -484,6 +514,7 @@ void main() {
                         : computeAdaptiveFireflyClamp(pc.indirectClamp, inPdfCode);
                     emissiveContrib = clampIndirectRadiance(emissiveContrib, effClamp);
                 }
+                emissiveContrib *= invSpp;
                 ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                 if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
                     vec4 prev = imageLoad(uAccumImage, pixelCoord);
@@ -491,11 +522,14 @@ void main() {
                 }
                 if (pc.captureMlData != 0u) {
                     bool isV4 = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+#if !IS_SECONDARY_BOUNCE
                     bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
                     if (isMlDenoiser && bounce == 0u) {
                         vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
                         imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, emissiveContrib, seed), prevSkip.a));
-                    } else {
+                    } else
+#endif
+                    {
                         if (bounce > 0u) {
                             wfAddSplitIndirect(pixelCoord,
                                                outIsSpecularPath ? vec3(0.0) : emissiveContrib,
@@ -564,16 +598,18 @@ void main() {
                     }
                 }
 
-                nextDirection = vec3(0.0);
+                vec3 nextDirection = vec3(0.0);
                 vec3 nextOrigin;
 
                 float rFlip = (pc.captureMlData != 0u)
                     ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u)
                     : ((pc.secondarySortMode >= 2u)
-                        ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex + pc.currentBounce * 3u)
+                        ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex + pc.currentBounce * 3u)
                         : randFloat(seed));
                 bool reflected0 = (cannotRefract || rFlip < reflectProb);
+#if !IS_SECONDARY_BOUNCE
                 vec3 preScatterTp = throughput;
+#endif
                 if (reflected0) {
                     // Specular reflection: achromatic Fresnel reflection (preserves white highlights)
                     nextDirection = reflect(rayDir, hitNormal);
@@ -625,7 +661,7 @@ void main() {
                 if (bounce + 1u >= pc.maxBounces) {
                     pathTerminated = true;
                 } else {
-                    float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
+                    float maxThresh = max(throughput.r, max(throughput.g, throughput.b));
                     if (!(maxThresh > 0.0)) { // only zero/NaN throughput: a threshold kill would be uncompensated (biased)
                         pathTerminated = true;
                     } else if (bounce >= 2u) {
@@ -649,6 +685,7 @@ void main() {
                                 ? uvec2(packInteriorSlot(matId, iorVal), 0u)
                                 : uvec2(0u);
                             bool isV4Capture = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+#if !IS_SECONDARY_BOUNCE
                             bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
                             bool hasGbufferTargets = (pc.captureMlData != 0u) || ((ubo.flags & ((1u << 9) | (1u << 14))) != 0u);
                             bool domReflect0 = cannotRefract || (reflectProb >= 0.5);
@@ -659,6 +696,7 @@ void main() {
                             bool hadInternalReflect = false;
                             bool psrWroteGuides = false;
                             float psrPathLength = hitT;
+#endif
 
                             while (survivesToNext && deltaEvents < maxDelta) {
                                 float closestT = 10000.0;
@@ -675,7 +713,9 @@ void main() {
                                     hitInstIdx, hitInstMatOffset, hitO2w, hitW2o
                                 );
 
+#if !IS_SECONDARY_BOUNCE
                                 psrPathLength += closestT;
+#endif
 
                                 // Miss: ray escaped out of glass into sky / environment
                                 if (closestTri < 0) {
@@ -687,17 +727,20 @@ void main() {
                                         float t = 0.5 * (currDirection.y + 1.0);
                                         skyColor = mix(vec3(0.02, 0.02, 0.04), vec3(0.05, 0.07, 0.1), t);
                                     }
-                                    vec3 skyContrib = clampIndirectRadiance(throughput * skyColor, pc.indirectClamp);
+                                    vec3 skyContrib = clampIndirectRadiance(throughput * skyColor, pc.indirectClamp) * invSpp;
                                     ivec2 pixelCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
                                     if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
                                         vec4 prev = imageLoad(uAccumImage, pixelCoord);
                                         imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, skyContrib, seed), prev.a));
                                     }
                                     if (pc.captureMlData != 0u) {
+#if !IS_SECONDARY_BOUNCE
                                         if (isMlDenoiser && bounce == 0u && !reflected0 && !hadInternalReflect) {
                                             vec4 prevSkip = imageLoad(uMlSkipImage, pixelCoord);
                                             imageStore(uMlSkipImage, pixelCoord, vec4(addFp16Stochastic(prevSkip.rgb, skyContrib, seed), prevSkip.a));
-                                        } else {
+                                        } else
+#endif
+                                        {
                                             wfAddSplitIndirect(pixelCoord,
                                                                outIsSpecularPath ? vec3(0.0) : skyContrib,
                                                                outIsSpecularPath ? skyContrib : vec3(0.0),
@@ -719,6 +762,7 @@ void main() {
                                             }
                                         }
                                     }
+#if !IS_SECONDARY_BOUNCE
                                     if (bounce == 0u) {
                                         if (outIsSpecularPath) {
                                             wfStoreIndirectSpecularHitDist(pixelCoord, psrPathLength, true, pc.captureMlData, pc.sppSampleIndex);
@@ -730,6 +774,7 @@ void main() {
                                         writeDielectricPsrSkyGuides(pixelCoord, rayDir, pc.captureMlData);
                                         psrWroteGuides = true;
                                     }
+#endif
                                     survivesToNext = false;
                                     break;
                                 }
@@ -756,7 +801,10 @@ void main() {
                                 // If non-dielectric, rough, textured, or emissive, emit ray for specialized downstream microkernels
                                 // and perform Primary Surface Replacement (PSR) of G-buffer guides via the 3x3 psrXform.
                                 if (isNonSmoothDielectric) {
+#if !IS_SECONDARY_BOUNCE || ENABLE_NRC
                                     ivec2 psrCoord = ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width));
+#endif
+#if !IS_SECONDARY_BOUNCE
                                     if (enablePsrGuides) {
                                         bool forceDiff = writeDielectricPsrSurfaceGuides(
                                             psrCoord, currOrigin, currDirection, rayDir, currPsrXform,
@@ -775,6 +823,8 @@ void main() {
                                             wfStoreIndirectDiffuseHitDist(psrCoord, psrPathLength, false, pc.captureMlData, pc.sppSampleIndex);
                                         }
                                     }
+#endif
+#if ENABLE_NRC
                                     if (pc.enableNrc == 1u && ((ubo.flags & (1u << 1)) != 0u) &&
                                         bounce >= max(pc.nrcBounce, 1u) && !inNrcSkip && dMatId < pc.numMaterials) {
                                         ShadeMaterial rSm = shadeMaterials[dMatId];
@@ -795,7 +845,7 @@ void main() {
                                             }
                                             bool rEmitVis = (tri.padding0 == TRI_LIGHT_NONE) || (rFront && tri.padding0 != TRI_LIGHT_NEE_ONLY);
                                             if (rEmitVis && length(rEmit) > 1e-3) {
-                                                vec3 emitContrib = clampIndirectRadiance(throughput * rEmit, pc.indirectClamp);
+                                                vec3 emitContrib = clampIndirectRadiance(throughput * rEmit, pc.indirectClamp) * invSpp;
                                                 if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
                                                     vec4 prev = imageLoad(uAccumImage, psrCoord);
                                                     imageStore(uAccumImage, psrCoord, vec4(addFp16Stochastic(prev.rgb, emitContrib, seed), prev.a));
@@ -846,16 +896,20 @@ void main() {
                                             nrcQSpecFlag = outIsSpecularPath ? 1.0 : 0.0;
                                             nrcQView = -currDirection;
                                             nrcQSpecRatio = rSpecRatio;
-                                            nrcQThroughput = throughput * rRefl;
+                                            nrcQThroughput = throughput * rRefl * invSpp;
                                             nrcQPixelIdx = pixelIndex;
                                             survivesToNext = false;
                                             break;
                                         }
                                     }
+#endif
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+#if !IS_SECONDARY_BOUNCE
                                     bool curNrcSkip = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+#else
+                                    bool curNrcSkip = (inNrcSkip && bounce < 2u);
+#endif
                                     nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, 0u, curNrcSkip);
-                                    nextDirection = currDirection;
                                     survivesToNext = true;
                                     break;
                                 }
@@ -897,9 +951,12 @@ void main() {
                                     commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                     currOrigin = offsetRayOrigin(dHitPoint, currDirection);
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+#if !IS_SECONDARY_BOUNCE
                                     bool curNrcSkipInt = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+#else
+                                    bool curNrcSkipInt = (inNrcSkip && bounce < 2u);
+#endif
                                     nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, 0u, curNrcSkipInt);
-                                    nextDirection = currDirection;
                                     survivesToNext = true;
                                     continue;
                                 }
@@ -926,14 +983,20 @@ void main() {
                                 float rFlipD = (pc.captureMlData != 0u || ((ubo.flags & (1u << 9)) != 0u))
                                     ? sampleSobolOwen1D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + deltaEvents + 1u)
                                     : randFloat(seed);
+#if !IS_SECONDARY_BOUNCE
                                 bool dDomReflect = dCannotRefract || (dReflectProb >= 0.5);
+#endif
                                 bool dDoReflect = (dCannotRefract || rFlipD < dReflectProb);
+#if !IS_SECONDARY_BOUNCE
                                 if (dDoReflect != dDomReflect) {
                                     enablePsrGuides = false;
                                 }
+#endif
                                 if (dDoReflect) {
+#if !IS_SECONDARY_BOUNCE
                                     hadInternalReflect = true;
                                     currPsrXform = currPsrXform * buildReflectionMatrix(dHitNormal);
+#endif
                                     currDirection = reflect(currDirection, dHitNormal);
                                     currOrigin = offsetRayOrigin(dHitPoint, dHitNormal);
                                 } else {
@@ -956,22 +1019,26 @@ void main() {
                                         vec3 refrVec = refract(prevDir, dHitNormal, dEta);
                                         if (dot(refrVec, refrVec) > 1e-6) {
                                             currDirection = normalize(refrVec);
+#if !IS_SECONDARY_BOUNCE
                                             currPsrXform = currPsrXform * buildRotationMatrixFromTo(currDirection, prevDir);
+#endif
                                             currOrigin = offsetRayOrigin(dHitPoint, -dHitNormal);
                                             commitNestedDielectricStack(interiorStack, dMatId, dIorVal, dFrontFace);
                                             throughput *= dMat.albedo.rgb;
                                         } else {
                                             // Post-dispersion Total Internal Reflection fallback
+#if !IS_SECONDARY_BOUNCE
                                             hadInternalReflect = true;
                                             enablePsrGuides = false;
                                             currPsrXform = currPsrXform * buildReflectionMatrix(dHitNormal);
+#endif
                                             currDirection = reflect(prevDir, dHitNormal);
                                             currOrigin = offsetRayOrigin(dHitPoint, dHitNormal);
                                         }
                                     }
                                 }
 
-                                float maxThresh = max(throughput.r, max(throughput.g, throughput.b)) * float(max(ubo.spp, 1u));
+                                float maxThresh = max(throughput.r, max(throughput.g, throughput.b));
                                 if (!(maxThresh > 0.0)) {
                                     survivesToNext = false;
                                     break;
@@ -982,12 +1049,16 @@ void main() {
                                 }
 
                                 nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
+#if !IS_SECONDARY_BOUNCE
                                 bool curNrcSkipEnd = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+#else
+                                bool curNrcSkipEnd = (inNrcSkip && bounce < 2u);
+#endif
                                 nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, 0u, curNrcSkipEnd);
-                                nextDirection = currDirection;
                                 survivesToNext = true;
                             }
 
+#if !IS_SECONDARY_BOUNCE
                             // Deterministic dominant-lobe PSR fallback trace on bounce-0 when the stochastic
                             // delta path diverged from the dominant reflection/refraction lobe before exporting guides.
                             if (bounce == 0u && pc.sppSampleIndex == 0u && !psrWroteGuides && !isV4Capture && hasGbufferTargets) {
@@ -1152,6 +1223,7 @@ void main() {
                                     }
                                 }
                             }
+#endif
                         }
                     }
                 }
@@ -1159,6 +1231,7 @@ void main() {
         }
     }
 
+#if ENABLE_NRC
     uvec4 nrcQBallot = subgroupBallot(emitNrcQuery);
     uint nrcQWaveCount = subgroupBallotBitCount(nrcQBallot);
     uint nrcQWaveBase = 0u;
@@ -1183,6 +1256,7 @@ void main() {
             nrcQueries[qIdx].throughput = vec4(nrcQThroughput, 0.0);
         }
     }
+#endif
 
     // Standard single-queue linear compaction for ray geometry and state
     uvec4 ballot = subgroupBallot(survivesToNext);
@@ -1207,7 +1281,8 @@ void main() {
 
     if (pc.secondarySortMode == 1u && waveActiveCount > 0u) {
         // Producer-Side Binning: Record compacted ray indices into 8 directional octant queues
-        uint oct = survivesToNext ? getDirectionalOctant(nextDirection) : 0u;
+        vec3 binnedDir = survivesToNext ? unpackOct32(floatBitsToUint(nextGeom.originPackedDir.w)) : vec3(0.0);
+        uint oct = survivesToNext ? getDirectionalOctant(binnedDir) : 0u;
         uvec4 activeBallot = subgroupBallot(survivesToNext);
         while (subgroupBallotBitCount(activeBallot) > 0u) {
             uint leaderLane = subgroupBallotFindLSB(activeBallot);
@@ -1233,28 +1308,6 @@ void main() {
             activeBallot.w &= ~octBallot.w;
         }
     }
-
-#if ENABLE_RESTIR_PT
-    // Subgroup Wave Ballot Compaction for ReSTIR GI Reconnection Visibility Rays
-    uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
-    uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
-    uint giShadowWaveCount = subgroupBallotBitCount(giShadowBallot);
-
-    uint giShadowGlobalOffset = 0u;
-    if (giShadowWaveCount > 0u) {
-        if (subgroupElect()) {
-            giShadowGlobalOffset = atomicAdd(queueCounters.shadowRayCount, giShadowWaveCount);
-        }
-        giShadowGlobalOffset = subgroupBroadcastFirst(giShadowGlobalOffset);
-    }
-
-    if (hasGiShadowRay) {
-        uint targetIdxGiShadow = giShadowGlobalOffset + giShadowLaneSlot;
-        if (targetIdxGiShadow < pc.maxQueueCapacity) {
-            shadowRays[targetIdxGiShadow] = giShadowCandidate;
-        }
-    }
-#endif
 
     // Atomic workgroup retirement to prepare downstream dispatches directly
     memoryBarrierBuffer();

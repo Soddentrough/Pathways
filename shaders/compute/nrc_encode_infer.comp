@@ -13,8 +13,12 @@ layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 #define ML_CAPTURE_UPWAYS_V4_BIT 4u
 #define ML_CAPTURE_SPLIT_4SIG_BIT 8u
 
-// Quad-subgroup shared memory buffers reusing s_layer0 in-place (~9.25 KiB LDS -> 16/16 Wave32 occupancy)
-shared float16_t s_layer0[4 * 16 * 64];
+// Quad-subgroup shared memory buffers for 4 independent Wave32 batches (64 queries total)
+shared float16_t s_layer0[4 * 16 * 64]; // 8 KB: layer 0/2 activation staging
+shared float16_t s_layer1[4 * 16 * 64]; // 8 KB: layer 1 activation staging
+shared uint      s_uTileA[4 * 128];     // 2 KB: packed 16x16 FP16 WMMA A-tile scratch
+shared uint      s_uTileB[4 * 128];     // 2 KB: packed 16x16 FP16 WMMA B-tile scratch
+shared float     s_fAcc[4 * 16 * 16];   // 4 KB: FP32 WMMA accumulator staging
 shared vec3 s_throughput[64];
 shared uint s_pixelMeta[64]; // 0xFFFFFFFFu = invalid; bit 31 = isSpec, bits 0..30 = pixelIdx
 
@@ -207,99 +211,135 @@ void main() {
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
+    uint sgUTileOff  = sg * 128u;
+    uint sgAccOff    = sg * 256u;
+    // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32 WMMA accumulators.
+    float zAcc = float(pc.width == 0xFFFFFFFFu);
+
     // ==========================================
-    // 3. LAYER 0: 64 -> 64 WMMA (in-place s_layer0)
+    // 3. LAYER 0: 64 -> 64 WMMA (packed 16x16 uint tiles + FP32 accumulator)
     // ==========================================
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles0[4];
-    for (uint k = 0u; k < 4u; ++k) {
-        coopMatLoad(aTiles0[k], s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupBarrier();
     for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0;
-        c0 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (col * 16u);
-            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
-            c0 = coopMatMulAdd(aTiles0[k], bTile, c0);
+            for (uint e = 0u; e < 4u; ++e) {
+                uint uIdx = tid * 4u + e;
+                uint r = uIdx >> 3u;
+                uint c2 = (uIdx & 7u) * 2u;
+                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2]),
+                    float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2 + 1u])));
+                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(weights[wOff + r * 64u + c2]),
+                    float(weights[wOff + r * 64u + c2 + 1u])));
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            c0 = coopMatMulAdd(aTile, bTile, c0);
+            subgroupBarrier();
         }
 
-        coopMatStore(c0, s_layer0, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupMemoryBarrierShared();
-    subgroupBarrier();
-    {
-        float16_t b0_lo = weights[NRC_B0_OFFSET + tid];
-        float16_t b0_hi = weights[NRC_B0_OFFSET + tid + 32u];
-        for (uint r = 0u; r < 16u; ++r) {
-            uint rowOff = sgLayerOff + r * 64u;
-            float16_t v0 = s_layer0[rowOff + tid] + b0_lo;
-            s_layer0[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
-            float16_t v1 = s_layer0[rowOff + tid + 32u] + b0_hi;
-            s_layer0[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
+        coopMatStore(c0, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = 0u; e < 8u; ++e) {
+            uint idx = tid * 8u + e;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B0_OFFSET + col * 16u + c]);
+            s_layer1[sgLayerOff + r * 64u + col * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
         }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
     }
-    subgroupMemoryBarrierShared();
-    subgroupBarrier();
 
     // ==========================================
-    // 4. LAYER 1: 64 -> 64 WMMA (in-place s_layer0)
+    // 4. LAYER 1: 64 -> 64 WMMA
     // ==========================================
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTiles1[4];
-    for (uint k = 0u; k < 4u; ++k) {
-        coopMatLoad(aTiles1[k], s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupBarrier();
     for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1;
-        c1 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
         for (uint k = 0u; k < 4u; ++k) {
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
             uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (col * 16u);
-            coopMatLoad(bTile, weights, wOff, 64u, gl_CooperativeMatrixLayoutRowMajor);
-            c1 = coopMatMulAdd(aTiles1[k], bTile, c1);
+            for (uint e = 0u; e < 4u; ++e) {
+                uint uIdx = tid * 4u + e;
+                uint r = uIdx >> 3u;
+                uint c2 = (uIdx & 7u) * 2u;
+                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(s_layer1[sgLayerOff + r * 64u + k * 16u + c2]),
+                    float(s_layer1[sgLayerOff + r * 64u + k * 16u + c2 + 1u])));
+                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                    float(weights[wOff + r * 64u + c2]),
+                    float(weights[wOff + r * 64u + c2 + 1u])));
+            }
+            subgroupMemoryBarrierShared();
+            subgroupBarrier();
+
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
+            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
+            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+            c1 = coopMatMulAdd(aTile, bTile, c1);
+            subgroupBarrier();
         }
 
-        coopMatStore(c1, s_layer0, sgLayerOff + col * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
-    }
-    subgroupMemoryBarrierShared();
-    subgroupBarrier();
-    {
-        float16_t b1_lo = weights[NRC_B1_OFFSET + tid];
-        float16_t b1_hi = weights[NRC_B1_OFFSET + tid + 32u];
-        for (uint r = 0u; r < 16u; ++r) {
-            uint rowOff = sgLayerOff + r * 64u;
-            float16_t v0 = s_layer0[rowOff + tid] + b1_lo;
-            s_layer0[rowOff + tid] = (v0 > float16_t(0.0)) ? v0 : (float16_t(0.01) * v0);
-            float16_t v1 = s_layer0[rowOff + tid + 32u] + b1_hi;
-            s_layer0[rowOff + tid + 32u] = (v1 > float16_t(0.0)) ? v1 : (float16_t(0.01) * v1);
+        coopMatStore(c1, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        for (uint e = 0u; e < 8u; ++e) {
+            uint idx = tid * 8u + e;
+            uint r = idx >> 4u;
+            uint c = idx & 15u;
+            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B1_OFFSET + col * 16u + c]);
+            s_layer0[sgLayerOff + r * 64u + col * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
         }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
     }
-    subgroupMemoryBarrierShared();
-    subgroupBarrier();
 
     // ==========================================
     // 5. LAYER 2: 64 -> 16 WMMA (Output layer in-place s_layer0)
     // ==========================================
-    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2;
-    c2 = coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(float16_t(0.0));
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
     for (uint k = 0u; k < 4u; ++k) {
+        uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
+        for (uint e = 0u; e < 4u; ++e) {
+            uint uIdx = tid * 4u + e;
+            uint r = uIdx >> 3u;
+            uint c2_col = (uIdx & 7u) * 2u;
+            s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2_col]),
+                float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2_col + 1u])));
+            s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
+                float(weights[wOff + uIdx * 2u]),
+                float(weights[wOff + uIdx * 2u + 1u])));
+        }
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-        coopMatLoad(aTile, s_layer0, sgLayerOff + k * 16u, 64u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-        uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
-        coopMatLoad(bTile, weights, wOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
         c2 = coopMatMulAdd(aTile, bTile, c2);
+        subgroupBarrier();
     }
     subgroupBarrier();
 
-    coopMatStore(c2, s_layer0, sgLayerOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(c2, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
@@ -310,11 +350,11 @@ void main() {
         if (meta != 0xFFFFFFFFu) {
             uint pixelIdx = meta & 0x7FFFFFFFu;
             bool isSpec = (meta & 0x80000000u) != 0u;
-            uint outRow = sgLayerOff + tid * 16u;
+            uint outRow = sgAccOff + tid * 16u;
             vec3 rawPred = vec3(
-                float(s_layer0[outRow + 0u] + weights[NRC_B2_OFFSET + 0u]),
-                float(s_layer0[outRow + 1u] + weights[NRC_B2_OFFSET + 1u]),
-                float(s_layer0[outRow + 2u] + weights[NRC_B2_OFFSET + 2u])
+                s_fAcc[outRow + 0u] + float(weights[NRC_B2_OFFSET + 0u]),
+                s_fAcc[outRow + 1u] + float(weights[NRC_B2_OFFSET + 1u]),
+                s_fAcc[outRow + 2u] + float(weights[NRC_B2_OFFSET + 2u])
             );
             if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
             if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;

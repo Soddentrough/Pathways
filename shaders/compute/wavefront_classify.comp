@@ -20,7 +20,7 @@ layout(std430, binding = 37) writeonly buffer X1ContextsBuffer {
     X1Context x1Contexts[];
 };
 layout(std430, binding = 38) writeonly buffer GiCurrentReservoirsBuffer {
-    GiReservoir giReservoirs[];
+    uvec2 giCurrentData[];
 };
 
 layout(local_size_x = 8, local_size_y = 4) in;
@@ -250,8 +250,8 @@ void main() {
                     }
                 }
                 if ((ubo.flags & (1u << 9)) != 0u && pc.sppSampleIndex == 0u) {
-                    currentReservoirs[pixelIndex] = invalidDiReservoir();
-                    giReservoirs[pixelIndex] = invalidGiReservoir();
+                    currentReservoirs[pixelIndex].flags = 0u;
+                    giCurrentData[pixelIndex].y = 0u;
                 }
             }
         } else {
@@ -296,7 +296,7 @@ void main() {
                 }
                 isSpecular = (met0 > 0.5) && (m0.roughness < 0.05) && (m0.albedoTex == 0u) && (m0.mrTex == 0u);
             }
-            state = packRayState(f16vec3(invSpp), seed, pixelIndex, isSpecular, false);
+            state = packRayState(f16vec3(1.0), seed, pixelIndex, isSpecular, false);
 
             if (pc.sppSampleIndex == 0u) {
                 bool needNormals = (pc.pad0 == 0u) || ((pc.pad0 & 1u) != 0u) || (pc.captureMlData != 0u);
@@ -339,11 +339,16 @@ void main() {
                     imageStore(uAccumImage, storeCoord, vec4(0.0, 0.0, 0.0, -min(primaryDepth, 65000.0)));
                 }
 
-                vec2 quantUv = unpackHalf2x16(packHalf2x16(hitUv - floor(hitUv)));
-                float rayConeBaseLod = computeRayConeBaseLod(
-                    hit.hitData1.w >> 16u, closestT, direction, hitNormal,
-                    2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
-                    0u, 0u);
+                vec2 quantUv = vec2(0.0);
+                float rayConeBaseLod = -16.0;
+                if (needNormals || pc.captureMlData != 0u) {
+                    quantUv = unpackHalf2x16(packHalf2x16(hitUv - floor(hitUv)));
+                    if (closestTri >= 0) {
+                        rayConeBaseLod = computeRayConeBaseLod(hit.hitData1.w >> 16u, closestT, direction, hitNormal,
+                                                               2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
+                                                               0u, 0u);
+                    }
+                }
 
                 vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                 if (needNormals) {
@@ -692,6 +697,7 @@ void main() {
             queueCounters.nextActiveCount = 0u;
             queueCounters.shadowRayCount = 0u;
             queueCounters.retiredWorkgroups = 0u;
+            queueCounters.pad[0] = 0u;
         }
     }
 }

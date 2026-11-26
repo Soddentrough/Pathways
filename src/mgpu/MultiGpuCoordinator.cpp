@@ -323,6 +323,7 @@ void MultiGpuCoordinator::recordPrimaryRayTracing(
         rtParams.cameraMovedLastFrame = params.cameraMovedThisFrame || params.cameraMovedLastFrame;
         rtParams.diagnosticHalfTiles = false;
         rtParams.isRestirActive = params.config.enable_restir;
+        rtParams.envNeeEnabled = params.envNeeEnabled;
 
         rtOrchestrator->recordRayTracing(
             cmd, rtParams,

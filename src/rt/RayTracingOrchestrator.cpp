@@ -13,12 +13,14 @@ RayTracingOrchestrator::RayTracingOrchestrator(
     VkDevice device,
     VmaAllocator allocator,
     VkPhysicalDevice physicalDevice,
-    VkPhysicalDeviceType deviceType
+    VkPhysicalDeviceType deviceType,
+    VkPipelineCache pipelineCache
 )
     : m_device(device),
       m_allocator(allocator),
       m_physicalDevice(physicalDevice),
-      m_deviceType(deviceType) {
+      m_deviceType(deviceType),
+      m_pipelineCache(pipelineCache) {
 }
 
 RayTracingOrchestrator::~RayTracingOrchestrator() {
@@ -44,7 +46,8 @@ void RayTracingOrchestrator::initWavefrontPipeline(
     bool enableDgcPreprocess,
     bool hasSubgroupSizeControl,
     uint32_t initialBatchPixels,
-    const std::vector<char>& tailMegakernelCode
+    const std::vector<char>& tailMegakernelCode,
+    const std::vector<char>& shadeDielectricSecCode
 ) {
     m_wavefrontPipeline = std::make_unique<WavefrontPipeline>(
         m_device, m_allocator,
@@ -57,7 +60,9 @@ void RayTracingOrchestrator::initWavefrontPipeline(
         enableDgcPreprocess,
         hasSubgroupSizeControl,
         initialBatchPixels,
-        tailMegakernelCode
+        tailMegakernelCode,
+        m_pipelineCache,
+        shadeDielectricSecCode
     );
     Logger::info("Wavefront Path Tracing Pipeline (Ray Queues & DGC) initialized successfully.");
 }
@@ -69,7 +74,10 @@ void RayTracingOrchestrator::initWavefrontSpecializedVariants(
     const std::vector<char>& shadeComplexRestirCode,
     const std::vector<char>& shadeComplexSecRestirCode,
     const std::vector<char>& shadeDielectricRestirCode,
-    const std::vector<char>& shadeEmissiveRestirCode
+    const std::vector<char>& shadeEmissiveRestirCode,
+    const std::vector<char>& restirGiReuseCode,
+    const std::vector<char>& restirDiReuseCode,
+    const std::vector<char>& shadeDielectricSecRestirCode
 ) {
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->initSpecializedVariants(
@@ -79,7 +87,68 @@ void RayTracingOrchestrator::initWavefrontSpecializedVariants(
             shadeComplexRestirCode,
             shadeComplexSecRestirCode,
             shadeDielectricRestirCode,
-            shadeEmissiveRestirCode
+            shadeEmissiveRestirCode,
+            restirGiReuseCode,
+            restirDiReuseCode,
+            shadeDielectricSecRestirCode
+        );
+    }
+}
+
+void RayTracingOrchestrator::initWavefrontAlphaPipeline(const std::vector<char>& intersectAlphaCode) {
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->initAlphaIntersectPipeline(intersectAlphaCode);
+    }
+}
+
+void RayTracingOrchestrator::initWavefrontTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode) {
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->initTailMegakernelPipeline(tailMegakernelCode);
+    }
+}
+
+void RayTracingOrchestrator::initWavefrontRestirVariants(
+    const std::vector<char>& shadeDiffuseRestirCode,
+    const std::vector<char>& shadeDiffuseSecRestirCode,
+    const std::vector<char>& shadeComplexRestirCode,
+    const std::vector<char>& shadeComplexSecRestirCode,
+    const std::vector<char>& shadeDielectricRestirCode,
+    const std::vector<char>& shadeEmissiveRestirCode,
+    const std::vector<char>& restirGiReuseCode,
+    const std::vector<char>& restirDiReuseCode,
+    const std::vector<char>& shadeDielectricSecRestirCode
+) {
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->initRestirVariants(
+            shadeDiffuseRestirCode,
+            shadeDiffuseSecRestirCode,
+            shadeComplexRestirCode,
+            shadeComplexSecRestirCode,
+            shadeDielectricRestirCode,
+            shadeEmissiveRestirCode,
+            restirGiReuseCode,
+            restirDiReuseCode,
+            shadeDielectricSecRestirCode
+        );
+    }
+}
+
+void RayTracingOrchestrator::initWavefrontNrcVariants(
+    const std::vector<char>& shadeDiffuseNrcCode,
+    const std::vector<char>& shadeDiffuseSecNrcCode,
+    const std::vector<char>& shadeComplexNrcCode,
+    const std::vector<char>& shadeComplexSecNrcCode,
+    const std::vector<char>& shadeDielectricNrcCode,
+    const std::vector<char>& shadeDielectricSecNrcCode
+) {
+    if (m_wavefrontPipeline) {
+        m_wavefrontPipeline->initNrcVariants(
+            shadeDiffuseNrcCode,
+            shadeDiffuseSecNrcCode,
+            shadeComplexNrcCode,
+            shadeComplexSecNrcCode,
+            shadeDielectricNrcCode,
+            shadeDielectricSecNrcCode
         );
     }
 }
@@ -95,7 +164,8 @@ void RayTracingOrchestrator::initNRC(
         m_device, m_allocator,
         width, height,
         inferCode, trainCode, resolveCode,
-        m_physicalDevice
+        m_physicalDevice,
+        m_pipelineCache
     );
     Logger::info("Neural Direct-Light Caching Subsystem (Wave32 WMMA & Atomic Buffer) initialized. Note: caches unshadowed direct light only — see docs/NRC.md.");
 }
@@ -138,7 +208,7 @@ uint32_t RayTracingOrchestrator::getTargetBatchPixels(const Config& config) cons
         return 1500000u;
     }
 
-    if (totalDeviceVram < 16ULL * 1024 * 1024 * 1024) {
+    if (totalDeviceVram < 15ULL * 1024 * 1024 * 1024) {
         return 2000000u;
     }
 
@@ -244,18 +314,10 @@ WavefrontSortMode RayTracingOrchestrator::getEffectiveWavefrontSortMode(const Co
         return WavefrontSortMode::None;
     }
 
-    float divergentRatio = getDivergentAreaRatio(sceneData);
-    if (divergentRatio < 0.001f) {
-        return WavefrontSortMode::Archetype;
-    }
-
-    if (m_deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
-        if (divergentRatio < 0.12f) {
-            return WavefrontSortMode::Archetype;
-        }
-    }
-
-    return WavefrontSortMode::Dual;
+    // Pure Archetype sorting consistently outperforms 12-bit Dual Morton sorting across
+    // non-ReSTIR scenes without spatial shuffle scatter penalties (10/11 sorted scenes faster).
+    (void)getDivergentAreaRatio(sceneData);
+    return WavefrontSortMode::Archetype;
 }
 
 void RayTracingOrchestrator::resize(uint32_t width, uint32_t height, const Config& config) {
@@ -300,7 +362,8 @@ void RayTracingOrchestrator::recordRayTracing(
     Image* mlDirectDiffuseImage,
     Image* mlIndirectDiffuseImage,
     Image* mlDirectSpecularImage,
-    Image* mlIndirectSpecularImage
+    Image* mlIndirectSpecularImage,
+    Image* motionVectorImage
 ) {
     if (params.skipRayTracing || !m_wavefrontPipeline) return;
 
@@ -429,6 +492,9 @@ void RayTracingOrchestrator::recordRayTracing(
         const glm::vec3 nrcBMax = hasFocalBounds ? sceneData.focalBoundsMax : sceneData.boundsMax;
         wfSceneData.boundsMin = nrcBMin;
         wfSceneData.boundsMax = nrcBMax;
+        wfSceneData.sceneBoundsMin = sceneData.boundsMin;
+        wfSceneData.sceneBoundsMax = sceneData.boundsMax;
+        wfSceneData.envNeeEnabled = params.envNeeEnabled;
         wfSceneData.streamlineSecondaryShading = config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = config.max_secondary_distance;
@@ -470,10 +536,10 @@ void RayTracingOrchestrator::recordRayTracing(
                             config.upscaler_mode == UpscalerMode::FSR ||
                             config.denoiser_mode == DenoiserMode::Upways ||
                             config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
-                            params.isRestirActive ||
                             config.enable_caustics ||
                             !config.capture_training_data_dir.empty());
-        bool needGbuffers = needNormals || params.isRestirActive || (config.upscaler_mode == UpscalerMode::FSR);
+        bool needNdStore = needNormals;
+        bool needMvStore = needNormals || params.isRestirActive || (config.upscaler_mode == UpscalerMode::FSR);
         bool captureMl = (config.denoiser_mode == DenoiserMode::Upways ||
                           config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
                           config.upscaler_mode == UpscalerMode::Upways ||
@@ -489,7 +555,7 @@ void RayTracingOrchestrator::recordRayTracing(
                                   | (((captureMl || captureSplit4Sig) && keepAccumWithMl) ? 2u : 0u)
                                   | (captureMlV4 ? 4u : 0u)
                                   | (captureSplit4Sig ? 8u : 0u);
-        wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needGbuffers ? 2u : 0u) | (needGbuffers ? 4u : 0u);
+        wfSceneData.gbufferFlags = (1u << 31) | (needNormals ? 1u : 0u) | (needNdStore ? 2u : 0u) | (needMvStore ? 4u : 0u);
 
         if (causticsPipeline && config.enable_caustics && sceneData.hasDielectrics && numLights > 0) {
             causticsPipeline->recordTrace(
@@ -537,7 +603,8 @@ void RayTracingOrchestrator::recordRayTracing(
         }
 
         const bool deferNdHistoryToMgpuMerge = params.isMultiGpu && (params.mgpuMode == MultiGpuMode::CheckerboardTile);
-        if ((params.isRestirActive || config.enable_caustics) && !deferNdHistoryToMgpuMerge && normalDepthImage && prevNormalDepthImage) {
+        Image* depthHistorySrc = (needNdStore || !motionVectorImage) ? normalDepthImage : motionVectorImage;
+        if ((params.isRestirActive || config.enable_caustics) && !deferNdHistoryToMgpuMerge && depthHistorySrc && prevNormalDepthImage) {
             VkImageCopy copyRegion{};
             copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
@@ -555,7 +622,7 @@ void RayTracingOrchestrator::recordRayTracing(
             imgBarriers[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
             imgBarriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             imgBarriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            imgBarriers[0].image = normalDepthImage->getImage();
+            imgBarriers[0].image = depthHistorySrc->getImage();
             imgBarriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
             imgBarriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -574,7 +641,7 @@ void RayTracingOrchestrator::recordRayTracing(
             vkCmdPipelineBarrier2(cmd, &copyDep);
 
             vkCmdCopyImage(cmd,
-                           normalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
+                           depthHistorySrc->getImage(), VK_IMAGE_LAYOUT_GENERAL,
                            prevNormalDepthImage->getImage(), VK_IMAGE_LAYOUT_GENERAL,
                            1, &copyRegion);
 
@@ -596,7 +663,7 @@ void RayTracingOrchestrator::recordRayTracing(
             postBarriers[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             postBarriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             postBarriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            postBarriers[1].image = normalDepthImage->getImage();
+            postBarriers[1].image = depthHistorySrc->getImage();
             postBarriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
             VkDependencyInfo postDep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };

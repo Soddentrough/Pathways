@@ -110,7 +110,7 @@ struct Config {
     uint32_t macro_tile_size = 0; // Legacy macro-tile cache panning (deprecated in favor of coarse batches)
     uint32_t batch_count = 0;    // Coarse batch count (0 = auto-detect based on GPU profile, 1 = monolithic, 2, 4, 8, etc.)
     uint32_t batch_pixels = 0;   // Coarse batch ray budget in pixels (0 = auto-detect based on GPU profile)
-    SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherent; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=4) [Default: 100% coalesced SIMD reads]
+    SecondarySortMode secondary_sort_mode = SecondarySortMode::DirectCoherentK8; // Direct Coherent Ray Generation via Tangent Space Reuse (Xiang et al. 2023, K=8) [Default: 100% coalesced SIMD reads]
     bool enable_macro_blas = false;        // Merge static instance clusters into spatial Macro-BLASes [Default: false on APU to preserve L2 cache locality, opt-in via --macro-blas]
     uint32_t macro_blas_max_tris = 250000; // Maximum geometry expansion budget for Macro-BLAS merging (250k tris ~ 32 MB VRAM)
     uint32_t macro_blas_max_prop_tris = 800; // Maximum prototype triangle count to be considered a prop candidate for merging
@@ -119,7 +119,7 @@ struct Config {
     bool distance_clamping = true;            // Scene-scale invariant secondary ray distance clamping [Default: true]
     float max_secondary_distance = 0.0f;      // Override maximum secondary ray distance in world units (0 = automatic scene diameter * 1.25)
     float indirect_clamp = 35.0f;             // Maximum indirect / secondary bounce radiance luminance (0.0 = unlimited / unclamped, default: 35.0)
-    bool enable_tail_megakernel = false;      // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: false, opt-in via --tail-megakernel]
+    bool enable_tail_megakernel = true;       // Hybrid Wavefront-to-Megakernel transition for late bounces [Default: true, disable via --no-tail-megakernel]
     uint32_t tail_megakernel_bounce = 2;      // Bounce at which to switch from Wavefront to Tail Megakernel (default: 2)
     uint32_t delta_unroll = 6;                // Max delta-chain unroll depth for smooth dielectrics [Default: 6, 0 = Pure Wavefront]
     uint32_t width = 3840;

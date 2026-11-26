@@ -402,12 +402,10 @@ struct Light {
         } \
     } while(false)
 
-// 64-byte hierarchical 3D Light Tree node layout (FEAT-02)
+// 32-byte cache-line-paired hierarchical 3D Light Tree node layout (FEAT-02)
 struct LightTreeNode {
-    vec4 bboxMin;   // xyz: bboxMin, w: radiant flux (Phi)
-    vec4 bboxMax;   // xyz: bboxMax, w: coneAngleCos
-    vec4 coneAxis;  // xyz: cone center axis, w: padding
-    uvec4 children; // x: leftChild (or lightIdx if leaf), y: rightChild, z: isLeaf, w: padding
+    vec4 centerFlux;       // xyz: bbox center, w: radiant flux (Phi)
+    uvec4 extentConeChild; // x: halfExt.xy (fp16x2), y: halfExt.z + coneCos (fp16x2), z: oct32(coneAxis), w: [31] isLeaf | [30:0] lightIdx/firstChild
 };
 
 // Evaluate spatial importance metric of a LightTree node from surface point x.
@@ -415,30 +413,28 @@ struct LightTreeNode {
 // hits found by BSDF sampling, where the previous vertex normal is unknown, so
 // the importance must not depend on it. hitNormal is kept for the signature.
 float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode node) {
-    float flux = node.bboxMin.w;
+    float flux = node.centerFlux.w;
     if (flux <= 1e-7) return 0.0;
 
-    vec3 bMin = node.bboxMin.xyz;
-    vec3 bMax = node.bboxMax.xyz;
+    vec2 heXY = unpackHalf2x16(node.extentConeChild.x);
+    vec2 heZC = unpackHalf2x16(node.extentConeChild.y);
+    vec3 halfExt = vec3(heXY.x, heXY.y, heZC.x);
 
-    // Point-to-box minimum squared distance
-    vec3 clampedPoint = clamp(hitPoint, bMin, bMax);
-    vec3 delta = hitPoint - clampedPoint;
+    vec3 toNode = node.centerFlux.xyz - hitPoint;
+    vec3 delta = max(abs(toNode) - halfExt, vec3(0.0));
     float distSq = max(dot(delta, delta), 1e-4);
 
-    // Direction vector from hitPoint to node centroid
-    vec3 boxCentroid = 0.5 * (bMin + bMax);
-    vec3 toNode = boxCentroid - hitPoint;
-    float centerDist = length(toNode);
-
-    // Light orientation bounding cone weighting
-    float coneCos = node.bboxMax.w;
+    // Light orientation bounding cone weighting (only compute length/oct when bounded)
+    float coneCos = heZC.y;
     float cosCone = 1.0;
-    if (coneCos > -0.99 && centerDist > 1e-4) {
-        vec3 dir = toNode / centerDist;
-        vec3 coneAxis = node.coneAxis.xyz;
-        float cosLightDir = dot(coneAxis, -dir);
-        cosCone = clamp((cosLightDir - coneCos) / max(1.0 - coneCos, 1e-3), 0.05, 1.0);
+    if (coneCos > -0.99) {
+        float centerDistSq = dot(toNode, toNode);
+        if (centerDistSq > 1e-8) {
+            vec3 dir = toNode * inversesqrt(centerDistSq);
+            vec3 coneAxis = unpackOct32(node.extentConeChild.z);
+            float cosLightDir = dot(coneAxis, -dir);
+            cosCone = clamp((cosLightDir - coneCos) / max(1.0 - coneCos, 1e-3), 0.05, 1.0);
+        }
     }
 
     return (flux * cosCone) / distSq;
@@ -451,18 +447,20 @@ float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode n
             outIdx = 0u; \
             outPdf = 1.0; \
         } else { \
-            uint nodeIdx_ = 0u; \
+            LightTreeNode node_ = lightNodes[0u]; \
             float pathProb_ = 1.0; \
+            outIdx = 0u; \
             for (uint depth_ = 0u; depth_ < 32u; ++depth_) { \
-                LightTreeNode node_ = lightNodes[nodeIdx_]; \
-                if (node_.children.z == 1u /* isLeaf */) { \
-                    outIdx = node_.children.x; \
+                uint childWord_ = node_.extentConeChild.w; \
+                if ((childWord_ & 0x80000000u) != 0u) { \
+                    outIdx = childWord_ & 0x7FFFFFFFu; \
                     break; \
                 } \
-                uint leftIdx_ = node_.children.x; \
-                uint rightIdx_ = node_.children.y; \
-                float impLeft_ = evalLightTreeNodeImportance(hitPoint, hitNormal, lightNodes[leftIdx_]); \
-                float impRight_ = evalLightTreeNodeImportance(hitPoint, hitNormal, lightNodes[rightIdx_]); \
+                uint firstChild_ = childWord_ & 0x7FFFFFFFu; \
+                LightTreeNode leftNode_ = lightNodes[firstChild_]; \
+                LightTreeNode rightNode_ = lightNodes[firstChild_ + 1u]; \
+                float impLeft_ = evalLightTreeNodeImportance(hitPoint, hitNormal, leftNode_); \
+                float impRight_ = evalLightTreeNodeImportance(hitPoint, hitNormal, rightNode_); \
                 float totalImp_ = impLeft_ + impRight_; \
                 if (totalImp_ <= 1e-12) { \
                     impLeft_ = 0.5; \
@@ -470,15 +468,16 @@ float evalLightTreeNodeImportance(vec3 hitPoint, vec3 hitNormal, LightTreeNode n
                 } \
                 float probLeft_ = clamp(impLeft_ / totalImp_, 0.001, 0.999); \
                 if (randFloat(seed) < probLeft_) { \
-                    nodeIdx_ = leftIdx_; \
+                    node_ = leftNode_; \
                     pathProb_ *= probLeft_; \
                 } else { \
-                    nodeIdx_ = rightIdx_; \
+                    node_ = rightNode_; \
                     pathProb_ *= (1.0 - probLeft_); \
                 } \
             } \
-            if (lightNodes[nodeIdx_].children.z == 1u) { \
-                outIdx = lightNodes[nodeIdx_].children.x; \
+            uint leafWord_ = node_.extentConeChild.w; \
+            if ((leafWord_ & 0x80000000u) != 0u) { \
+                outIdx = leafWord_ & 0x7FFFFFFFu; \
             } \
             outPdf = max(pathProb_, 1e-20); \
         } \

@@ -170,6 +170,8 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
+    ${SHADER_DIR}/compute/restir_di_reuse.comp
+    ${SHADER_DIR}/compute/restir_gi_reuse.comp
     ${SHADER_DIR}/compute/restir_debug_view.comp
     ${SHADER_DIR}/ui/imgui_hdr.frag
 )
@@ -244,11 +246,22 @@ function(add_specialized_wf_shader OUT_NAME SRC_FILE)
     set(SPV_FILES ${SPV_FILES} ${OUT_SPV} PARENT_SCOPE)
 endfunction()
 
-add_specialized_wf_shader(wavefront_shade_diffuse_restir.comp wavefront_shade_diffuse.comp -DENABLE_RESTIR_PT=1)
-add_specialized_wf_shader(wavefront_shade_diffuse_sec_restir.comp wavefront_shade_diffuse.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1)
-add_specialized_wf_shader(wavefront_shade_complex_restir.comp wavefront_shade_complex.comp -DENABLE_RESTIR_PT=1)
-add_specialized_wf_shader(wavefront_shade_complex_sec_restir.comp wavefront_shade_complex.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1)
-add_specialized_wf_shader(wavefront_shade_dielectric_restir.comp wavefront_shade_dielectric.comp -DENABLE_RESTIR_PT=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_sec.comp wavefront_shade_dielectric.comp -DIS_SECONDARY_BOUNCE=1)
+
+# NRC specialized material shading variants (isolates NRC VGPR/descriptor pressure from Pure MC paths)
+add_specialized_wf_shader(wavefront_shade_diffuse_nrc.comp wavefront_shade_diffuse.comp -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_diffuse_sec_nrc.comp wavefront_shade_diffuse.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_complex_nrc.comp wavefront_shade_complex.comp -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_complex_sec_nrc.comp wavefront_shade_complex.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_nrc.comp wavefront_shade_dielectric.comp -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_sec_nrc.comp wavefront_shade_dielectric.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_NRC=1)
+
+add_specialized_wf_shader(wavefront_shade_diffuse_restir.comp wavefront_shade_diffuse.comp -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_diffuse_sec_restir.comp wavefront_shade_diffuse.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_complex_restir.comp wavefront_shade_complex.comp -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_complex_sec_restir.comp wavefront_shade_complex.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_restir.comp wavefront_shade_dielectric.comp -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
+add_specialized_wf_shader(wavefront_shade_dielectric_sec_restir.comp wavefront_shade_dielectric.comp -DIS_SECONDARY_BOUNCE=1 -DENABLE_RESTIR_PT=1 -DENABLE_NRC=1)
 add_specialized_wf_shader(wavefront_shade_emissive_restir.comp wavefront_shade_emissive.comp -DENABLE_RESTIR_PT=1)
 
 # Upways 4.0 INT8 QAT & FP16 WMMA variants
@@ -726,6 +739,11 @@ add_test(NAME BlasBatch COMMAND test_blas_batch)
 add_executable(test_light_tree tests/test_light_tree.cpp)
 target_link_libraries(test_light_tree PRIVATE pathways_engine_core)
 add_test(NAME LightTree COMMAND test_light_tree)
+
+# 2D Equirectangular Environment Importance Table & MIS Math Unit Test Target
+add_executable(test_env_importance tests/test_env_importance.cpp)
+target_link_libraries(test_env_importance PRIVATE pathways_engine_core)
+add_test(NAME EnvImportance COMMAND test_env_importance)
 
 # glTF KHR_mesh_quantization, KHR_materials_specular & MiniJson Unit Test Target
 add_executable(test_mesh_quantization tests/test_mesh_quantization.cpp)

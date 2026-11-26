@@ -47,7 +47,8 @@ public:
                const std::vector<char>& inferSpv,
                const std::vector<char>& trainSpv,
                const std::vector<char>& resolveSpv = {},
-               VkPhysicalDevice physDevice = VK_NULL_HANDLE);
+               VkPhysicalDevice physDevice = VK_NULL_HANDLE,
+               VkPipelineCache pipelineCache = VK_NULL_HANDLE);
     ~NRCManager();
 
     NRCManager(const NRCManager&) = delete;
@@ -115,6 +116,7 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     uint32_t m_maxQueries = 0;

@@ -38,17 +38,15 @@
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// Reservoir layout: 8 × 4 B = 32 bytes, matches DiReservoirGPU in ReSTIRTypes.hpp
+// Reservoir layout: 6 x 4 B = 24 bytes, matches DiReservoirGPU in ReSTIRTypes.hpp
 // -----------------------------------------------------------------------------
 struct DiReservoir {
-    uint  idxM;        // [23:0] light index (up to 16.7M lights), [31:24] M (0..255)
-    float wSum;        // RIS weight sum
-    float targetPdf;   // p̂ of the selected sample at the storing pixel
-    uint  flags;       // [7:0] age, [8] valid, [9] transmission lobe, [25:10] oct16(x1 normal)
-    float hitDist;     // x1 -> light-sample distance (1e4 for directional lights)
-    uint  lightPacked; // [15:0] oct16(light normal), [31:16] bf16(selectPdf)
-    uint  x1Misc;      // [15:0] fp16 cos(theta at light, stored config), [31:16] fp16 primary hit distance
-    uint  lightUv16;   // packUnorm2x16(luv) — full 16-bit area-light sample UV
+    uint  idxM;          // [23:0] light index (up to 16.7M lights), [31:24] M (0..255)
+    float wSum;          // RIS weight sum
+    uint  targetCosBits; // [31:8] fp32(targetPdf)[31:8], [7:0] unorm8 cos(theta at light)
+    uint  flags;         // [7:0] age (transient diffTrans pre-reuse), [8] valid, [9] trans lobe, [25:10] oct16(x1 normal)
+    uint  distHitT;      // [15:0] fp16 hitDist, [31:16] fp16 primary hit distance
+    uint  lightUv16;     // packUnorm2x16(luv) — full 16-bit area-light sample UV
 };
 
 // Tunables / bias gates
@@ -86,6 +84,13 @@ uint restirGetM(uint idxM) {
 
 uint restirPackOct16(vec3 v) {
     vec2 enc = octEncode(normalize(v)) * 0.5 + 0.5;
+    uint u8 = uint(clamp(enc.x * 255.0, 0.0, 255.0));
+    uint v8 = uint(clamp(enc.y * 255.0, 0.0, 255.0));
+    return (u8 & 0xFFu) | ((v8 & 0xFFu) << 8u);
+}
+
+uint restirPackOct16FromOct32(uint oct32) {
+    vec2 enc = clamp(unpackSnorm2x16(oct32), vec2(-1.0), vec2(1.0)) * 0.5 + 0.5;
     uint u8 = uint(clamp(enc.x * 255.0, 0.0, 255.0));
     uint v8 = uint(clamp(enc.y * 255.0, 0.0, 255.0));
     return (u8 & 0xFFu) | ((v8 & 0xFFu) << 8u);
@@ -146,15 +151,45 @@ vec2 restirUnpackUv8(uint packedUv) {
     return vec2(u, v);
 }
 
+// Transient ReSTIR DI control flags packed into bits [31:26] of DiReservoir.flags
+// (bits [25:0] store age, valid, trans, oct16(x1Normal)).
+const uint DI_FLAG_ACTIVE           = (1u << 26u); // bounce-0 diffuse/complex surface ran ReSTIR DI
+const uint DI_FLAG_FRESH_VISIBLE    = (1u << 27u); // fresh DI sample passed shadow ray test
+const uint DI_FLAG_NEED_FRESH_VIS   = (1u << 28u); // shadow ray was queued for fresh DI sample
+const uint DI_FLAG_DI_MIS_ACTIVE    = (1u << 29u); // DI ReSTIR MIS enabled on primary hit
+const uint DI_FLAG_HAS_CONT         = (1u << 30u); // surface also has indirect bounce-1 continuation
+const uint DI_FLAG_MERGE_MATTE_SPEC = (1u << 31u); // fold matte spec into ML diffuse output
+const uint DI_FLAG_HISTORY_MASK     = 0x03FFFFFFu; // persistent history bits [25:0]
+
+uint restirDiPackTargetCos(float targetPdf, float cosLight) {
+    uint tBits = (targetPdf > 0.0) ? (floatBitsToUint(targetPdf) & ~0xFFu) : 0u;
+    uint c8 = uint(clamp(round(clamp(cosLight, 0.0, 1.0) * 255.0), 0.0, 255.0));
+    return tBits | c8;
+}
+
+float restirDiGetTarget(uint targetCosBits) {
+    return uintBitsToFloat(targetCosBits & ~0xFFu);
+}
+
+float restirDiGetCosLight(uint targetCosBits) {
+    return float(targetCosBits & 0xFFu) * (1.0 / 255.0);
+}
+
+uint restirDiPackDistHitT(float hitDist, float hitT) {
+    return packHalf2x16(vec2(clamp(hitDist, 0.0, 60000.0), clamp(hitT, 0.0, 60000.0)));
+}
+
+vec2 restirDiUnpackDistHitT(uint distHitT) {
+    return unpackHalf2x16(distHitT);
+}
+
 DiReservoir invalidDiReservoir() {
     DiReservoir r;
     r.idxM = 0u;
     r.wSum = 0.0;
-    r.targetPdf = 0.0;
+    r.targetCosBits = 0u;
     r.flags = 0u;
-    r.hitDist = 0.0;
-    r.lightPacked = 0u;
-    r.x1Misc = 0u;
+    r.distHitT = 0u;
     r.lightUv16 = 0u;
     return r;
 }
@@ -170,6 +205,25 @@ DiReservoir invalidDiReservoir() {
 // -----------------------------------------------------------------------------
 // Direct light path reconnection for a stored (lightIndex, luv) sample
 // -----------------------------------------------------------------------------
+bool reconnectEnvDirectPath(
+    vec2 envUv,
+    float envIntensity,
+    out vec3 lightDir,
+    out float lightDist,
+    out vec3 lightEmission
+) {
+    if (!(envIntensity > 0.0)) {
+        lightDir = vec3(0.0, 1.0, 0.0);
+        lightDist = 0.0;
+        lightEmission = vec3(0.0);
+        return false;
+    }
+    lightDir = envUvToDir(envUv);
+    lightDist = 10000.0;
+    lightEmission = textureLod(environmentMap, envUv, 0.0).rgb * envIntensity;
+    return true;
+}
+
 bool reconnectDirectPath(
     vec3 hitPoint,
     Light light,
@@ -293,6 +347,7 @@ float restirEvalTargetPdf(
 
 void restirDiFreshStream(
     uint numLights,
+    float envIntensity,
     bool useLightTree,
     vec3 hitPoint,
     vec3 hitNormal,
@@ -320,62 +375,86 @@ void restirDiFreshStream(
     sel.luv = vec2(0.5);
     sel.isTrans = false;
 
-    for (uint c = 0u; c < M; ++c) {
-        uint lightIdx = 0u;
-        float lightSelectPdf = 1.0;
-        if (useLightTree && numLights > 1u) {
-            SAMPLE_LIGHT_TREE(numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
-        } else {
-            SAMPLE_LIGHT_ALIAS(numLights, seed, lightIdx, lightSelectPdf);
-        }
+    float pEnv = (envNeeActive() && envIntensity > 0.0)
+        ? ((numLights == 0u) ? 1.0 : envNeeSelectProb())
+        : 0.0;
+    if (numLights == 0u && pEnv <= 0.0) {
+        r.idxM = restirPackIdxM(0u, M);
+        r.wSum = 0.0;
+        r.targetCosBits = restirDiPackTargetCos(0.0, 1.0);
+        r.flags = restirPackFlags(0u, true, false, hitNormal);
+        r.distHitT = restirDiPackDistHitT(0.0, hitT);
+        r.lightUv16 = 0u;
+        return;
+    }
 
-        Light light = lights[lightIdx];
+    for (uint c = 0u; c < M; ++c) {
+        bool pickEnv = (numLights == 0u) || (pEnv > 0.0 && randFloat(seed) < pEnv);
+        uint lightIdx = RESTIR_LIGHT_IDX_ENV;
+        float lightSelectPdf = pEnv;
         vec3 lightDir = vec3(0.0);
         float lightDist = 0.0;
         float lightPdf = 1.0;
-        vec3 lightEmission = light.emission.rgb;
+        vec3 lightEmission = vec3(0.0);
         bool validLightSample = false;
         vec2 luv = vec2(0.5);
         float cosLight = 1.0;
 
-        uint lightType = uint(light.position.w);
-        if (lightType == 0u || lightType == 3u /* AREA QUAD / TRIANGLE */) {
-            luv = randVec2(seed);
-            vec2 uv = luv;
-            if (lightType == 3u) {
-                float r1 = sqrt(luv.x);
-                uv = vec2(1.0 - r1, luv.y * r1);
-            }
-            vec3 lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
-            vec3 toLight = lightPoint - hitPoint;
-            lightDist = length(toLight);
-            lightDir = toLight / max(lightDist, 1e-4);
-
-            cosLight = dot(-lightDir, light.normal.xyz);
-            if (cosLight > 0.0) {
-                float area = light.emission.w;
-                lightPdf = (lightDist * lightDist) / (area * cosLight);
+        if (pickEnv) {
+            if (sampleEnvMapImportance(randVec3(seed), lightDir, luv, lightPdf)) {
+                lightDist = 10000.0;
+                lightEmission = textureLod(environmentMap, luv, 0.0).rgb * envIntensity;
                 validLightSample = true;
             }
-        } else if (lightType == 1u /* SPOT */) {
-            vec3 toLight = light.position.xyz - hitPoint;
-            lightDist = length(toLight);
-            lightDir = toLight / max(lightDist, 1e-4);
+        } else {
+            if (useLightTree && numLights > 1u) {
+                SAMPLE_LIGHT_TREE(numLights, hitPoint, hitNormal, seed, lightIdx, lightSelectPdf);
+            } else {
+                SAMPLE_LIGHT_ALIAS(numLights, seed, lightIdx, lightSelectPdf);
+            }
+            lightSelectPdf *= max(1.0 - pEnv, 1e-20);
 
-            float cosSpot = dot(-lightDir, light.normal.xyz);
-            float innerCos = light.u.w;
-            float outerCos = light.v.w;
-            if (cosSpot >= outerCos) {
-                float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+            Light light = lights[lightIdx];
+            lightEmission = light.emission.rgb;
+            uint lightType = uint(light.position.w);
+            if (lightType == 0u || lightType == 3u /* AREA QUAD / TRIANGLE */) {
+                luv = randVec2(seed);
+                vec2 uv = luv;
+                if (lightType == 3u) {
+                    float r1 = sqrt(luv.x);
+                    uv = vec2(1.0 - r1, luv.y * r1);
+                }
+                vec3 lightPoint = light.position.xyz + uv.x * light.u.xyz + uv.y * light.v.xyz;
+                vec3 toLight = lightPoint - hitPoint;
+                lightDist = length(toLight);
+                lightDir = toLight / max(lightDist, 1e-4);
+
+                cosLight = dot(-lightDir, light.normal.xyz);
+                if (cosLight > 0.0) {
+                    float area = light.emission.w;
+                    lightPdf = (lightDist * lightDist) / (area * cosLight);
+                    validLightSample = true;
+                }
+            } else if (lightType == 1u /* SPOT */) {
+                vec3 toLight = light.position.xyz - hitPoint;
+                lightDist = length(toLight);
+                lightDir = toLight / max(lightDist, 1e-4);
+
+                float cosSpot = dot(-lightDir, light.normal.xyz);
+                float innerCos = light.u.w;
+                float outerCos = light.v.w;
+                if (cosSpot >= outerCos) {
+                    float spotFactor = clamp((cosSpot - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                    lightEmission *= spotFactor / max(lightDist * lightDist, 1e-4);
+                    lightPdf = 1.0;
+                    validLightSample = true;
+                }
+            } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
+                lightDir = normalize(light.normal.xyz);
+                lightDist = 10000.0;
                 lightPdf = 1.0;
                 validLightSample = true;
             }
-        } else if (uint(light.position.w) == 2u /* DIRECTIONAL */) {
-            lightDir = normalize(light.normal.xyz);
-            lightDist = 10000.0;
-            lightPdf = 1.0;
-            validLightSample = true;
         }
 
         float rawNdotL = dot(hitNormal, lightDir);
@@ -407,21 +486,17 @@ void restirDiFreshStream(
     if (sel.has) {
         r.idxM = restirPackIdxM(sel.lightIdx, M);
         r.wSum = totalWeightSum;
-        r.targetPdf = sel.target;
-        r.hitDist = sel.dist;
-        r.lightPacked = restirPackLightNormalAndSelectPdf(lights[sel.lightIdx].normal.xyz, sel.selectPdf);
+        r.targetCosBits = restirDiPackTargetCos(sel.target, sel.cosLight);
         r.flags = restirPackFlags(0u, true, sel.isTrans, hitNormal);
-        r.x1Misc = restirPackF16Pair(sel.cosLight, min(hitT, 60000.0));
+        r.distHitT = restirDiPackDistHitT(sel.dist, hitT);
         r.lightUv16 = packUnorm2x16(sel.luv);
     } else {
         // Unlit / backfacing candidates evaluated this frame: carries 0 weight, but M trials
         r.idxM = restirPackIdxM(0u, M);
         r.wSum = 0.0;
-        r.targetPdf = 0.0;
-        r.hitDist = 0.0;
-        r.lightPacked = 0u;
+        r.targetCosBits = restirDiPackTargetCos(0.0, 1.0);
         r.flags = restirPackFlags(0u, true, false, hitNormal);
-        r.x1Misc = restirPackF16Pair(1.0, min(hitT, 60000.0));
+        r.distHitT = restirDiPackDistHitT(0.0, hitT);
         r.lightUv16 = 0u;
     }
 }
@@ -434,6 +509,7 @@ void restirDiFreshStream(
 bool restirDiPrepareTapShadowRay(
     in DiReservoir src,
     uint numLights,
+    float envIntensity,
     vec3 hitPoint,
     vec3 hitNormal,
     float expectedPrevHitT,
@@ -450,20 +526,23 @@ bool restirDiPrepareTapShadowRay(
     uint mSrc = restirGetM(src.idxM);
     if (mSrc == 0u) return false;
     uint srcLightIdx = restirGetLightIdx(src.idxM);
-    if (srcLightIdx >= numLights) return false;
+    bool srcIsEnv = (srcLightIdx == RESTIR_LIGHT_IDX_ENV) && envNeeActive() && (envIntensity > 0.0);
+    if (!srcIsEnv && srcLightIdx >= numLights) return false;
     if (dot(hitNormal, restirGetX1Normal(src.flags)) < RESTIR_TAP_NORMAL_MIN_DOT) return false;
-    vec2 srcMisc = restirUnpackF16Pair(src.x1Misc);
-    float srcX1Dist = srcMisc.y;
+    vec2 srcDistHitT = restirDiUnpackDistHitT(src.distHitT);
+    float srcX1Dist = srcDistHitT.y;
     float relDepthDiff = abs(expectedPrevHitT - srcX1Dist) / max(max(expectedPrevHitT, srcX1Dist), 1e-4);
     float tapDepthGate = (numLights > 4096u) ? 0.04 : RESTIR_TAP_DEPTH_REL_GATE;
     if (relDepthDiff > tapDepthGate) return false;
-    if (src.targetPdf <= 0.0 || src.wSum <= 0.0) return false;
+    if (restirDiGetTarget(src.targetCosBits) <= 0.0 || src.wSum <= 0.0) return false;
 
-    Light srcLight = lights[srcLightIdx];
     vec2 srcLuv = unpackUnorm2x16(src.lightUv16);
     vec3 reconEmission;
-    float cosLightNew;
-    if (!reconnectDirectPath(hitPoint, srcLight, srcLuv, outShadowDir, outShadowDist, reconEmission, cosLightNew)) {
+    float cosLightNew = 1.0;
+    bool reconOk = srcIsEnv
+        ? reconnectEnvDirectPath(srcLuv, envIntensity, outShadowDir, outShadowDist, reconEmission)
+        : reconnectDirectPath(hitPoint, lights[srcLightIdx], srcLuv, outShadowDir, outShadowDist, reconEmission, cosLightNew);
+    if (!reconOk) {
         return false;
     }
     float rawNdotL = dot(hitNormal, outShadowDir);
@@ -483,6 +562,7 @@ bool restirDiApplyTapEx(
     inout DiSample sel,
     in DiReservoir src,
     uint numLights,
+    float envIntensity,
     vec3 hitPoint,
     vec3 hitNormal,
     float hitT,
@@ -520,12 +600,13 @@ bool restirDiApplyTapEx(
     if (mSrc == 0u) return false;
 
     uint srcLightIdx = restirGetLightIdx(src.idxM);
-    if (srcLightIdx >= numLights) return false;
+    bool srcIsEnv = (srcLightIdx == RESTIR_LIGHT_IDX_ENV) && envNeeActive() && (envIntensity > 0.0);
+    if (!srcIsEnv && srcLightIdx >= numLights) return false;
 
     // Disocclusion / surface-similarity gates against the stored x1 context.
     if (dot(hitNormal, restirGetX1Normal(src.flags)) < RESTIR_TAP_NORMAL_MIN_DOT) return false;
-    vec2 srcMisc = restirUnpackF16Pair(src.x1Misc);
-    float srcX1Dist = srcMisc.y;
+    vec2 srcDistHitT = restirDiUnpackDistHitT(src.distHitT);
+    float srcX1Dist = srcDistHitT.y;
     float relDepthDiff = abs(expectedPrevHitT - srcX1Dist) / max(max(expectedPrevHitT, srcX1Dist), 1e-4);
     float tapDepthGate = (numLights > 4096u) ? 0.04 : RESTIR_TAP_DEPTH_REL_GATE;
     if (relDepthDiff > tapDepthGate) return false;
@@ -535,19 +616,21 @@ bool restirDiApplyTapEx(
     outEval.mTap = mTap;
 
     // If source evaluated samples with 0 weight, it contributes 0 weight but carries mTap trials.
-    if (src.targetPdf <= 0.0 || src.wSum <= 0.0) {
+    float srcTargetPdf = restirDiGetTarget(src.targetCosBits);
+    if (srcTargetPdf <= 0.0 || src.wSum <= 0.0) {
         uint combinedM = min(restirGetM(r.idxM) + mTap, 255u);
         r.idxM = restirPackIdxM(restirGetLightIdx(r.idxM), combinedM);
         return false;
     }
 
-    Light srcLight = lights[srcLightIdx];
     vec2 srcLuv = unpackUnorm2x16(src.lightUv16);
     vec3 reconDir;
     float reconDist;
     vec3 reconEmission;
-    float cosLightNew;
-    bool reconOk = reconnectDirectPath(hitPoint, srcLight, srcLuv, reconDir, reconDist, reconEmission, cosLightNew);
+    float cosLightNew = 1.0;
+    bool reconOk = srcIsEnv
+        ? reconnectEnvDirectPath(srcLuv, envIntensity, reconDir, reconDist, reconEmission)
+        : reconnectDirectPath(hitPoint, lights[srcLightIdx], srcLuv, reconDir, reconDist, reconEmission, cosLightNew);
 
     float rawNdotL = reconOk ? dot(hitNormal, reconDir) : 0.0;
     bool isTrans = (rawNdotL < 0.0 && diffTrans > 0.001);
@@ -564,11 +647,11 @@ bool restirDiApplyTapEx(
     float pHat = restirEvalTargetPdf(reconEmission, reconDir, hitNormal, V,
                                      diffColor, F0, alphaRoughness, diffTrans, isTrans);
 
-    uint srcLightType = uint(srcLight.position.w);
-    float J = evalDirectReuseJacobian(srcLightType, cosLightNew, reconDist, srcMisc.x, src.hitDist);
+    uint srcLightType = srcIsEnv ? 2u : uint(lights[srcLightIdx].position.w);
+    float J = evalDirectReuseJacobian(srcLightType, cosLightNew, reconDist, restirDiGetCosLight(src.targetCosBits), srcDistHitT.x);
 
     // History M-truncation scales the stored sum by mTap/mSrc before re-weighting.
-    float W_src = src.wSum / max(float(mSrc) * src.targetPdf, 1e-6);
+    float W_src = src.wSum / max(float(mSrc) * srcTargetPdf, 1e-6);
     float wFactor = W_src * J;
     if (clampWeight) {
         bool isAreaSrc = (srcLightType == 0u || srcLightType == 3u);
@@ -592,7 +675,7 @@ bool restirDiApplyTapEx(
         weight = 0.0;
     }
 
-    float cachedSelectPdf = restirUnpackSelectPdf(src.lightPacked);
+    float cachedSelectPdf = -1.0;
     if (weight > 0.0) {
         outEval.weightOverPHat = wFactor * float(mTap);
         outEval.tapSample.lightIdx = srcLightIdx;
@@ -625,13 +708,11 @@ bool restirDiApplyTapEx(
         sel.has = true;
 
         r.idxM = restirPackIdxM(srcLightIdx, combinedM);
-        r.targetPdf = pHat;
-        r.hitDist = reconDist;
-        r.lightPacked = restirPackLightNormalAndSelectPdf(srcLight.normal.xyz, cachedSelectPdf);
+        r.targetCosBits = restirDiPackTargetCos(pHat, cosLightNew);
         // x1 context is re-stamped with the CURRENT surface: the reservoir
         // describes this pixel for the next frame's taps.
         r.flags = restirPackFlags(ageNew, true, isTrans, hitNormal);
-        r.x1Misc = restirPackF16Pair(cosLightNew, min(hitT, 60000.0));
+        r.distHitT = restirDiPackDistHitT(reconDist, hitT);
         r.lightUv16 = packUnorm2x16(srcLuv);
         return true;
     } else {
@@ -645,6 +726,7 @@ bool restirDiApplyTap(
     inout DiSample sel,
     in DiReservoir src,
     uint numLights,
+    float envIntensity,
     vec3 hitPoint,
     vec3 hitNormal,
     float hitT,
@@ -662,7 +744,7 @@ bool restirDiApplyTap(
 ) {
     DiTapEval unusedEval;
     return restirDiApplyTapEx(
-        r, sel, src, numLights, hitPoint, hitNormal, hitT, expectedPrevHitT,
+        r, sel, src, numLights, envIntensity, hitPoint, hitNormal, hitT, expectedPrevHitT,
         V, diffColor, F0, alphaRoughness, diffTrans,
         mCap, ageNew, isOccluded, clampWeight, seed, unusedEval
     );
@@ -699,14 +781,16 @@ struct GiReservoir {
     uint dSrcFlagsM;
 };
 
-// Per-pixel BRDF context at the primary hit x1 (24 bytes, matches X1ContextGPU).
+// Per-pixel BRDF context at the primary hit x1 (16 bytes / 1 uvec4, matches X1ContextGPU).
 struct X1Context {
-    uint n1Oct;     // oct32(x1 world shading normal)
-    uint albedoRG;  // fp16 (baseColor.r, baseColor.g)
-    uint albedoB;   // [15:0] fp16 baseColor.b, [31:16] fp16 metallic
-    uint flags;     // [0] valid (GI), [1] diRestirMis, [31:2] qSelf fp32[31:2]
-    uint woOct;     // oct32(x1 -> camera direction, V at primary hit)
-    uint f0Pad;     // [15:0] fp16 dielectric scalar F0, [31:16] fp16 roughness
+    uvec4 data;
+    // .x: n1Oct  - oct32(x1 world shading normal)
+    // .y: alRG   - fp16 (baseColor.r, baseColor.g)
+    // .z: alBM   - fp16 (baseColor.b, metallic)
+    // .w: packed - [1:0] flags (valid, diRestirMis),
+    //              [9:2] roughness (unorm8),
+    //              [17:10] sqrt(f0Scalar) (unorm8; 0.04 -> 51/255 exact),
+    //              [31:18] qSelf (positive fp32 bits [30:17])
 };
 
 const uint  GI_MAX_AGE          = 63u;
@@ -737,48 +821,70 @@ vec3 restirUnpackRgb9e5(uint p) {
     return vec3(float(p & 0x1FFu), float((p >> 9u) & 0x1FFu), float((p >> 18u) & 0x1FFu)) * scale;
 }
 
+const uint X1_FLAG_VALID         = 1u;
+const uint X1_FLAG_DI_RESTIR_MIS = 2u;
+const uint X1_FLAGS_MASK         = 3u;
+
+uint packX1PackedW(uint flags, float f0Scalar, float roughness, float qSelf) {
+    uint rQ = clamp(uint(roundEven(clamp(roughness, 0.0, 1.0) * 255.0)), 0u, 255u);
+    uint fQ = clamp(uint(roundEven(sqrt(clamp(f0Scalar, 0.0, 1.0)) * 255.0)), 0u, 255u);
+    uint qBits = (qSelf > 0.0) ? (((floatBitsToUint(qSelf) + (1u << 16u)) >> 17u) & 0x3FFFu) : 0u;
+    return (flags & X1_FLAGS_MASK) | (rQ << 2u) | (fQ << 10u) | (qBits << 18u);
+}
+
 X1Context invalidX1Context() {
     X1Context c;
-    c.n1Oct = 0u;
-    c.albedoRG = 0u;
-    c.albedoB = 0u;
-    c.flags = 0u;
-    c.woOct = 0u;
-    c.f0Pad = 0u;
+    c.data = uvec4(0u);
+    return c;
+}
+
+X1Context makeDiMisOnlyX1Context() {
+    X1Context c;
+    c.data = uvec4(0u, 0u, 0u, X1_FLAG_DI_RESTIR_MIS);
+    return c;
+}
+
+X1Context makeX1Context(vec3 n1, vec3 baseColor, float metallic, vec3 wo, float f0Scalar, float roughness, float qSelf, uint flags) {
+    X1Context c;
+    c.data.x = packOct32(normalize(n1));
+    c.data.y = packHalf2x16(clamp(baseColor.rg, vec2(0.0), vec2(65000.0)));
+    c.data.z = packHalf2x16(vec2(clamp(baseColor.b, 0.0, 65000.0), clamp(metallic, 0.0, 1.0)));
+    c.data.w = packX1PackedW(flags, f0Scalar, roughness, max(qSelf, 1e-8));
+    return c;
+}
+
+X1Context makePrepackedX1Context(vec3 n1, uint preY, uint preZ, uint preRF0Mask, float qSelf, uint flags) {
+    X1Context c;
+    float qEff = max(qSelf, 1e-8);
+    uint qBits = ((floatBitsToUint(qEff) + (1u << 16u)) >> 17u) & 0x3FFFu;
+    c.data.x = packOct32(normalize(n1));
+    c.data.y = preY;
+    c.data.z = preZ;
+    c.data.w = (flags & X1_FLAGS_MASK) | (preRF0Mask & 0x3FFFCu) | (qBits << 18u);
     return c;
 }
 
 X1Context makeX1Context(vec3 n1, vec3 baseColor, float metallic, vec3 wo, float f0Scalar, float roughness, float qSelf) {
-    X1Context c;
-    c.n1Oct = packOct32(normalize(n1));
-    c.albedoRG = packHalf2x16(clamp(baseColor.rg, vec2(0.0), vec2(65000.0)));
-    c.albedoB = packHalf2x16(vec2(clamp(baseColor.b, 0.0, 65000.0), clamp(metallic, 0.0, 1.0)));
-    c.flags = (floatBitsToUint(max(qSelf, 1e-8)) & ~3u) | 1u;
-    c.woOct = packOct32(normalize(wo));
-    c.f0Pad = packHalf2x16(vec2(clamp(f0Scalar, 0.0, 1.0), clamp(roughness, 0.0, 1.0)));
-    return c;
+    return makeX1Context(n1, baseColor, metallic, wo, f0Scalar, roughness, qSelf, X1_FLAG_VALID);
 }
 
-const uint  X1_FLAG_VALID         = 1u;
-const uint  X1_FLAG_DI_RESTIR_MIS = 2u;
-
-bool  x1ContextValid(X1Context c)            { return (c.flags & X1_FLAG_VALID) != 0u; }
-bool  x1ContextHasDiRestirMis(X1Context c)   { return (c.flags & X1_FLAG_DI_RESTIR_MIS) != 0u; }
-X1Context makeDiMisOnlyX1Context() {
-    X1Context c = invalidX1Context();
-    c.flags = X1_FLAG_DI_RESTIR_MIS;
-    return c;
-}
-vec3  x1ContextNormal(X1Context c)    { return unpackOct32(c.n1Oct); }
+bool  x1ContextValid(X1Context c)          { return (c.data.w & X1_FLAG_VALID) != 0u; }
+bool  x1ContextHasDiRestirMis(X1Context c) { return (c.data.w & X1_FLAG_DI_RESTIR_MIS) != 0u; }
+vec3  x1ContextNormal(X1Context c)         { return unpackOct32(c.data.x); }
 vec3  x1ContextBaseColor(X1Context c) {
-    vec2 rg = unpackHalf2x16(c.albedoRG);
-    return vec3(rg.x, rg.y, unpackHalf2x16(c.albedoB).x);
+    vec2 rg = unpackHalf2x16(c.data.y);
+    return vec3(rg.x, rg.y, unpackHalf2x16(c.data.z).x);
 }
-float x1ContextMetallic(X1Context c)  { return unpackHalf2x16(c.albedoB).y; }
-float x1ContextQSelf(X1Context c)     { return uintBitsToFloat(c.flags & ~3u); }
-vec3  x1ContextWo(X1Context c)        { return unpackOct32(c.woOct); }
-float x1ContextF0(X1Context c)        { return unpackHalf2x16(c.f0Pad).x; }
-float x1ContextRoughness(X1Context c) { return unpackHalf2x16(c.f0Pad).y; }
+float x1ContextMetallic(X1Context c)  { return unpackHalf2x16(c.data.z).y; }
+float x1ContextRoughness(X1Context c) { return float((c.data.w >> 2u) & 0xFFu) * (1.0 / 255.0); }
+float x1ContextF0(X1Context c) {
+    float s = float((c.data.w >> 10u) & 0xFFu) * (1.0 / 255.0);
+    return s * s;
+}
+float x1ContextQSelf(X1Context c) {
+    uint rawBits = (c.data.w & 0xFFFC0000u) >> 1u;
+    return (rawBits != 0u) ? uintBitsToFloat(rawBits) : 0.0;
+}
 
 GiReservoir invalidGiReservoir() {
     GiReservoir r;
@@ -806,7 +912,7 @@ vec3  giGetN2(GiReservoir r)        { return restirUnpackOct16(r.normalsPacked &
 vec3  giGetX1Normal(GiReservoir r)  { return restirUnpackOct16((r.normalsPacked >> 16u) & 0xFFFFu); }
 vec3  giGetRadiance(GiReservoir r)  { return restirUnpackRgb9e5(r.radRgb9e5); }
 
-GiReservoir makeGiReservoir(bool hasSurface, vec3 x2, vec3 n2, vec3 x1Normal, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
+GiReservoir makeGiReservoirOct16(bool hasSurface, vec3 x2, vec3 n2, uint octN1, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
     GiReservoir r = invalidGiReservoir();
     bool validSurf = hasSurface && (target > 0.0);
     r.posXBits = validSurf ? floatBitsToUint(x2.x) : 0u;
@@ -818,14 +924,60 @@ GiReservoir makeGiReservoir(bool hasSurface, vec3 x2, vec3 n2, vec3 x1Normal, fl
     r.targetCosBits = tBits | uCos;
     r.radRgb9e5 = validSurf ? restirPackRgb9e5(radiance) : 0u;
     uint octN2 = validSurf ? restirPackOct16(n2) : 0u;
-    uint octN1 = restirPackOct16(x1Normal);
-    r.normalsPacked = octN2 | (octN1 << 16u);
+    r.normalsPacked = octN2 | ((octN1 & 0xFFFFu) << 16u);
     uint dHalf = validSurf ? (packHalf2x16(vec2(clamp(dSrc, 0.0, 65000.0), 0.0)) & 0xFFFFu) : 0u;
     r.dSrcFlagsM = dHalf |
                    (1u << 16u) |
                    ((validSurf ? 1u : 0u) << 17u) |
                    ((min(age, GI_MAX_AGE) & 0x3Fu) << 18u) |
                    ((min(M, 255u) & 0xFFu) << 24u);
+    return r;
+}
+
+GiReservoir makeGiReservoir(bool hasSurface, vec3 x2, vec3 n2, vec3 x1Normal, float wSum, uint M, float target, vec3 radiance, float dSrc, float cosSrc, uint age) {
+    return makeGiReservoirOct16(hasSurface, x2, n2, restirPackOct16(x1Normal), wSum, M, target, radiance, dSrc, cosSrc, age);
+}
+
+// Planar SoA pack/unpack helpers for binding 38/39 (uvec2[4 * N] inside 32B/pixel allocation):
+//   Plane 0 [0 .. N-1]:     GiMeta    (x = radRgb9e5, y = oct16(x1Normal) | flags | age | M)  [8 B/px]
+//   Plane 1 [N .. 3N-1]:    GiPosN2   ([0] = (posX, posY), [1] = (posZ, oct16(n2) | fp16 dSrc)) [16 B/px]
+//   Plane 2 [3N .. 4N-1]:   GiWeights (x = wSumBits, y = targetCosBits)                         [8 B/px]
+bool  giMetaIsValid(uint metaY)     { return ((metaY >> 16u) & 1u) != 0u; }
+bool  giMetaHasSurface(uint metaY)  { return ((metaY >> 17u) & 1u) != 0u; }
+uint  giMetaGetAge(uint metaY)      { return (metaY >> 18u) & 0x3Fu; }
+uint  giMetaGetM(uint metaY)        { return (metaY >> 24u) & 0xFFu; }
+vec3  giMetaGetX1Normal(uint metaY) { return restirUnpackOct16(metaY & 0xFFFFu); }
+
+uvec2 giPackEmptyMeta(uint octN1, uint M) {
+    return uvec2(0u, (octN1 & 0xFFFFu) | (1u << 16u) | ((min(M, 255u) & 0xFFu) << 24u));
+}
+
+uvec2 giPackMeta(GiReservoir r) {
+    return uvec2(r.radRgb9e5, (r.dSrcFlagsM & 0xFFFF0000u) | ((r.normalsPacked >> 16u) & 0xFFFFu));
+}
+
+uvec2 giPackPosN2_0(GiReservoir r) {
+    return uvec2(r.posXBits, r.posYBits);
+}
+
+uvec2 giPackPosN2_1(GiReservoir r) {
+    return uvec2(r.posZBits, (r.normalsPacked & 0xFFFFu) | ((r.dSrcFlagsM & 0xFFFFu) << 16u));
+}
+
+uvec2 giPackWeights(GiReservoir r) {
+    return uvec2(r.wSumBits, r.targetCosBits);
+}
+
+GiReservoir giUnpackFromSoa(uvec2 meta, uvec2 p0, uvec2 p1, uvec2 w) {
+    GiReservoir r;
+    r.posXBits = p0.x;
+    r.posYBits = p0.y;
+    r.posZBits = p1.x;
+    r.wSumBits = w.x;
+    r.targetCosBits = w.y;
+    r.radRgb9e5 = meta.x;
+    r.normalsPacked = (p1.y & 0xFFFFu) | ((meta.y & 0xFFFFu) << 16u);
+    r.dSrcFlagsM = (p1.y >> 16u) | (meta.y & 0xFFFF0000u);
     return r;
 }
 

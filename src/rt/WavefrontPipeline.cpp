@@ -24,8 +24,10 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                                      bool enableDgcPreprocess,
                                      bool supportsSubgroupSizeControl,
                                      uint32_t maxBatchPixels,
-                                     const std::vector<char>& tailMegakernelCode)
-    : m_device(device), m_allocator(allocator), m_width(width), m_height(height),
+                                     const std::vector<char>& tailMegakernelCode,
+                                     VkPipelineCache pipelineCache,
+                                     const std::vector<char>& shadeDielectricSecCode)
+    : m_device(device), m_allocator(allocator), m_pipelineCache(pipelineCache), m_width(width), m_height(height),
       m_maxBatchPixels(maxBatchPixels),
       m_supportsExecutionSet(supportsExecutionSet), m_enableDgcPreprocess(enableDgcPreprocess),
       m_supportsSubgroupSizeControl(supportsSubgroupSizeControl) {
@@ -40,7 +42,7 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
                     shadeDiffuseCode, shadeDielectricCode, shadeComplexCode,
                     shadeEmissiveCode,
                     shadeDiffuseSecCode, shadeComplexSecCode,
-                    tailMegakernelCode);
+                    tailMegakernelCode, shadeDielectricSecCode);
 
     VkQueryPoolCreateInfo qpInfo{};
     qpInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
@@ -89,6 +91,7 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeEmissivePipeline) vkDestroyPipeline(m_device, m_shadeEmissivePipeline, nullptr);
     if (m_shadeDiffuseSecPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecPipeline, nullptr);
     if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
+    if (m_shadeDielectricSecPipeline) vkDestroyPipeline(m_device, m_shadeDielectricSecPipeline, nullptr);
     if (m_tailMegakernelPipeline) vkDestroyPipeline(m_device, m_tailMegakernelPipeline, nullptr);
     if (m_intersectAlphaPipeline) vkDestroyPipeline(m_device, m_intersectAlphaPipeline, nullptr);
     if (m_shadeDiffuseRestirPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseRestirPipeline, nullptr);
@@ -96,7 +99,16 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeComplexRestirPipeline) vkDestroyPipeline(m_device, m_shadeComplexRestirPipeline, nullptr);
     if (m_shadeComplexSecRestirPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecRestirPipeline, nullptr);
     if (m_shadeDielectricRestirPipeline) vkDestroyPipeline(m_device, m_shadeDielectricRestirPipeline, nullptr);
+    if (m_shadeDielectricSecRestirPipeline) vkDestroyPipeline(m_device, m_shadeDielectricSecRestirPipeline, nullptr);
     if (m_shadeEmissiveRestirPipeline) vkDestroyPipeline(m_device, m_shadeEmissiveRestirPipeline, nullptr);
+    if (m_shadeDiffuseNrcPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseNrcPipeline, nullptr);
+    if (m_shadeDiffuseSecNrcPipeline) vkDestroyPipeline(m_device, m_shadeDiffuseSecNrcPipeline, nullptr);
+    if (m_shadeComplexNrcPipeline) vkDestroyPipeline(m_device, m_shadeComplexNrcPipeline, nullptr);
+    if (m_shadeComplexSecNrcPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecNrcPipeline, nullptr);
+    if (m_shadeDielectricNrcPipeline) vkDestroyPipeline(m_device, m_shadeDielectricNrcPipeline, nullptr);
+    if (m_shadeDielectricSecNrcPipeline) vkDestroyPipeline(m_device, m_shadeDielectricSecNrcPipeline, nullptr);
+    if (m_restirDiReusePipeline) vkDestroyPipeline(m_device, m_restirDiReusePipeline, nullptr);
+    if (m_restirGiReusePipeline) vkDestroyPipeline(m_device, m_restirGiReusePipeline, nullptr);
 
     if (m_classifyPipeline) vkDestroyPipeline(m_device, m_classifyPipeline, nullptr);
     if (m_intersectPipeline) vkDestroyPipeline(m_device, m_intersectPipeline, nullptr);
@@ -167,7 +179,8 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 42, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uDirectDiffuseImage
         { 43, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uIndirectDiffuseImage
         { 44, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uDirectSpecularImage
-        { 45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uIndirectSpecularImage
+        { 45, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uIndirectSpecularImage
+        { 46, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // EnvImportanceBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -347,7 +360,9 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
                                                VkImageView mlDirectDiffuseImageView,
                                                VkImageView mlIndirectDiffuseImageView,
                                                VkImageView mlDirectSpecularImageView,
-                                               VkImageView mlIndirectSpecularImageView) {
+                                               VkImageView mlIndirectSpecularImageView,
+                                               VkBuffer envImportanceBuffer,
+                                               VkDeviceSize envImportanceSize) {
     if (frameSlot >= 2) frameSlot = 0;
     if (accumImageView == VK_NULL_HANDLE) return;
 
@@ -406,6 +421,10 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     VkBuffer actualLightTree = (lightTreeBuffer != VK_NULL_HANDLE) ? lightTreeBuffer : m_dummyReservoir->getBuffer();
     VkDeviceSize actualLightTreeSize = (lightTreeBuffer != VK_NULL_HANDLE && lightTreeSize > 0) ? lightTreeSize : VK_WHOLE_SIZE;
     VkDescriptorBufferInfo lightTreeInfo{ actualLightTree, 0, actualLightTreeSize };
+
+    VkBuffer actualEnvImp = (envImportanceBuffer != VK_NULL_HANDLE) ? envImportanceBuffer : m_dummyReservoir->getBuffer();
+    VkDeviceSize actualEnvImpSize = (envImportanceBuffer != VK_NULL_HANDLE && envImportanceSize > 0) ? envImportanceSize : VK_WHOLE_SIZE;
+    VkDescriptorBufferInfo envImpInfo{ actualEnvImp, 0, actualEnvImpSize };
 
     VkBuffer actualInstanceBuffer = (instanceBuffer != VK_NULL_HANDLE) ? instanceBuffer : m_dummyReservoir->getBuffer();
     VkDeviceSize actualInstanceSize = (instanceBuffer != VK_NULL_HANDLE && instanceSize > 0) ? instanceSize : VK_WHOLE_SIZE;
@@ -485,6 +504,7 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 43, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &indirectDiffImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 44, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &directSpecImageInfo, nullptr, nullptr });
         writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 45, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &indirectSpecImageInfo, nullptr, nullptr });
+        writes.push_back({ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, dset, 46, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &envImpInfo, nullptr });
 
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -516,7 +536,8 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
                                         const std::vector<char>& shadeEmissiveCode,
                                         const std::vector<char>& shadeDiffuseSecCode,
                                         const std::vector<char>& shadeComplexSecCode,
-                                        const std::vector<char>& tailMegakernelCode) {
+                                        const std::vector<char>& tailMegakernelCode,
+                                        const std::vector<char>& shadeDielectricSecCode) {
     // Pipeline Layout (128 bytes push constants for all stages)
     VkPushConstantRange pcRange{};
     pcRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -534,32 +555,20 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
         throw std::runtime_error("WavefrontPipeline: Failed to create pipeline layout!");
     }
 
-    m_classifyPipeline  = buildComputePipeline(classifyCode, "classify");
-    m_intersectPipeline = buildComputePipeline(intersectCode, "intersect");
-    m_shadePipeline     = buildComputePipeline(shadeCode, "shade");
-    m_shadowPipeline    = buildComputePipeline(shadowCode, "shadow");
-
-    if (!shadeDiffuseCode.empty()) {
-        m_shadeDiffusePipeline = buildComputePipeline(shadeDiffuseCode, "shade_diffuse");
-    }
-    if (!shadeDielectricCode.empty()) {
-        m_shadeDielectricPipeline = buildComputePipeline(shadeDielectricCode, "shade_dielectric");
-    }
-    if (!shadeComplexCode.empty()) {
-        m_shadeComplexPipeline = buildComputePipeline(shadeComplexCode, "shade_complex");
-    }
-    if (!shadeEmissiveCode.empty()) {
-        m_shadeEmissivePipeline = buildComputePipeline(shadeEmissiveCode, "shade_emissive");
-    }
-    if (!shadeDiffuseSecCode.empty()) {
-        m_shadeDiffuseSecPipeline = buildComputePipeline(shadeDiffuseSecCode, "shade_diffuse_sec");
-    }
-    if (!shadeComplexSecCode.empty()) {
-        m_shadeComplexSecPipeline = buildComputePipeline(shadeComplexSecCode, "shade_complex_sec");
-    }
-    if (!tailMegakernelCode.empty()) {
-        m_tailMegakernelPipeline = buildComputePipeline(tailMegakernelCode, "tail_megakernel");
-    }
+    buildComputePipelinesBatch({
+        { &classifyCode,            "classify",            &m_classifyPipeline },
+        { &intersectCode,           "intersect",           &m_intersectPipeline },
+        { &shadeCode,               "shade",               &m_shadePipeline },
+        { &shadowCode,              "shadow",              &m_shadowPipeline },
+        { &shadeDiffuseCode,        "shade_diffuse",       &m_shadeDiffusePipeline },
+        { &shadeDielectricCode,     "shade_dielectric",    &m_shadeDielectricPipeline },
+        { &shadeComplexCode,        "shade_complex",       &m_shadeComplexPipeline },
+        { &shadeEmissiveCode,       "shade_emissive",      &m_shadeEmissivePipeline },
+        { &shadeDiffuseSecCode,     "shade_diffuse_sec",   &m_shadeDiffuseSecPipeline },
+        { &shadeComplexSecCode,     "shade_complex_sec",   &m_shadeComplexSecPipeline },
+        { &shadeDielectricSecCode,  "shade_dielectric_sec",&m_shadeDielectricSecPipeline },
+        { &tailMegakernelCode,      "tail_megakernel",     &m_tailMegakernelPipeline }
+    });
 
     // Initialize DGCManager with Execution Set support flag:
     // [0] classify, [1] intersect, [2] shade, [3] shadow
@@ -581,11 +590,12 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
 
         VkPipeline secDiffuse = m_shadeDiffuseSecPipeline ? m_shadeDiffuseSecPipeline : m_shadeDiffusePipeline;
         VkPipeline secComplex = m_shadeComplexSecPipeline ? m_shadeComplexSecPipeline : m_shadeComplexPipeline;
+        VkPipeline secDielectric = m_shadeDielectricSecPipeline ? m_shadeDielectricSecPipeline : m_shadeDielectricPipeline;
 
         m_secondaryMatPipelines = {
             secDiffuse,                 // Slot 0: STANDARD Sec
             secComplex,                 // Slot 1: COMPLEX Sec
-            m_shadeDielectricPipeline,  // Slot 2: DIELECTRIC
+            secDielectric,              // Slot 2: DIELECTRIC Sec
             m_shadeEmissivePipeline     // Slot 3: EMISSIVE
         };
 
@@ -593,73 +603,123 @@ void WavefrontPipeline::createPipelines(const std::vector<char>& classifyCode,
     }
 }
 
-VkPipeline WavefrontPipeline::buildComputePipeline(const std::vector<char>& code, const char* name) {
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSize32{};
-    subgroupSize32.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
-    subgroupSize32.requiredSubgroupSize = 32;
-
-    VkShaderModuleCreateInfo moduleInfo{};
-    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    moduleInfo.pNext = m_supportsSubgroupSizeControl ? &subgroupSize32 : nullptr;
-    moduleInfo.codeSize = code.size();
-    moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-    VkPipelineShaderStageCreateInfo stage{};
-    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.pNext = &moduleInfo;
-    stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    stage.module = VK_NULL_HANDLE;
-    stage.pName = "main";
-
-    VkPipelineCreateFlags2CreateInfo flags2Info{};
-    flags2Info.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
-    flags2Info.pNext = nullptr;
-    flags2Info.flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
-
-    VkComputePipelineCreateInfo compInfo{};
-    compInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-    compInfo.pNext = &flags2Info;
-    compInfo.stage = stage;
-    compInfo.layout = m_pipelineLayout;
-
-    VkPipeline pipe = VK_NULL_HANDLE;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &pipe) != VK_SUCCESS) {
-        throw std::runtime_error(std::string("WavefrontPipeline: Failed to create compute pipeline ") + name);
+void WavefrontPipeline::buildComputePipelinesBatch(const std::vector<ComputePipelineSpec>& specs) {
+    std::vector<const ComputePipelineSpec*> active;
+    active.reserve(specs.size());
+    for (const auto& s : specs) {
+        if (s.code && !s.code->empty() && s.outPipeline && *s.outPipeline == VK_NULL_HANDLE) {
+            active.push_back(&s);
+        }
     }
+    if (active.empty()) {
+        return;
+    }
+
+    const size_t n = active.size();
+    std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> subgroupInfos(n);
+    std::vector<VkShaderModuleCreateInfo> moduleInfos(n);
+    std::vector<VkPipelineCreateFlags2CreateInfo> flags2Infos(n);
+    std::vector<VkComputePipelineCreateInfo> compInfos(n);
+    std::vector<VkPipeline> pipes(n, VK_NULL_HANDLE);
+
+    for (size_t i = 0; i < n; ++i) {
+        subgroupInfos[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+        subgroupInfos[i].pNext = nullptr;
+        subgroupInfos[i].requiredSubgroupSize = 32;
+
+        moduleInfos[i].sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        moduleInfos[i].pNext = m_supportsSubgroupSizeControl ? &subgroupInfos[i] : nullptr;
+        moduleInfos[i].codeSize = active[i]->code->size();
+        moduleInfos[i].pCode = reinterpret_cast<const uint32_t*>(active[i]->code->data());
+
+        flags2Infos[i].sType = VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO;
+        flags2Infos[i].pNext = nullptr;
+        flags2Infos[i].flags = VK_PIPELINE_CREATE_2_INDIRECT_BINDABLE_BIT_EXT;
+
+        compInfos[i].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+        compInfos[i].pNext = &flags2Infos[i];
+        compInfos[i].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        compInfos[i].stage.pNext = &moduleInfos[i];
+        compInfos[i].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        compInfos[i].stage.module = VK_NULL_HANDLE;
+        compInfos[i].stage.pName = "main";
+        compInfos[i].layout = m_pipelineLayout;
+    }
+
+    // Create one compute pipeline at a time so Khronos Validation Layers 1.4.357
+    // do not crash on batched inline VkShaderModuleCreateInfo (maintenance5) arrays,
+    // while still sharing m_pipelineCache across every shader compilation.
+    for (size_t i = 0; i < n; ++i) {
+        if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &compInfos[i], nullptr, &pipes[i]) != VK_SUCCESS) {
+            for (size_t j = 0; j < i; ++j) {
+                if (pipes[j] != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(m_device, pipes[j], nullptr);
+                }
+            }
+            throw std::runtime_error(std::string("WavefrontPipeline: Failed to create compute pipeline ") + active[i]->name);
+        }
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        *active[i]->outPipeline = pipes[i];
+    }
+}
+
+VkPipeline WavefrontPipeline::buildComputePipeline(const std::vector<char>& code, const char* name) {
+    VkPipeline pipe = VK_NULL_HANDLE;
+    buildComputePipelinesBatch({ { &code, name, &pipe } });
     return pipe;
 }
 
-void WavefrontPipeline::initSpecializedVariants(
-    const std::vector<char>& intersectAlphaCode,
+void WavefrontPipeline::initAlphaIntersectPipeline(const std::vector<char>& intersectAlphaCode) {
+    buildComputePipelinesBatch({
+        { &intersectAlphaCode, "intersect_alpha", &m_intersectAlphaPipeline }
+    });
+}
+
+void WavefrontPipeline::initTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode) {
+    buildComputePipelinesBatch({
+        { &tailMegakernelCode, "tail_megakernel", &m_tailMegakernelPipeline }
+    });
+}
+
+void WavefrontPipeline::rebuildMaterialExecutionSets() {
+    if (m_dgcManager && !m_primaryMatPipelines.empty()) {
+        m_dgcManager->initMaterialExecutionSets({
+            m_primaryMatPipelines,
+            m_secondaryMatPipelines,
+            m_restirPrimaryMatPipelines,
+            m_restirBounce1MatPipelines,
+            m_nrcPrimaryMatPipelines,
+            m_nrcSecondaryMatPipelines
+        });
+    }
+}
+
+void WavefrontPipeline::initRestirVariants(
     const std::vector<char>& shadeDiffuseRestirCode,
     const std::vector<char>& shadeDiffuseSecRestirCode,
     const std::vector<char>& shadeComplexRestirCode,
     const std::vector<char>& shadeComplexSecRestirCode,
     const std::vector<char>& shadeDielectricRestirCode,
-    const std::vector<char>& shadeEmissiveRestirCode) {
-    if (!intersectAlphaCode.empty() && m_intersectAlphaPipeline == VK_NULL_HANDLE) {
-        m_intersectAlphaPipeline = buildComputePipeline(intersectAlphaCode, "intersect_alpha");
-    }
-    if (!shadeDiffuseRestirCode.empty() && m_shadeDiffuseRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeDiffuseRestirPipeline = buildComputePipeline(shadeDiffuseRestirCode, "shade_diffuse_restir");
-    }
-    if (!shadeDiffuseSecRestirCode.empty() && m_shadeDiffuseSecRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeDiffuseSecRestirPipeline = buildComputePipeline(shadeDiffuseSecRestirCode, "shade_diffuse_sec_restir");
-    }
-    if (!shadeComplexRestirCode.empty() && m_shadeComplexRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeComplexRestirPipeline = buildComputePipeline(shadeComplexRestirCode, "shade_complex_restir");
-    }
-    if (!shadeComplexSecRestirCode.empty() && m_shadeComplexSecRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeComplexSecRestirPipeline = buildComputePipeline(shadeComplexSecRestirCode, "shade_complex_sec_restir");
-    }
-    if (!shadeDielectricRestirCode.empty() && m_shadeDielectricRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeDielectricRestirPipeline = buildComputePipeline(shadeDielectricRestirCode, "shade_dielectric_restir");
-    }
-    if (!shadeEmissiveRestirCode.empty() && m_shadeEmissiveRestirPipeline == VK_NULL_HANDLE) {
-        m_shadeEmissiveRestirPipeline = buildComputePipeline(shadeEmissiveRestirCode, "shade_emissive_restir");
-    }
+    const std::vector<char>& shadeEmissiveRestirCode,
+    const std::vector<char>& restirGiReuseCode,
+    const std::vector<char>& restirDiReuseCode,
+    const std::vector<char>& shadeDielectricSecRestirCode) {
+    buildComputePipelinesBatch({
+        { &shadeDiffuseRestirCode,       "shade_diffuse_restir",       &m_shadeDiffuseRestirPipeline },
+        { &shadeDiffuseSecRestirCode,    "shade_diffuse_sec_restir",   &m_shadeDiffuseSecRestirPipeline },
+        { &shadeComplexRestirCode,       "shade_complex_restir",       &m_shadeComplexRestirPipeline },
+        { &shadeComplexSecRestirCode,    "shade_complex_sec_restir",   &m_shadeComplexSecRestirPipeline },
+        { &shadeDielectricRestirCode,    "shade_dielectric_restir",    &m_shadeDielectricRestirPipeline },
+        { &shadeDielectricSecRestirCode, "shade_dielectric_sec_restir",&m_shadeDielectricSecRestirPipeline },
+        { &shadeEmissiveRestirCode,      "shade_emissive_restir",      &m_shadeEmissiveRestirPipeline },
+        { &restirGiReuseCode,            "restir_gi_reuse",            &m_restirGiReusePipeline },
+        { &restirDiReuseCode,            "restir_di_reuse",            &m_restirDiReusePipeline }
+    });
 
-    if (m_shadeDiffuseRestirPipeline && m_shadeComplexRestirPipeline &&
+    if (m_restirPrimaryMatPipelines.empty() &&
+        m_shadeDiffuseRestirPipeline && m_shadeComplexRestirPipeline &&
         m_shadeDielectricRestirPipeline && m_shadeEmissiveRestirPipeline) {
         m_restirPrimaryMatPipelines = {
             m_shadeDiffuseRestirPipeline,
@@ -669,20 +729,98 @@ void WavefrontPipeline::initSpecializedVariants(
         };
         VkPipeline secDiffRestir = m_shadeDiffuseSecRestirPipeline ? m_shadeDiffuseSecRestirPipeline : m_shadeDiffuseRestirPipeline;
         VkPipeline secCompRestir = m_shadeComplexSecRestirPipeline ? m_shadeComplexSecRestirPipeline : m_shadeComplexRestirPipeline;
+        VkPipeline secDielRestir = m_shadeDielectricSecRestirPipeline ? m_shadeDielectricSecRestirPipeline : m_shadeDielectricRestirPipeline;
         m_restirBounce1MatPipelines = {
             secDiffRestir,
             secCompRestir,
+            secDielRestir,
+            m_shadeEmissiveRestirPipeline
+        };
+        rebuildMaterialExecutionSets();
+    }
+}
+
+void WavefrontPipeline::initSpecializedVariants(
+    const std::vector<char>& intersectAlphaCode,
+    const std::vector<char>& shadeDiffuseRestirCode,
+    const std::vector<char>& shadeDiffuseSecRestirCode,
+    const std::vector<char>& shadeComplexRestirCode,
+    const std::vector<char>& shadeComplexSecRestirCode,
+    const std::vector<char>& shadeDielectricRestirCode,
+    const std::vector<char>& shadeEmissiveRestirCode,
+    const std::vector<char>& restirGiReuseCode,
+    const std::vector<char>& restirDiReuseCode,
+    const std::vector<char>& shadeDielectricSecRestirCode) {
+    buildComputePipelinesBatch({
+        { &intersectAlphaCode,           "intersect_alpha",            &m_intersectAlphaPipeline },
+        { &shadeDiffuseRestirCode,       "shade_diffuse_restir",       &m_shadeDiffuseRestirPipeline },
+        { &shadeDiffuseSecRestirCode,    "shade_diffuse_sec_restir",   &m_shadeDiffuseSecRestirPipeline },
+        { &shadeComplexRestirCode,       "shade_complex_restir",       &m_shadeComplexRestirPipeline },
+        { &shadeComplexSecRestirCode,    "shade_complex_sec_restir",   &m_shadeComplexSecRestirPipeline },
+        { &shadeDielectricRestirCode,    "shade_dielectric_restir",    &m_shadeDielectricRestirPipeline },
+        { &shadeDielectricSecRestirCode, "shade_dielectric_sec_restir",&m_shadeDielectricSecRestirPipeline },
+        { &shadeEmissiveRestirCode,      "shade_emissive_restir",      &m_shadeEmissiveRestirPipeline },
+        { &restirGiReuseCode,            "restir_gi_reuse",            &m_restirGiReusePipeline },
+        { &restirDiReuseCode,            "restir_di_reuse",            &m_restirDiReusePipeline }
+    });
+
+    if (m_restirPrimaryMatPipelines.empty() &&
+        m_shadeDiffuseRestirPipeline && m_shadeComplexRestirPipeline &&
+        m_shadeDielectricRestirPipeline && m_shadeEmissiveRestirPipeline) {
+        m_restirPrimaryMatPipelines = {
+            m_shadeDiffuseRestirPipeline,
+            m_shadeComplexRestirPipeline,
             m_shadeDielectricRestirPipeline,
             m_shadeEmissiveRestirPipeline
         };
-        if (m_dgcManager && !m_primaryMatPipelines.empty()) {
-            m_dgcManager->initMaterialExecutionSets({
-                m_primaryMatPipelines,
-                m_secondaryMatPipelines,
-                m_restirPrimaryMatPipelines,
-                m_restirBounce1MatPipelines
-            });
-        }
+        VkPipeline secDiffRestir = m_shadeDiffuseSecRestirPipeline ? m_shadeDiffuseSecRestirPipeline : m_shadeDiffuseRestirPipeline;
+        VkPipeline secCompRestir = m_shadeComplexSecRestirPipeline ? m_shadeComplexSecRestirPipeline : m_shadeComplexRestirPipeline;
+        VkPipeline secDielRestir = m_shadeDielectricSecRestirPipeline ? m_shadeDielectricSecRestirPipeline : m_shadeDielectricRestirPipeline;
+        m_restirBounce1MatPipelines = {
+            secDiffRestir,
+            secCompRestir,
+            secDielRestir,
+            m_shadeEmissiveRestirPipeline
+        };
+        rebuildMaterialExecutionSets();
+    }
+}
+
+void WavefrontPipeline::initNrcVariants(
+    const std::vector<char>& shadeDiffuseNrcCode,
+    const std::vector<char>& shadeDiffuseSecNrcCode,
+    const std::vector<char>& shadeComplexNrcCode,
+    const std::vector<char>& shadeComplexSecNrcCode,
+    const std::vector<char>& shadeDielectricNrcCode,
+    const std::vector<char>& shadeDielectricSecNrcCode) {
+    buildComputePipelinesBatch({
+        { &shadeDiffuseNrcCode,       "shade_diffuse_nrc",        &m_shadeDiffuseNrcPipeline },
+        { &shadeDiffuseSecNrcCode,    "shade_diffuse_sec_nrc",    &m_shadeDiffuseSecNrcPipeline },
+        { &shadeComplexNrcCode,       "shade_complex_nrc",        &m_shadeComplexNrcPipeline },
+        { &shadeComplexSecNrcCode,    "shade_complex_sec_nrc",    &m_shadeComplexSecNrcPipeline },
+        { &shadeDielectricNrcCode,    "shade_dielectric_nrc",     &m_shadeDielectricNrcPipeline },
+        { &shadeDielectricSecNrcCode, "shade_dielectric_sec_nrc", &m_shadeDielectricSecNrcPipeline }
+    });
+
+    if (m_nrcPrimaryMatPipelines.empty() &&
+        m_shadeDiffuseNrcPipeline && m_shadeComplexNrcPipeline &&
+        m_shadeDielectricNrcPipeline && m_shadeEmissivePipeline) {
+        m_nrcPrimaryMatPipelines = {
+            m_shadeDiffuseNrcPipeline,
+            m_shadeComplexNrcPipeline,
+            m_shadeDielectricNrcPipeline,
+            m_shadeEmissivePipeline
+        };
+        VkPipeline secDiffNrc = m_shadeDiffuseSecNrcPipeline ? m_shadeDiffuseSecNrcPipeline : m_shadeDiffuseNrcPipeline;
+        VkPipeline secCompNrc = m_shadeComplexSecNrcPipeline ? m_shadeComplexSecNrcPipeline : m_shadeComplexNrcPipeline;
+        VkPipeline secDielNrc = m_shadeDielectricSecNrcPipeline ? m_shadeDielectricSecNrcPipeline : m_shadeDielectricNrcPipeline;
+        m_nrcSecondaryMatPipelines = {
+            secDiffNrc,
+            secCompNrc,
+            secDielNrc,
+            m_shadeEmissivePipeline
+        };
+        rebuildMaterialExecutionSets();
     }
 }
 
@@ -719,7 +857,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
     m_hasRecordedSlot[frameSlot] = true;
     m_slotBounces[frameSlot] = maxBounces;
 
-    bool useTailMegakernel = sceneData.enableTailMegakernel && (m_tailMegakernelPipeline != VK_NULL_HANDLE) && (maxBounces > sceneData.tailMegakernelBounce);
+    bool useTailMegakernel = sceneData.enableTailMegakernel &&
+                             !sceneData.enableNrc &&
+                             (m_tailMegakernelPipeline != VK_NULL_HANDLE) &&
+                             (maxBounces > sceneData.tailMegakernelBounce);
     uint32_t cutoffBounce = useTailMegakernel ? std::max(1u, sceneData.tailMegakernelBounce) : maxBounces;
     m_slotTailMegakernelBounce[frameSlot] = useTailMegakernel ? cutoffBounce : 0u;
 
@@ -896,6 +1037,9 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         for (uint32_t b = 0; b < cutoffBounce; ++b) {
             auto& bTs = batchTs.bounces[b];
             bool canProfileBounce = (sampleIdx == 0);
+            uint32_t bounceSecondarySortMode = (useTailMegakernel && (b + 1 == cutoffBounce) && (effectiveSecondarySortMode == 1u))
+                ? 0u
+                : effectiveSecondarySortMode;
 
             // 4a. Shading microkernel(s)
             WavefrontShadePC shadePC{
@@ -910,7 +1054,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .sppSampleIndex = sampleIdx,
                 .hasEnvMap = sceneData.hasEnvMap,
                 .envMapIntensity = sceneData.envMapIntensity,
-                .secondarySortMode = effectiveSecondarySortMode,
+                .secondarySortMode = bounceSecondarySortMode,
                 .enableNrc = sceneData.enableNrc ? 1u : 0u,
                 .nrcBounce = sceneData.nrcBounce,
                 .nrcTrainRatio = sceneData.nrcTrainRatio,
@@ -942,9 +1086,25 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                             execSetIdx = 2u;
                             matPipelinesPtr = &m_restirPrimaryMatPipelines;
                         }
+                    } else if (sceneData.enableNrc && !m_nrcPrimaryMatPipelines.empty()) {
+                        if (sceneData.streamlineSecondaryShading && !m_nrcSecondaryMatPipelines.empty()) {
+                            execSetIdx = 5u;
+                            matPipelinesPtr = &m_nrcSecondaryMatPipelines;
+                        } else {
+                            execSetIdx = 4u;
+                            matPipelinesPtr = &m_nrcPrimaryMatPipelines;
+                        }
                     } else if (sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty()) {
                         execSetIdx = 1u;
                         matPipelinesPtr = &m_secondaryMatPipelines;
+                    }
+                } else if (sceneData.enableNrc && !m_nrcPrimaryMatPipelines.empty()) {
+                    if (b >= 1u && sceneData.streamlineSecondaryShading && !m_nrcSecondaryMatPipelines.empty()) {
+                        execSetIdx = 5u;
+                        matPipelinesPtr = &m_nrcSecondaryMatPipelines;
+                    } else {
+                        execSetIdx = 4u;
+                        matPipelinesPtr = &m_nrcPrimaryMatPipelines;
                     }
                 } else if (b >= 1u && sceneData.streamlineSecondaryShading && !m_secondaryMatPipelines.empty()) {
                     execSetIdx = 1u;
@@ -972,8 +1132,18 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             // Determine if shadow and intersect passes are required
             bool hasInlineShadows = sceneData.inlineShadows && ((sceneData.cameraFlags & (1u << 6)) != 0);
-            bool hasRestirPtIndirectShadow = ((sceneData.cameraFlags & (1u << 9)) != 0) && (b <= 1);
-            bool needShadowDispatch = (sceneData.numLights > 0 || hasRestirPtIndirectShadow) && (!hasInlineShadows || b > 0 || hasRestirPtIndirectShadow);
+            const bool hasAnyNeeLight = (sceneData.numLights > 0) || sceneData.envNeeEnabled;
+            const bool runRestirDiReusePass = (b == 0) && useMaterialSort && !hasInlineShadows &&
+                ((sceneData.cameraFlags & (1u << 9)) != 0) &&
+                hasAnyNeeLight &&
+                (m_restirDiReusePipeline != VK_NULL_HANDLE);
+            const bool runRestirGiReusePass = (b == 1) && useMaterialSort &&
+                ((sceneData.cameraFlags & (1u << 9)) != 0) &&
+                (m_restirGiReusePipeline != VK_NULL_HANDLE);
+
+            bool hasRestirPtIndirectShadow = ((sceneData.cameraFlags & (1u << 9)) != 0) && (b == 1);
+            bool needShadowDispatch = (hasAnyNeeLight || hasRestirPtIndirectShadow) &&
+                (!hasInlineShadows || b > 0 || hasRestirPtIndirectShadow || runRestirDiReusePass);
             bool needIntersect = (b + 1 < cutoffBounce);
 
             if (!needShadowDispatch && !needIntersect && !useTailMegakernel) {
@@ -1012,7 +1182,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 if (sceneData.maxSecondaryRayDistance > 0.0f) {
                     maxRayDist = sceneData.maxSecondaryRayDistance;
                 } else {
-                    glm::vec3 extent = sceneData.boundsMax - sceneData.boundsMin;
+                    glm::vec3 extent = sceneData.sceneBoundsMax - sceneData.sceneBoundsMin;
                     float sceneDiameter = glm::length(extent);
                     if (sceneDiameter > 0.01f) {
                         maxRayDist = sceneDiameter * 1.25f;
@@ -1082,19 +1252,99 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectEnd);
                 }
 
-                // Barrier: Shadow & Intersect -> Next Bounce Shade (global memory barrier2)
+                // Barrier: Shadow & Intersect -> Next Bounce Shade / ReSTIR GI Reuse
                 recordMemoryBarrier2(cmd,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT);
-            } else if (useTailMegakernel && b + 1 == cutoffBounce) {
-                // Terminal wavefront bounce transitioning to Tail Megakernel!
+            }
+
+            if (runRestirDiReusePass) {
+                if (!(b + 1 < cutoffBounce)) {
+                    recordMemoryBarrier2(cmd,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+                }
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirDiReusePipeline);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadePC), &shadePC);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseStart);
+                vkCmdDispatch(cmd, (storeWidth + 15) / 16, (fh + 7) / 8, 1);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseEnd);
+
                 recordMemoryBarrier2(cmd,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
+                const VkDeviceSize diReuseShadowOffset = static_cast<VkDeviceSize>(4) * 16;
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseShadowStart);
+                vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), diReuseShadowOffset);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseShadowEnd);
+
+                if ((b + 1 < cutoffBounce) || (useTailMegakernel && b + 1 == cutoffBounce)) {
+                    recordMemoryBarrier2(cmd,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT);
+                }
+            }
+
+            if (runRestirGiReusePass) {
+                if (!(b + 1 < cutoffBounce)) {
+                    recordMemoryBarrier2(cmd,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+                }
+
+                WavefrontShadePC reusePC = shadePC;
+                reusePC.currentBounce = (b + 1 < cutoffBounce) ? 1u : 0u;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_restirGiReusePipeline);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(reusePC), &reusePC);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseStart);
+                vkCmdDispatch(cmd, (storeWidth + 7) / 8, (fh + 3) / 4, 1);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseEnd);
+
+                recordMemoryBarrier2(cmd,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                    VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_shadowPipeline);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
+                const VkDeviceSize giReuseShadowOffset = static_cast<VkDeviceSize>(1 * 16 + 4) * 16;
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseShadowStart);
+                vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), giReuseShadowOffset);
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseShadowEnd);
+
+                if ((b + 1 < cutoffBounce) || (useTailMegakernel && b + 1 == cutoffBounce)) {
+                    recordMemoryBarrier2(cmd,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_COMMAND_PREPROCESS_READ_BIT_EXT);
+                }
+            }
+
+            if (!(b + 1 < cutoffBounce) && useTailMegakernel && b + 1 == cutoffBounce) {
+                // Terminal wavefront bounce transitioning to Tail Megakernel!
+                if (!runRestirDiReusePass && !runRestirGiReusePass) {
+                    recordMemoryBarrier2(cmd,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+                }
 
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tailMegakernelPipeline);
 
@@ -1110,7 +1360,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     .sppSampleIndex = sampleIdx,
                     .hasEnvMap = sceneData.hasEnvMap,
                     .envMapIntensity = sceneData.envMapIntensity,
-                    .secondarySortMode = sceneData.secondarySortMode,
+                    .secondarySortMode = (effectiveSecondarySortMode == 1u) ? 0u : effectiveSecondarySortMode,
                     .enableNrc = sceneData.enableNrc ? 1u : 0u,
                     .nrcBounce = sceneData.nrcBounce,
                     .nrcTrainRatio = sceneData.nrcTrainRatio,
@@ -1270,6 +1520,10 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
                 const auto& bTs = batchTs.bounces[b];
                 bp.shadeMs += toMs(bTs.shadeEnd, bTs.shadeStart);
                 bp.shadowMs += toMs(bTs.shadowEnd, bTs.shadowStart);
+                data.diReuseMs += toMs(bTs.diReuseEnd, bTs.diReuseStart);
+                data.diReuseShadowMs += toMs(bTs.diReuseShadowEnd, bTs.diReuseShadowStart);
+                data.giReuseMs += toMs(bTs.giReuseEnd, bTs.giReuseStart);
+                data.giReuseShadowMs += toMs(bTs.giReuseShadowEnd, bTs.giReuseShadowStart);
                 if (tailBounce > 0 && b + 1 == tailBounce) {
                     data.tailMegakernelMs += toMs(bTs.intersectEnd, bTs.intersectStart);
                 } else if (b + 1 < effectiveBounces) {
@@ -1279,8 +1533,10 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
                     bp.gapBeforeShadeMs += toMs(bTs.shadeStart, batchTs.classifyEnd);
                 } else {
                     const auto& prevBTs = batchTs.bounces[b - 1];
-                    uint64_t prevEnd = prevBTs.intersectEnd ? prevBTs.intersectEnd
-                                     : (prevBTs.shadowEnd ? prevBTs.shadowEnd : prevBTs.shadeEnd);
+                    uint64_t prevEnd = prevBTs.giReuseShadowEnd ? prevBTs.giReuseShadowEnd
+                                     : (prevBTs.diReuseShadowEnd ? prevBTs.diReuseShadowEnd
+                                     : (prevBTs.intersectEnd ? prevBTs.intersectEnd
+                                     : (prevBTs.shadowEnd ? prevBTs.shadowEnd : prevBTs.shadeEnd)));
                     bp.gapBeforeShadeMs += toMs(bTs.shadeStart, prevEnd);
                 }
                 bp.gapBeforeShadowMs += toMs(bTs.shadowStart, bTs.shadeEnd);
@@ -1332,17 +1588,23 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
             break;
         }
 
-        double shadeRead = bp.activeCount * 64.0;
-        double shadeWrite = (bp.shadowCount * 32.0) + (bp.nextCount * 48.0);
+        const double matIdxBytes = isMaterialMode ? 4.0 : 0.0;
+        double shadeRead = bp.activeCount * (64.0 + matIdxBytes);
+        double shadeWrite = (bp.shadowCount * 32.0) + (bp.nextCount * 32.0);
         double shadowRead = bp.shadowCount * 32.0;
-        double intersectTraffic = bp.nextCount * 32.0;
+        double intersectTraffic = 0.0;
+        if (tailBounce > 0 && b + 1 == tailBounce) {
+            intersectTraffic = bp.nextCount * 32.0;
+        } else if (b + 1 < effectiveBounces && bp.intersectMs >= 0.0) {
+            intersectTraffic = bp.nextCount * (48.0 + matIdxBytes);
+        }
         totalTrafficBytes += (shadeRead + shadeWrite + shadowRead + intersectTraffic);
 
         data.bounces.push_back(bp);
     }
 
     uint32_t primaryRays = (m_width * m_height);
-    totalTrafficBytes += primaryRays * 64.0;
+    totalTrafficBytes += primaryRays * (64.0 + (isMaterialMode ? 4.0 : 0.0));
     data.estimatedVramTrafficMb = totalTrafficBytes / (1024.0 * 1024.0);
 
     return data;
@@ -1366,12 +1628,20 @@ void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double times
         std::string shadowStr = (bp.shadowMs > 0.0005) ? std::format("Shadow: {:.3f} ms ({} rays)", bp.shadowMs, bp.shadowCount)
                                                        : "Shadow: Inline (on-chip)";
         if (isMaterialMode) {
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms (std: {}, comp: {}, diel: {}, emis: {}) | {} | Intersect: {:.3f} ms ({} rays)",
-                         bp.bounce, bp.shadeMs, bp.diffCount, bp.compCount, bp.dielCount, bp.emisCount,
+            Logger::info("      [Bounce {}] Gap1: {:.3f} ms | Shade: {:.3f} ms (std: {}, comp: {}, diel: {}, emis: {}) | {} | Intersect: {:.3f} ms ({} rays)",
+                         bp.bounce, bp.gapBeforeShadeMs, bp.shadeMs, bp.diffCount, bp.compCount, bp.dielCount, bp.emisCount,
                          shadowStr, bp.intersectMs, bp.nextCount);
         } else {
-            Logger::info("      [Bounce {}] Shade: {:.3f} ms ({} rays) | {} | Intersect: {:.3f} ms ({} rays)",
-                         bp.bounce, bp.shadeMs, bp.activeCount, shadowStr, bp.intersectMs, bp.nextCount);
+            Logger::info("      [Bounce {}] Gap1: {:.3f} ms | Shade: {:.3f} ms ({} rays) | {} | Intersect: {:.3f} ms ({} rays)",
+                         bp.bounce, bp.gapBeforeShadeMs, bp.shadeMs, bp.activeCount, shadowStr, bp.intersectMs, bp.nextCount);
+        }
+        if (bp.bounce == 0 && (data.diReuseMs > 0.0005 || data.diReuseShadowMs > 0.0005)) {
+            Logger::info("      [ReSTIR DI Reuse] Compute: {:.3f} ms | Fallback Shadow: {:.3f} ms",
+                         data.diReuseMs, data.diReuseShadowMs);
+        }
+        if (bp.bounce == 1 && (data.giReuseMs > 0.0005 || data.giReuseShadowMs > 0.0005)) {
+            Logger::info("      [ReSTIR GI Reuse] Compute: {:.3f} ms | Fallback Shadow: {:.3f} ms",
+                         data.giReuseMs, data.giReuseShadowMs);
         }
     }
     if (data.tailMegakernelBounce > 0 && data.tailMegakernelMs > 0.0) {

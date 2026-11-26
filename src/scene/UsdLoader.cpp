@@ -1080,6 +1080,7 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
         // --- Process Lights (UsdLux) ---
         else if (prim.IsA<UsdLuxDomeLight>()) {
             hasDomeLight = true;
+            data.hasDomeLight = true;
             UsdLuxDomeLight dome(prim);
             Logger::info("UsdLoader: Detected UsdLuxDomeLight at '{}'", prim.GetPath().GetString());
 
@@ -1099,6 +1100,10 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
                     Logger::warn("UsdLoader: DomeLight texture '{}' could not be resolved", rawPath);
                 }
             }
+
+            GfVec3f domeColor(1.0f, 1.0f, 1.0f);
+            dome.GetColorAttr().Get(&domeColor, evalTime);
+            data.domeLightColor = glm::vec3(domeColor[0], domeColor[1], domeColor[2]);
 
             float intensity = 1.0f;
             dome.GetIntensityAttr().Get(&intensity);
@@ -1979,14 +1984,17 @@ SceneData UsdLoader::loadSceneData(const std::string& filepath, const UsdLoadOpt
             }
         }
 
-        if (data.lights.empty() && !hasDomeLight) {
+        if (data.lights.empty() && !hasDomeLight && !options.suppressFallbackSun) {
             glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
             LightGPU sunLight{};
             sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
             sunLight.normal = glm::vec4(sunDir, 0.0f);
             sunLight.emission = glm::vec4(12.0f, 11.5f, 10.0f, 1.0f);
             data.lights.push_back(sunLight);
+            data.hasFallbackSun = true;
             Logger::info("UsdLoader: Scene had no lights; added directional sun light matching sky dome");
+        } else if (data.lights.empty() && !hasDomeLight && options.suppressFallbackSun) {
+            Logger::info("UsdLoader: Skipping fallback directional sun because an HDRI environment map is active.");
         }
 
         MeshRange range{};

@@ -31,7 +31,7 @@ layout(std430, binding = 1) readonly buffer DiReservoirsBuffer {
     DiReservoir diReservoirs[];
 };
 layout(std430, binding = 2) readonly buffer GiReservoirsBuffer {
-    GiReservoir giReservoirs[];
+    uvec2 giData[];
 };
 layout(std430, binding = 3) readonly buffer X1ContextsBuffer {
     X1Context x1Contexts[];
@@ -89,12 +89,14 @@ void main() {
 
     // Bounds guard: the buffers may be smaller than expected (e.g. after a
     // resize race between passes) — never index out of range.
-    if (idx < x1Contexts.length()) {
+    uint giStride = giData.length() >> 2u;
+    if (idx < x1Contexts.length() && idx < giStride) {
         bool diValid = restirIsValid(diReservoirs[idx].flags);
         bool x1Valid = x1ContextValid(x1Contexts[idx]);
-        bool giValid = giIsValid(giReservoirs[idx]);
+        uvec2 giMeta = giData[idx];
+        bool giValid = giMetaIsValid(giMeta.y);
         uint diM = restirGetM(diReservoirs[idx].idxM);
-        uint giM = giGetM(giReservoirs[idx]);
+        uint giM = giMetaGetM(giMeta.y);
 
         switch (pc.mode) {
             case 1u: // DI M (log scale: 1 -> 0, 30 -> ~0.5, >=128 -> 1)
@@ -102,7 +104,8 @@ void main() {
                 break;
             case 2u: // DI finalized weight
                 if (diValid) {
-                    float w = diReservoirs[idx].wSum / max(diReservoirs[idx].targetPdf * float(max(diM, 1u)), 1e-8);
+                    float diTarget = restirDiGetTarget(diReservoirs[idx].targetCosBits);
+                    float w = diReservoirs[idx].wSum / max(diTarget * float(max(diM, 1u)), 1e-8);
                     color = debugHeat(debugLogScale(w));
                 }
                 break;
@@ -113,9 +116,11 @@ void main() {
                 if (giValid) color = debugHeat(log2(float(max(giM, 1u))) / 7.0);
                 break;
             case 5u: // GI finalized weight
-                if (giValid) {
-                    float w = giGetWSum(giReservoirs[idx]) /
-                              max(giGetTarget(giReservoirs[idx]) * float(max(giM, 1u)), 1e-8);
+                if (giValid && giMetaHasSurface(giMeta.y)) {
+                    uvec2 giW = giData[3u * giStride + idx];
+                    float giTarget = uintBitsToFloat(giW.y & ~0xFFu);
+                    float w = uintBitsToFloat(giW.x) /
+                              max(giTarget * float(max(giM, 1u)), 1e-8);
                     color = debugHeat(debugLogScale(w));
                 }
                 break;

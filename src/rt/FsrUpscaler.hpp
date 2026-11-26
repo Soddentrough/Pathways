@@ -38,7 +38,8 @@ public:
         const std::vector<char>& sdkPrepSpv,
         VkFormat format = VK_FORMAT_R16G16B16A16_SFLOAT,
         const std::string& instanceName = "GPU 0 Primary Viewport",
-        FsrVersion targetVersion = FsrVersion::Auto
+        FsrVersion targetVersion = FsrVersion::Auto,
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE
     );
     ~FsrUpscaler() override;
 
@@ -83,6 +84,7 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VkPhysicalDevice m_physDevice = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     uint32_t m_renderWidth = 0;
     uint32_t m_renderHeight = 0;
     uint32_t m_displayWidth = 0;

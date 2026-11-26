@@ -1,6 +1,8 @@
 #ifndef MIS_COMMON_GLSL
 #define MIS_COMMON_GLSL
 
+#include "env_importance.glsl"
+
 // =============================================================================
 // Consistent NEE <-> BSDF-sampling multiple importance sampling (plan P1a).
 // =============================================================================
@@ -49,13 +51,11 @@
 // lobe, or a shader that performs no NEE). Codes 1..4095 cover
 // pdf in [2^-20, 2^44) with 1/64-octave (~1.1 %) steps.
 uint encodeBsdfPdf(float pdf) {
-    if (!(pdf > 0.0)) return 1u;
-    float c = round((log2(pdf) + 20.0) * 64.0);
-    return uint(clamp(c, 1.0, 4095.0));
+    return envEncodeBsdfPdf(pdf);
 }
 
 float decodeBsdfPdf(uint code) {
-    return exp2(float(code) * (1.0 / 64.0) - 20.0);
+    return envDecodeBsdfPdf(code);
 }
 
 float quantizeBsdfPdf(float pdf) {
@@ -78,13 +78,16 @@ float lightTreeSelectPdf(uint lightIdx, vec3 x) {
     uint bits = floatBitsToUint(lights[lightIdx].pad0.y);
     uint depth = floatBitsToUint(lights[lightIdx].pad0.z);
     if (depth > 32u) return 0.0;
-    uint node = 0u;
+    LightTreeNode n = lightNodes[0u];
     float p = 1.0;
     for (uint d = 0u; d < depth; ++d) {
-        LightTreeNode n = lightNodes[node];
-        if (n.children.z == 1u) return 0.0;
-        float impL = evalLightTreeNodeImportance(x, vec3(0.0), lightNodes[n.children.x]);
-        float impR = evalLightTreeNodeImportance(x, vec3(0.0), lightNodes[n.children.y]);
+        uint childWord = n.extentConeChild.w;
+        if ((childWord & 0x80000000u) != 0u) return 0.0;
+        uint firstChild = childWord & 0x7FFFFFFFu;
+        LightTreeNode leftNode = lightNodes[firstChild];
+        LightTreeNode rightNode = lightNodes[firstChild + 1u];
+        float impL = evalLightTreeNodeImportance(x, vec3(0.0), leftNode);
+        float impR = evalLightTreeNodeImportance(x, vec3(0.0), rightNode);
         float tot = impL + impR;
         if (tot <= 1e-12) {
             impL = 0.5;
@@ -93,19 +96,25 @@ float lightTreeSelectPdf(uint lightIdx, vec3 x) {
         float pL = clamp(impL / tot, 0.001, 0.999);
         bool right = ((bits >> d) & 1u) != 0u;
         p *= right ? (1.0 - pL) : pL;
-        node = right ? n.children.y : n.children.x;
+        n = right ? rightNode : leftNode;
     }
-    LightTreeNode leaf = lightNodes[node];
-    if (leaf.children.z != 1u || leaf.children.x != lightIdx) return 0.0;
+    uint leafWord = n.extentConeChild.w;
+    if ((leafWord & 0x80000000u) == 0u || (leafWord & 0x7FFFFFFFu) != lightIdx) return 0.0;
     return max(p, 1e-20);
 }
 
 float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
-    if (numLights <= 1u) return 1.0;
-    if ((ubo.flags & UBO_FLAG_LIGHT_TREE) != 0u) {
-        return lightTreeSelectPdf(lightIdx, x);
-    }
-    return max(lights[lightIdx].sampling.z, 1e-20);
+    float pExplicit = (numLights > 0u) ? max(1.0 - envNeeSelectProb(), 0.0) : 0.0;
+    if (pExplicit <= 0.0) return 0.0;
+    if (numLights <= 1u) return pExplicit;
+    float condPdf = ((ubo.flags & UBO_FLAG_LIGHT_TREE) != 0u)
+        ? lightTreeSelectPdf(lightIdx, x)
+        : max(lights[lightIdx].sampling.z, 1e-20);
+    return condPdf * pExplicit;
+}
+
+uint restirEffectiveLightCount(uint numLights) {
+    return envNeeActive() ? max(numLights, 8u) : numLights;
 }
 
 // ---- NEE side ------------------------------------------------------------------
@@ -121,7 +130,8 @@ float misLightSelectPdf(uint lightIdx, vec3 x, uint numLights) {
 // Deterministic effective light-sample multiplier for Bounce-0 ReSTIR DI vs Bounce-1 BSDF emitter hits.
 // Depends solely on uniform frame/scene parameters so NEE and BSDF-hit weights sum to 1.0 pointwise.
 float restirDiMisLightScale(uint numLights) {
-    float freshM = float(max(min(numLights, 8u), 1u));
+    uint effLights = restirEffectiveLightCount(numLights);
+    float freshM = float(max(min(effLights, 8u), 1u));
     bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
     if (!hasHistory) return freshM;
     return min(freshM * 3.0, 40.0);
@@ -132,46 +142,50 @@ float restirDiMisLightScale(uint numLights) {
 #endif
 
 uint restirDiFreshM(uint numLights, uint captureMlData) {
-    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return max(min(numLights, 8u), 1u);
-    if (numLights <= 1u) return 1u;
-    if (numLights > 4096u) {
+    uint effLights = restirEffectiveLightCount(numLights);
+    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return max(min(effLights, 8u), 1u);
+    if (effLights <= 1u) return 1u;
+    if (effLights > 4096u) {
         bool noHistory = (ubo.frameIndex == 0u) || ((ubo.flags & (1u << 23)) != 0u);
         return noHistory ? 4u : 2u;
     }
-    return min(numLights, 16u);
+    return min(effLights, 8u);
 }
 
 float restirDiMisLightScale(uint numLights, uint captureMlData) {
-    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return float(max(min(numLights, 8u), 1u));
+    uint effLights = restirEffectiveLightCount(numLights);
+    if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u) return float(max(min(effLights, 8u), 1u));
     float freshM = float(restirDiFreshM(numLights, captureMlData));
     bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
-    if (!hasHistory || numLights <= 4u) return freshM;
-    if (captureMlData != 0u || numLights > 4096u) {
+    if (!hasHistory || effLights <= 4u) return freshM;
+    if (captureMlData != 0u || effLights > 4096u) {
         return min(freshM * 2.5, 24.0);
     }
     return min(freshM * 4.0, 64.0);
 }
 
 uint restirSecondaryFreshM(uint bounce, uint numLights, bool isSpecularPath, uint captureMlData) {
-    if (numLights <= 1u) return 1u;
+    uint effLights = restirEffectiveLightCount(numLights);
+    if (effLights <= 1u) return 1u;
     bool rawRestirMode = (captureMlData == 0u);
-    if (numLights > 4096u) {
+    if (effLights > 4096u) {
         if (bounce == 1u) {
             return isSpecularPath ? 2u : 1u;
         }
         return 1u;
     }
     if (bounce == 1u) {
-        return min(numLights, isSpecularPath ? (rawRestirMode ? 32u : 16u) : (rawRestirMode ? 16u : 8u));
+        return min(effLights, isSpecularPath ? (rawRestirMode ? 8u : 6u) : (rawRestirMode ? 4u : 4u));
     }
     if (bounce == 2u) {
-        return min(numLights, isSpecularPath ? 16u : (rawRestirMode ? 8u : 4u));
+        return min(effLights, isSpecularPath ? 4u : 2u);
     }
-    return min(numLights, rawRestirMode ? 4u : 2u);
+    return min(effLights, 2u);
 }
 
 float restirSecondaryMisLightScale(uint spawnBounce, uint numLights, uint captureMlData, uint enableNrc) {
-    if (captureMlData != 0u || enableNrc != 0u || numLights <= 1u) return 1.0;
+    uint effLights = restirEffectiveLightCount(numLights);
+    if (captureMlData != 0u || enableNrc != 0u || effLights <= 1u) return 1.0;
     if ((ubo.flags & (1u << 9)) == 0u || (ubo.flags & (1u << 10)) != 0u) return 1.0;
     if (spawnBounce == 1u) {
         bool hasHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
@@ -179,6 +193,16 @@ float restirSecondaryMisLightScale(uint spawnBounce, uint numLights, uint captur
         return (freshM1 <= 1.0) ? 1.0 : (hasHistory ? min(freshM1 * 2.5, 40.0) : freshM1);
     }
     return float(restirSecondaryFreshM(spawnBounce, numLights, false, captureMlData));
+}
+
+float envNeeMisWeightScaled(float envPdfSolidAngle, float bsdfPdf, bool canContinue, float lightSampleScale) {
+    if ((ubo.flags & UBO_FLAG_DBG_NO_NEE_AREA) != 0u) return 0.0;
+    if ((ubo.flags & UBO_FLAG_INDIRECT_LIGHT) == 0u) return 1.0;
+    if (!canContinue) return 0.0;
+    if (misReferenceMode()) return 0.0;
+    float pl = envPdfSolidAngle * max(lightSampleScale, 1.0);
+    float pb = quantizeBsdfPdf(bsdfPdf);
+    return pl / (pl + pb);
 }
 
 float neeMisWeightScaled(uint lightIdx, float lightPdfSolidAngle, float bsdfPdf, bool canContinue, float lightSampleScale) {
@@ -233,6 +257,10 @@ float emitterHitMisWeightScaled(uint hitType, uint primId, uint instId, vec3 ori
 float emitterHitMisWeight(uint hitType, uint primId, uint instId, vec3 origin, vec3 dir, float hitT,
                           uint pdfCode, uint numLights) {
     return emitterHitMisWeightScaled(hitType, primId, instId, origin, dir, hitT, pdfCode, numLights, 1.0);
+}
+
+float envHitMisWeightScaled(vec3 dir, uint pdfCode, uint numLights, float lightSampleScale) {
+    return envHitMisWeightForFlags(dir, pdfCode, numLights, ubo.flags, lightSampleScale);
 }
 
 #endif // MIS_COMMON_GLSL

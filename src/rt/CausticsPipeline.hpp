@@ -31,7 +31,8 @@ public:
                      const std::vector<char>& traceSpv,
                      const std::vector<char>& splatSpv,
                      const std::vector<char>& filterSpv,
-                     ImmediateSubmitFn immediateSubmit = nullptr);
+                     ImmediateSubmitFn immediateSubmit = nullptr,
+                     VkPipelineCache pipelineCache = VK_NULL_HANDLE);
     ~CausticsPipeline();
 
     CausticsPipeline(const CausticsPipeline&) = delete;
@@ -100,6 +101,7 @@ private:
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
     bool m_hasSubgroupSizeControl = false;
     uint32_t m_width = 0;
     uint32_t m_height = 0;

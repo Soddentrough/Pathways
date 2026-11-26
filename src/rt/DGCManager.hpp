@@ -108,8 +108,8 @@ private:
     VkIndirectCommandsLayoutEXT m_indirectLayout = VK_NULL_HANDLE;
     VkIndirectExecutionSetEXT m_executionSet = VK_NULL_HANDLE;
     VkIndirectCommandsLayoutEXT m_materialIndirectLayout = VK_NULL_HANDLE;
-    std::array<VkIndirectExecutionSetEXT, 4> m_materialExecutionSets = {
-        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE
+    std::array<VkIndirectExecutionSetEXT, 6> m_materialExecutionSets = {
+        VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE
     };
     std::unique_ptr<Buffer> m_preprocessBuffer;
     VkDeviceSize m_sliceSize = 4096;

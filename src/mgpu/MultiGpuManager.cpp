@@ -93,6 +93,56 @@ static void uploadToDeviceBufferSec(GpuDeviceNode& secNode, Buffer& dstBuffer, c
     vkFreeCommandBuffers(device, secNode.commandPool, 1, &cmd);
 }
 
+static void uploadSecondaryEnvAndImportance(GpuDeviceNode& secNode, const Config& config, const SceneData& scene) {
+    VkDevice secDevice = secNode.context->getDevice();
+    VmaAllocator secAlloc = secNode.context->getAllocator();
+    VkQueue secQueue = secNode.context->getGraphicsQueue();
+    VkCommandPool secPool = secNode.commandPool;
+
+    const bool useDomeAttrs = (!config.custom_hdri && scene.hasDomeLight);
+    const glm::vec3 envTint = useDomeAttrs ? scene.domeLightColor : glm::vec3(1.0f);
+    const bool solidColorDome = useDomeAttrs && scene.domeLightHdriPath.empty();
+    const float activeEnvIntensity = useDomeAttrs ? scene.domeLightIntensity : 1.0f;
+
+    EnvImportanceTable envImpTable{};
+    bool usedExplicitOrDome = false;
+    secNode.environmentMap = Texture::createSceneEnvironmentMap(
+        secDevice, secAlloc, secQueue, secPool,
+        config.hdri_path, config.scene_path, scene.domeLightHdriPath,
+        &envImpTable, envTint, solidColorDome, &usedExplicitOrDome
+    );
+
+    const float explicitIrr = computeExplicitLightIrradianceEstimate(scene.lights, scene.sceneRadius);
+    envImpTable.header.envSelectProb = computeEnvSelectProb(
+        secNode.environmentMap != nullptr,
+        envImpTable.header.envTotalFlux,
+        activeEnvIntensity,
+        static_cast<uint32_t>(scene.lights.size()),
+        explicitIrr,
+        usedExplicitOrDome,
+        scene.hasFallbackSun
+    );
+    secNode.envNeeEnabled = (envImpTable.header.width > 0u && envImpTable.header.envSelectProb > 0.0f);
+
+    const std::vector<uint8_t> bytes = packEnvImportanceBufferBytes(envImpTable);
+    secNode.envImportanceBuffer = std::make_unique<Buffer>(
+        secAlloc, static_cast<VkDeviceSize>(bytes.size()),
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+    uploadToDeviceBufferSec(secNode, *secNode.envImportanceBuffer, bytes.data(), bytes.size());
+}
+
+static bool sceneHasAlphaMaterials(const SceneData& scene) {
+    for (const auto& mat : scene.materials) {
+        if (mat.alphaMode != ALPHA_MODE_OPAQUE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const SceneData& scene, const std::vector<char>& updateTlasSpv) {
     if (!secNode.context->hasRayTracing()) return;
 
@@ -354,7 +404,8 @@ static void createSecondaryAccelerationStructures(GpuDeviceNode& secNode, const 
     }
 
     secNode.tlasUpdatePipeline = std::make_unique<GpuTlasUpdatePipeline>(
-        secDevice, secAlloc, secNode.context->hasSubgroupSizeControl()
+        secDevice, secAlloc, secNode.context->hasSubgroupSizeControl(),
+        secNode.context->getPipelineCache()
     );
     secNode.tlasUpdatePipeline->initShaderInstances(secNode.instanceBuffer.get(), instanceUpload);
     secNode.tlasUpdatePipeline->initBuffers(asInstances, secNode.asManager.get());
@@ -1572,10 +1623,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     secNode->dummyNormal = Texture::createDummyNormal(secDevice, secAlloc, secQueue, secPool);
     secNode->blueNoiseTexture = Texture::createBlueNoise64(secDevice, secAlloc, secQueue, secPool);
 
-    secNode->environmentMap = Texture::createSceneEnvironmentMap(
-        secDevice, secAlloc, secQueue, secPool,
-        config.hdri_path, config.scene_path, scene.domeLightHdriPath
-    );
+    uploadSecondaryEnvAndImportance(*secNode, config, scene);
 
     secNode->sceneTextures.clear();
     for (const auto& texData : scene.textures) {
@@ -1648,7 +1696,10 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
             auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
             auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
             auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
-            auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
+            std::vector<char> wfTailMegakernelCode;
+            if (config.enable_tail_megakernel) {
+                wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
+            }
 
             bool enableSecExecSet = secNode->context->supportsDgcExecutionSet() && Config::dgcExecSetRequested();
 
@@ -1663,17 +1714,39 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 config.dgc_preprocess && secNode->context->supportsDgcPreprocess(),
                 secNode->context->hasSubgroupSizeControl(),
                 0,
-                wfTailMegakernelCode
+                wfTailMegakernelCode,
+                secNode->context->getPipelineCache()
             );
-            secNode->wavefrontPipeline->initSpecializedVariants(
-                loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
-                loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv")
-            );
+            const bool secNeedAlpha = sceneHasAlphaMaterials(scene);
+            const bool secNeedRestir = config.enable_restir;
+            if (secNeedAlpha && secNeedRestir) {
+                secNode->wavefrontPipeline->initSpecializedVariants(
+                    loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+                    loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                );
+            } else if (secNeedAlpha) {
+                secNode->wavefrontPipeline->initAlphaIntersectPipeline(
+                    loadShaderSPIRV("wavefront_intersect_alpha.comp.spv")
+                );
+            } else if (secNeedRestir) {
+                secNode->wavefrontPipeline->initRestirVariants(
+                    loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+                    loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                );
+            }
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
             if (config.enable_restir && config.mgpu_mode != MultiGpuMode::Off) {
                 secNode->restirManager->resize(std::max(initRenderW, secWidth), initRenderH);
@@ -1724,7 +1797,8 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 prepCode,
                 accumFormat,
                 "[GPU 1 Secondary Peer]",
-                config.fsr_version
+                config.fsr_version,
+                secNode->context->getPipelineCache()
             );
             Logger::info("Secondary GPU: FSR Upscaler initialized successfully [GPU 1 Secondary Peer].");
         } catch (const std::exception& e) {
@@ -1793,6 +1867,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
     vkQueueSubmit2(secNode->context->getGraphicsQueue(), 1, &initSubmit, VK_NULL_HANDLE);
     vkQueueWaitIdle(secNode->context->getGraphicsQueue());
 
+    secNode->context->savePipelineCache();
     Logger::info("Secondary GPU Node fully initialized: {} ({})", secNode->deviceName, secNode->context->getPciLinkString());
     m_devices.push_back(std::move(secNode));
     m_active = true;
@@ -1979,8 +2054,10 @@ void MultiGpuManager::ensureSecondaryCaustics(GpuDeviceNode* secNode) {
                 secNode->context->hasSubgroupSizeControl(),
                 secW, secH, m_config.caustic_photons,
                 traceSpv, splatSpv, filterSpv,
-                immediateSubmitSec
+                immediateSubmitSec,
+                secNode->context->getPipelineCache()
             );
+            secNode->context->savePipelineCache();
         } else {
             secNode->causticsPipeline->resize(secW, secH, immediateSubmitSec);
         }
@@ -2030,8 +2107,10 @@ void MultiGpuManager::ensureSecondaryNrc(GpuDeviceNode* secNode) {
             secNode->nrcManager = std::make_unique<NRCManager>(
                 secDevice, secAlloc, nrcW, nrcH,
                 nrcInferCode, nrcTrainCode, nrcResolveCode,
-                secNode->context->getPhysicalDevice()
+                secNode->context->getPhysicalDevice(),
+                secNode->context->getPipelineCache()
             );
+            secNode->context->savePipelineCache();
         } catch (const std::exception& e) {
             Logger::warn("Failed to initialize secondary GPU NRC Manager: {}", e.what());
             secNode->nrcManager.reset();
@@ -2125,7 +2204,9 @@ void MultiGpuManager::updateSecondaryWavefrontDescriptors(GpuDeviceNode* secNode
             VK_NULL_HANDLE,
             VK_NULL_HANDLE,
             VK_NULL_HANDLE,
-            VK_NULL_HANDLE
+            VK_NULL_HANDLE,
+            secNode->envImportanceBuffer ? secNode->envImportanceBuffer->getBuffer() : VK_NULL_HANDLE,
+            secNode->envImportanceBuffer ? secNode->envImportanceBuffer->getSize() : 0
         );
     }
 }
@@ -2437,6 +2518,9 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
         wfSceneData.nrcTrainRatio = m_config.nrc_train_ratio;
         wfSceneData.boundsMin = m_focalBoundsMin;
         wfSceneData.boundsMax = m_focalBoundsMax;
+        wfSceneData.sceneBoundsMin = m_boundsMin;
+        wfSceneData.sceneBoundsMax = m_boundsMax;
+        wfSceneData.envNeeEnabled = node->envNeeEnabled;
         wfSceneData.streamlineSecondaryShading = m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_config.max_secondary_distance;
@@ -3200,7 +3284,29 @@ void MultiGpuManager::setConfig(const Config& config) {
             vkDeviceWaitIdle(secNode->context->getDevice());
             initSharedHostBuffer(reqSharedSize);
         }
+        if (m_config.enable_tail_megakernel && m_config.mgpu_mode != MultiGpuMode::Off &&
+            secNode->wavefrontPipeline && !secNode->wavefrontPipeline->hasTailMegakernelPipeline()) {
+            waitWorkerIdle();
+            vkDeviceWaitIdle(secNode->context->getDevice());
+            secNode->wavefrontPipeline->initTailMegakernelPipeline(loadShaderSPIRV("wavefront_tail_megakernel.comp.spv"));
+            secNode->context->savePipelineCache();
+        }
         if (m_config.enable_restir && m_config.mgpu_mode != MultiGpuMode::Off) {
+            if (secNode->wavefrontPipeline && !secNode->wavefrontPipeline->hasRestirPipelines()) {
+                waitWorkerIdle();
+                vkDeviceWaitIdle(secNode->context->getDevice());
+                secNode->wavefrontPipeline->initRestirVariants(
+                    loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+                    loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+                    loadShaderSPIRV("restir_di_reuse.comp.spv")
+                );
+                secNode->context->savePipelineCache();
+            }
             if (!secNode->restirManager) {
                 secNode->restirManager = std::make_unique<ReSTIRManager>(secNode->context->getDevice(), secNode->context->getAllocator());
             }
@@ -3230,8 +3336,10 @@ void MultiGpuManager::setConfig(const Config& config) {
                             renderW, renderH, config.width, config.height,
                             prepCode, accumFormat,
                             "[GPU 1 Secondary Peer]",
-                            config.fsr_version
+                            config.fsr_version,
+                            secNode->context->getPipelineCache()
                         );
+                        secNode->context->savePipelineCache();
                         Logger::info("Secondary GPU: FSR Upscaler initialized on setConfig [GPU 1 Secondary Peer].");
                     } catch (const std::exception& e) {
                         Logger::warn("Failed to initialize secondary GPU FSR upscaler on setConfig: {}", e.what());
@@ -3440,11 +3548,8 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         }
     }
 
-    // 3b. Unified HDRI sky dome synchronization on secondary GPU
-    secNode->environmentMap = Texture::createSceneEnvironmentMap(
-        secDevice, secAlloc, secQueue, secPool,
-        m_config.hdri_path, m_config.scene_path, scene.domeLightHdriPath
-    );
+    // 3b. Unified HDRI sky dome + 2D importance alias synchronization on secondary GPU
+    uploadSecondaryEnvAndImportance(*secNode, m_config, scene);
 
     if (secNode->causticsPipeline) {
         secNode->causticsPipeline->resetHistory();
@@ -3468,6 +3573,10 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         }
     }
     if (secNode->wavefrontPipeline) {
+        if (sceneHasAlphaMaterials(scene) && !secNode->wavefrontPipeline->hasAlphaIntersectPipeline()) {
+            secNode->wavefrontPipeline->initAlphaIntersectPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+            secNode->context->savePipelineCache();
+        }
         updateSecondaryWavefrontDescriptors(secNode.get());
     }
     Logger::info("Secondary GPU Node reloaded scene successfully ({} triangles, {} materials).", scene.triangles.size(), scene.materials.size());

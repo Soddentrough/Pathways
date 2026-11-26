@@ -81,7 +81,7 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
     if (m_engine->m_sceneHasAlphaMask)             flags |= (1 << 10);
     if (m_engine->m_config.inline_primary_shadows) flags |= (1 << 6);
     const bool useCaptureRestir = (!isReference && m_engine->isRestirActive() && m_engine->m_config.capture_channels >= 23);
-    if (m_engine->m_config.enable_light_tree || (!m_engine->m_sceneData.lightTreeNodes.empty() && useCaptureRestir)) flags |= (1 << 7);
+    if ((m_engine->m_config.enable_light_tree || useCaptureRestir) && !m_engine->m_sceneData.lightTreeNodes.empty()) flags |= (1 << 7);
     if (useCaptureRestir) flags |= (1 << 9);
     if (m_engine->m_config.enable_delta_unroll) flags |= (1 << 11);
     if (m_engine->m_config.transparent_shadows && !m_engine->m_config.reference_mode) flags |= (1 << 26);
@@ -156,7 +156,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             wfSceneData.numMaterials = m_engine->m_numMaterials;
             wfSceneData.numLights = m_engine->m_numLights;
             wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
-            wfSceneData.envMapIntensity = 1.0f;
+            wfSceneData.envMapIntensity = m_engine->m_sceneManager
+                ? m_engine->m_sceneManager->getEffectiveEnvIntensity()
+                : ((!m_engine->m_config.custom_hdri && m_engine->m_sceneData.hasDomeLight) ? m_engine->m_sceneData.domeLightIntensity : 1.0f);
+            wfSceneData.envNeeEnabled = m_engine->m_envNeeEnabled;
             wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
             wfSceneData.accumulateHistory = 1u;
             wfSceneData.sortMode = static_cast<uint32_t>(m_engine->getEffectiveWavefrontSortMode());
@@ -165,6 +168,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
             wfSceneData.cameraFlags = flags;
             wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
             wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
+            wfSceneData.sceneBoundsMin = m_engine->m_sceneData.boundsMin;
+            wfSceneData.sceneBoundsMax = m_engine->m_sceneData.boundsMax;
             wfSceneData.streamlineSecondaryShading = m_engine->m_config.streamline_secondary_shading;
             wfSceneData.enableDistanceClamping = m_engine->m_config.distance_clamping;
             wfSceneData.maxSecondaryRayDistance = m_engine->m_config.max_secondary_distance;
@@ -373,7 +378,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.numMaterials = m_engine->m_numMaterials;
         wfSceneData.numLights = m_engine->m_numLights;
         wfSceneData.hasEnvMap = m_engine->m_environmentMap ? 1u : 0u;
-        wfSceneData.envMapIntensity = 1.0f;
+        wfSceneData.envMapIntensity = m_engine->m_sceneManager
+            ? m_engine->m_sceneManager->getEffectiveEnvIntensity()
+            : ((!m_engine->m_config.custom_hdri && m_engine->m_sceneData.hasDomeLight) ? m_engine->m_sceneData.domeLightIntensity : 1.0f);
+        wfSceneData.envNeeEnabled = m_engine->m_envNeeEnabled;
         wfSceneData.frameIndex = frameIdx;
         wfSceneData.useMorton = m_engine->m_config.use_morton ? 1u : 0u;
         wfSceneData.accumulateHistory = 0u;
@@ -383,6 +391,8 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
         wfSceneData.cameraFlags = flags;
         wfSceneData.boundsMin = m_engine->m_sceneData.boundsMin;
         wfSceneData.boundsMax = m_engine->m_sceneData.boundsMax;
+        wfSceneData.sceneBoundsMin = m_engine->m_sceneData.boundsMin;
+        wfSceneData.sceneBoundsMax = m_engine->m_sceneData.boundsMax;
         wfSceneData.streamlineSecondaryShading = m_engine->m_config.streamline_secondary_shading;
         wfSceneData.enableDistanceClamping = m_engine->m_config.distance_clamping;
         wfSceneData.maxSecondaryRayDistance = m_engine->m_config.max_secondary_distance;
@@ -663,7 +673,10 @@ void TrainingCaptureManager::captureTrainingFrame(uint32_t frameIdx, bool isRefe
                         const auto& res = resPixels[p];
                         uint32_t M = (res.idxM >> 16) & 0xFFFFu;
                         float res_m = std::clamp(static_cast<float>(M) / 64.0f, 0.0f, 1.0f);
-                        float pHat = std::max(res.targetPdf, 1e-4f);
+                        uint32_t tBits = res.targetCosBits & ~0xFFu;
+                        float targetPdf = 0.0f;
+                        std::memcpy(&targetPdf, &tBits, sizeof(float));
+                        float pHat = std::max(targetPdf, 1e-4f);
                         float res_w = std::clamp(res.wSum / (std::max(static_cast<float>(M), 1.0f) * pHat), 0.0f, 4.0f) * 0.25f;
 
                         inputPayload[p * outChannels + 20] = glm::packHalf1x16(res_m);

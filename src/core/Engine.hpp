@@ -175,6 +175,8 @@ private:
     Buffer* m_shadeMaterialBuffer = nullptr;
     Buffer* m_lightBuffer = nullptr;
     Buffer* m_lightTreeBuffer = nullptr;
+    Buffer* m_envImportanceBuffer = nullptr;
+    bool m_envNeeEnabled = false;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_cameraUBOs;
     std::array<std::unique_ptr<Buffer>, MAX_FRAMES_IN_FLIGHT> m_centerDepthBuffers;
     float m_gpuCenterDepth = 0.0f;
@@ -328,6 +330,9 @@ private:
     std::unique_ptr<DenoiserPipeline> m_denoiser;
     void ensureNrcInitialized();
     void ensureDenoiserInitialized();
+    void ensureWavefrontAlphaPipeline();
+    void ensureWavefrontTailMegakernelPipeline();
+    void ensureWavefrontRestirPipelines();
 
     // Real-Time Caustics Subsystem
     std::unique_ptr<CausticsPipeline> m_causticsPipeline;

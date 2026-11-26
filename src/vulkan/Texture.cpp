@@ -268,7 +268,8 @@ std::unique_ptr<Texture> Texture::createFromPixels(
         image->transitionLayout(
             cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
         );
     }
 
@@ -311,6 +312,161 @@ std::unique_ptr<Texture> Texture::createFromPixels(
     return std::make_unique<Texture>(device, allocator, std::move(image), sampler);
 }
 
+std::unique_ptr<Texture> Texture::createFloatEnvFromPixels(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    uint32_t width, uint32_t height, const float* rgbaPixels
+) {
+    if (!rgbaPixels || width == 0 || height == 0) {
+        throw std::runtime_error("Texture::createFloatEnvFromPixels: invalid pixel parameters!");
+    }
+
+    const uint32_t rawMips = (width > 1 || height > 1)
+        ? (static_cast<uint32_t>(std::floor(std::log2(std::max(width, height)))) + 1u)
+        : 1u;
+    const uint32_t mipLevels = std::min(rawMips, 12u);
+
+    // Build seamless equirectangular mip chain on CPU (wrap U, clamp V) so
+    // R32G32B32A32_SFLOAT avoids linear-blit format limitations and seam artifacts.
+    struct MipLevelData {
+        uint32_t w = 0;
+        uint32_t h = 0;
+        VkDeviceSize byteOffset = 0;
+        std::vector<float> pixels;
+    };
+    std::vector<MipLevelData> mips(mipLevels);
+    mips[0].w = width;
+    mips[0].h = height;
+    mips[0].pixels.assign(rgbaPixels, rgbaPixels + static_cast<size_t>(width) * height * 4);
+    sanitizeHdrRgbaPixels(mips[0].pixels.data(), static_cast<size_t>(width) * height);
+
+    VkDeviceSize totalStagingBytes = static_cast<VkDeviceSize>(width) * height * 4 * sizeof(float);
+    for (uint32_t m = 1; m < mipLevels; ++m) {
+        const auto& prev = mips[m - 1];
+        auto& curr = mips[m];
+        curr.w = std::max(1u, prev.w / 2u);
+        curr.h = std::max(1u, prev.h / 2u);
+        curr.byteOffset = totalStagingBytes;
+        curr.pixels.resize(static_cast<size_t>(curr.w) * curr.h * 4);
+
+        for (uint32_t y = 0; y < curr.h; ++y) {
+            uint32_t sy0 = std::min(y * 2u, prev.h - 1u);
+            uint32_t sy1 = std::min(sy0 + 1u, prev.h - 1u);
+            for (uint32_t x = 0; x < curr.w; ++x) {
+                uint32_t sx0 = (x * 2u) % prev.w;
+                uint32_t sx1 = (sx0 + 1u) % prev.w;
+                const float* p00 = &prev.pixels[(static_cast<size_t>(sy0) * prev.w + sx0) * 4];
+                const float* p10 = &prev.pixels[(static_cast<size_t>(sy0) * prev.w + sx1) * 4];
+                const float* p01 = &prev.pixels[(static_cast<size_t>(sy1) * prev.w + sx0) * 4];
+                const float* p11 = &prev.pixels[(static_cast<size_t>(sy1) * prev.w + sx1) * 4];
+                float* dst = &curr.pixels[(static_cast<size_t>(y) * curr.w + x) * 4];
+                dst[0] = 0.25f * (p00[0] + p10[0] + p01[0] + p11[0]);
+                dst[1] = 0.25f * (p00[1] + p10[1] + p01[1] + p11[1]);
+                dst[2] = 0.25f * (p00[2] + p10[2] + p01[2] + p11[2]);
+                dst[3] = 1.0f;
+            }
+        }
+        totalStagingBytes += static_cast<VkDeviceSize>(curr.w) * curr.h * 4 * sizeof(float);
+    }
+
+    auto image = std::make_unique<Image>(
+        device, allocator, width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT, std::vector<uint32_t>{}, mipLevels
+    );
+
+    Buffer staging(
+        allocator, totalStagingBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    uint8_t* mapped = static_cast<uint8_t*>(staging.map());
+    std::vector<VkBufferImageCopy> regions(mipLevels);
+    for (uint32_t m = 0; m < mipLevels; ++m) {
+        const VkDeviceSize levelBytes = mips[m].pixels.size() * sizeof(float);
+        std::memcpy(mapped + mips[m].byteOffset, mips[m].pixels.data(), levelBytes);
+        VkBufferImageCopy region{};
+        region.bufferOffset = mips[m].byteOffset;
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = m;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {mips[m].w, mips[m].h, 1};
+        regions[m] = region;
+    }
+    staging.unmap();
+    staging.flush();
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = pool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device, &allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    image->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT
+    );
+
+    vkCmdCopyBufferToImage(
+        cmd, staging.getBuffer(), image->getImage(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        static_cast<uint32_t>(regions.size()), regions.data()
+    );
+
+    image->transitionLayout(
+        cmd, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+    );
+
+    vkEndCommandBuffer(cmd);
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, pool, 1, &cmd);
+
+    VkSamplerCreateInfo samplerInfo{};
+    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = static_cast<float>(mipLevels);
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    samplerInfo.compareEnable = VK_FALSE;
+
+    VkSampler sampler = VK_NULL_HANDLE;
+    VkResult res = vkCreateSampler(device, &samplerInfo, nullptr, &sampler);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create environment texture sampler!");
+    }
+
+    return std::make_unique<Texture>(device, allocator, std::move(image), sampler);
+}
+
 std::unique_ptr<Texture> Texture::createDummyWhite(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool
 ) {
@@ -338,7 +494,7 @@ std::unique_ptr<Texture> Texture::createBlueNoise64(
 
 std::unique_ptr<Texture> Texture::createProceduralHdrSky(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-    uint32_t width, uint32_t height
+    uint32_t width, uint32_t height, EnvImportanceTable* outImportance
 ) {
     std::vector<glm::vec4> pixels(width * height);
     const float PI = 3.14159265358979323846f;
@@ -393,17 +549,16 @@ std::unique_ptr<Texture> Texture::createProceduralHdrSky(
         }
     }
 
-    size_t byteSize = pixels.size() * sizeof(glm::vec4);
-    return createFromPixels(
-        device, allocator, queue, pool,
-        width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
-        pixels.data(), byteSize, true
-    );
+    const float* rawPtr = &pixels[0].x;
+    if (outImportance) {
+        *outImportance = buildEnvImportanceTable(rawPtr, width, height);
+    }
+    return createFloatEnvFromPixels(device, allocator, queue, pool, width, height, rawPtr);
 }
 
 std::unique_ptr<Texture> Texture::createProceduralNightHdrSky(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-    uint32_t width, uint32_t height
+    uint32_t width, uint32_t height, EnvImportanceTable* outImportance
 ) {
     std::vector<glm::vec4> pixels(width * height);
     const float PI = 3.14159265358979323846f;
@@ -533,17 +688,16 @@ std::unique_ptr<Texture> Texture::createProceduralNightHdrSky(
         }
     }
 
-    size_t byteSize = pixels.size() * sizeof(glm::vec4);
-    return createFromPixels(
-        device, allocator, queue, pool,
-        width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
-        pixels.data(), byteSize, true
-    );
+    const float* rawNightPtr = &pixels[0].x;
+    if (outImportance) {
+        *outImportance = buildEnvImportanceTable(rawNightPtr, width, height);
+    }
+    return createFloatEnvFromPixels(device, allocator, queue, pool, width, height, rawNightPtr);
 }
 
 std::unique_ptr<Texture> Texture::createProceduralStudioHdrSky(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-    uint32_t width, uint32_t height
+    uint32_t width, uint32_t height, EnvImportanceTable* outImportance
 ) {
     std::vector<glm::vec4> pixels(width * height);
     const float PI = 3.14159265358979323846f;
@@ -643,13 +797,87 @@ std::unique_ptr<Texture> Texture::createProceduralStudioHdrSky(
         }
     }
 
-    size_t byteSize = pixels.size() * sizeof(glm::vec4);
-    return createFromPixels(
-        device, allocator, queue, pool,
-        width, height, VK_FORMAT_R32G32B32A32_SFLOAT,
-        pixels.data(), byteSize, true
-    );
+    const float* rawStudioPtr = &pixels[0].x;
+    if (outImportance) {
+        *outImportance = buildEnvImportanceTable(rawStudioPtr, width, height);
+    }
+    return createFloatEnvFromPixels(device, allocator, queue, pool, width, height, rawStudioPtr);
 }
+
+std::unique_ptr<Texture> Texture::createProceduralSolidHdrSky(
+    VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+    const glm::vec3& color, uint32_t width, uint32_t height, EnvImportanceTable* outImportance
+) {
+    std::vector<float> pixels(static_cast<size_t>(width) * height * 4, 0.0f);
+    const glm::vec3 safeCol(
+        (std::isfinite(color.r) && color.r > 0.0f) ? color.r : 0.0f,
+        (std::isfinite(color.g) && color.g > 0.0f) ? color.g : 0.0f,
+        (std::isfinite(color.b) && color.b > 0.0f) ? color.b : 0.0f
+    );
+    for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) {
+        pixels[i * 4 + 0] = safeCol.r;
+        pixels[i * 4 + 1] = safeCol.g;
+        pixels[i * 4 + 2] = safeCol.b;
+        pixels[i * 4 + 3] = 1.0f;
+    }
+    if (outImportance) {
+        *outImportance = buildEnvImportanceTable(pixels.data(), width, height);
+    }
+    return createFloatEnvFromPixels(device, allocator, queue, pool, width, height, pixels.data());
+}
+
+namespace {
+
+bool loadHdrFileRgbaFloat(
+    const std::string& filepath,
+    std::vector<float>& outRgba,
+    uint32_t& outW,
+    uint32_t& outH,
+    const glm::vec3& tint = glm::vec3(1.0f)
+) {
+    if (!std::filesystem::exists(filepath)) {
+        Logger::warn("Texture file not found: {}", filepath);
+        return false;
+    }
+
+    std::string ext = std::filesystem::path(filepath).extension().string();
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    int w = 0, h = 0, comp = 0;
+    if (ext == ".exr") {
+        float* rgba = nullptr;
+        const char* err = nullptr;
+        int ret = LoadEXR(&rgba, &w, &h, filepath.c_str(), &err);
+        if (ret != TINYEXR_SUCCESS || !rgba || w <= 0 || h <= 0) {
+            Logger::error("Failed to load EXR image: {} ({})", filepath, err ? err : "unknown error");
+            if (err) FreeEXRErrorMessage(err);
+            return false;
+        }
+        outW = static_cast<uint32_t>(w);
+        outH = static_cast<uint32_t>(h);
+        outRgba.assign(rgba, rgba + static_cast<size_t>(outW) * outH * 4);
+        free(rgba);
+        sanitizeHdrRgbaPixels(outRgba.data(), static_cast<size_t>(outW) * outH, tint);
+        Logger::info("Loaded EXR environment map: {} ({}x{}, 32-bit Float)", filepath, w, h);
+        return true;
+    }
+
+    float* data = stbi_loadf(filepath.c_str(), &w, &h, &comp, 4);
+    if (!data || w <= 0 || h <= 0) {
+        Logger::error("Failed to load HDR/Env image: {} ({})", filepath, stbi_failure_reason());
+        if (data) stbi_image_free(data);
+        return false;
+    }
+    outW = static_cast<uint32_t>(w);
+    outH = static_cast<uint32_t>(h);
+    outRgba.assign(data, data + static_cast<size_t>(outW) * outH * 4);
+    stbi_image_free(data);
+    sanitizeHdrRgbaPixels(outRgba.data(), static_cast<size_t>(outW) * outH, tint);
+    Logger::info("Loaded {} environment map: {} ({}x{}, 32-bit Float)", (ext == ".hdr") ? "HDRI" : "LDR->Float", filepath, w, h);
+    return true;
+}
+
+} // namespace
 
 std::unique_ptr<Texture> Texture::loadFromFile(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
@@ -661,81 +889,96 @@ std::unique_ptr<Texture> Texture::loadFromFile(
     }
 
     std::string ext = std::filesystem::path(filepath).extension().string();
-    for (auto& c : ext) c = std::tolower(c);
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (ext == ".hdr" || ext == ".exr") {
+        std::vector<float> rgba;
+        uint32_t w = 0, h = 0;
+        if (!loadHdrFileRgbaFloat(filepath, rgba, w, h)) {
+            return nullptr;
+        }
+        return createFloatEnvFromPixels(device, allocator, queue, pool, w, h, rgba.data());
+    }
 
     int w = 0, h = 0, comp = 0;
-    if (ext == ".hdr") {
-        float* data = stbi_loadf(filepath.c_str(), &w, &h, &comp, 4);
-        if (!data) {
-            Logger::error("Failed to load HDR image: {} ({})", filepath, stbi_failure_reason());
-            return nullptr;
-        }
-        size_t byteSize = static_cast<size_t>(w) * h * 4 * sizeof(float);
-        auto tex = createFromPixels(
-            device, allocator, queue, pool,
-            static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-            VK_FORMAT_R32G32B32A32_SFLOAT, data, byteSize, true
-        );
-        stbi_image_free(data);
-        Logger::info("Loaded HDRI environment map: {} ({}x{}, 32-bit Float)", filepath, w, h);
-        return tex;
-    } else if (ext == ".exr") {
-        float* rgba = nullptr;
-        const char* err = nullptr;
-        int ret = LoadEXR(&rgba, &w, &h, filepath.c_str(), &err);
-        if (ret != TINYEXR_SUCCESS || !rgba || w <= 0 || h <= 0) {
-            Logger::error("Failed to load EXR image: {} ({})", filepath, err ? err : "unknown error");
-            if (err) FreeEXRErrorMessage(err);
-            return nullptr;
-        }
-        size_t byteSize = static_cast<size_t>(w) * h * 4 * sizeof(float);
-        auto tex = createFromPixels(
-            device, allocator, queue, pool,
-            static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-            VK_FORMAT_R32G32B32A32_SFLOAT, rgba, byteSize, true
-        );
-        free(rgba);
-        Logger::info("Loaded EXR environment map: {} ({}x{}, 32-bit Float)", filepath, w, h);
-        return tex;
-    } else {
-        stbi_uc* data = stbi_load(filepath.c_str(), &w, &h, &comp, 4);
-        if (!data) {
-            Logger::error("Failed to load LDR texture image: {} ({})", filepath, stbi_failure_reason());
-            return nullptr;
-        }
-        size_t byteSize = static_cast<size_t>(w) * h * 4;
-        auto tex = createFromPixels(
-            device, allocator, queue, pool,
-            static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-            VK_FORMAT_R8G8B8A8_UNORM, data, byteSize, false, (w >= 64 && h >= 64)
-        );
-        stbi_image_free(data);
-        Logger::info("Loaded texture image: {} ({}x{}, RGBA8)", filepath, w, h);
-        return tex;
+    stbi_uc* data = stbi_load(filepath.c_str(), &w, &h, &comp, 4);
+    if (!data) {
+        Logger::error("Failed to load LDR texture image: {} ({})", filepath, stbi_failure_reason());
+        return nullptr;
     }
+    size_t byteSize = static_cast<size_t>(w) * h * 4;
+    auto tex = createFromPixels(
+        device, allocator, queue, pool,
+        static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+        VK_FORMAT_R8G8B8A8_UNORM, data, byteSize, false, (w >= 64 && h >= 64)
+    );
+    stbi_image_free(data);
+    Logger::info("Loaded texture image: {} ({}x{}, RGBA8)", filepath, w, h);
+    return tex;
 }
 
 std::unique_ptr<Texture> Texture::createSceneEnvironmentMap(
     VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
     const std::string& hdriPath, const std::string& scenePath,
-    const std::string& domeLightHdriPath
+    const std::string& domeLightHdriPath,
+    EnvImportanceTable* outImportance,
+    const glm::vec3& envTint,
+    bool solidColorDome,
+    bool* outUsedExplicitOrDome
 ) {
     std::unique_ptr<Texture> envMap = nullptr;
-
-    // 1. Explicit user-provided or scene-associated HDRI path
-    if (!hdriPath.empty() && hdriPath != "night" && hdriPath != "night-sky") {
-        envMap = Texture::loadFromFile(device, allocator, queue, pool, hdriPath);
+    if (outImportance) {
+        *outImportance = EnvImportanceTable{};
+    }
+    if (outUsedExplicitOrDome) {
+        *outUsedExplicitOrDome = false;
     }
 
-    // 2. USD DomeLight HDRI
-    if (!envMap && !domeLightHdriPath.empty()) {
-        envMap = Texture::loadFromFile(device, allocator, queue, pool, domeLightHdriPath);
-        if (envMap) {
-            Logger::info("Loaded USD DomeLight HDRI from UsdLuxDomeLight schema: {}", domeLightHdriPath);
+    const bool isBuiltinKeyword = (hdriPath == "night" || hdriPath == "night-sky" ||
+                                   hdriPath == "studio" || hdriPath == "dark");
+
+    auto loadHdrOrLdrEnv = [&](const std::string& path, const glm::vec3& tint) -> std::unique_ptr<Texture> {
+        std::vector<float> rgba;
+        uint32_t w = 0, h = 0;
+        if (!loadHdrFileRgbaFloat(path, rgba, w, h, tint)) {
+            return nullptr;
+        }
+        if (outImportance) {
+            *outImportance = buildEnvImportanceTable(rgba.data(), w, h);
+        }
+        return createFloatEnvFromPixels(device, allocator, queue, pool, w, h, rgba.data());
+    };
+
+    // 1. Explicit user-provided or scene-associated HDRI path (excluding built-in keywords)
+    if (!hdriPath.empty() && !isBuiltinKeyword) {
+        envMap = loadHdrOrLdrEnv(hdriPath, envTint);
+        if (envMap && outUsedExplicitOrDome) {
+            *outUsedExplicitOrDome = true;
         }
     }
 
-    // 3. Procedural Sky Dome selection based on scene type
+    // 2. USD DomeLight HDRI (when not overridden by explicit HDRI keyword/file)
+    if (!envMap && !isBuiltinKeyword && !domeLightHdriPath.empty()) {
+        envMap = loadHdrOrLdrEnv(domeLightHdriPath, envTint);
+        if (envMap) {
+            Logger::info("Loaded USD DomeLight HDRI from UsdLuxDomeLight schema: {}", domeLightHdriPath);
+            if (outUsedExplicitOrDome) {
+                *outUsedExplicitOrDome = true;
+            }
+        }
+    }
+
+    // 3. Untextured UsdLuxDomeLight constant tint
+    if (!envMap && !isBuiltinKeyword && solidColorDome) {
+        envMap = Texture::createProceduralSolidHdrSky(device, allocator, queue, pool, envTint, 16, 8, outImportance);
+        if (envMap && outUsedExplicitOrDome) {
+            *outUsedExplicitOrDome = true;
+        }
+        Logger::info("Initialized USD DomeLight constant color environment ({:.3f}, {:.3f}, {:.3f}).",
+                     envTint.r, envTint.g, envTint.b);
+    }
+
+    // 4. Procedural Sky Dome selection based on scene type
     if (!envMap) {
         bool isCyber = (hdriPath == "night" || hdriPath == "night-sky" ||
                         scenePath == "cyber-city" || scenePath == "procedural:cyber-city" ||
@@ -746,13 +989,13 @@ std::unique_ptr<Texture> Texture::createSceneEnvironmentMap(
                                  scenePath == "procedural:infinity_mirror" || scenePath == "infinity_mirror" ||
                                  scenePath == "Procedural Infinity Mirror" || scenePath == "Infinity Mirror");
         if (isCyber) {
-            envMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool);
-            Logger::info("Initialized procedural Cyber Night HDRI sky dome (1024x512, 32-bit Float).");
+            envMap = Texture::createProceduralNightHdrSky(device, allocator, queue, pool, 2048, 1024, outImportance);
+            Logger::info("Initialized procedural Cyber Night HDRI sky dome (2048x1024, 32-bit Float).");
         } else if (isInfinityMirror) {
-            envMap = Texture::createProceduralStudioHdrSky(device, allocator, queue, pool);
+            envMap = Texture::createProceduralStudioHdrSky(device, allocator, queue, pool, 1024, 512, outImportance);
             Logger::info("Initialized procedural Starry Void HDRI environment (1024x512, 32-bit Float, Subtle Stars).");
         } else {
-            envMap = Texture::createProceduralHdrSky(device, allocator, queue, pool);
+            envMap = Texture::createProceduralHdrSky(device, allocator, queue, pool, 512, 256, outImportance);
             Logger::info("Initialized procedural Day HDRI sky dome (512x256, 32-bit Float).");
         }
     }

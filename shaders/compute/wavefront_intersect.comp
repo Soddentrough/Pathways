@@ -164,7 +164,7 @@ void main() {
                 vec3 hitP = origin + hit.hitData0.x * direction;
                 vec3 pNorm = fract((hitP * 0.1) + 0.5);
                 uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
-                mortonCode = morton3D_10bit(qPos) & 0x0FFFu;
+                mortonCode = (morton3D_10bit(qPos) >> 18u) & 0x0FFFu;
             }
             uint sortKey = inRange ? ((archetype << 12u) | mortonCode) : 0xFFFFu;
             uint sortedLane = gl_SubgroupInvocationID;

@@ -1,0 +1,174 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_EXT_shader_image_load_formatted : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 4) in;
+
+layout(binding = 0) uniform image2D uAccumImage;
+layout(binding = 23, rgba16f) uniform readonly image2D uMotionVectorImage;
+layout(binding = 24, rgba16f) uniform readonly image2D uNormalDepthImage;
+layout(binding = 26, rgba16f) uniform readonly image2D uMlAlbedoRoughnessImage;
+layout(binding = 28, rgba16f) uniform image2D uMlDiffuseImage;
+layout(binding = 29, rgba16f) uniform image2D uMlSpecularImage;
+layout(binding = 33, rgba16f) uniform readonly image2D uPrevNormalDepthImage;
+layout(binding = 41, rgba16f) uniform readonly image2D uMlSpecAlbedoImage;
+
+layout(binding = 1) uniform CameraUBO {
+    mat4 viewInverse;
+    mat4 projInverse;
+    mat4 prevViewProj;
+    vec4 position;
+    vec4 viewParams;
+    uint frameIndex;
+    uint spp;
+    uint maxBounces;
+    uint flags;
+    mat4 unjitteredViewProj;
+    vec4 jitterOffset;
+} ubo;
+
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
+
+layout(std430, binding = 12) writeonly buffer ShadowRayQueue {
+    PackedShadowRay shadowRays[];
+};
+
+layout(std430, binding = 13) buffer IndirectCommand {
+    DispatchCommand commands[];
+} indirect;
+
+#include "restir_common.glsl"
+#include "wavefront_radiance_output.glsl"
+#include "bsdf_standard.glsl"
+
+layout(std430, binding = 37) readonly buffer X1ContextsBuffer {
+    X1Context x1Contexts[];
+};
+
+layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
+    uvec2 giCurrentData[];
+};
+
+layout(std430, binding = 39) readonly buffer GiHistoryReservoirsBuffer {
+    uvec2 giHistoryData[];
+};
+
+#define ENABLE_INLINE_SHADOWS 0
+#include "restir_gi_reuse.glsl"
+
+layout(push_constant) uniform PushConstants {
+    WavefrontShadePC pc;
+};
+
+void main() {
+    ivec2 giPix = ivec2(gl_GlobalInvocationID.xy);
+    bool inRange = (giPix.x < int(pc.width) && giPix.y < int(pc.height));
+
+    bool hasGiShadowRay = false;
+    PackedShadowRay giShadowCandidate;
+
+    if (inRange) {
+        uint pixelIndex = uint(giPix.y) * pc.width + uint(giPix.x);
+        X1Context giCtx = x1Contexts[pixelIndex];
+        if ((giCtx.data.w & X1_FLAG_VALID) != 0u) {
+            uvec2 selfMeta = giCurrentData[pixelIndex];
+            uint selfFlagsM = selfMeta.y;
+            if (((selfFlagsM >> 16u) & 1u) != 0u) {
+                vec4 mvData = imageLoad(uMotionVectorImage, giPix);
+                float linDepth = mvData.w;
+                uint clsSeed = uint(giPix.x * 1973 + giPix.y * 9277 + (ubo.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) | 1u;
+                bool enableTaa = (ubo.flags & (1u << 21)) != 0u;
+                vec2 jitter = (enableTaa || pc.captureMlData != 0u) ? vec2(0.0) : (randVec2(clsSeed) - vec2(0.5));
+                vec2 uv = (vec2(giPix) + vec2(0.5) + jitter) / vec2(float(pc.width), float(pc.height));
+                vec2 ndc = uv * 2.0 - 1.0;
+                vec4 target = ubo.projInverse * vec4(ndc.x, ndc.y, 1.0, 1.0);
+                vec3 rayDir = normalize((ubo.viewInverse * vec4(normalize(target.xyz / target.w), 0.0)).xyz);
+                float camZ = max(dot(rayDir, -ubo.viewInverse[2].xyz), 1e-4);
+                vec3 giX1 = ubo.position.xyz + rayDir * (linDepth / camZ);
+                vec3 giWo = -rayDir;
+
+                uint selfRadBits = selfMeta.x;
+                bool hasSelfCandidate = (((selfFlagsM >> 17u) & 1u) != 0u) && (selfRadBits != 0u);
+                vec3 selfX2 = vec3(0.0);
+                vec3 selfN2 = vec3(0.0, 1.0, 0.0);
+                float selfHitT = 0.0;
+                float cosRcSelf = 0.0;
+                vec3 giL2 = vec3(0.0);
+                if (hasSelfCandidate) {
+                    uint giCurrStride = giCurrentData.length() >> 2u;
+                    uvec2 selfP0 = giCurrentData[giCurrStride + pixelIndex * 2u];
+                    uvec2 selfP1 = giCurrentData[giCurrStride + pixelIndex * 2u + 1u];
+                    selfX2 = vec3(uintBitsToFloat(selfP0.x), uintBitsToFloat(selfP0.y), uintBitsToFloat(selfP1.x));
+                    selfN2 = restirUnpackOct16(selfP1.y & 0xFFFFu);
+                    selfHitT = unpackHalf2x16(selfP1.y >> 16u).x;
+                    vec3 toSelfX1 = giX1 - selfX2;
+                    float toLenSq = dot(toSelfX1, toSelfX1);
+                    vec3 selfInDir = (toLenSq > 1e-12) ? (toSelfX1 * inversesqrt(toLenSq)) : selfN2;
+                    cosRcSelf = clamp(dot(selfN2, selfInDir), 0.0, 1.0);
+                    giL2 = restirUnpackRgb9e5(selfRadBits);
+                }
+
+                uint giReuseSeed = uint(giPix.x * 1973 + giPix.y * 9277 + (pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex) * 26699) ^ 0xC2B2AE35u;
+                giReuseSeed |= 1u;
+                pcg_hash(giReuseSeed);
+
+                restirGiRunReuse(
+                    pixelIndex, pc.width, pc.height, pc.frameIndex, 0u /* finalize giReservoirs for all samples */,
+                    pc.restirMCap, pc.captureMlData, pc.indirectClamp,
+                    false, pc.numOpaqueTriangles,
+                    giCtx, mvData, giX1, giWo, linDepth, hasSelfCandidate, selfX2, selfN2, selfHitT, cosRcSelf, giL2,
+                    giReuseSeed, hasGiShadowRay, giShadowCandidate
+                );
+            }
+        }
+    }
+
+    uvec4 giShadowBallot = subgroupBallot(hasGiShadowRay);
+    uint giShadowLaneSlot = subgroupBallotExclusiveBitCount(giShadowBallot);
+    uint giShadowWaveCount = subgroupBallotBitCount(giShadowBallot);
+
+    uint giShadowGlobalOffset = 0u;
+    if (giShadowWaveCount > 0u) {
+        if (subgroupElect()) {
+            giShadowGlobalOffset = atomicAdd(queueCounters.shadowRayCount, giShadowWaveCount);
+        }
+        giShadowGlobalOffset = subgroupBroadcastFirst(giShadowGlobalOffset);
+    }
+
+    if (hasGiShadowRay) {
+        uint targetIdxGiShadow = giShadowGlobalOffset + giShadowLaneSlot;
+        if (targetIdxGiShadow < pc.maxQueueCapacity) {
+            shadowRays[targetIdxGiShadow] = giShadowCandidate;
+        }
+    }
+
+    memoryBarrierBuffer();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        uint numWgs = gl_NumWorkGroups.x * gl_NumWorkGroups.y;
+        uint retired = atomicAdd(queueCounters.pad[0], 1u);
+        if (retired == numWgs - 1u) {
+            queueCounters.pad[0] = 0u;
+            bool b2WillRun = (pc.currentBounce == 1u) && (queueCounters.totalShadeWorkgroups > 0u);
+            if (!b2WillRun) {
+                uint cnt = atomicExchange(queueCounters.shadowRayCount, 0u);
+                queueCounters.currentShadowCount = cnt;
+                indirect.commands[1u * 16u + 4u].x = (cnt + 31u) / 32u;
+                indirect.commands[1u * 16u + 4u].y = 1u;
+                indirect.commands[1u * 16u + 4u].z = 1u;
+                indirect.commands[1u * 16u + 4u].pad = cnt;
+            } else {
+                indirect.commands[1u * 16u + 4u].x = 0u;
+                indirect.commands[1u * 16u + 4u].y = 1u;
+                indirect.commands[1u * 16u + 4u].z = 1u;
+                indirect.commands[1u * 16u + 4u].pad = 0u;
+            }
+        }
+    }
+}

@@ -15,70 +15,59 @@
 #endif
 
 bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numOpaqueTriangles) {
-    bool occluded = false;
-
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (ubo.flags & (1u << 6)) != 0u; // approximate light check
     bool hasAlphaShadow = (ubo.flags & (1u << 27)) != 0u;
+    bool simpleOpaque = !hasAlphaShadow && (!transparentShadows || !enableCaustics);
 
-    if (!hasAlphaShadow && (!transparentShadows || !enableCaustics)) {
-        LOCAL_RQ_DECL
-        rayQueryInitializeEXT(RQ_OBJ, topLevelAS,
-                              gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                              (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
-                              origin, EPSILON, dir, maxDist - EPSILON * 2.0);
-        rayQueryProceedEXT(RQ_OBJ);
-        occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
-    } else {
-        LOCAL_RQ_DECL
-        uint rqFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT
-                     | (transparentShadows ? gl_RayFlagsNoOpaqueEXT : 0u);
-        rayQueryInitializeEXT(RQ_OBJ, topLevelAS, rqFlags,
-                              RAY_MASK_ALL, origin, EPSILON, dir, maxDist - EPSILON * 2.0);
-        while (rayQueryProceedEXT(RQ_OBJ)) {
-            if (rayQueryGetIntersectionTypeEXT(RQ_OBJ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
-                uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(RQ_OBJ, false);
-                uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(RQ_OBJ, false);
-                uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(RQ_OBJ, false);
-                InstanceGPU inst = instances[instIdx];
-                uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
-                uint matId = triangles[triIdx].materialId + inst.materialOffset;
-                uint arch = materialArchetypes[matId];
-                ShadeMaterial sm = shadeMaterials[matId];
+    LOCAL_RQ_DECL
+    uint rqFlags = gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT
+                 | (simpleOpaque ? gl_RayFlagsOpaqueEXT : (transparentShadows ? gl_RayFlagsNoOpaqueEXT : 0u));
+    uint rayMask = (simpleOpaque && transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL;
+    rayQueryInitializeEXT(RQ_OBJ, topLevelAS, rqFlags, rayMask,
+                          origin, EPSILON, dir, maxDist - EPSILON * 2.0);
+    while (rayQueryProceedEXT(RQ_OBJ)) {
+        if (!simpleOpaque && rayQueryGetIntersectionTypeEXT(RQ_OBJ, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint instIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(RQ_OBJ, false);
+            uint geomIdx = rayQueryGetIntersectionGeometryIndexEXT(RQ_OBJ, false);
+            uint primIdx = rayQueryGetIntersectionPrimitiveIndexEXT(RQ_OBJ, false);
+            InstanceGPU inst = instances[instIdx];
+            uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
+            uint matId = triangles[triIdx].materialId + inst.materialOffset;
+            uint arch = materialArchetypes[matId];
+            ShadeMaterial sm = shadeMaterials[matId];
 
-                if (transparentShadows) {
-                    if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
-                        continue;
-                    }
-                    if (enableCaustics && arch == 2u) {
-                        if (smIsThin(sm)) {
-                            continue;
-                        }
-                    }
+            if (transparentShadows) {
+                if (arch == 3u || (!enableCaustics && arch == 2u)) { // EMISSIVE or DIELECTRIC
+                    continue;
                 }
-                uint alphaMode = smGetAlphaMode(sm);
-                if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
-                    vec2 bary = rayQueryGetIntersectionBarycentricsEXT(RQ_OBJ, false);
-                    float cw = 1.0 - bary.x - bary.y;
-                    vec2 cuv = cw * vec2(triangles[triIdx].uv0x, triangles[triIdx].uv0y)
-                             + bary.x * vec2(triangles[triIdx].uv1x, triangles[triIdx].uv1y)
-                             + bary.y * vec2(triangles[triIdx].uv2x, triangles[triIdx].uv2y);
-                    float calpha = sm.albedo.a;
-                    uint albTex = smGetAlbedoTex(sm);
-                    if (albTex > 0u && albTex <= 512u) {
-                        calpha *= SAMPLE_SCENE_TEXTURE(albTex, cuv).a;
-                    }
-                    float cutoff = (alphaMode == 1u) ? smGetAlphaCutoff(sm) : 0.5;
-                    if (calpha < cutoff) {
+                if (enableCaustics && arch == 2u) {
+                    if (smIsThin(sm)) {
                         continue;
                     }
                 }
-                rayQueryConfirmIntersectionEXT(RQ_OBJ);
-                rayQueryTerminateEXT(RQ_OBJ);
             }
+            uint alphaMode = smGetAlphaMode(sm);
+            if (alphaMode != 0u /* ALPHA_MODE_OPAQUE */) {
+                vec2 bary = rayQueryGetIntersectionBarycentricsEXT(RQ_OBJ, false);
+                float cw = 1.0 - bary.x - bary.y;
+                vec2 cuv = cw * vec2(triangles[triIdx].uv0x, triangles[triIdx].uv0y)
+                         + bary.x * vec2(triangles[triIdx].uv1x, triangles[triIdx].uv1y)
+                         + bary.y * vec2(triangles[triIdx].uv2x, triangles[triIdx].uv2y);
+                float calpha = sm.albedo.a;
+                uint albTex = smGetAlbedoTex(sm);
+                if (albTex > 0u && albTex <= 512u) {
+                    calpha *= SAMPLE_SCENE_TEXTURE(albTex, cuv).a;
+                }
+                float cutoff = (alphaMode == 1u) ? smGetAlphaCutoff(sm) : 0.5;
+                if (calpha < cutoff) {
+                    continue;
+                }
+            }
+            rayQueryConfirmIntersectionEXT(RQ_OBJ);
+            rayQueryTerminateEXT(RQ_OBJ);
         }
-        occluded = (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     }
 
-    return occluded;
+    return (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
 }

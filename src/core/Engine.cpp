@@ -301,6 +301,10 @@ Engine::Engine(const Config& config) : m_config(config) {
         }
     }
 
+    if (m_window && !m_config.headless) {
+        m_window->show();
+    }
+
     Logger::info("Pathways Engine initialization complete. Ready to render.");
 }
 
@@ -402,7 +406,8 @@ void Engine::initVulkan() {
     m_tlasUpdatePipeline = std::make_unique<GpuTlasUpdatePipeline>(
         device,
         allocator,
-        m_context->hasSubgroupSizeControl()
+        m_context->hasSubgroupSizeControl(),
+        m_context->getPipelineCache()
     );
 
     // Command buffers (Double-buffered)
@@ -481,6 +486,8 @@ SceneData cloneLightweightSceneMetadata(const SceneData& src) {
     dst.dielectricBoundsMax = src.dielectricBoundsMax;
     dst.domeLightHdriPath = src.domeLightHdriPath;
     dst.domeLightIntensity = src.domeLightIntensity;
+    dst.hasDomeLight = src.hasDomeLight;
+    dst.domeLightColor = src.domeLightColor;
     dst.hasSceneMetadata = src.hasSceneMetadata;
     dst.sceneSourceFormat = src.sceneSourceFormat;
     dst.sceneDefaultSpp = src.sceneDefaultSpp;
@@ -502,6 +509,8 @@ void Engine::syncScenePointers() {
         m_shadeMaterialBuffer = m_sceneManager->getShadeMaterialBuffer();
         m_lightBuffer = m_sceneManager->getLightBuffer();
         m_lightTreeBuffer = m_sceneManager->getLightTreeBuffer();
+        m_envImportanceBuffer = m_sceneManager->getEnvImportanceBuffer();
+        m_envNeeEnabled = m_sceneManager->isEnvNeeEnabled();
         m_positionBuffer = m_sceneManager->getPositionBuffer();
 
         m_dummyWhite = m_sceneManager->getDummyWhite();
@@ -528,6 +537,8 @@ void Engine::syncScenePointers() {
         m_shadeMaterialBuffer = nullptr;
         m_lightBuffer = nullptr;
         m_lightTreeBuffer = nullptr;
+        m_envImportanceBuffer = nullptr;
+        m_envNeeEnabled = false;
         m_positionBuffer = nullptr;
 
         m_dummyWhite = nullptr;
@@ -633,12 +644,19 @@ void Engine::initScene() {
 
     std::string scenePath = m_config.scene_path;
     std::string resolvedScene = m_sceneManager->resolveScenePath(scenePath);
+    if (!m_config.custom_hdri && m_config.hdri_path.empty()) {
+        std::string detected = m_sceneManager->detectSceneHdri(resolvedScene);
+        if (!detected.empty()) {
+            m_config.hdri_path = detected;
+        }
+    }
 
     UsdLoadOptions options{};
     options.instanceDensity = m_config.instance_density;
     options.cullDistance = m_config.cull_distance;
     options.cameraPosOverride = m_config.camera_pos;
     options.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
+    options.suppressFallbackSun = !m_config.hdri_path.empty();
 
     SceneData loadedData = SceneManager::loadRawSceneData(resolvedScene, options);
     m_sceneManager->ingestSceneData(std::move(loadedData), resolvedScene, m_config, m_geometryPipeline.get());
@@ -678,7 +696,7 @@ void Engine::initScene() {
     createAccelerationStructures();
 
     // Textures & HDRI Environment Map Initialization
-    m_sceneManager->loadTextures(m_config.hdri_path, m_config.scene_path);
+    m_sceneManager->loadTextures(m_config.hdri_path, m_config.scene_path, m_config.custom_hdri);
 
     syncScenePointers();
 
@@ -759,13 +777,16 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 
     // Reload scene textures & environment map
     if (m_sceneManager) {
-        m_sceneManager->loadTextures(m_config.hdri_path, filepath);
+        m_sceneManager->loadTextures(m_config.hdri_path, filepath, m_config.custom_hdri);
     }
 
     syncScenePointers();
 
     // Update primary descriptor sets
     updateSceneDescriptors();
+    if (m_sceneHasAlphaMask) {
+        ensureWavefrontAlphaPipeline();
+    }
 
     // Secondary GPU reload
     if (m_mgpu && m_mgpu->isSecondaryInitialized()) {
@@ -858,14 +879,19 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 
 bool Engine::loadScene(const std::string& filepath) {
     m_dynamicWavefrontBounces = m_config.max_bounces;
+    std::string resolved = m_sceneManager ? m_sceneManager->resolveScenePath(filepath) : filepath;
+    std::string activeHdri = m_config.custom_hdri
+        ? m_config.hdri_path
+        : (m_sceneManager ? m_sceneManager->detectSceneHdri(resolved) : "");
     UsdLoadOptions options{};
     options.instanceDensity = m_config.instance_density;
     options.cullDistance = m_config.cull_distance;
     options.cameraPosOverride = m_config.camera_pos;
     options.viewportAspect = (m_config.height > 0) ? (static_cast<float>(m_config.width) / static_cast<float>(m_config.height)) : (16.0f / 9.0f);
+    options.suppressFallbackSun = !activeHdri.empty();
 
-    SceneData newScene = SceneManager::loadRawSceneData(filepath, options);
-    return applyLoadedScene(std::move(newScene), filepath);
+    SceneData newScene = SceneManager::loadRawSceneData(resolved, options);
+    return applyLoadedScene(std::move(newScene), resolved);
 }
 
 void Engine::updateSceneTransparencyFlag() {
@@ -968,7 +994,28 @@ WavefrontSortMode Engine::getEffectiveWavefrontSortMode() const {
 }
 
 void Engine::ensureNrcInitialized() {
-    if (!m_rtOrchestrator || m_nrcManager) return;
+    if (!m_rtOrchestrator) return;
+    WavefrontPipeline* wf = m_rtOrchestrator->getWavefrontPipeline();
+    if (wf && !wf->hasNrcPipelines()) {
+        try {
+            vkDeviceWaitIdle(m_context->getDevice());
+            m_rtOrchestrator->initWavefrontNrcVariants(
+                loadShaderSPIRV("wavefront_shade_diffuse_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_diffuse_sec_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_complex_sec_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_dielectric_nrc.comp.spv"),
+                loadShaderSPIRV("wavefront_shade_dielectric_sec_nrc.comp.spv")
+            );
+            m_context->savePipelineCache();
+        } catch (const std::exception& e) {
+            if (m_config.enable_nrc) {
+                throw std::runtime_error(std::string("NRC wavefront variant loading failed: ") + e.what());
+            }
+            Logger::warn("Wavefront NRC variant pipelines initialization failed: {}", e.what());
+        }
+    }
+    if (m_nrcManager) return;
     try {
         auto nrcInferCode = loadShaderSPIRV("nrc_encode_infer.comp.spv");
         auto nrcTrainCode = loadShaderSPIRV("nrc_train.comp.spv");
@@ -993,7 +1040,8 @@ void Engine::ensureDenoiserInitialized() {
             m_context->getDevice(), m_context->getPhysicalDevice(), m_context->getAllocator(),
             m_context->getGraphicsQueue(),
             [this](const std::string& name) { return loadShaderSPIRV(name); },
-            m_context->hasSubgroupSizeControl()
+            m_context->hasSubgroupSizeControl(),
+            m_context->getPipelineCache()
         );
         m_denoiser->resize(m_config.getRenderWidth(), m_config.getRenderHeight(), m_config.accum_format, m_commandBuffers[0]);
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
@@ -1002,6 +1050,49 @@ void Engine::ensureDenoiserInitialized() {
             throw std::runtime_error(std::string("DenoiserPipeline requested but initialization failed: ") + e.what());
         }
         Logger::warn("DenoiserPipeline initialization failed: {}", e.what());
+    }
+}
+
+void Engine::ensureWavefrontAlphaPipeline() {
+    if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasAlphaIntersectPipeline()) return;
+    try {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_rtOrchestrator->initWavefrontAlphaPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+        m_context->savePipelineCache();
+    } catch (const std::exception& e) {
+        Logger::warn("Wavefront alpha intersect pipeline initialization failed: {}", e.what());
+    }
+}
+
+void Engine::ensureWavefrontTailMegakernelPipeline() {
+    if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasTailMegakernelPipeline()) return;
+    try {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_rtOrchestrator->initWavefrontTailMegakernelPipeline(loadShaderSPIRV("wavefront_tail_megakernel.comp.spv"));
+        m_context->savePipelineCache();
+    } catch (const std::exception& e) {
+        Logger::warn("Wavefront tail megakernel pipeline initialization failed: {}", e.what());
+    }
+}
+
+void Engine::ensureWavefrontRestirPipelines() {
+    if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasRestirPipelines()) return;
+    try {
+        vkDeviceWaitIdle(m_context->getDevice());
+        m_rtOrchestrator->initWavefrontRestirVariants(
+            loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+            loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+            loadShaderSPIRV("restir_di_reuse.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+        );
+        m_context->savePipelineCache();
+    } catch (const std::exception& e) {
+        Logger::warn("Wavefront ReSTIR variant pipelines initialization failed: {}", e.what());
     }
 }
 
@@ -1017,7 +1108,8 @@ void Engine::initPipelines() {
     m_rtOrchestrator = std::make_unique<RayTracingOrchestrator>(
         device, m_context->getAllocator(),
         m_context->getPhysicalDevice(),
-        m_context->getDeviceProperties().deviceType
+        m_context->getDeviceProperties().deviceType,
+        m_context->getPipelineCache()
     );
 
     // 6. Wavefront Path Tracing Pipeline (Ray Queues & DGC)
@@ -1031,7 +1123,11 @@ void Engine::initPipelines() {
     auto wfShadeEmissiveCode = loadShaderSPIRV("wavefront_shade_emissive.comp.spv");
     auto wfShadeDiffuseSecCode = loadShaderSPIRV("wavefront_shade_diffuse_sec.comp.spv");
     auto wfShadeComplexSecCode = loadShaderSPIRV("wavefront_shade_complex_sec.comp.spv");
-    auto wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
+    auto wfShadeDielectricSecCode = loadShaderSPIRV("wavefront_shade_dielectric_sec.comp.spv");
+    std::vector<char> wfTailMegakernelCode;
+    if (m_config.enable_tail_megakernel) {
+        wfTailMegakernelCode = loadShaderSPIRV("wavefront_tail_megakernel.comp.spv");
+    }
 
     uint32_t initRenderW = m_config.getRenderWidth();
     uint32_t initRenderH = m_config.getRenderHeight();
@@ -1059,17 +1155,37 @@ void Engine::initPipelines() {
         m_dgcPreprocessEnabled,
         m_context->hasSubgroupSizeControl(),
         initBatchPixels,
-        wfTailMegakernelCode
+        wfTailMegakernelCode,
+        wfShadeDielectricSecCode
     );
-    m_rtOrchestrator->initWavefrontSpecializedVariants(
-        loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
-        loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv")
-    );
+    if (m_sceneHasAlphaMask && isRestirActive()) {
+        m_rtOrchestrator->initWavefrontSpecializedVariants(
+            loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+            loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+            loadShaderSPIRV("restir_di_reuse.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+        );
+    } else if (m_sceneHasAlphaMask) {
+        m_rtOrchestrator->initWavefrontAlphaPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+    } else if (isRestirActive()) {
+        m_rtOrchestrator->initWavefrontRestirVariants(
+            loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_diffuse_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_complex_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
+            loadShaderSPIRV("restir_gi_reuse.comp.spv"),
+            loadShaderSPIRV("restir_di_reuse.comp.spv"),
+            loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+        );
+    }
 
     // 6c. Neural Radiance Caching (NRC) Manager (Wave32 WMMA — lazily allocated when enabled)
     if (m_config.enable_nrc) {
@@ -1092,7 +1208,8 @@ void Engine::initPipelines() {
         device, allocator,
         m_context->hasSubgroupSizeControl(),
         m_descriptorPool,
-        tonemapCode, fusedCode, runningAvgCode, blendCode, mergeCode, restirDebugCode
+        tonemapCode, fusedCode, runningAvgCode, blendCode, mergeCode, restirDebugCode,
+        m_context->getPipelineCache()
     );
     updateMergeDescriptors();
 
@@ -1113,7 +1230,8 @@ void Engine::initPipelines() {
         device, m_context->getPhysicalDevice(), allocator,
         m_context->getGraphicsQueue(),
         [this](const std::string& name) { return loadShaderSPIRV(name); },
-        m_context->getInstance()
+        m_context->getInstance(),
+        m_context->getPipelineCache()
     );
     m_superResolution->init(m_config, m_postProcess.get(), m_commandBuffers[0]);
 
@@ -1152,6 +1270,7 @@ void Engine::initPipelines() {
 
     updateAllImageDescriptors();
     updateSceneDescriptors();
+    m_context->savePipelineCache();
 }
 
 void Engine::updateAllImageDescriptors() {
@@ -1345,9 +1464,11 @@ void Engine::initCaustics() {
                 si.pCommandBufferInfos = &csi;
                 vkQueueSubmit2(m_context->getGraphicsQueue(), 1, &si, VK_NULL_HANDLE);
                 vkQueueWaitIdle(m_context->getGraphicsQueue());
-            }
+            },
+            m_context->getPipelineCache()
         );
 
+        m_context->savePipelineCache();
         updateAllImageDescriptors();
     } catch (const std::exception& e) {
         Logger::warn("CausticsPipeline initialization failed: {}", e.what());
@@ -1412,6 +1533,7 @@ void Engine::updateWavefrontSceneDescriptors() {
     wfParams.materialBuffer = m_materialBuffer;
     wfParams.lightBuffer = m_lightBuffer;
     wfParams.lightTreeBuffer = m_lightTreeBuffer;
+    wfParams.envImportanceBuffer = m_envImportanceBuffer;
     wfParams.instanceBuffer = m_instanceBuffer;
     wfParams.materialArchetypeBuffer = m_materialArchetypeBuffer;
     wfParams.shadeMaterialBuffer = m_shadeMaterialBuffer;
@@ -1820,6 +1942,7 @@ void Engine::renderFrame() {
     if (m_config.enable_nrc && !m_nrcManager) {
         vkDeviceWaitIdle(device);
         ensureNrcInitialized();
+        m_context->savePipelineCache();
         updateWavefrontSceneDescriptors();
         m_resetAccumulation = true;
     } else if (!m_config.enable_nrc && m_nrcManager) {
@@ -1851,6 +1974,7 @@ void Engine::renderFrame() {
     if (wantDenoiserPipeline && !m_denoiser) {
         vkDeviceWaitIdle(device);
         ensureDenoiserInitialized();
+        m_context->savePipelineCache();
         updateFsrDescriptors();
         m_resetAccumulation = true;
     } else if (!wantDenoiserPipeline && m_denoiser) {
@@ -2013,6 +2137,9 @@ void Engine::renderFrame() {
                     targetGbW, targetGbH, concurrentQueues, m_commandBuffers[0]
                 );
                 syncRenderTargetPointers();
+                // Keep SuperResolutionManager's cached Image* pointers synchronized with the
+                // recreated render-space targets before m_superResolution->resize() runs.
+                updateUpwaysDescriptors();
                 if (m_causticsPipeline) {
                     m_causticsPipeline->resize(targetGbW, targetGbH, [this](auto recordFn) {
                         VkCommandBuffer c = m_commandBuffers[0];
@@ -2195,7 +2322,7 @@ void Engine::renderFrame() {
     bool cameraJustStopped = (!cameraMovedThisFrame && m_cameraMovedLastFrame);
     bool hardReset = m_resetAccumulation || (m_totalFramesRendered == 0);
     bool accumReset = cameraMovedThisFrame || cameraJustStopped || instanceMovedThisFrame || instanceJustStopped || hardReset;
-    if (hardReset) {
+    if (hardReset || cameraMovedThisFrame || cameraJustStopped) {
         m_dynamicWavefrontBounces = m_config.max_bounces;
     }
     if (accumReset && !sceneLoadingActive) {
@@ -2257,7 +2384,7 @@ void Engine::renderFrame() {
     if (m_sceneHasAlphaMask)            flags |= (1 << 10);
     if (m_sceneHasAlphaShadow)          flags |= (1 << 27);
     if (m_config.inline_primary_shadows) flags |= (1 << 6);
-    if (m_config.enable_light_tree || (!m_sceneData.lightTreeNodes.empty())) flags |= (1 << 7);
+    if (m_config.enable_light_tree && (!m_sceneData.lightTreeNodes.empty())) flags |= (1 << 7);
     if (m_config.enable_caustics) {
         if (m_sceneData.hasDielectrics && m_numLights > 0) {
             if (!m_causticsPipeline) {
@@ -2356,6 +2483,16 @@ void Engine::renderFrame() {
         updateMergeDescriptors();
     }
 
+    if (m_sceneHasAlphaMask) {
+        ensureWavefrontAlphaPipeline();
+    }
+    if (m_config.enable_tail_megakernel) {
+        ensureWavefrontTailMegakernelPipeline();
+    }
+    if (isRestirActive()) {
+        ensureWavefrontRestirPipelines();
+    }
+
     // Lazy reservoir allocation: the grid only exists while ReSTIR has been
     // enabled at least once, keeping 152 B/pixel (DI 64B + GI 64B + X1 ctx 24B) out of the idle footprint.
     if (isRestirActive() && m_restirManager && !m_restirManager->isInitialized()) {
@@ -2435,7 +2572,9 @@ void Engine::renderFrame() {
     VkCommandBuffer activeCmd = cmd;
 
     uint32_t hasEnvMap = m_environmentMap ? 1 : 0;
-    float envIntensity = 1.0f;
+    float envIntensity = m_sceneManager
+        ? m_sceneManager->getEffectiveEnvIntensity()
+        : ((!m_config.custom_hdri && m_sceneData.hasDomeLight) ? m_sceneData.domeLightIntensity : 1.0f);
     MultiGpuFramePlan mgpuPlan{};
     uint32_t qBase = m_currentFrame * QUERIES_PER_FRAME;
 
@@ -2504,6 +2643,7 @@ void Engine::renderFrame() {
             rtParams.cameraMovedLastFrame = m_cameraMovedLastFrame;
             rtParams.diagnosticHalfTiles = m_config.diagnostic_half_tiles;
             rtParams.isRestirActive = isRestirActive();
+            rtParams.envNeeEnabled = m_envNeeEnabled;
 
             m_rtOrchestrator->recordRayTracing(
                 cmd, rtParams,
@@ -2526,7 +2666,8 @@ void Engine::renderFrame() {
                 m_mlDirectDiffuseImage,
                 m_mlIndirectDiffuseImage,
                 m_mlDirectSpecularImage,
-                m_mlIndirectSpecularImage
+                m_mlIndirectSpecularImage,
+                m_motionVectorImage
             );
         }
 
@@ -2711,7 +2852,8 @@ void Engine::renderFrame() {
             envIntensity,
             m_temporalResetRequested,
             m_accumulatedSamples,
-            getEffectiveWavefrontSortMode()
+            getEffectiveWavefrontSortMode(),
+            m_envNeeEnabled
         };
 
         const bool useDenoiserPipeline = (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
@@ -3300,6 +3442,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
 
     destroyGBufferResources();
     createGBufferResources();
+    // Keep SuperResolutionManager's cached Image* pointers synchronized with the
+    // recreated swapchain/G-buffer targets before m_superResolution->resize() runs.
+    updateUpwaysDescriptors();
     destroySplitSignalResources();
     if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration || m_config.capture_channels >= 44u) {
         ensureSplitSignalResources();

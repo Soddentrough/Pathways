@@ -244,6 +244,21 @@ int main() {
 
         check_true(!Config::dgcExecSetRequested(), "Default DGC execution set policy must be disabled (multi-dispatch default)");
 
+        // Tier 1 default alignment checks
+        check_true(cfgDef.enable_tail_megakernel, "Default enable_tail_megakernel must be true");
+        check_true(cfgDef.tail_megakernel_bounce == 2u, "Default tail_megakernel_bounce must be 2");
+        check_true(cfgDef.delta_unroll == 6u, "Default delta_unroll must be 6");
+        check_true(cfgDef.max_delta_events == 6u, "Default max_delta_events must be 6");
+        check_true(cfgDef.secondary_sort_mode == SecondarySortMode::DirectCoherentK8,
+                   "Default secondary_sort_mode must be DirectCoherentK8");
+
+        const char* argvNoTail[] = { "pathways", "--no-tail-megakernel", "--delta-unroll", "2", "--sec-sort", "direct" };
+        Config cTier1Ov = Config::parse(6, const_cast<char**>(argvNoTail));
+        check_true(!cTier1Ov.enable_tail_megakernel, "--no-tail-megakernel disables tail megakernel");
+        check_true(cTier1Ov.delta_unroll == 2u, "--delta-unroll 2 overrides default");
+        check_true(cTier1Ov.secondary_sort_mode == SecondarySortMode::DirectCoherent,
+                   "--sec-sort direct overrides default");
+
         std::cout << "  -> Pipeline CLI flags, sort modes, indirect clamp, and frame budget successfully verified." << std::endl;
     }
 

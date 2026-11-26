@@ -69,7 +69,8 @@ public:
         VmaAllocator allocator,
         VkQueue queue,
         ShaderLoader shaderLoader,
-        bool forceWave32 = false
+        bool forceWave32 = false,
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE
     );
     ~DenoiserPipeline();
 
@@ -122,6 +123,7 @@ private:
     VkQueue m_queue = VK_NULL_HANDLE;
     ShaderLoader m_shaderLoader;
     bool m_forceWave32 = false;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;

@@ -12,34 +12,56 @@
 //   - giReservoirs[], giHistoryReservoirs[]
 // =============================================================================
 
-StdBsdf giReconstructBsdf(X1Context ctx, uint captureMlData) {
-    vec3 n1 = x1ContextNormal(ctx);
-    vec3 wo = x1ContextWo(ctx);
+struct GiBrdf {
+    vec3 diffuseColor;
+    vec3 F0;
+    float alpha;
+};
+
+GiBrdf giReconstructBsdf(X1Context ctx, uint captureMlData) {
     vec3 baseColor = x1ContextBaseColor(ctx);
     float metallic = x1ContextMetallic(ctx);
     float f0Scalar = x1ContextF0(ctx);
     float roughness = x1ContextRoughness(ctx);
-    vec3 diffuseColor = baseColor * (1.0 - metallic);
-    vec3 F0 = mix(vec3(f0Scalar), baseColor, metallic);
-    StdBsdf b = makeStdBsdf(diffuseColor, F0, roughness * roughness, 0.0, metallic, dot(n1, wo), STD_BSDF_FULL);
+    GiBrdf b;
+    b.diffuseColor = baseColor * (1.0 - metallic);
+    b.F0 = mix(vec3(f0Scalar), baseColor, metallic);
+    b.alpha = max(roughness * roughness, STD_BSDF_MIN_ALPHA);
     return b;
 }
 
-StdBsdf giReconstructTargetBsdf(X1Context ctx, uint captureMlData) {
-    vec3 n1 = x1ContextNormal(ctx);
-    vec3 wo = x1ContextWo(ctx);
+GiBrdf giReconstructTargetBsdf(X1Context ctx, uint captureMlData) {
     vec3 baseColor = x1ContextBaseColor(ctx);
     float metallic = x1ContextMetallic(ctx);
     float f0Scalar = x1ContextF0(ctx);
     float origRoughness = x1ContextRoughness(ctx);
     float targetRoughness = max(origRoughness, 0.35);
-    vec3 diffuseColor = baseColor * (1.0 - metallic);
-    vec3 F0 = mix(vec3(f0Scalar), baseColor, metallic);
-    StdBsdf b = makeStdBsdf(diffuseColor, F0, targetRoughness * targetRoughness, 0.0, metallic, dot(n1, wo), STD_BSDF_FULL);
+    GiBrdf b;
+    b.diffuseColor = baseColor * (1.0 - metallic);
+    b.F0 = mix(vec3(f0Scalar), baseColor, metallic);
+    b.alpha = max(targetRoughness * targetRoughness, STD_BSDF_MIN_ALPHA);
     return b;
 }
 
-float giTargetAtBsdf(StdBsdf giBsdf, vec3 n1, vec3 wo, vec3 x1, vec3 x2, vec3 radiance) {
+vec3 giEvalBsdfSplit(GiBrdf b, vec3 N, vec3 V, vec3 L, out vec3 specFCos) {
+    specFCos = vec3(0.0);
+    float NdotL = dot(N, L);
+    if (NdotL <= 0.0) return vec3(0.0);
+    float NdotV = max(dot(N, V), 1e-4);
+    vec3 H = normalize(V + L);
+    float NdotH = clamp(dot(N, H), 0.0, 1.0);
+    float VdotH = clamp(dot(V, H), 0.0, 1.0);
+    vec3 F = fresnelSchlickVec(VdotH, b.F0);
+    float D = distributionGGX(NdotH, b.alpha);
+    float Vis = visibilitySmithGGXCorrelated(NdotL, NdotV, b.alpha);
+    vec3 ms = multiScatterSpecularApprox(b.alpha, NdotV, b.F0);
+    vec3 spec = (D * Vis * NdotL) * F * ms;
+    vec3 diff = (vec3(1.0) - F) * b.diffuseColor * (INV_PI * NdotL);
+    specFCos = spec;
+    return spec + diff;
+}
+
+float giTargetAtBsdf(GiBrdf giBsdf, vec3 n1, vec3 wo, vec3 x1, vec3 x2, vec3 radiance) {
     vec3 dv = x2 - x1;
     float dist = length(dv);
     if (dist < GI_TAP_MIN_DIST) return 0.0;
@@ -47,8 +69,8 @@ float giTargetAtBsdf(StdBsdf giBsdf, vec3 n1, vec3 wo, vec3 x1, vec3 x2, vec3 ra
     if (dot(n1, wi) <= GI_TAP_MIN_COS) return 0.0;
     vec3 L2 = max(radiance, vec3(0.0));
     if (dot(L2, vec3(0.2126, 0.7152, 0.0722)) <= 1e-6) return 0.0;
-    float unusedPdf = 0.0;
-    vec3 fCos = stdBsdfEval(giBsdf, n1, wo, wi, unusedPdf);
+    vec3 unusedSpec;
+    vec3 fCos = giEvalBsdfSplit(giBsdf, n1, wo, wi, unusedSpec);
     return max(dot(fCos * L2, vec3(0.2126, 0.7152, 0.0722)), 0.0);
 }
 
@@ -62,7 +84,7 @@ struct GiTapEval {
 bool giApplyTapEx(
     inout GiReservoir r,
     in GiReservoir tap,
-    StdBsdf giBsdf,
+    GiBrdf giBsdf,
     vec3 x1,
     vec3 n1,
     vec3 wo,
@@ -167,12 +189,10 @@ bool giApplyTapEx(
         r = makeGiReservoir(true, x2c, n2c, n1, combined, combinedM, pHat, radC, dNew, cosRcNew, ageNew);
         return true;
     }
+    uint packedM = min(combinedM, 255u) << 24u;
+    r.dSrcFlagsM = (r.dSrcFlagsM & 0x00FFFFFFu) | packedM;
     if (giIsValid(r) && giHasSurface(r) && giGetTarget(r) > 0.0) {
-        r = makeGiReservoir(true, giGetX2(r), giGetN2(r), n1, combined, combinedM, giGetTarget(r),
-                            giGetRadiance(r), giGetDSrc(r), giGetCosSrc(r), giGetAge(r));
-    } else {
-        r = makeGiReservoir(false, vec3(0.0), vec3(0.0, 1.0, 0.0), n1, 0.0, combinedM, 0.0,
-                            vec3(0.0), 0.0, 0.0, giIsValid(r) ? giGetAge(r) : ageNew);
+        r.wSumBits = floatBitsToUint(max(combined, 0.0));
     }
     return false;
 }
@@ -180,7 +200,7 @@ bool giApplyTapEx(
 bool giApplyTap(
     inout GiReservoir r,
     in GiReservoir tap,
-    StdBsdf giBsdf,
+    GiBrdf giBsdf,
     vec3 x1,
     vec3 n1,
     vec3 wo,
@@ -201,7 +221,7 @@ bool giApplyTap(
 }
 
 void giAccumulateRbSample(
-    StdBsdf giBsdf,
+    GiBrdf giBsdf,
     vec3 giN1,
     vec3 giWo,
     bool mergeMatteSpec,
@@ -214,9 +234,8 @@ void giAccumulateRbSample(
     inout vec3 rbSpecSum
 ) {
     if (mWeight == 0u || wFactor <= 0.0) return;
-    float unusedPdf = 0.0;
     vec3 specFCos = vec3(0.0);
-    vec3 fCos = stdBsdfEvalSplit(giBsdf, giN1, giWo, wi, unusedPdf, specFCos);
+    vec3 fCos = giEvalBsdfSplit(giBsdf, giN1, giWo, wi, specFCos);
     vec3 scale = L2 * wFactor;
     vec3 diff = mergeMatteSpec ? (fCos * scale) : (max(fCos - specFCos, vec3(0.0)) * scale);
     vec3 spec = mergeMatteSpec ? vec3(0.0) : (specFCos * scale);
@@ -246,7 +265,10 @@ void restirGiRunReuse(
     bool useInlineVis,
     uint numOpaqueTriangles,
     X1Context giCtx,
+    vec4 mvData,
     vec3 giX1,
+    vec3 giWo,
+    float selfDepth,
     bool hasSelfCandidate,
     vec3 selfX2,
     vec3 selfN2,
@@ -265,12 +287,12 @@ void restirGiRunReuse(
 #endif
 
     vec3 giN1 = x1ContextNormal(giCtx);
-    vec3 giWo = x1ContextWo(giCtx);
     float giMetallic = x1ContextMetallic(giCtx);
     float giRoughness = x1ContextRoughness(giCtx);
     float giQSelf = x1ContextQSelf(giCtx);
-    StdBsdf giBsdf = giReconstructBsdf(giCtx, captureMlData);
-    StdBsdf giTargetBsdf = giReconstructTargetBsdf(giCtx, captureMlData);
+    GiBrdf giBsdf = giReconstructBsdf(giCtx, captureMlData);
+    bool sameGiTargetBsdf = (giRoughness >= 0.35);
+    GiBrdf giTargetBsdf = sameGiTargetBsdf ? giBsdf : giReconstructTargetBsdf(giCtx, captureMlData);
 
     GiReservoir giR = makeGiReservoir(false, vec3(0.0), vec3(0.0, 1.0, 0.0), giN1, 0.0, 1u, 0.0, vec3(0.0), 0.0, 0.0, 0u);
     bool giWinnerSelf = false;
@@ -283,191 +305,160 @@ void restirGiRunReuse(
         }
     }
 
+    uint giCurrStride = giCurrentData.length() >> 2u;
+    uint giHistStride = giHistoryData.length() >> 2u;
     ivec2 giPix = ivec2(int(pixelIndex % width), int(pixelIndex / width));
-    vec4 mvData = vec4(0.0);
     ivec2 giPrev = giPix;
     float expectedPrevDepth = 1.0;
     bool hasGiMotion = false;
     bool canReuseHistory = (ubo.frameIndex > 0u) && ((ubo.flags & (1u << 23)) == 0u);
-    bool isV4Gi = (captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
     bool isMlGi = (captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
-    bool useRbGi = (!isMlGi) && inlineVisActive;
-    bool mergeMatteSpecRb = (!isMlGi) && (giRoughness >= 0.70 && giMetallic < 0.05);
-    vec3 rbDiffSum = vec3(0.0);
-    vec3 rbSpecSum = vec3(0.0);
-    uint rbMTotal = 1u;
-
-    GiReservoir giTempR = giR;
-    bool giTempWinnerSelf = giWinnerSelf;
-    GiTapEval tempEval;
-    tempEval.mTap = 0u;
-    tempEval.visWFactor = 0.0;
-    tempEval.dirToX2 = vec3(0.0, 1.0, 0.0);
-    tempEval.radiance = vec3(0.0);
-
+    // Defer visibility testing to a single wave-ballot queued shadow ray on the final
+    // selected reservoir sample instead of tracing multiple inline rayQueryEXT calls per pixel.
     if (canReuseHistory) {
-        mvData = imageLoad(uMotionVectorImage, giPix);
         vec2 giMvPx = mvData.xy * vec2(float(width), float(height));
         hasGiMotion = dot(giMvPx, giMvPx) > 0.25;
-        float selfDepth = max(dot(giX1 - ubo.position.xyz, -ubo.viewInverse[2].xyz), 0.0);
         expectedPrevDepth = max(selfDepth + mvData.z, 1e-4);
         giPrev = ivec2(round(vec2(giPix) - giMvPx));
 
         bool allowTemporalGiHistory = isMlGi || hasGiMotion;
-        if (allowTemporalGiHistory && abs(mvData.x) < 1.5 && abs(mvData.y) < 1.5 &&
-            giPrev.x >= 0 && giPrev.y >= 0 && giPrev.x < int(width) && giPrev.y < int(height)) {
-            float prevTapDepth = imageLoad(uPrevNormalDepthImage, giPrev).w;
-            float relDepthDiff = abs(expectedPrevDepth - prevTapDepth) / max(max(expectedPrevDepth, prevTapDepth), 1e-4);
-            float tempDepthGate = hasGiMotion ? 0.03 : 0.05;
-            if (relDepthDiff <= tempDepthGate) {
-                GiReservoir giTap = giHistoryReservoirs[uint(giPrev.y) * width + uint(giPrev.x)];
-                uint tempMCap = min(restirMCap, hasGiMotion ? 4u : (isMlGi ? 8u : 3u));
-                uint giAgeNew = min(giGetAge(giTap) + 1u, GI_MAX_AGE);
-                bool inlineVisTemp = inlineVisActive;
-                if (giApplyTapEx(giTempR, giTap, giTargetBsdf, giX1, giN1, giWo, giRoughness,
-                                 tempMCap, giAgeNew, inlineVisTemp, numOpaqueTriangles,
-                                 hasGiMotion ? 22.0 : 0.0, hasGiMotion ? 28.0 : 0.0, seed, tempEval)) {
-                    giTempWinnerSelf = false;
-                }
-            }
-        }
-    }
+        bool allowSpatialGi = true;
 
-    // Save pure TEMPORAL reservoir to history (never feed spatial reuse back into temporal history)
-    if (sppSampleIndex == 0u) {
-        giReservoirs[pixelIndex] = giIsValid(giTempR) ? giTempR : invalidGiReservoir();
-    }
-
-    if (useRbGi && giWinnerSelf) {
-        vec3 selfTo = selfX2 - giX1;
-        float selfDist = length(selfTo);
-        if (selfDist > 2.0 * EPSILON) {
-            float wSelf = 1.0 / giQSelf;
-            if (indirectClamp > 0.0) {
-                wSelf = min(wSelf, hasGiMotion ? 24.0 : GI_WEIGHT_CLAMP_MAX);
-            }
-            giAccumulateRbSample(
-                giBsdf, giN1, giWo, mergeMatteSpecRb, indirectClamp, 1u, wSelf,
-                selfTo / selfDist, giL2, rbDiffSum, rbSpecSum
-            );
-        }
-    }
-    if (useRbGi && hasGiMotion && tempEval.mTap > 0u) {
-        rbMTotal += tempEval.mTap;
-        float effTempClamp = (indirectClamp > 0.0) ? min(indirectClamp, 10.0) : 0.0;
-        giAccumulateRbSample(
-            giBsdf, giN1, giWo, mergeMatteSpecRb, effTempClamp, tempEval.mTap,
-            min(tempEval.visWFactor, 24.0), tempEval.dirToX2, tempEval.radiance, rbDiffSum, rbSpecSum
-        );
-    }
-
-    bool useTempForGiShade = isMlGi || hasGiMotion;
-    GiReservoir giShadeR = useTempForGiShade ? giTempR : giR;
-    bool giShadeWinnerSelf = useTempForGiShade ? giTempWinnerSelf : giWinnerSelf;
-
-    if (canReuseHistory) {
-        uint tapHash = (pixelIndex * 0x9E3779B9u) ^ (frameIndex * 0x85EBCA6Bu);
+        uint tileHashId = (uint(giPix.x >> 3) + uint(giPix.y >> 2) * ((width + 7u) >> 3));
+        uint tapHash = (tileHashId * 0x9E3779B9u) ^ (frameIndex * 0x85EBCA6Bu);
         if (isMlGi) {
             tapHash ^= 0xA3C59AC3u;
         }
         pcg_hash(tapHash);
         uint rot = (tapHash >> 30u) & 3u;
-        uint numSpatialTaps = isMlGi
-            ? 1u
-            : (hasGiMotion ? 1u : ((numOpaqueTriangles > 2000000u) ? 1u : 8u));
+        uint numSpatialTaps = 1u;
         uint tapOff = (tapHash >> 24u) % 24u;
+        uint tempMCap = min(restirMCap, hasGiMotion ? 4u : (isMlGi ? 8u : 3u));
         uint spatialMCap = isMlGi
             ? min(restirMCap, hasGiMotion ? 4u : 8u)
-            : (hasGiMotion ? min(restirMCap, 4u) : 1u);
+            : min(restirMCap, 4u);
+        float tempDepthGate = hasGiMotion ? 0.03 : 0.05;
         float spatDepthGate = isMlGi ? 0.03 : RESTIR_TAP_DEPTH_REL_GATE;
         float spatNormalGate = isMlGi ? 0.95 : RESTIR_TAP_NORMAL_MIN_DOT;
 
-        for (uint tap = 0u; tap < numSpatialTaps; ++tap) {
-            uint tapIdx = isMlGi
-                ? (((tapHash >> 27u) + tap) & 7u)
-                : (hasGiMotion
-                    ? (8u + ((tapOff + tap * 7u) % 24u))
-                    : (((tapHash >> 24u) + tap * 3u) & 31u));
-            ivec2 base = RESTIR_TAP_OFFSETS[tapIdx];
-            if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
-            if ((rot & 2u) != 0u) base = -base;
-            ivec2 offset = base;
-            ivec2 giCoord = giPrev + offset;
-            if (giCoord.x < 0 || giCoord.y < 0 || giCoord.x >= int(width) || giCoord.y >= int(height)) {
-                continue;
+        if (!allowTemporalGiHistory && sppSampleIndex == 0u && hasSelfCandidate) {
+            if (giWinnerSelf) {
+                giCurrentData[3u * giCurrStride + pixelIndex] = giPackWeights(giR);
+            } else {
+                giCurrentData[pixelIndex].y = (giR.dSrcFlagsM & 0xFFFF0000u) | ((giR.normalsPacked >> 16u) & 0xFFFFu);
+                giCurrentData[3u * giCurrStride + pixelIndex].x = 0u;
             }
-            float prevTapDepth = imageLoad(uPrevNormalDepthImage, giCoord).w;
-            float relDepthDiff = abs(expectedPrevDepth - prevTapDepth) / max(max(expectedPrevDepth, prevTapDepth), 1e-4);
-            if (relDepthDiff > spatDepthGate) continue;
+        }
 
-            GiReservoir giTap = giHistoryReservoirs[uint(giCoord.y) * width + uint(giCoord.x)];
-            if (dot(giN1, giGetX1Normal(giTap)) < spatNormalGate) continue;
-            GiTapEval spatEval;
-            if (giApplyTapEx(giShadeR, giTap, giTargetBsdf, giX1, giN1, giWo, giRoughness,
-                             spatialMCap, giGetAge(giTap), inlineVisActive, numOpaqueTriangles,
-                             hasGiMotion ? 22.0 : 28.0, hasGiMotion ? 28.0 : 32.0, seed, spatEval)) {
-                giShadeWinnerSelf = false;
+        // Single unified loop for Temporal (-1) and Spatial (0..numSpatialTaps-1) so LLPC
+        // keeps only one inlined copy of giApplyTap.
+        int startTap = allowTemporalGiHistory ? -1 : 0;
+        int endTap = allowSpatialGi ? int(numSpatialTaps) : 0;
+        [[dont_unroll]]
+        for (int tapPass = startTap; tapPass < endTap; ++tapPass) {
+            bool isTemp = (tapPass < 0);
+            ivec2 giCoord = giPrev;
+            if (!isTemp) {
+                uint tap = uint(tapPass);
+                uint tapIdx = isMlGi
+                    ? (((tapHash >> 27u) + tap) & 7u)
+                    : (hasGiMotion
+                        ? (8u + ((tapOff + tap * 7u) % 24u))
+                        : (((tapHash >> 24u) + tap * 3u) & 31u));
+                ivec2 base = RESTIR_TAP_OFFSETS[tapIdx];
+                if ((rot & 1u) != 0u) base = ivec2(-base.y, base.x);
+                if ((rot & 2u) != 0u) base = -base;
+                giCoord += base;
             }
-            if (useRbGi && spatEval.mTap > 0u) {
-                rbMTotal += spatEval.mTap;
-                float effSpatClamp = (hasGiMotion && indirectClamp > 0.0) ? min(indirectClamp, 10.0) : indirectClamp;
-                float maxW = (indirectClamp > 0.0) ? (hasGiMotion ? 24.0 : GI_WEIGHT_CLAMP_MAX) : 1e30;
-                giAccumulateRbSample(
-                    giBsdf, giN1, giWo, mergeMatteSpecRb, effSpatClamp, spatEval.mTap,
-                    min(spatEval.visWFactor, maxW), spatEval.dirToX2, spatEval.radiance, rbDiffSum, rbSpecSum
-                );
+
+            bool inBounds = (giCoord.x >= 0 && giCoord.y >= 0 && giCoord.x < int(width) && giCoord.y < int(height));
+            bool motionOk = !isTemp || (abs(mvData.x) < 1.5 && abs(mvData.y) < 1.5);
+            if (inBounds && motionOk) {
+                uint tapPix = uint(giCoord.y) * width + uint(giCoord.x);
+                uvec2 tapMeta = giHistoryData[tapPix];
+                uint tapFlagsM = tapMeta.y;
+                uint tapAge = giMetaGetAge(tapFlagsM);
+                uint tapM = giMetaGetM(tapFlagsM);
+                bool tapUsable = giMetaIsValid(tapFlagsM) && (tapM > 0u) && (tapAge < GI_MAX_AGE);
+                bool tapHasRad = giMetaHasSurface(tapFlagsM) && (tapMeta.x != 0u);
+                bool isLastEphemeralTap = (!isTemp) && (tapPass + 1 == endTap);
+                bool canSkipFinalEmptyTap = isLastEphemeralTap && !giHasSurface(giR) && !tapHasRad;
+                bool normalOk = tapUsable && !canSkipFinalEmptyTap &&
+                                (isTemp || (dot(giN1, giMetaGetX1Normal(tapFlagsM)) >= spatNormalGate));
+                if (normalOk) {
+                    float prevTapDepth = imageLoad(uPrevNormalDepthImage, giCoord).w;
+                    float relDepthDiff = abs(expectedPrevDepth - prevTapDepth) / max(max(expectedPrevDepth, prevTapDepth), 1e-4);
+                    float depthGate = isTemp ? tempDepthGate : spatDepthGate;
+                    if (relDepthDiff <= depthGate) {
+                        uint mCap = isTemp ? tempMCap : spatialMCap;
+                        uint mTap = min(tapM, mCap);
+                        uint giAgeNew = isTemp ? min(tapAge + 1u, GI_MAX_AGE) : tapAge;
+                        uvec2 tapW = tapHasRad ? giHistoryData[3u * giHistStride + tapPix] : uvec2(0u);
+                        bool tapHasWeights = tapHasRad && (tapW.x != 0u) && ((tapW.y & ~0xFFu) != 0u);
+                        if (!tapHasWeights) {
+                            if (mTap > 0u) {
+                                uint mSelf = giIsValid(giR) ? giGetM(giR) : 0u;
+                                uint combinedM = mSelf + mTap;
+                                giR.dSrcFlagsM = (giR.dSrcFlagsM & 0x00FFFFFFu) | (min(combinedM, 255u) << 24u);
+                            }
+                        } else {
+                            uvec2 tapP0 = giHistoryData[giHistStride + tapPix * 2u];
+                            uvec2 tapP1 = giHistoryData[giHistStride + tapPix * 2u + 1u];
+                            GiReservoir giTap = giUnpackFromSoa(tapMeta, tapP0, tapP1, tapW);
+                            float wSrcMax = isTemp ? (hasGiMotion ? 22.0 : 0.0) : (hasGiMotion ? 22.0 : 28.0);
+                            float wFacMax = isTemp ? (hasGiMotion ? 28.0 : 0.0) : (hasGiMotion ? 28.0 : 32.0);
+                            if (giApplyTap(giR, giTap, giTargetBsdf, giX1, giN1, giWo, giRoughness,
+                                           mCap, giAgeNew, false, numOpaqueTriangles,
+                                           wSrcMax, wFacMax, seed)) {
+                                giWinnerSelf = false;
+                            }
+                        }
+                    }
+                }
             }
+            if (isTemp && sppSampleIndex == 0u) {
+                if (giWinnerSelf) {
+                    giCurrentData[3u * giCurrStride + pixelIndex] = giPackWeights(giR);
+                    if (giGetM(giR) != 1u) {
+                        giCurrentData[pixelIndex].y = (giR.dSrcFlagsM & 0xFFFF0000u) | ((giR.normalsPacked >> 16u) & 0xFFFFu);
+                    }
+                } else {
+                    if (giIsValid(giR)) {
+                        giCurrentData[pixelIndex] = giPackMeta(giR);
+                        giCurrentData[giCurrStride + pixelIndex * 2u] = giPackPosN2_0(giR);
+                        giCurrentData[giCurrStride + pixelIndex * 2u + 1u] = giPackPosN2_1(giR);
+                        giCurrentData[3u * giCurrStride + pixelIndex] = giPackWeights(giR);
+                    } else {
+                        giCurrentData[pixelIndex].y = 0u;
+                    }
+                }
+            }
+        }
+    } else if (sppSampleIndex == 0u && hasSelfCandidate) {
+        if (giWinnerSelf) {
+            giCurrentData[3u * giCurrStride + pixelIndex] = giPackWeights(giR);
+        } else {
+            giCurrentData[pixelIndex].y = (giR.dSrcFlagsM & 0xFFFF0000u) | ((giR.normalsPacked >> 16u) & 0xFFFFu);
+            giCurrentData[3u * giCurrStride + pixelIndex].x = 0u;
         }
     }
 
-    if (useRbGi) {
-        float invDenom = ((ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0) / float(max(rbMTotal, 1u));
-        vec3 diffContrib = rbDiffSum * invDenom;
-        vec3 specContrib = rbSpecSum * invDenom;
-        vec3 rawTotal = diffContrib + specContrib;
-        float effGiClamp = (hasGiMotion && rbMTotal > 1u && indirectClamp > 0.0)
-            ? min(indirectClamp, 10.0)
-            : indirectClamp;
-        vec3 totalContrib = (effGiClamp > 0.0) ? clampIndirectRadiance(rawTotal, effGiClamp) : rawTotal;
-        float rawLum = dot(rawTotal, vec3(0.2126, 0.7152, 0.0722));
-        float clampedScale = (rawLum > 1e-8) ? (dot(totalContrib, vec3(0.2126, 0.7152, 0.0722)) / rawLum) : 1.0;
-        diffContrib *= clampedScale;
-        specContrib *= clampedScale;
-        if (dot(totalContrib, totalContrib) > 1e-12) {
-            if (captureMlData == 0u || (captureMlData & 2u) != 0u) {
-                vec4 prevAcc = imageLoad(uAccumImage, giPix);
-                imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib, seed), prevAcc.a));
-            }
-            wfAddSplitIndirect(giPix, diffContrib, specContrib, captureMlData, seed);
-            if (captureMlData != 0u) {
-                if (dot(diffContrib, diffContrib) > 1e-12) {
-                    vec4 prevDiff = imageLoad(uMlDiffuseImage, giPix);
-                    imageStore(uMlDiffuseImage, giPix, vec4(addFp16Stochastic(prevDiff.rgb, diffContrib, seed), prevDiff.a));
-                }
-                if (dot(specContrib, specContrib) > 1e-12) {
-                    vec4 prevSpec = imageLoad(uMlSpecularImage, giPix);
-                    imageStore(uMlSpecularImage, giPix, vec4(addFp16Stochastic(prevSpec.rgb, specContrib, seed), prevSpec.a));
-                }
-            }
-        }
-    } else if (giIsValid(giShadeR) && giHasSurface(giShadeR) && giGetM(giShadeR) > 0u && giGetTarget(giShadeR) > 0.0) {
+    if (giIsValid(giR) && giHasSurface(giR) && giGetM(giR) > 0u && giGetTarget(giR) > 0.0) {
         {
-            vec3 giX2w = giShadeWinnerSelf ? selfX2 : giGetX2(giShadeR);
+            vec3 giX2w = giWinnerSelf ? selfX2 : giGetX2(giR);
             vec3 giToW = giX2w - giX1;
             float giDistW = length(giToW);
             if (giDistW > 2.0 * EPSILON) {
-                vec3 giDirW = giToW / giDistW;
-                float unusedPdfW = 0.0;
                 vec3 specFCosW = vec3(0.0);
-                vec3 fCosW = stdBsdfEvalSplit(giBsdf, giN1, giWo, giDirW, unusedPdfW, specFCosW);
-                vec3 giL2w = giGetRadiance(giShadeR);
-                float giTargetW = giGetTarget(giShadeR);
-                float giW = giGetWSum(giShadeR) / max(float(giGetM(giShadeR)) * giTargetW, 1e-8);
+                vec3 fCosW = giEvalBsdfSplit(giBsdf, giN1, giWo, giToW / giDistW, specFCosW);
+                vec3 giL2w = giGetRadiance(giR);
+                float giTargetW = giGetTarget(giR);
+                float giW = giGetWSum(giR) / max(float(giGetM(giR)) * giTargetW, 1e-8);
                 if (indirectClamp > 0.0) {
                     giW = min(giW, hasGiMotion ? 24.0 : GI_WEIGHT_CLAMP_MAX);
                 }
                 float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
-                vec3 scaleW = giL2w * (giW * invSpp);
+                vec3 scaleW = giL2w * giW;
 
                 bool isV4 = (captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
                 bool isMlGiOut = (captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
@@ -475,7 +466,7 @@ void restirGiRunReuse(
                 vec3 diffContrib = mergeMatteSpec ? (fCosW * scaleW) : (max(fCosW - specFCosW, vec3(0.0)) * scaleW);
                 vec3 specContrib = mergeMatteSpec ? vec3(0.0) : (specFCosW * scaleW);
                 vec3 rawTotal = diffContrib + specContrib;
-                float effGiClamp = (hasGiMotion && !giShadeWinnerSelf && indirectClamp > 0.0)
+                float effGiClamp = (hasGiMotion && !giWinnerSelf && indirectClamp > 0.0)
                     ? min(indirectClamp, 10.0)
                     : indirectClamp;
                 vec3 totalContrib = (effGiClamp > 0.0) ? clampIndirectRadiance(rawTotal, effGiClamp) : rawTotal;
@@ -484,31 +475,33 @@ void restirGiRunReuse(
                 diffContrib *= clampedScale;
                 specContrib *= clampedScale;
                 if (dot(totalContrib, totalContrib) > 1e-12) {
-                    if (giShadeWinnerSelf || inlineVisActive || ((ubo.flags & (1u << 4)) == 0u)) {
-                        if (captureMlData == 0u || (captureMlData & 2u) != 0u) {
+                    if (giWinnerSelf || ((ubo.flags & (1u << 4)) == 0u)) {
+                        if (captureMlData == 0u || (captureMlData & ML_CAPTURE_KEEP_ACCUM_BIT) != 0u) {
                             vec4 prevAcc = imageLoad(uAccumImage, giPix);
-                            imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib, seed), prevAcc.a));
+                            imageStore(uAccumImage, giPix, vec4(addFp16Stochastic(prevAcc.rgb, totalContrib * invSpp, seed), prevAcc.a));
                         }
-                        wfAddSplitIndirect(giPix, diffContrib, specContrib, captureMlData, seed);
-                        if (captureMlData != 0u) {
+                        wfAddSplitIndirect(giPix, diffContrib * invSpp, specContrib * invSpp, captureMlData, seed);
+                        if ((captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
                             if (dot(diffContrib, diffContrib) > 1e-12) {
+                                vec3 scaledDiff = diffContrib * invSpp;
                                 vec3 outDiff = isV4
-                                    ? demodulateMlSafe(diffContrib, imageLoad(uMlAlbedoRoughnessImage, giPix).rgb)
-                                    : diffContrib;
+                                    ? demodulateMlSafe(scaledDiff, imageLoad(uMlAlbedoRoughnessImage, giPix).rgb)
+                                    : scaledDiff;
                                 vec4 prevDiff = imageLoad(uMlDiffuseImage, giPix);
                                 imageStore(uMlDiffuseImage, giPix, vec4(addFp16Stochastic(prevDiff.rgb, outDiff, seed), prevDiff.a));
                             }
                             if (dot(specContrib, specContrib) > 1e-12) {
+                                vec3 scaledSpec = specContrib * invSpp;
                                 vec3 outSpec = isV4
-                                    ? demodulateMlSafe(specContrib, imageLoad(uMlSpecAlbedoImage, giPix).rgb)
-                                    : specContrib;
+                                    ? demodulateMlSafe(scaledSpec, imageLoad(uMlSpecAlbedoImage, giPix).rgb)
+                                    : scaledSpec;
                                 vec4 prevSpec = imageLoad(uMlSpecularImage, giPix);
                                 imageStore(uMlSpecularImage, giPix, vec4(addFp16Stochastic(prevSpec.rgb, outSpec, seed), prevSpec.a));
                             }
                         }
                     } else {
                         vec3 giVisOrig = offsetRayOrigin(giX1, giN1);
-                        vec3 giVisTarget = offsetRayOrigin(giX2w, giGetN2(giShadeR));
+                        vec3 giVisTarget = offsetRayOrigin(giX2w, giGetN2(giR));
                         vec3 giVisTo = giVisTarget - giVisOrig;
                         float giVisDist = length(giVisTo);
                         if (giVisDist > 2.0 * EPSILON) {

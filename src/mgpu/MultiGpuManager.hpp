@@ -59,6 +59,8 @@ struct GpuDeviceNode {
     std::unique_ptr<Buffer> shadeMaterialBuffer;
     std::unique_ptr<Buffer> lightBuffer;
     std::unique_ptr<Buffer> lightTreeBuffer;
+    std::unique_ptr<Buffer> envImportanceBuffer;
+    bool envNeeEnabled = false;
     std::array<std::unique_ptr<Buffer>, NUM_IN_FLIGHT> cameraUBOs;
 
     // Secondary Hardware Acceleration Structures (VK_KHR_ray_query)

@@ -7,6 +7,9 @@
 #include <cstddef>
 #include <cmath>
 #include <vector>
+#include <cstring>
+#include <random>
+#include <glm/gtc/packing.hpp>
 #include <vulkan/vulkan.h>
 
 using namespace pathways;
@@ -281,6 +284,178 @@ int main() {
                 check_true(vkCtx.getValidationErrors() == 0, "Zero Vulkan validation errors during NRC GPU execution");
                 std::cout << "  -> Live GPU NRC inference, resolve, and online training executed cleanly ("
                           << nrc.getActiveBackendName() << ", 0 validation errors)." << std::endl;
+
+                // [TEST 6] Numeric Inference & Training Parity Check (detect channel bias / WMMA mismatch)
+                {
+                    NRCManager nrcNum(device, allocator, 64, 64, inferSpv, trainSpv, resolveSpv, vkCtx.getPhysicalDevice());
+                    Image numAccum(device, allocator, 64, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                   VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                    Image numDiff(device, allocator, 64, 64, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                  VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                    nrcNum.updateDescriptors(numAccum.getImageView(), numDiff.getImageView());
+
+                    std::vector<NRCQuery> qVec(32);
+                    for (uint32_t i = 0; i < 32; ++i) {
+                        uint32_t pix = i;
+                        float pixF = 0.0f;
+                        std::memcpy(&pixF, &pix, sizeof(float));
+                        qVec[i].pos_roughness = glm::vec4(0.1f * float(i % 4), 1.0f, -0.2f, 0.8f);
+                        qVec[i].normal_flags = glm::vec4(0.0f, 0.0f, 1.0f, 0.0f);
+                        qVec[i].dir_pixelIndex = glm::vec4(0.0f, 0.0f, 1.0f, pixF);
+                        qVec[i].albedo_pad = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f); // specRatio = 0.0
+                        qVec[i].throughput = glm::vec4(1.0f, 1.0f, 1.0f, 0.0f);
+                    }
+                    std::vector<NRCTrainingRecord> tVec(32);
+                    for (uint32_t i = 0; i < 32; ++i) {
+                        uint32_t pix = i;
+                        float pixF = 0.0f;
+                        std::memcpy(&pixF, &pix, sizeof(float));
+                        tVec[i].pos_roughness = qVec[i].pos_roughness;
+                        tVec[i].normal_flags = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f);
+                        tVec[i].dir_pixelIndex = qVec[i].dir_pixelIndex;
+                        tVec[i].albedo_pad = qVec[i].albedo_pad;
+                        tVec[i].throughput = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f); // hasTail = 0
+                        tVec[i].targetRadiance = glm::vec4(0.50f, 0.50f, 0.50f, 0.0f); // neutral gray
+                        tVec[i].tailPos_roughness = glm::vec4(0.0f);
+                        tVec[i].tailPacked = glm::vec4(0.0f);
+                    }
+                    Buffer readbackBuf(allocator, 64ull * 64ull * 8ull, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_TO_CPU);
+
+                    auto runProbe = [&](uint32_t trainIters, glm::vec3& outMeanRgb) {
+                        VkCommandPool cpool = VK_NULL_HANDLE;
+                        vkCreateCommandPool(device, &cpInfo, nullptr, &cpool);
+                        VkCommandBuffer cb = VK_NULL_HANDLE;
+                        VkCommandBufferAllocateInfo cba{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr, cpool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
+                        vkAllocateCommandBuffers(device, &cba, &cb);
+                        vkBeginCommandBuffer(cb, &beginInfo);
+
+                        numAccum.transitionLayout(cb, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                        numDiff.transitionLayout(cb, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                        vkCmdClearColorImage(cb, numAccum.getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &range);
+                        vkCmdClearColorImage(cb, numDiff.getImage(), VK_IMAGE_LAYOUT_GENERAL, &zeroClear, 1, &range);
+
+                        nrcNum.resetCounters(cb);
+                        vkCmdUpdateBuffer(cb, nrcNum.getQueryQueue()->getBuffer(), 0, qVec.size() * sizeof(NRCQuery), qVec.data());
+                        vkCmdUpdateBuffer(cb, nrcNum.getTrainQueue()->getBuffer(), 0, tVec.size() * sizeof(NRCTrainingRecord), tVec.data());
+                        const uint32_t cnt[8] = { 32u, 32u, 1u, 1u, 1u, 0u, 0u, 0u };
+                        vkCmdUpdateBuffer(cb, nrcNum.getCounters()->getBuffer(), 0, sizeof(cnt), cnt);
+
+                        VkMemoryBarrier2 tb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, nullptr, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT };
+                        VkDependencyInfo td{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO, nullptr, 0, 1, &tb, 0, nullptr, 0, nullptr };
+                        vkCmdPipelineBarrier2(cb, &td);
+
+                        for (uint32_t it = 0; it < trainIters; ++it) {
+                            nrcNum.recordTraining(cb, it, glm::vec3(-1.5f), glm::vec3(1.5f), 2e-3f, 512);
+                        }
+                        nrcNum.recordInference(cb, 64, 64, glm::vec3(-1.5f), glm::vec3(1.5f), 32, 0, 0, 24.0f);
+
+                        numAccum.transitionLayout(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                                                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+                        VkBufferImageCopy reg{};
+                        reg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                        reg.imageExtent = { 64, 64, 1 };
+                        vkCmdCopyImageToBuffer(cb, numAccum.getImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readbackBuf.getBuffer(), 1, &reg);
+                        vkEndCommandBuffer(cb);
+
+                        VkSubmitInfo sinfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr, 0, nullptr, nullptr, 1, &cb, 0, nullptr };
+                        vkQueueSubmit(queue, 1, &sinfo, VK_NULL_HANDLE);
+                        vkQueueWaitIdle(queue);
+                        vkDestroyCommandPool(device, cpool, nullptr);
+
+                        const uint16_t* px = reinterpret_cast<const uint16_t*>(readbackBuf.map());
+                        outMeanRgb = glm::vec3(0.0f);
+                        for (uint32_t i = 0; i < 32; ++i) {
+                            outMeanRgb.r += glm::unpackHalf1x16(px[i * 4 + 0]);
+                            outMeanRgb.g += glm::unpackHalf1x16(px[i * 4 + 1]);
+                            outMeanRgb.b += glm::unpackHalf1x16(px[i * 4 + 2]);
+                        }
+                        readbackBuf.unmap();
+                        outMeanRgb /= 32.0f;
+                    };
+
+                    glm::vec3 initRgb(0.0f), trainedRgb(0.0f);
+                    runProbe(0, initRgb);
+
+                    // Compute exact CPU reference of initWeights() on qVec[0]
+                    glm::vec3 cpuPred(0.0f);
+                    {
+                        std::mt19937 rng(42);
+                        std::normal_distribution<float> weightDist(0.0f, std::sqrt(2.0f / 64.0f));
+                        std::vector<float> W(9360, 0.0f);
+                        auto setP = [&](size_t idx, float v) { W[idx] = glm::unpackHalf1x16(glm::packHalf1x16(v)); };
+                        for (size_t i = 0; i < 4096; ++i) setP(i, weightDist(rng));
+                        for (size_t i = 0; i < 64; ++i) setP(4096 + i, 0.0f);
+                        for (size_t i = 0; i < 4096; ++i) setP(4160 + i, weightDist(rng));
+                        for (size_t i = 0; i < 64; ++i) setP(8256 + i, 0.0f);
+                        for (size_t i = 0; i < 1024; ++i) setP(8320 + i, weightDist(rng) * 0.02f);
+                        for (size_t i = 0; i < 16; ++i) setP(9344 + i, i < 3 ? 0.02f : 0.0f);
+
+                        glm::vec3 np = glm::clamp((glm::vec3(qVec[0].pos_roughness) - glm::vec3(-1.5f)) / glm::vec3(3.0f), glm::vec3(0.0f), glm::vec3(1.0f));
+                        float x[64]{};
+                        const float PI = 3.14159265359f;
+                        // Channels 0..15 stay 0.0 (untrained hash grid starts zero-initialized)
+                        // Channels 16..23: linear skip-encoding
+                        x[16] = np.x; x[17] = np.y; x[18] = np.z;
+                        x[19] = 0.0f; x[20] = 0.0f; x[21] = 1.0f;
+                        x[22] = 0.0f; x[23] = 0.0f;
+                        // Channels 24..41: 3-octave Fourier encoding (axes 0..2, amp *= 0.5)
+                        for (int ax = 0; ax < 3; ++ax) {
+                            float th = np[ax] * PI, s = std::sin(th), c = std::cos(th), amp = 1.0f;
+                            for (int o = 0; o < 3; ++o) {
+                                x[24 + ax * 6 + o * 2 + 0] = s * amp;
+                                x[24 + ax * 6 + o * 2 + 1] = c * amp;
+                                if (o < 2) { float s2 = 2*s*c, c2 = c*c - s*s; s = s2; c = c2; amp *= 0.5f; }
+                            }
+                        }
+                        // Channels 42..50: Order-2 SH of N=(0,0,1)
+                        x[42] = 0.282095f;
+                        x[44] = 0.488603f;
+                        x[48] = 0.315392f * 2.0f;
+                        // Channels 51..63: V=(0,0,1), R=(0,0,1), NdotV=1, rough=0.8, rough^2=0.64, specRatio=0, 1-spec=1, F=0, bias=1
+                        x[51]=0.0f; x[52]=0.0f; x[53]=1.0f;
+                        x[54]=0.0f; x[55]=0.0f; x[56]=1.0f;
+                        x[57]=1.0f; x[58]=0.8f; x[59]=0.64f;
+                        x[60]=0.0f; x[61]=1.0f; x[62]=0.0f; x[63]=1.0f;
+                        for (int i = 0; i < 64; ++i) x[i] = glm::unpackHalf1x16(glm::packHalf1x16(x[i]));
+                        float h0[64]{}, h1[64]{};
+                        for (int j = 0; j < 64; ++j) {
+                            float s = W[4096 + j];
+                            for (int i = 0; i < 64; ++i) s += x[i] * W[i * 64 + j];
+                            h0[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
+                        }
+                        for (int j = 0; j < 64; ++j) {
+                            float s = W[8256 + j];
+                            for (int i = 0; i < 64; ++i) s += h0[i] * W[4160 + i * 64 + j];
+                            h1[j] = glm::unpackHalf1x16(glm::packHalf1x16((s > 0.0f) ? s : 0.01f * s));
+                        }
+                        for (int c = 0; c < 3; ++c) {
+                            float s = W[9344 + c];
+                            for (int i = 0; i < 64; ++i) s += h1[i] * W[8320 + i * 16 + c];
+                            cpuPred[c] = std::max(0.0f, s);
+                        }
+                    }
+
+                    // Uniform query 0 prediction matches CPU FP16 reference (qVec has 4 x-phases; mean is close to initRgb)
+                    float initErr = std::max({ std::abs(initRgb.r - cpuPred.r), std::abs(initRgb.g - cpuPred.g), std::abs(initRgb.b - cpuPred.b) });
+                    if (initErr >= 5e-3f) {
+                        std::cerr << "  -> [FAIL] CPU init=(" << cpuPred.r << ", " << cpuPred.g << ", " << cpuPred.b
+                                  << ") vs GPU init=(" << initRgb.r << ", " << initRgb.g << ", " << initRgb.b << ")" << std::endl;
+                    }
+                    check_true(initErr < 5e-3f, "NRC GPU WMMA initial inference matches CPU FP16 reference");
+
+                    runProbe(8, trainedRgb);
+                    float maxCh = std::max({ trainedRgb.r, trainedRgb.g, trainedRgb.b });
+                    float minCh = std::min({ trainedRgb.r, trainedRgb.g, trainedRgb.b });
+                    float channelSpread = maxCh - minCh;
+                    float targetErr = std::max({ std::abs(trainedRgb.r - 0.50f), std::abs(trainedRgb.g - 0.50f), std::abs(trainedRgb.b - 0.50f) });
+                    if (targetErr >= 0.15f || channelSpread >= 0.10f) {
+                        std::cerr << "  -> [FAIL] Trained RGB=(" << trainedRgb.r << ", " << trainedRgb.g << ", " << trainedRgb.b << ")" << std::endl;
+                    }
+                    check_true(targetErr < 0.15f && channelSpread < 0.10f,
+                               "NRC GPU WMMA training converges neutrally toward gray target without channel bias");
+                    std::cout << "  -> [TEST 6] NRC WMMA numeric inference & neutral training parity passed." << std::endl;
+                }
             }
         }
     }

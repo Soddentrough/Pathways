@@ -239,7 +239,7 @@ SceneData SceneManager::loadRawSceneData(const std::string& filepath, const UsdL
         if (UsdLoader::isUsdFile(filepath)) {
             return UsdLoader::loadSceneData(filepath, usdOptions);
         } else {
-            return GltfLoader::loadSceneData(filepath);
+            return GltfLoader::loadSceneData(filepath, usdOptions.suppressFallbackSun);
         }
     }
 }
@@ -284,6 +284,9 @@ void SceneManager::requestSceneChange(const std::string& filepath, const Config&
     usdOptions.cullDistance = config.cull_distance;
     usdOptions.cameraPosOverride = config.camera_pos;
     usdOptions.viewportAspect = (config.height > 0) ? (static_cast<float>(config.width) / static_cast<float>(config.height)) : (16.0f / 9.0f);
+    std::string resolvedNext = resolveScenePath(filepath);
+    std::string nextHdri = config.custom_hdri ? config.hdri_path : detectSceneHdri(resolvedNext);
+    usdOptions.suppressFallbackSun = !nextHdri.empty();
 
     m_sceneLoadingFuture = std::async(std::launch::async, [filepath, usdOptions]() -> SceneData {
         return SceneManager::loadRawSceneData(filepath, usdOptions);
@@ -594,7 +597,83 @@ void SceneManager::recordDynamicLightUpload(VkCommandBuffer cmd, uint32_t frameS
     m_dynamicLightsDirty = false;
 }
 
-void SceneManager::loadTextures(const std::string& hdriPath, const std::string& scenePath) {
+void SceneManager::uploadEnvImportanceBuffer() {
+    const float explicitIrr = computeExplicitLightIrradianceEstimate(m_sceneData.lights, m_sceneData.sceneRadius);
+    m_envImportanceTable.header.envSelectProb = computeEnvSelectProb(
+        m_environmentMap != nullptr,
+        m_envImportanceTable.header.envTotalFlux,
+        m_activeEnvIntensity,
+        m_numLights,
+        explicitIrr,
+        m_envIsExplicitOrDome,
+        m_sceneData.hasFallbackSun
+    );
+
+    const std::vector<uint8_t> bytes = packEnvImportanceBufferBytes(m_envImportanceTable);
+    const VkDeviceSize bufSize = static_cast<VkDeviceSize>(bytes.size());
+
+    if (m_device != VK_NULL_HANDLE && m_queue != VK_NULL_HANDLE) {
+        vkQueueWaitIdle(m_queue);
+    }
+    m_envImportanceBuffer = std::make_unique<Buffer>(
+        m_allocator, bufSize,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        0
+    );
+
+    Buffer staging(
+        m_allocator, bufSize,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    staging.copyFrom(bytes.data(), bufSize);
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    VkBufferCopy copyRegion{ 0, 0, bufSize };
+    vkCmdCopyBuffer(cmd, staging.getBuffer(), m_envImportanceBuffer->getBuffer(), 1, &copyRegion);
+
+    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    vkEndCommandBuffer(cmd);
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
+
+    Logger::info("Env Importance Table: {}x{}, totalFlux={:.3f}, envSelectProb={:.3f}, intensity={:.3f}",
+                 m_envImportanceTable.header.width,
+                 m_envImportanceTable.header.height,
+                 m_envImportanceTable.header.envTotalFlux,
+                 m_envImportanceTable.header.envSelectProb,
+                 m_activeEnvIntensity);
+}
+
+void SceneManager::loadTextures(const std::string& hdriPath, const std::string& scenePath, bool customHdri) {
     if (!m_dummyWhite) {
         m_dummyWhite = Texture::createDummyWhite(m_device, m_allocator, m_queue, m_commandPool);
     }
@@ -605,10 +684,17 @@ void SceneManager::loadTextures(const std::string& hdriPath, const std::string& 
         m_blueNoiseTexture = Texture::createBlueNoise64(m_device, m_allocator, m_queue, m_commandPool);
     }
 
+    const bool useDomeAttrs = (!customHdri && m_sceneData.hasDomeLight);
+    const glm::vec3 envTint = useDomeAttrs ? m_sceneData.domeLightColor : glm::vec3(1.0f);
+    const bool solidColorDome = useDomeAttrs && m_sceneData.domeLightHdriPath.empty();
+    m_activeEnvIntensity = useDomeAttrs ? m_sceneData.domeLightIntensity : 1.0f;
+
     m_environmentMap = Texture::createSceneEnvironmentMap(
         m_device, m_allocator, m_queue, m_commandPool,
-        hdriPath, scenePath, m_sceneData.domeLightHdriPath
+        hdriPath, scenePath, m_sceneData.domeLightHdriPath,
+        &m_envImportanceTable, envTint, solidColorDome, &m_envIsExplicitOrDome
     );
+    uploadEnvImportanceBuffer();
 
     m_sceneTextures.clear();
     for (const auto& texData : m_sceneData.textures) {
@@ -693,6 +779,8 @@ SceneData SceneManager::reloadPreparedSceneData(const std::string& filepath, con
         : (16.0f / 9.0f);
 
     std::string resolvedPath = resolveScenePath(filepath);
+    std::string activeHdri = config.custom_hdri ? config.hdri_path : detectSceneHdri(resolvedPath);
+    usdOptions.suppressFallbackSun = !activeHdri.empty();
     SceneData prepared = loadRawSceneData(resolvedPath, usdOptions);
     if (prepared.triangles.empty()) {
         prepared = ProceduralScene::createCornellBox();

@@ -24,9 +24,9 @@ shared uint s_a[1024];    // 128*8 = 1024 uint32 (4,096 B)
 shared uint s_a[2048];    // 128*16 = 2048 uint32 (8,192 B)
 #endif
 #if UPWAYS_IS_INT8
-shared int s_acc[2304];   // 9,216 B (stride 18 avoids 16-way LDS bank conflicts)
+shared int s_acc[1024];   // 4,096 B (16B-aligned stride 16 matches upways_denoiser_wmma)
 #else
-shared float s_acc[2304]; // 9,216 B (stride 18 avoids 16-way LDS bank conflicts)
+shared float s_acc[1024]; // 4,096 B (16B-aligned stride 16 matches upways_denoiser_wmma)
 #endif
 
 void writeSA4Vecs(uint px, vec4 v[4], out float actScale) {
@@ -99,10 +99,12 @@ void evalPwNTile(
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
     coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32/i32 WMMA accumulators.
+    float zAcc = float(pc.lrWidth == 0xFFFFFFFFu);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
     uint r0 = (sg * 32u) * aStride;
     uint r1 = (sg * 32u + 16u) * aStride;
@@ -118,10 +120,12 @@ void evalPwNTile(
     coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
     coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
     coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on i32 WMMA accumulators.
+    int32_t zAcc = int32_t(pc.lrWidth == 0xFFFFFFFFu);
     coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
-        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
     coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
-        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
     uint r0 = (sg * 32u) * aStride;
     uint r1 = (sg * 32u + 16u) * aStride;
@@ -137,10 +141,12 @@ void evalPwNTile(
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA0;
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA1;
     coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+    // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32 WMMA accumulators.
+    float zAcc = float(pc.lrWidth == 0xFFFFFFFFu);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc0 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc1 =
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
     uint r0 = (sg * 32u) * aStride;
     uint r1 = (sg * 32u + 16u) * aStride;
@@ -153,18 +159,33 @@ void evalPwNTile(
     }
 #endif
 
-    coopMatStore(acc0, s_acc, sg * 576u,        18u, gl_CooperativeMatrixLayoutRowMajor);
-    coopMatStore(acc1, s_acc, sg * 576u + 288u, 18u, gl_CooperativeMatrixLayoutRowMajor);
+    uint baseAcc = sg * 256u;
+    coopMatStore(acc0, s_acc, baseAcc, 16u, gl_CooperativeMatrixLayoutRowMajor);
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
-    uint baseAcc = sg * 576u + lane * 18u;
-    uint cBase   = ob * 16u;
+    vec4 a0, a1, a2, a3;
+    uint rBase = baseAcc + (lane & 15u) * 16u;
+    if (lane < 16u) {
+        a0 = vec4(s_acc[rBase + 0u],  s_acc[rBase + 1u],  s_acc[rBase + 2u],  s_acc[rBase + 3u]);
+        a1 = vec4(s_acc[rBase + 4u],  s_acc[rBase + 5u],  s_acc[rBase + 6u],  s_acc[rBase + 7u]);
+        a2 = vec4(s_acc[rBase + 8u],  s_acc[rBase + 9u],  s_acc[rBase + 10u], s_acc[rBase + 11u]);
+        a3 = vec4(s_acc[rBase + 12u], s_acc[rBase + 13u], s_acc[rBase + 14u], s_acc[rBase + 15u]);
+    }
+    subgroupBarrier();
 
-    vec4 a0 = vec4(s_acc[baseAcc + 0u],  s_acc[baseAcc + 1u],  s_acc[baseAcc + 2u],  s_acc[baseAcc + 3u]);
-    vec4 a1 = vec4(s_acc[baseAcc + 4u],  s_acc[baseAcc + 5u],  s_acc[baseAcc + 6u],  s_acc[baseAcc + 7u]);
-    vec4 a2 = vec4(s_acc[baseAcc + 8u],  s_acc[baseAcc + 9u],  s_acc[baseAcc + 10u], s_acc[baseAcc + 11u]);
-    vec4 a3 = vec4(s_acc[baseAcc + 12u], s_acc[baseAcc + 13u], s_acc[baseAcc + 14u], s_acc[baseAcc + 15u]);
+    coopMatStore(acc1, s_acc, baseAcc, 16u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+
+    if (lane >= 16u) {
+        a0 = vec4(s_acc[rBase + 0u],  s_acc[rBase + 1u],  s_acc[rBase + 2u],  s_acc[rBase + 3u]);
+        a1 = vec4(s_acc[rBase + 4u],  s_acc[rBase + 5u],  s_acc[rBase + 6u],  s_acc[rBase + 7u]);
+        a2 = vec4(s_acc[rBase + 8u],  s_acc[rBase + 9u],  s_acc[rBase + 10u], s_acc[rBase + 11u]);
+        a3 = vec4(s_acc[rBase + 12u], s_acc[rBase + 13u], s_acc[rBase + 14u], s_acc[rBase + 15u]);
+    }
+
+    uint cBase = ob * 16u;
 
     vec4 sc0 = vec4(g_w32.w32[sOff + cBase + 0u],  g_w32.w32[sOff + cBase + 1u],  g_w32.w32[sOff + cBase + 2u],  g_w32.w32[sOff + cBase + 3u]);
     vec4 sc1 = vec4(g_w32.w32[sOff + cBase + 4u],  g_w32.w32[sOff + cBase + 5u],  g_w32.w32[sOff + cBase + 6u],  g_w32.w32[sOff + cBase + 7u]);

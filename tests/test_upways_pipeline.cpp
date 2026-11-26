@@ -281,14 +281,14 @@ int main() {
         const uint32_t ldsPrep = 5u * 180u * 8u;                  // s_diff, s_spec, s_nrmDep, s_logDiff, s_logSpec
         const uint32_t ldsDenoiser8Bit = (3072u + 1024u) * 4u;    // s_buf + s_acc (FP8 / INT8)
         const uint32_t ldsDenoiserFp16 = (6144u + 1024u) * 4u;    // s_buf + s_acc (FP16)
-        const uint32_t ldsUpscaler8Bit = 1024u * 8u + 1024u * 4u + 2304u * 4u;
-        const uint32_t ldsUpscalerFp16 = 1024u * 8u + 2048u * 4u + 2304u * 4u;
+        const uint32_t ldsUpscaler8Bit = 1024u * 8u + 1024u * 4u + 1024u * 4u;
+        const uint32_t ldsUpscalerFp16 = 1024u * 8u + 2048u * 4u + 1024u * 4u;
 
         check_true(ldsPrep == 7200u && ldsPrep <= 32768u, "denoise_prep LDS == 7,200 B <= 32 KiB");
         check_true(ldsDenoiser8Bit == 16384u && ldsDenoiser8Bit <= 32768u, "denoiser_wmma 8-bit LDS == 16,384 B <= 32 KiB");
         check_true(ldsDenoiserFp16 == 28672u && ldsDenoiserFp16 <= 32768u, "denoiser_wmma FP16 LDS == 28,672 B <= 32 KiB");
-        check_true(ldsUpscaler8Bit == 21504u && ldsUpscaler8Bit <= 32768u, "upscaler_wmma 8-bit LDS == 21,504 B <= 32 KiB");
-        check_true(ldsUpscalerFp16 == 25600u && ldsUpscalerFp16 <= 32768u, "upscaler_wmma FP16 LDS == 25,600 B <= 32 KiB");
+        check_true(ldsUpscaler8Bit == 16384u && ldsUpscaler8Bit <= 32768u, "upscaler_wmma 8-bit LDS == 16,384 B <= 32 KiB");
+        check_true(ldsUpscalerFp16 == 20480u && ldsUpscalerFp16 <= 32768u, "upscaler_wmma FP16 LDS == 20,480 B <= 32 KiB");
     }
 
     // 6. Config CLI Parsing

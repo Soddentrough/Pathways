@@ -16,11 +16,13 @@ PostProcessPipeline::PostProcessPipeline(
     const std::vector<char>& runningAvgSpv,
     const std::vector<char>& blendSpv,
     const std::vector<char>& mergeSpv,
-    const std::vector<char>& restirDebugSpv)
+    const std::vector<char>& restirDebugSpv,
+    VkPipelineCache pipelineCache)
     : m_device(device),
       m_allocator(allocator),
       m_hasSubgroupSizeControl(hasSubgroupSizeControl),
-      m_globalPool(globalPool)
+      m_globalPool(globalPool),
+      m_pipelineCache(pipelineCache)
 {
     createDescriptorLayouts();
     allocateDescriptorSets();
@@ -243,7 +245,7 @@ void PostProcessPipeline::createPipelines(
         pipeInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &smInfo, 0, VK_SHADER_STAGE_COMPUTE_BIT, VK_NULL_HANDLE, "main", nullptr };
 
         VkPipeline pipe = VK_NULL_HANDLE;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &pipe) != VK_SUCCESS) {
+        if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipeInfo, nullptr, &pipe) != VK_SUCCESS) {
             throw std::runtime_error(errMsg);
         }
         return pipe;
@@ -441,7 +443,7 @@ void PostProcessPipeline::createDebugViewPipeline(const std::vector<char>& spv) 
     VkComputePipelineCreateInfo pipelineInfo{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     pipelineInfo.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &smInfo, 0, VK_SHADER_STAGE_COMPUTE_BIT, VK_NULL_HANDLE, "main", nullptr };
     pipelineInfo.layout = m_restirDebugPipelineLayout;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_restirDebugPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipelineInfo, nullptr, &m_restirDebugPipeline) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create ReSTIR debug view pipeline");
     }
 }

@@ -4,6 +4,8 @@
 #include "vk_mem_alloc.h"
 #include "vulkan/Image.hpp"
 #include "vulkan/Buffer.hpp"
+#include "scene/EnvMapImportance.hpp"
+#include <glm/glm.hpp>
 #include <memory>
 #include <string>
 #include <vector>
@@ -54,19 +56,33 @@ public:
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool
     );
 
+    static std::unique_ptr<Texture> createFloatEnvFromPixels(
+        VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+        uint32_t width, uint32_t height, const float* rgbaPixels
+    );
+
     static std::unique_ptr<Texture> createProceduralHdrSky(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-        uint32_t width = 512, uint32_t height = 256
+        uint32_t width = 512, uint32_t height = 256,
+        EnvImportanceTable* outImportance = nullptr
     );
 
     static std::unique_ptr<Texture> createProceduralNightHdrSky(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-        uint32_t width = 2048, uint32_t height = 1024
+        uint32_t width = 2048, uint32_t height = 1024,
+        EnvImportanceTable* outImportance = nullptr
     );
 
     static std::unique_ptr<Texture> createProceduralStudioHdrSky(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
-        uint32_t width = 1024, uint32_t height = 512
+        uint32_t width = 1024, uint32_t height = 512,
+        EnvImportanceTable* outImportance = nullptr
+    );
+
+    static std::unique_ptr<Texture> createProceduralSolidHdrSky(
+        VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
+        const glm::vec3& color, uint32_t width = 16, uint32_t height = 8,
+        EnvImportanceTable* outImportance = nullptr
     );
 
     static std::unique_ptr<Texture> loadFromFile(
@@ -77,7 +93,11 @@ public:
     static std::unique_ptr<Texture> createSceneEnvironmentMap(
         VkDevice device, VmaAllocator allocator, VkQueue queue, VkCommandPool pool,
         const std::string& hdriPath, const std::string& scenePath,
-        const std::string& domeLightHdriPath = ""
+        const std::string& domeLightHdriPath = "",
+        EnvImportanceTable* outImportance = nullptr,
+        const glm::vec3& envTint = glm::vec3(1.0f),
+        bool solidColorDome = false,
+        bool* outUsedExplicitOrDome = nullptr
     );
 
 private:

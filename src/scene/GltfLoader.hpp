@@ -62,7 +62,7 @@ struct GltfScene {
 class GltfLoader {
 public:
     static bool load(const std::string& filepath, GltfScene& outScene);
-    static SceneData loadSceneData(const std::string& filepath);
+    static SceneData loadSceneData(const std::string& filepath, bool suppressFallbackSun = false);
 };
 
 } // namespace pathways

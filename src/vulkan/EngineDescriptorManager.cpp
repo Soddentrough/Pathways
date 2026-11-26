@@ -113,7 +113,9 @@ void EngineDescriptorManager::updateWavefrontDescriptors(const WavefrontDescript
             params.mlDirectDiffuseImage ? params.mlDirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
             params.mlIndirectDiffuseImage ? params.mlIndirectDiffuseImage->getImageView() : VK_NULL_HANDLE,
             params.mlDirectSpecularImage ? params.mlDirectSpecularImage->getImageView() : VK_NULL_HANDLE,
-            params.mlIndirectSpecularImage ? params.mlIndirectSpecularImage->getImageView() : VK_NULL_HANDLE
+            params.mlIndirectSpecularImage ? params.mlIndirectSpecularImage->getImageView() : VK_NULL_HANDLE,
+            params.envImportanceBuffer ? params.envImportanceBuffer->getBuffer() : VK_NULL_HANDLE,
+            params.envImportanceBuffer ? params.envImportanceBuffer->getSize() : 0
         );
     }
 

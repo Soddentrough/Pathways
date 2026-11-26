@@ -187,6 +187,9 @@ public:
     // Physical devices enumeration (for multi-GPU)
     static std::vector<VkPhysicalDevice> enumeratePhysicalDevices(VkInstance instance);
 
+    VkPipelineCache getPipelineCache() const { return m_pipelineCache; }
+    void savePipelineCache() const;
+
 private:
     void createInstance(const Config& config);
     void setupDebugMessenger();
@@ -194,12 +197,17 @@ private:
     void verifyPhysicalDeviceRequirements();
     void createLogicalDevice(const Config& config);
     void initVMA();
+    void initPipelineCache();
+    void destroyPipelineCache();
 
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
     VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
+    std::string m_pipelineCachePath;
+    mutable size_t m_lastSavedPipelineCacheBytes = 0;
 
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     VkQueue m_transferQueue = VK_NULL_HANDLE;

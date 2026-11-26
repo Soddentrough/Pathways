@@ -96,7 +96,8 @@ public:
         const std::vector<char>& runningAvgSpv,
         const std::vector<char>& blendSpv,
         const std::vector<char>& mergeSpv,
-        const std::vector<char>& restirDebugSpv
+        const std::vector<char>& restirDebugSpv,
+        VkPipelineCache pipelineCache = VK_NULL_HANDLE
     );
     ~PostProcessPipeline();
 
@@ -166,6 +167,7 @@ private:
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     bool m_hasSubgroupSizeControl = false;
     VkDescriptorPool m_globalPool = VK_NULL_HANDLE;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     // Descriptors
     VkDescriptorSetLayout m_tonemapDescLayout = VK_NULL_HANDLE;

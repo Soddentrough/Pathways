@@ -31,7 +31,8 @@ DenoiserPipeline::DenoiserPipeline(
     VmaAllocator allocator,
     VkQueue queue,
     ShaderLoader shaderLoader,
-    bool forceWave32
+    bool forceWave32,
+    VkPipelineCache pipelineCache
 )
     : m_device(device)
     , m_physDevice(physDevice)
@@ -39,6 +40,7 @@ DenoiserPipeline::DenoiserPipeline(
     , m_queue(queue)
     , m_shaderLoader(std::move(shaderLoader))
     , m_forceWave32(forceWave32)
+    , m_pipelineCache(pipelineCache)
 {
     createDescriptorSetLayouts();
     initPipelines();
@@ -182,7 +184,7 @@ void DenoiserPipeline::initPipelines() {
         compInfo.stage.module = VK_NULL_HANDLE;
         compInfo.stage.pName = "main";
 
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &compInfo, nullptr, &outPipeline) != VK_SUCCESS) {
+        if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &compInfo, nullptr, &outPipeline) != VK_SUCCESS) {
             throw std::runtime_error("Failed to create DenoiserPipeline compute pipeline for " + spvName);
         }
     };

@@ -53,6 +53,7 @@ public:
     const DisplayInfo& getDisplayInfo() const { return m_displayInfo; }
 
     VkSurfaceKHR createSurface(VkInstance instance);
+    void show();
     void pollEvents();
 
     void setWindowResolution(uint32_t width, uint32_t height);
@@ -85,6 +86,7 @@ private:
 #endif
     bool m_headless = false;
     bool m_shouldClose = false;
+    bool m_shown = false;
     bool m_isFullscreen = false;
     bool m_exclusiveFullscreen = false;
     bool m_composedBorderlessActive = false;

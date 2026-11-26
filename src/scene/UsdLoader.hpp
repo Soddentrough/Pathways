@@ -14,6 +14,7 @@ struct UsdLoadOptions {
     float cullDistance = 0.0f;    // Max distance in meters from camera to cull instances (0 = disabled)
     std::optional<glm::vec3> cameraPosOverride;
     float viewportAspect = 16.0f / 9.0f; // Viewport aspect ratio for fallback camera frustum fitting
+    bool suppressFallbackSun = false; // Skip synthetic fallback directional sun when an explicit/scene HDRI is active
 };
 
 class UsdLoader {

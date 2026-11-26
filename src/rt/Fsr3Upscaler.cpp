@@ -21,10 +21,12 @@ FsrUpscaler::FsrUpscaler(
     const std::vector<char>& sdkPrepSpv,
     VkFormat format,
     const std::string& instanceName,
-    FsrVersion targetVersion
+    FsrVersion targetVersion,
+    VkPipelineCache pipelineCache
 ) : m_device(device),
     m_physDevice(physicalDevice),
     m_allocator(allocator),
+    m_pipelineCache(pipelineCache),
     m_renderWidth(renderWidth),
     m_renderHeight(renderHeight),
     m_displayWidth(displayWidth),
@@ -413,7 +415,7 @@ void FsrUpscaler::createPipelines(const std::vector<char>& sdkPrepSpv) {
     pipeInfo.stage.module = shaderModule;
     pipeInfo.stage.pName = "main";
 
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_sdkPrepPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipeInfo, nullptr, &m_sdkPrepPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, shaderModule, nullptr);
         throw std::runtime_error("FsrUpscaler: Failed to create SDK prep compute pipeline!");
     }

@@ -22,13 +22,15 @@ SuperResolutionManager::SuperResolutionManager(VkDevice device,
                                                VmaAllocator allocator,
                                                VkQueue queue,
                                                ShaderLoaderFunc shaderLoader,
-                                               VkInstance instance)
+                                               VkInstance instance,
+                                               VkPipelineCache pipelineCache)
     : m_device(device),
       m_physicalDevice(physicalDevice),
       m_allocator(allocator),
       m_queue(queue),
       m_shaderLoader(std::move(shaderLoader)),
-      m_instance(instance) {
+      m_instance(instance),
+      m_pipelineCache(pipelineCache) {
 }
 
 SuperResolutionManager::~SuperResolutionManager() {
@@ -220,7 +222,8 @@ void SuperResolutionManager::createFsrPipelines(const Config& config) {
             sdkPrepCode,
             format,
             "[GPU 0 Primary Viewport]",
-            config.fsr_version
+            config.fsr_version,
+            m_pipelineCache
         );
 
         Logger::info("AMD FSR Super-Resolution Pipeline initialized on demand.");

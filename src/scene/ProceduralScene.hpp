@@ -233,6 +233,8 @@ struct SceneData {
     // Environment Map & Dome Light Ingestion
     std::string domeLightHdriPath;
     float domeLightIntensity = 1.0f;
+    bool hasDomeLight = false;
+    glm::vec3 domeLightColor = glm::vec3(1.0f);
 
     // Scene Authoring Metadata & Fallback Tracking
     bool hasSceneMetadata = false;

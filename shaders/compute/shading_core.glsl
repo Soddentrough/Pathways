@@ -103,6 +103,7 @@ bool evalStandardDirectNEEScaled(
     vec3 hitNormal,
     vec3 V,
     uint numLights,
+    float envIntensity,
     uint numCandidates,
     bool canContinue,
     float lightSampleScale,
@@ -118,7 +119,11 @@ bool evalStandardDirectNEEScaled(
     outLightDist = 0.0;
     outDiffContrib = vec3(0.0);
     outSpecContrib = vec3(0.0);
-    if (numLights == 0u) return false;
+
+    float pEnv = (envNeeActive() && envIntensity > 0.0)
+        ? ((numLights == 0u) ? 1.0 : envNeeSelectProb())
+        : 0.0;
+    if (numLights == 0u && pEnv <= 0.0) return false;
 
     bool useLightTree = ((ubo.flags & UBO_FLAG_LIGHT_TREE) != 0u) && (numLights > 1u);
     uint M = max(numCandidates, 1u);
@@ -131,56 +136,70 @@ bool evalStandardDirectNEEScaled(
     vec3 selOrigin = vec3(0.0);
 
     for (uint c = 0u; c < M; ++c) {
-        uint lightIdx = 0u;
-        float lightPickPdf = 1.0;
-        if (useLightTree) {
-            SAMPLE_LIGHT_TREE(numLights, hitPoint, hitNormal, seed, lightIdx, lightPickPdf);
-        } else {
-            SAMPLE_LIGHT_ALIAS(numLights, seed, lightIdx, lightPickPdf);
-        }
-        Light light = lights[lightIdx];
-        uint lightType = uint(light.position.w + 0.5);
-
+        bool pickEnv = (numLights == 0u) || (pEnv > 0.0 && randFloat(seed) < pEnv);
+        uint lightIdx = RESTIR_LIGHT_IDX_ENV;
+        float lightPickPdf = pEnv;
         vec3 lightDir = vec3(0.0, 1.0, 0.0);
         float lightDist = 0.0;
-        vec3 candEmission = light.emission.rgb;
+        vec3 candEmission = vec3(0.0);
         float candPdfSolidAngle = 1.0;
+        uint lightType = 2u;
         bool validCand = false;
 
-        if (lightType == 2u /* DIRECTIONAL */) {
-            lightDir = normalize(light.normal.xyz);
-            lightDist = 10000.0;
-            candPdfSolidAngle = 1.0;
-            validCand = true;
-        } else if (lightType == 1u /* SPOT */) {
-            vec3 toLight = light.position.xyz - hitPoint;
-            float distSq = max(dot(toLight, toLight), 1e-4);
-            lightDist = sqrt(distSq);
-            lightDir = toLight / lightDist;
-            float thetaCos = dot(-lightDir, light.normal.xyz);
-            float innerCos = light.u.w;
-            float outerCos = light.v.w;
-            if (thetaCos >= outerCos) {
-                float spotAtten = clamp((thetaCos - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
-                candEmission *= spotAtten / distSq;
+        if (pickEnv) {
+            vec2 envUv;
+            if (sampleEnvMapImportance(randVec3(seed), lightDir, envUv, candPdfSolidAngle)) {
+                candEmission = textureLod(environmentMap, envUv, 0.0).rgb * envIntensity;
+                lightDist = 10000.0;
+                validCand = true;
+            }
+        } else {
+            float explicitPickPdf = 1.0;
+            if (useLightTree) {
+                SAMPLE_LIGHT_TREE(numLights, hitPoint, hitNormal, seed, lightIdx, explicitPickPdf);
+            } else {
+                SAMPLE_LIGHT_ALIAS(numLights, seed, lightIdx, explicitPickPdf);
+            }
+            lightPickPdf = explicitPickPdf * max(1.0 - pEnv, 1e-20);
+            Light light = lights[lightIdx];
+            lightType = uint(light.position.w + 0.5);
+            candEmission = light.emission.rgb;
+
+            if (lightType == 2u /* DIRECTIONAL */) {
+                lightDir = normalize(light.normal.xyz);
+                lightDist = 10000.0;
                 candPdfSolidAngle = 1.0;
                 validCand = true;
-            }
-        } else /* AREA QUAD or AREA TRIANGLE */ {
-            vec2 ruv = randVec2(seed);
-            if (lightType == 3u /* AREA TRIANGLE */) {
-                float r1 = sqrt(ruv.x);
-                ruv = vec2(1.0 - r1, ruv.y * r1);
-            }
-            vec3 lightPos = light.position.xyz + light.u.xyz * ruv.x + light.v.xyz * ruv.y;
-            vec3 toLight = lightPos - hitPoint;
-            float distSq = max(dot(toLight, toLight), 1e-4);
-            lightDist = sqrt(distSq);
-            lightDir = toLight / lightDist;
-            float cosLight = dot(light.normal.xyz, -lightDir);
-            if (cosLight > 0.0 && light.emission.w > 0.0) {
-                candPdfSolidAngle = distSq / max(light.emission.w * cosLight, 1e-12);
-                validCand = true;
+            } else if (lightType == 1u /* SPOT */) {
+                vec3 toLight = light.position.xyz - hitPoint;
+                float distSq = max(dot(toLight, toLight), 1e-4);
+                lightDist = sqrt(distSq);
+                lightDir = toLight / lightDist;
+                float thetaCos = dot(-lightDir, light.normal.xyz);
+                float innerCos = light.u.w;
+                float outerCos = light.v.w;
+                if (thetaCos >= outerCos) {
+                    float spotAtten = clamp((thetaCos - outerCos) / max(innerCos - outerCos, 1e-4), 0.0, 1.0);
+                    candEmission *= spotAtten / distSq;
+                    candPdfSolidAngle = 1.0;
+                    validCand = true;
+                }
+            } else /* AREA QUAD or AREA TRIANGLE */ {
+                vec2 ruv = randVec2(seed);
+                if (lightType == 3u /* AREA TRIANGLE */) {
+                    float r1 = sqrt(ruv.x);
+                    ruv = vec2(1.0 - r1, ruv.y * r1);
+                }
+                vec3 lightPos = light.position.xyz + light.u.xyz * ruv.x + light.v.xyz * ruv.y;
+                vec3 toLight = lightPos - hitPoint;
+                float distSq = max(dot(toLight, toLight), 1e-4);
+                lightDist = sqrt(distSq);
+                lightDir = toLight / lightDist;
+                float cosLight = dot(light.normal.xyz, -lightDir);
+                if (cosLight > 0.0 && light.emission.w > 0.0) {
+                    candPdfSolidAngle = distSq / max(light.emission.w * cosLight, 1e-12);
+                    validCand = true;
+                }
             }
         }
 
@@ -192,9 +211,11 @@ bool evalStandardDirectNEEScaled(
         if (dot(totalFCos, totalFCos) <= 1e-14) continue;
 
         float sourcePdf = max(candPdfSolidAngle * lightPickPdf, 1e-20);
-        float misW = (lightType == 0u || lightType == 3u)
-            ? neeMisWeightScaled(lightIdx, sourcePdf, bsdfPdf, canContinue, lightSampleScale)
-            : 1.0;
+        float misW = pickEnv
+            ? envNeeMisWeightScaled(sourcePdf, bsdfPdf, canContinue, lightSampleScale)
+            : ((lightType == 0u || lightType == 3u)
+                ? neeMisWeightScaled(lightIdx, sourcePdf, bsdfPdf, canContinue, lightSampleScale)
+                : 1.0);
         if (misW <= 0.0) continue;
 
         vec3 candDiff = max(totalFCos - specFCos, vec3(0.0)) * candEmission * misW;
@@ -231,6 +252,7 @@ bool evalStandardDirectNEE(
     vec3 hitNormal,
     vec3 V,
     uint numLights,
+    float envIntensity,
     uint numCandidates,
     bool canContinue,
     inout uint seed,
@@ -241,7 +263,7 @@ bool evalStandardDirectNEE(
     out vec3 outSpecContrib
 ) {
     return evalStandardDirectNEEScaled(
-        bsdf, hitPoint, hitNormal, V, numLights, numCandidates, canContinue, 1.0, seed,
+        bsdf, hitPoint, hitNormal, V, numLights, envIntensity, numCandidates, canContinue, 1.0, seed,
         outShadowOrigin, outLightDir, outLightDist, outDiffContrib, outSpecContrib
     );
 }

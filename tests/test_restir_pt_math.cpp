@@ -600,18 +600,20 @@ int main() {
     std::cout << "\n[TEST 10] Production ReSTIR PT Struct Alignment, Light UV16 & X1Context..." << std::endl;
     {
         // 10a. Static size & std430 alignment verification of production ReSTIRTypes.hpp structs
-        assert_true(sizeof(pathways::DiReservoirGPU) == 32, "DiReservoirGPU must strictly equal 32 bytes");
+        assert_true(sizeof(pathways::DiReservoirGPU) == 24, "DiReservoirGPU must strictly equal 24 bytes");
         assert_true(sizeof(pathways::HitGPU) == 16, "HitGPU must strictly equal 16 bytes");
         assert_true(sizeof(pathways::GiReservoirGPU) == 32, "GiReservoirGPU must strictly equal 32 bytes");
-        assert_true(sizeof(pathways::X1ContextGPU) == 24, "X1ContextGPU must strictly equal 24 bytes");
+        assert_true(sizeof(pathways::X1ContextGPU) == 16, "X1ContextGPU must strictly equal 16 bytes");
         assert_true(sizeof(pathways::ShadeMaterialGPU) == 64, "ShadeMaterialGPU must strictly equal 64 bytes");
         assert_true(sizeof(pathways::TriangleShadeGPU) == 64, "TriangleShadeGPU must strictly equal 64 bytes");
 
-        // Stride array alignment check: 4 DI or GI reservoirs fit into one 128B RDNA 4 vector cache line
+        // Stride array alignment check: 4 DI (96B) / GI (128B) reservoirs and 8 X1Contexts (128B)
         pathways::DiReservoirGPU diArray[4];
         pathways::GiReservoirGPU giArray[4];
-        assert_true(sizeof(diArray) == 128, "4x DiReservoirGPU fits exactly into one 128B RDNA 4 vector cache line");
+        pathways::X1ContextGPU x1Array[8];
+        assert_true(sizeof(diArray) == 96, "4x DiReservoirGPU must equal 96 bytes (24B scalar stride)");
         assert_true(sizeof(giArray) == 128, "4x GiReservoirGPU fits exactly into one 128B RDNA 4 vector cache line");
+        assert_true(sizeof(x1Array) == 128, "8x X1ContextGPU fits exactly into one 128B RDNA vector cache line");
 
         // 10a-2. DiReservoirGPU 16-bit area-light UV precision (packUnorm2x16 vs legacy 8-bit)
         glm::vec2 trueUv(0.314159f, 0.718281f);
@@ -621,23 +623,30 @@ int main() {
         assert_near(recUv.x, trueUv.x, 1.0f / 65535.0f + 1e-6f, "DiReservoirGPU 16-bit light UV.x roundtrip");
         assert_near(recUv.y, trueUv.y, 1.0f / 65535.0f + 1e-6f, "DiReservoirGPU 16-bit light UV.y roundtrip");
 
-        // 10a-3. X1ContextGPU 30-bit IEEE-754 qSelf + fp16 metallic roundtrip & zero squared-albedo bug
+        // 10a-3. X1ContextGPU 16-byte uvec4 roundtrip (14-bit round-to-nearest fp32 qSelf + fp16 metallic)
         float trueQSelf = 0.284195f;
         float trueMetallic = 0.35f;
+        float trueRoughness = 0.45f;
+        float trueF0 = 0.04f;
         glm::vec3 trueBaseColor(0.25f, 0.60f, 0.80f);
         uint32_t qBits = 0;
         std::memcpy(&qBits, &trueQSelf, sizeof(uint32_t));
+        uint32_t rQ = static_cast<uint32_t>(std::round(std::clamp(trueRoughness, 0.0f, 1.0f) * 255.0f));
+        uint32_t fQ = static_cast<uint32_t>(std::round(std::sqrt(std::clamp(trueF0, 0.0f, 1.0f)) * 255.0f));
+        uint32_t qPacked = ((qBits + (1u << 16u)) >> 17u) & 0x3FFFu;
         pathways::X1ContextGPU ctx{};
-        ctx.albedoRG = glm::packHalf2x16(glm::vec2(trueBaseColor.r, trueBaseColor.g));
-        ctx.albedoB = glm::packHalf2x16(glm::vec2(trueBaseColor.b, trueMetallic));
-        ctx.flags = (qBits & ~3u) | 1u;
+        ctx.data[1] = glm::packHalf2x16(glm::vec2(trueBaseColor.r, trueBaseColor.g));
+        ctx.data[2] = glm::packHalf2x16(glm::vec2(trueBaseColor.b, trueMetallic));
+        ctx.data[3] = 1u | (rQ << 2u) | (fQ << 10u) | (qPacked << 18u);
 
-        uint32_t recQBits = ctx.flags & ~3u;
+        uint32_t recQBits = (ctx.data[3] & 0xFFFC0000u) >> 1u;
         float recQSelf = 0.0f;
         std::memcpy(&recQSelf, &recQBits, sizeof(float));
-        float recMetallic = glm::unpackHalf2x16(ctx.albedoB).y;
-        assert_near(recQSelf, trueQSelf, 1e-6f, "X1ContextGPU 30-bit fp32 qSelf roundtrip (< 1e-6 error)");
+        float recMetallic = glm::unpackHalf2x16(ctx.data[2]).y;
+        float recSqrtF0 = static_cast<float>((ctx.data[3] >> 10u) & 0xFFu) / 255.0f;
+        assert_near(recQSelf, trueQSelf, trueQSelf * 0.01f, "X1ContextGPU 14-bit fp32 qSelf roundtrip (< 1% error)");
         assert_near(recMetallic, trueMetallic, 1e-3f, "X1ContextGPU fp16 metallic roundtrip");
+        assert_near(recSqrtF0 * recSqrtF0, trueF0, 1e-5f, "X1ContextGPU sqrt-encoded 0.04 F0 exact roundtrip");
 
         // Zero squared-albedo verification: at M = 1, wSelf = pSelf / qSelf and giW = wSelf / (1 * pSelf) = 1 / qSelf,
         // so fCos * L2 * giW == fCos * L2 / qSelf (single albedo power, never albedo^2).
@@ -1011,9 +1020,9 @@ int main() {
         pathways::DiReservoirGPU r{};
         r.idxM = (4u << 24) | 640834u; // M = 4 (8-bit), light index = 640,834 (24-bit, > 65535)
         r.wSum = 12.5f;
-        r.targetPdf = 2.5f;
+        r.targetCosBits = 0x3C004100u; // packed FP16 (targetPdf=2.5, cosLight=1.0)
         r.flags = 0x100u; // valid bit set
-        r.hitDist = 3.0f;
+        r.distHitT = 0x42004200u; // packed FP16 (dist=3.0, hitT=3.0)
 
         // Under inline shadow query: shadow ray is occluded
         bool occluded = true;

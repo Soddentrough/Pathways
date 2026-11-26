@@ -33,7 +33,7 @@ int main() {
         std::vector<LightTreeNodeGPU> nodes;
         buildLightTree(lights, nodes);
         check_true(nodes.size() == 1, "Empty tree should have 1 dummy node");
-        check_true(nodes[0].children.z == 1u, "Dummy node is marked leaf");
+        check_true(nodes[0].isLeaf(), "Dummy node is marked leaf");
         std::cout << "[PASS] Empty tree initialization verified." << std::endl;
     }
 
@@ -51,10 +51,10 @@ int main() {
         std::vector<LightTreeNodeGPU> nodes;
         buildLightTree(lights, nodes);
         check_true(nodes.size() == 1, "Single light tree has 1 node");
-        check_true(nodes[0].children.z == 1u, "Single node is leaf");
-        check_true(nodes[0].children.x == 0u, "Leaf light index is 0");
+        check_true(nodes[0].isLeaf(), "Single node is leaf");
+        check_true(nodes[0].lightIndex() == 0u, "Leaf light index is 0");
         float expectedFlux = calculateLightFlux(l);
-        assert_near(nodes[0].bboxMin.w, expectedFlux, 0.01f, "Single light flux matches");
+        assert_near(nodes[0].flux(), expectedFlux, 0.01f, "Single light flux matches");
         std::cout << "[PASS] Single light tree verified." << std::endl;
     }
 
@@ -91,10 +91,12 @@ int main() {
 
         std::vector<LightTreeNodeGPU> nodes;
         buildLightTree(lights, nodes);
+        check_true(computeLightTreePaths(nodes, lights), "All 64 lights must encode valid root-to-leaf paths");
 
         check_true(!nodes.empty(), "Nodes vector not empty");
+        check_true(nodes.size() == lights.size() * 2, "Pair-aligned 32B tree uses exact 2*N nodes");
         // Root is at index 0
-        assert_near(nodes[0].bboxMin.w, totalExpectedFlux, 0.1f, "Root total radiant flux matches");
+        assert_near(nodes[0].flux(), totalExpectedFlux, 0.1f, "Root total radiant flux matches");
 
         // Verify leaf nodes and light coverage
         std::unordered_set<uint32_t> coveredLightIndices;
@@ -106,29 +108,38 @@ int main() {
             check_true(nodeIdx < nodes.size(), "Valid node index");
             const auto& node = nodes[nodeIdx];
 
-            if (node.children.z == 1u) {
+            if (node.isLeaf()) {
                 // Leaf
                 leafCount++;
-                uint32_t lIdx = node.children.x;
+                uint32_t lIdx = node.lightIndex();
                 check_true(lIdx < lights.size(), "Valid leaf light index");
                 check_true(coveredLightIndices.find(lIdx) == coveredLightIndices.end(), "Each light visited exactly once");
                 coveredLightIndices.insert(lIdx);
+                uint32_t pathDepth = std::bit_cast<uint32_t>(lights[lIdx].pad0.z);
+                check_true(pathDepth <= 10u, "Leaf path depth valid and <= 10");
             } else {
-                // Internal node
-                uint32_t left = node.children.x;
-                uint32_t right = node.children.y;
-                check_true(left < nodes.size() && right < nodes.size(), "Children indices valid");
+                // Internal node: contiguous 64-byte cache-line sibling pair [left, left + 1] at even index
+                uint32_t left = node.firstChild();
+                uint32_t right = left + 1u;
+                check_true((left & 1u) == 0u && left >= 2u, "Sibling pair firstChild must be even >= 2");
+                check_true(right < nodes.size(), "Children pair within bounds");
 
                 // Verify bounding box bounds children
                 const auto& lNode = nodes[left];
                 const auto& rNode = nodes[right];
-                check_true(node.bboxMin.x <= lNode.bboxMin.x + 1e-4f && node.bboxMin.y <= lNode.bboxMin.y + 1e-4f && node.bboxMin.z <= lNode.bboxMin.z + 1e-4f, "Bounding box bounds left min");
-                check_true(node.bboxMax.x >= lNode.bboxMax.x - 1e-4f && node.bboxMax.y >= lNode.bboxMax.y - 1e-4f && node.bboxMax.z >= lNode.bboxMax.z - 1e-4f, "Bounding box bounds left max");
-                check_true(node.bboxMin.x <= rNode.bboxMin.x + 1e-4f && node.bboxMin.y <= rNode.bboxMin.y + 1e-4f && node.bboxMin.z <= rNode.bboxMin.z + 1e-4f, "Bounding box bounds right min");
-                check_true(node.bboxMax.x >= rNode.bboxMax.x - 1e-4f && node.bboxMax.y >= rNode.bboxMax.y - 1e-4f && node.bboxMax.z >= rNode.bboxMax.z - 1e-4f, "Bounding box bounds right max");
+                const glm::vec3 nMin = node.bboxMin();
+                const glm::vec3 nMax = node.bboxMax();
+                const glm::vec3 lMin = lNode.bboxMin();
+                const glm::vec3 lMax = lNode.bboxMax();
+                const glm::vec3 rMin = rNode.bboxMin();
+                const glm::vec3 rMax = rNode.bboxMax();
+                check_true(nMin.x <= lMin.x + 1e-4f && nMin.y <= lMin.y + 1e-4f && nMin.z <= lMin.z + 1e-4f, "Bounding box bounds left min");
+                check_true(nMax.x >= lMax.x - 1e-4f && nMax.y >= lMax.y - 1e-4f && nMax.z >= lMax.z - 1e-4f, "Bounding box bounds left max");
+                check_true(nMin.x <= rMin.x + 1e-4f && nMin.y <= rMin.y + 1e-4f && nMin.z <= rMin.z + 1e-4f, "Bounding box bounds right min");
+                check_true(nMax.x >= rMax.x - 1e-4f && nMax.y >= rMax.y - 1e-4f && nMax.z >= rMax.z - 1e-4f, "Bounding box bounds right max");
 
                 // Verify flux summation
-                assert_near(node.bboxMin.w, lNode.bboxMin.w + rNode.bboxMin.w, 0.01f, "Flux conservation in internal node");
+                assert_near(node.flux(), lNode.flux() + rNode.flux(), 0.01f, "Flux conservation in internal node");
 
                 self(self, left, depth + 1);
                 self(self, right, depth + 1);
@@ -140,7 +151,7 @@ int main() {
         check_true(leafCount == 64, "All 64 leaves present");
         check_true(coveredLightIndices.size() == 64, "All 64 lights covered");
         check_true(maxDepth <= 10, "Tree depth is O(log2 N)");
-        std::cout << "[PASS] 64-light tree hierarchy, flux conservation, and bounds verified (depth: " << maxDepth << ")." << std::endl;
+        std::cout << "[PASS] 64-light 32B pair-aligned tree hierarchy, flux conservation, and bounds verified (depth: " << maxDepth << ")." << std::endl;
     }
 
     // 4. SceneGeometryPipeline partitioning + dynamic LightTree rebuild flux conservation
@@ -196,7 +207,7 @@ int main() {
         scene.lights[0].emission *= 3.0f;
         scene.lights[0].emission.w = 1.0f;
         buildLightTree(scene.lights, nodesB);
-        assert_near(nodesB[0].bboxMin.w, nodesA[0].bboxMin.w * 3.0f, 0.05f,
+        assert_near(nodesB[0].flux(), nodesA[0].flux() * 3.0f, 0.05f,
                     "Dynamic light intensity scaling by 3x scales LightTree root flux by 3x");
         std::cout << "[PASS] SceneGeometryPipeline partitioning & dynamic LightTree rebuild verified." << std::endl;
     }

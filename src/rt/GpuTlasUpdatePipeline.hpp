@@ -18,7 +18,8 @@ class GpuTlasUpdatePipeline {
 public:
     static constexpr float SIMULATION_FIXED_TIMESTEP = 1.0f / 60.0f; // 60 Hz fixed tick
 
-    GpuTlasUpdatePipeline(VkDevice device, VmaAllocator allocator, bool hasSubgroupSizeControl);
+    GpuTlasUpdatePipeline(VkDevice device, VmaAllocator allocator, bool hasSubgroupSizeControl,
+                          VkPipelineCache pipelineCache = VK_NULL_HANDLE);
     ~GpuTlasUpdatePipeline();
 
     GpuTlasUpdatePipeline(const GpuTlasUpdatePipeline&) = delete;
@@ -65,6 +66,7 @@ private:
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     bool m_hasSubgroupSizeControl = false;
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
 
     // GPU-Timeline TLAS Instance & Scratch Buffers (Tier 3)
     std::unique_ptr<Buffer> m_tlasInstanceBuffer;

@@ -77,6 +77,7 @@ struct MultiGpuPlanParams {
     bool temporalResetRequested = false;
     uint32_t accumulatedSamples = 1;
     WavefrontSortMode effectiveWavefrontSortMode = WavefrontSortMode::None;
+    bool envNeeEnabled = false;
 };
 
 class MultiGpuCoordinator {

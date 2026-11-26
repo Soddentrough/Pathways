@@ -858,7 +858,7 @@ bool GltfLoader::load(const std::string& filepath, GltfScene& outScene) {
     return true;
 }
 
-SceneData GltfLoader::loadSceneData(const std::string& filepath) {
+SceneData GltfLoader::loadSceneData(const std::string& filepath, bool suppressFallbackSun) {
     GltfScene gltfScene;
     if (!load(filepath, gltfScene)) {
         Logger::warn("GltfLoader: Failed to load '{}', falling back to Cornell Box.", filepath);
@@ -1336,7 +1336,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
 
     // If the glTF had neither punctual lights, physical emissive mesh lights,
     // nor metadata lights, add a directional sun light matching the procedural sky dome
-    if (data.lights.empty()) {
+    // (unless an explicit HDRI environment map is active).
+    if (data.lights.empty() && !suppressFallbackSun) {
         glm::vec3 sunDir = glm::normalize(glm::vec3(0.5f, 0.7f, 0.5f));
         LightGPU sunLight{};
         sunLight.position = glm::vec4(0.0f, 0.0f, 0.0f, LIGHT_DIRECTIONAL);
@@ -1347,6 +1348,8 @@ SceneData GltfLoader::loadSceneData(const std::string& filepath) {
         data.hasFallbackSun = true;
         data.sceneWarnings.push_back("Synthetic Directional Sun active (no lights or emissive sources in scene asset)");
         Logger::info("GltfLoader: Scene had no lights; generated directional sun fallback matching procedural sky");
+    } else if (data.lights.empty() && suppressFallbackSun) {
+        Logger::info("GltfLoader: Skipping fallback directional sun because an HDRI environment map is active.");
     }
 
     Logger::info("GltfLoader generated SceneData: {} Triangles, {} Materials, {} Lights",

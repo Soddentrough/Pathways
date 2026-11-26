@@ -15,8 +15,9 @@ NRCManager::NRCManager(VkDevice device, VmaAllocator allocator,
                        const std::vector<char>& inferSpv,
                        const std::vector<char>& trainSpv,
                        const std::vector<char>& resolveSpv,
-                       VkPhysicalDevice physDevice)
-    : m_device(device), m_physDevice(physDevice), m_allocator(allocator), m_width(width), m_height(height)
+                       VkPhysicalDevice physDevice,
+                       VkPipelineCache pipelineCache)
+    : m_device(device), m_physDevice(physDevice), m_allocator(allocator), m_pipelineCache(pipelineCache), m_width(width), m_height(height)
 {
     initBuffers();
     initWeights();
@@ -427,7 +428,7 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
     inferPipeInfo.stage.module = inferMod;
     inferPipeInfo.stage.pName = "main";
     inferPipeInfo.stage.pNext = &subgroupSize32;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &inferPipeInfo, nullptr, &m_inferPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &inferPipeInfo, nullptr, &m_inferPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, inferMod, nullptr);
         throw std::runtime_error("NRCManager: Failed to create inference compute pipeline!");
     }
@@ -456,7 +457,7 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
     trainPipeInfo.stage.module = trainMod;
     trainPipeInfo.stage.pName = "main";
     trainPipeInfo.stage.pNext = &subgroupSize32;
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &trainPipeInfo, nullptr, &m_trainPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &trainPipeInfo, nullptr, &m_trainPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, trainMod, nullptr);
         throw std::runtime_error("NRCManager: Failed to create training compute pipeline!");
     }
@@ -486,7 +487,7 @@ void NRCManager::createPipelines(const std::vector<char>& inferSpv, const std::v
         resPipeInfo.stage.module = resMod;
         resPipeInfo.stage.pName = "main";
         resPipeInfo.stage.pNext = &subgroupSize32;
-        if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &resPipeInfo, nullptr, &m_resolvePipeline) != VK_SUCCESS) {
+        if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &resPipeInfo, nullptr, &m_resolvePipeline) != VK_SUCCESS) {
             vkDestroyShaderModule(m_device, resMod, nullptr);
             throw std::runtime_error("NRCManager: Failed to create resolve compute pipeline!");
         }

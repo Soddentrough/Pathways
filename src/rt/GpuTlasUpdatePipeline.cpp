@@ -9,8 +9,10 @@
 
 namespace pathways {
 
-GpuTlasUpdatePipeline::GpuTlasUpdatePipeline(VkDevice device, VmaAllocator allocator, bool hasSubgroupSizeControl)
-    : m_device(device), m_allocator(allocator), m_hasSubgroupSizeControl(hasSubgroupSizeControl) {
+GpuTlasUpdatePipeline::GpuTlasUpdatePipeline(VkDevice device, VmaAllocator allocator, bool hasSubgroupSizeControl,
+                                             VkPipelineCache pipelineCache)
+    : m_device(device), m_allocator(allocator), m_hasSubgroupSizeControl(hasSubgroupSizeControl),
+      m_pipelineCache(pipelineCache) {
 }
 
 GpuTlasUpdatePipeline::~GpuTlasUpdatePipeline() {
@@ -190,7 +192,7 @@ void GpuTlasUpdatePipeline::createPipeline(const std::vector<char>& compCode) {
     }
     pipeInfo.layout = m_updateTlasPipelineLayout;
 
-    if (vkCreateComputePipelines(m_device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &m_updateTlasPipeline) != VK_SUCCESS) {
+    if (vkCreateComputePipelines(m_device, m_pipelineCache, 1, &pipeInfo, nullptr, &m_updateTlasPipeline) != VK_SUCCESS) {
         vkDestroyShaderModule(m_device, compModule, nullptr);
         throw std::runtime_error("Failed to create TLAS update compute pipeline!");
     }

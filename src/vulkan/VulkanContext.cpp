@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <format>
 #include <array>
+#include <chrono>
+#include <cstdlib>
 
 namespace pathways {
 
@@ -70,11 +72,13 @@ VulkanContext::VulkanContext(const Config& config, VkSurfaceKHR surface, const s
     verifyPhysicalDeviceRequirements();
     createLogicalDevice(config);
     initVMA();
+    initPipelineCache();
     Logger::info("Vulkan 1.4 Context [{}] successfully initialized on: {}", m_contextRole, m_deviceName);
 }
 
 VulkanContext::~VulkanContext() {
     Logger::info("Destroying Vulkan Context [{}]...", m_contextRole);
+    destroyPipelineCache();
     if (m_allocator) {
         vmaDestroyAllocator(m_allocator);
     }
@@ -1354,6 +1358,132 @@ void VulkanContext::initVMA() {
         throw std::runtime_error("Failed to initialize Vulkan Memory Allocator (VMA)!");
     }
     Logger::info("VMA Allocator initialized successfully.");
+}
+
+void VulkanContext::initPipelineCache() {
+    if (m_device == VK_NULL_HANDLE) {
+        return;
+    }
+
+    std::filesystem::path cacheDir;
+    if (const char* envDir = std::getenv("PATHWAYS_PIPELINE_CACHE_DIR"); envDir && envDir[0] != '\0') {
+        cacheDir = envDir;
+    } else {
+#ifdef _WIN32
+        if (const char* localAppData = std::getenv("LOCALAPPDATA"); localAppData && localAppData[0] != '\0') {
+            cacheDir = std::filesystem::path(localAppData) / "pathways";
+        }
+#else
+        if (const char* xdgCache = std::getenv("XDG_CACHE_HOME"); xdgCache && xdgCache[0] != '\0') {
+            cacheDir = std::filesystem::path(xdgCache) / "pathways";
+        } else if (const char* home = std::getenv("HOME"); home && home[0] != '\0') {
+            cacheDir = std::filesystem::path(home) / ".cache" / "pathways";
+        }
+#endif
+    }
+
+    std::vector<uint8_t> initialData;
+    if (!cacheDir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(cacheDir, ec);
+        if (!ec) {
+            std::filesystem::path cachePath = cacheDir / std::format(
+                "vk_pipeline_cache_{:04x}_{:04x}_{:08x}.bin",
+                m_deviceProperties.vendorID,
+                m_deviceProperties.deviceID,
+                m_deviceProperties.driverVersion
+            );
+            m_pipelineCachePath = cachePath.string();
+            std::ifstream f(cachePath, std::ios::binary | std::ios::ate);
+            if (f.is_open()) {
+                const std::streamsize sz = f.tellg();
+                if (sz > 0) {
+                    initialData.resize(static_cast<size_t>(sz));
+                    f.seekg(0, std::ios::beg);
+                    if (!f.read(reinterpret_cast<char*>(initialData.data()), sz)) {
+                        initialData.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    m_lastSavedPipelineCacheBytes = initialData.size();
+
+    VkPipelineCacheCreateInfo cacheInfo{ VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    cacheInfo.initialDataSize = initialData.size();
+    cacheInfo.pInitialData = initialData.empty() ? nullptr : initialData.data();
+
+    if (vkCreatePipelineCache(m_device, &cacheInfo, nullptr, &m_pipelineCache) != VK_SUCCESS) {
+        m_pipelineCache = VK_NULL_HANDLE;
+        Logger::warn("[{}] Failed to create VkPipelineCache; proceeding with uncached pipeline creation.", m_contextRole);
+        return;
+    }
+
+    if (!initialData.empty()) {
+        Logger::info("[{}] Loaded Vulkan pipeline cache ({:.1f} KB) from '{}'.",
+                     m_contextRole, static_cast<double>(initialData.size()) / 1024.0, m_pipelineCachePath);
+    } else if (!m_pipelineCachePath.empty()) {
+        Logger::info("[{}] Initialized empty Vulkan pipeline cache (target: '{}').", m_contextRole, m_pipelineCachePath);
+    }
+}
+
+void VulkanContext::savePipelineCache() const {
+    if (m_device == VK_NULL_HANDLE || m_pipelineCache == VK_NULL_HANDLE || m_pipelineCachePath.empty()) {
+        return;
+    }
+
+    size_t cacheBytes = 0;
+    if (vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheBytes, nullptr) != VK_SUCCESS || cacheBytes == 0) {
+        return;
+    }
+    if (cacheBytes == m_lastSavedPipelineCacheBytes) {
+        return;
+    }
+
+    std::vector<uint8_t> outData(cacheBytes);
+    if (vkGetPipelineCacheData(m_device, m_pipelineCache, &cacheBytes, outData.data()) != VK_SUCCESS || cacheBytes == 0) {
+        return;
+    }
+
+    std::filesystem::path targetPath(m_pipelineCachePath);
+    std::filesystem::path tmpPath = targetPath.parent_path() / std::format(
+        "{}.tmp.{}.{}",
+        targetPath.filename().string(),
+        reinterpret_cast<uintptr_t>(this),
+        static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count())
+    );
+
+    std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(outData.data()), static_cast<std::streamsize>(cacheBytes));
+    out.close();
+    if (!out) {
+        std::error_code ec;
+        std::filesystem::remove(tmpPath, ec);
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmpPath, targetPath, ec);
+    if (ec) {
+        std::filesystem::remove(tmpPath, ec);
+        return;
+    }
+
+    m_lastSavedPipelineCacheBytes = cacheBytes;
+    Logger::info("[{}] Saved Vulkan pipeline cache ({:.1f} KB) to '{}'.",
+                 m_contextRole, static_cast<double>(cacheBytes) / 1024.0, m_pipelineCachePath);
+}
+
+void VulkanContext::destroyPipelineCache() {
+    if (m_device != VK_NULL_HANDLE && m_pipelineCache != VK_NULL_HANDLE) {
+        savePipelineCache();
+        vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
+        m_pipelineCache = VK_NULL_HANDLE;
+    }
 }
 
 namespace {
