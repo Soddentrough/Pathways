@@ -262,39 +262,24 @@ void main() {
 
             archetype = MATERIAL_ARCHETYPE_DIFFUSE;
 
-            vec3 tanDir = vec3(1.0, 0.0, 0.0);
-            float tanSign = 1.0;
-
             Triangle tri = triangles[closestTri];
-            vec3 localNormal = getTriangleNormal(tri, closestBary);
-            hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-            hitUv = getTriangleUV(tri, closestBary);
             matId = tri.materialId + hitInstMatOffset;
             archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
 
-            if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
-                tanDir = getTriangleTangent(tri, closestBary);
-                tanDir = normalize(mat3(hitO2w) * tanDir);
-                tanSign = getTriangleTangentSign(tri);
+            hit = packRayHitGeom(closestT, hitInstIdx, uint(closestTri), closestBary);
+
+            bool hasValidMat = (matId < pc.numMaterials);
+            ShadeMaterial smHit;
+            if (hasValidMat) {
+                smHit = shadeMaterials[matId];
             }
-
-            Hit hitAtom;
-            hitAtom.instanceId = hitInstIdx;
-            hitAtom.primitiveId = uint(closestTri);
-            hitAtom.baryPacked = packUnorm2x16(closestBary);
-            bool frontFace = dot(direction, hitNormal) < 0.0;
-            hitAtom.flags = (frontFace ? 2u : 0u) | (tri.tanSigns & 0xFFFF0000u);
-
-            hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
-
             bool isSpecular = (archetype == MATERIAL_ARCHETYPE_DIELECTRIC);
-            if (!isSpecular && matId < pc.numMaterials) {
-                Material m0 = materials[matId];
-                float met0 = m0.metallic;
-                if ((m0.type & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
+            if (!isSpecular && hasValidMat) {
+                float met0 = smHit.pbrParams.y;
+                if ((smGetTypeFlags(smHit) & MATERIAL_TYPE_MASK) == 1u /* MATERIAL_METALLIC */) {
                     met0 = max(met0, 1.0);
                 }
-                isSpecular = (met0 > 0.5) && (m0.roughness < 0.05) && (m0.albedoTex == 0u) && (m0.mrTex == 0u);
+                isSpecular = (met0 > 0.5) && (smHit.pbrParams.x < 0.05) && (smGetAlbedoTex(smHit) == 0u) && (smGetMrTex(smHit) == 0u);
             }
             state = packRayState(f16vec3(1.0), seed, pixelIndex, isSpecular, false);
 
@@ -339,12 +324,16 @@ void main() {
                     imageStore(uAccumImage, storeCoord, vec4(0.0, 0.0, 0.0, -min(primaryDepth, 65000.0)));
                 }
 
+                if (needNormals || needNdStore || isCenterPixel || pc.captureMlData != 0u) {
+                    hitNormal = normalize(transpose(mat3(hitW2o)) * getTriangleNormal(tri, closestBary));
+                }
                 vec2 quantUv = vec2(0.0);
                 float rayConeBaseLod = -16.0;
                 if (needNormals || pc.captureMlData != 0u) {
-                    quantUv = unpackHalf2x16(packHalf2x16(hitUv - floor(hitUv)));
+                    hitUv = getTriangleUV(tri, closestBary);
+                    quantUv = hitUv;
                     if (closestTri >= 0) {
-                        rayConeBaseLod = computeRayConeBaseLod(hit.hitData1.w >> 16u, closestT, direction, hitNormal,
+                        rayConeBaseLod = computeRayConeBaseLod(tri.tanSigns >> 16u, closestT, direction, hitNormal,
                                                                2.0 * abs(ubo.projInverse[1][1]) / float(max(fh, 1u)),
                                                                0u, 0u);
                     }
@@ -352,12 +341,14 @@ void main() {
 
                 vec3 shadingNormal = (dot(direction, hitNormal) < 0.0) ? hitNormal : -hitNormal;
                 if (needNormals) {
-                    if (matId < pc.numMaterials) {
-                        Material mat = materials[matId];
-                        if (mat.normalTex > 0u && mat.normalTex <= 512u) {
-                            vec3 normalMap = SAMPLE_SCENE_TEXTURE_LOD(mat.normalTex, quantUv, rayConeBaseLod).rgb * 2.0 - 1.0;
-                            normalMap.xy *= mat.normalScale;
+                    if (hasValidMat) {
+                        uint nTex = smGetNormalTex(smHit);
+                        if (nTex > 0u && nTex <= 512u) {
+                            vec3 normalMap = SAMPLE_SCENE_TEXTURE_LOD(nTex, quantUv, rayConeBaseLod).rgb * 2.0 - 1.0;
+                            normalMap.xy *= smGetNormalScale(smHit);
                             normalMap = normalize(normalMap);
+                            vec3 tanDir = normalize(mat3(hitO2w) * getTriangleTangent(tri, closestBary));
+                            float tanSign = getTriangleTangentSign(tri);
                             vec3 orthoTan = tanDir - dot(tanDir, shadingNormal) * shadingNormal;
                             float tanLenSq = dot(orthoTan, orthoTan);
                             vec3 gTan = (tanLenSq > 1e-6) ? (orthoTan * inversesqrt(tanLenSq)) : vec3(1.0, 0.0, 0.0);

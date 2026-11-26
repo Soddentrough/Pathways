@@ -111,32 +111,12 @@ void main() {
     uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
     if (inRange) {
         if (closestTri >= 0) {
-            Triangle tri = triangles[closestTri];
-            vec3 localNormal = getTriangleNormal(tri, closestBary);
-            vec3 hitNormal = normalize(transpose(mat3(hitW2o)) * localNormal);
-            vec2 hitUv = getTriangleUV(tri, closestBary);
-
-            uint matId = tri.materialId + hitInstMatOffset;
+            uint triIdx = uint(closestTri);
+            uint matId = triangles[triIdx].materialId + hitInstMatOffset;
             archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
-
-            vec3 tanDir = vec3(1.0, 0.0, 0.0);
-            float tanSign = 1.0;
-            if (archetype == MATERIAL_ARCHETYPE_COMPLEX || archetype == MATERIAL_ARCHETYPE_CONDUCTOR || archetype == MATERIAL_ARCHETYPE_DIELECTRIC) {
-                tanDir = getTriangleTangent(tri, closestBary);
-                tanDir = normalize(mat3(hitO2w) * tanDir);
-                tanSign = getTriangleTangentSign(tri);
-            }
-
-            Hit hitAtom;
-            hitAtom.instanceId = hitInstIdx;
-            hitAtom.primitiveId = uint(closestTri);
-            hitAtom.baryPacked = packUnorm2x16(closestBary);
-            bool frontFace = dot(direction, hitNormal) < 0.0;
-            hitAtom.flags = (frontFace ? 2u : 0u) | (tri.tanSigns & 0xFFFF0000u);
-
-            hit = packRayHit(closestT, matId, 0u, hitNormal, hitUv, tanDir, tanSign, hitAtom);
+            hit = packRayHitGeom(closestT, hitInstIdx, triIdx, closestBary);
         } else {
-            hit = packRayHit(closestT, 0u, 2u, vec3(0.0, 1.0, 0.0), vec2(0.0), vec3(1.0, 0.0, 0.0), 1.0, invalidHit());
+            hit = packRayHitMiss(closestT);
             archetype = MATERIAL_ARCHETYPE_DIFFUSE; // Miss radiance evaluated in diffuse microkernel
         }
     }
@@ -159,9 +139,8 @@ void main() {
             // Technique D: 3D Spatial-Morton + Material Dual-Binning via Intra-Wave Bitonic Sort
             // Only executes if the wave actually exhibits material divergence!
             uint mortonCode = 0u;
-            uint hitType = (floatBitsToUint(hit.hitData0.w) >> 16u) & 0x3u;
-            if (inRange && hitType != 2u) {
-                vec3 hitP = origin + hit.hitData0.x * direction;
+            if (inRange && !rayHitIsMiss(hit)) {
+                vec3 hitP = origin + uintBitsToFloat(hit.hitData.x) * direction;
                 vec3 pNorm = fract((hitP * 0.1) + 0.5);
                 uvec3 qPos = uvec3(clamp(pNorm * 1024.0, vec3(0.0), vec3(1023.0)));
                 mortonCode = (morton3D_10bit(qPos) >> 18u) & 0x0FFFu;

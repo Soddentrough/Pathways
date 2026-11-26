@@ -13,14 +13,9 @@ layout(local_size_x = 32, local_size_y = 4, local_size_z = 1) in;
 #define ML_CAPTURE_UPWAYS_V4_BIT 4u
 #define ML_CAPTURE_SPLIT_4SIG_BIT 8u
 
-// Quad-subgroup shared memory buffers for 4 independent Wave32 batches (64 queries total)
-shared float16_t s_layer0[4 * 16 * 64]; // 8 KB: layer 0/2 activation staging
-shared float16_t s_layer1[4 * 16 * 64]; // 8 KB: layer 1 activation staging
-shared uint      s_uTileA[4 * 128];     // 2 KB: packed 16x16 FP16 WMMA A-tile scratch
-shared uint      s_uTileB[4 * 128];     // 2 KB: packed 16x16 FP16 WMMA B-tile scratch
-shared float     s_fAcc[4 * 16 * 16];   // 4 KB: FP32 WMMA accumulator staging
-shared vec3 s_throughput[64];
-shared uint s_pixelMeta[64]; // 0xFFFFFFFFu = invalid; bit 31 = isSpec, bits 0..30 = pixelIdx
+// Quad-subgroup shared memory buffers for 4 independent Wave32 batches (64 queries total; 12 KB LDS)
+shared uint  s_layer[4 * 16 * 32]; // 8 KB: in-place packed FP16x2 activations (stride 32 uints = 64 FP16/row)
+shared float s_fAcc[4 * 16 * 16];  // 4 KB: FP32 WMMA accumulator staging
 
 layout(std430, set = 0, binding = 0) buffer AtomicAccumBuffer {
     uint nrcAtomicBuffer[];
@@ -31,7 +26,7 @@ layout(std430, set = 0, binding = 1) readonly buffer InQueryQueue {
 };
 
 layout(std430, set = 0, binding = 2) readonly buffer InWeights {
-    float16_t weights[];
+    uint weightsU32[];
 };
 
 layout(std430, set = 0, binding = 3) readonly buffer InCounters {
@@ -73,16 +68,14 @@ void main() {
     uint queryBase = (gl_WorkGroupID.x * 4u + sg) * 16u;
     if (queryBase >= actualCount) return;
 
-    uint sgLayerOff = sg * 1024u;
-    uint sgMetaOff = sg * 16u;
+    uint sgLayerOff = sg * 512u;
 
-    // 1. Wave32 parallel multi-frequency encoding (2 lanes per query: 16 queries x 64 features per subgroup)
+    // 1. Wave32 parallel multi-frequency encoding (2 lanes per query: 16 queries x 64 features packed as 32 uints per row)
     //    Out-of-range trailing slots are zero-padded so subgroupBarrier() covers the whole subgroup cleanly.
     uint qSlot = tid >> 1u;
     uint halfLane = tid & 1u;
-    uint metaSlot = sgMetaOff + qSlot;
     uint qIdx = queryBase + qSlot;
-    uint rowBase = sgLayerOff + qSlot * 64u;
+    uint rowBase = sgLayerOff + qSlot * 32u;
 
     if (qIdx < actualCount) {
         vec4 qPosRough = queries[qIdx].pos_roughness;
@@ -106,36 +99,25 @@ void main() {
                       + w4.y * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + d1, l)])
                       + w4.z * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + d2, l)])
                       + w4.w * unpackHalf2x16(hashGrid[nrcHashCorner(c0 + ivec3(1), l)]);
-            s_layer0[rowBase + l * 2u + 0u] = float16_t(feat.x);
-            s_layer0[rowBase + l * 2u + 1u] = float16_t(feat.y);
+            s_layer[rowBase + l] = packHalf2x16(feat);
         }
 
         if (halfLane == 0u) {
-            s_throughput[metaSlot] = queries[qIdx].throughput.xyz;
-            uint pix = floatBitsToUint(qDirPix.w);
-            bool isSpec = (qNormFlags.w > 0.5);
-            s_pixelMeta[metaSlot] = (pix < pc.width * pc.height) ? (pix | (isSpec ? 0x80000000u : 0u)) : 0xFFFFFFFFu;
+            // Channels 16..23: Linear identity coordinate & direction skip-encoding (uints 8..11)
+            s_layer[rowBase + 8u]  = packHalf2x16(vec2(normPos.x, normPos.y));
+            s_layer[rowBase + 9u]  = packHalf2x16(vec2(normPos.z, N.x));
+            s_layer[rowBase + 10u] = packHalf2x16(vec2(N.y, N.z));
+            s_layer[rowBase + 11u] = packHalf2x16(vec2(V.x, V.y));
 
-            // Channels 16..23: Linear identity coordinate & direction skip-encoding
-            s_layer0[rowBase + 16u] = float16_t(normPos.x);
-            s_layer0[rowBase + 17u] = float16_t(normPos.y);
-            s_layer0[rowBase + 18u] = float16_t(normPos.z);
-            s_layer0[rowBase + 19u] = float16_t(N.x);
-            s_layer0[rowBase + 20u] = float16_t(N.y);
-            s_layer0[rowBase + 21u] = float16_t(N.z);
-            s_layer0[rowBase + 22u] = float16_t(V.x);
-            s_layer0[rowBase + 23u] = float16_t(V.y);
-
-            // Channels 24..35: Coarse Fourier frequency encoding axes 0..1 (balanced SFU sin/cos)
+            // Channels 24..35: Coarse Fourier frequency encoding axes 0..1 (uints 12..17)
             for (uint axis = 0u; axis < 2u; ++axis) {
                 float th = normPos[axis] * PI;
                 float s = sin(th);
                 float c = cos(th);
                 float amp = 1.0;
-                uint axisBase = rowBase + 24u + axis * 6u;
+                uint axisBase = rowBase + 12u + axis * 3u;
                 for (uint o = 0u; o < 3u; ++o) {
-                    s_layer0[axisBase + o * 2u + 0u] = float16_t(s * amp);
-                    s_layer0[axisBase + o * 2u + 1u] = float16_t(c * amp);
+                    s_layer[axisBase + o] = packHalf2x16(vec2(s * amp, c * amp));
                     if (o < 2u) {
                         float s2 = 2.0 * s * c;
                         float c2 = c * c - s * s;
@@ -146,16 +128,15 @@ void main() {
                 }
             }
         } else {
-            // Channels 36..41: Coarse Fourier frequency encoding axis 2
+            // Channels 36..41: Coarse Fourier frequency encoding axis 2 (uints 18..20)
             {
                 float th = normPos[2u] * PI;
                 float s = sin(th);
                 float c = cos(th);
                 float amp = 1.0;
-                uint axisBase = rowBase + 36u;
+                uint axisBase = rowBase + 18u;
                 for (uint o = 0u; o < 3u; ++o) {
-                    s_layer0[axisBase + o * 2u + 0u] = float16_t(s * amp);
-                    s_layer0[axisBase + o * 2u + 1u] = float16_t(c * amp);
+                    s_layer[axisBase + o] = packHalf2x16(vec2(s * amp, c * amp));
                     if (o < 2u) {
                         float s2 = 2.0 * s * c;
                         float c2 = c * c - s * s;
@@ -171,171 +152,151 @@ void main() {
             float rough = clamp(qPosRough.w, 0.04, 1.0);
             float specRatio = clamp(queries[qIdx].albedo_pad.x, 0.0, 1.0);
 
-            // Channels 42..50: Order-2 real Spherical Harmonics of surface normal
-            s_layer0[rowBase + 42u] = float16_t(0.282095);
-            s_layer0[rowBase + 43u] = float16_t(0.488603 * N.y);
-            s_layer0[rowBase + 44u] = float16_t(0.488603 * N.z);
-            s_layer0[rowBase + 45u] = float16_t(0.488603 * N.x);
-            s_layer0[rowBase + 46u] = float16_t(1.092548 * N.x * N.y);
-            s_layer0[rowBase + 47u] = float16_t(1.092548 * N.y * N.z);
-            s_layer0[rowBase + 48u] = float16_t(0.315392 * (3.0 * N.z * N.z - 1.0));
-            s_layer0[rowBase + 49u] = float16_t(1.092548 * N.x * N.z);
-            s_layer0[rowBase + 50u] = float16_t(0.546274 * (N.x * N.x - N.y * N.y));
-
-            // Channels 51..63: View, Reflection, NdotV, Roughness, Specular Ratio, Fresnel, Bias
+            // Channels 42..50: Order-2 real Spherical Harmonics + Channels 51..63 (uints 21..31)
             float omc = 1.0 - ndotv;
             float omc2 = omc * omc;
-            s_layer0[rowBase + 51u] = float16_t(V.x);
-            s_layer0[rowBase + 52u] = float16_t(V.y);
-            s_layer0[rowBase + 53u] = float16_t(V.z);
-            s_layer0[rowBase + 54u] = float16_t(R.x);
-            s_layer0[rowBase + 55u] = float16_t(R.y);
-            s_layer0[rowBase + 56u] = float16_t(R.z);
-            s_layer0[rowBase + 57u] = float16_t(ndotv);
-            s_layer0[rowBase + 58u] = float16_t(rough);
-            s_layer0[rowBase + 59u] = float16_t(rough * rough);
-            s_layer0[rowBase + 60u] = float16_t(specRatio);
-            s_layer0[rowBase + 61u] = float16_t(1.0 - specRatio);
-            s_layer0[rowBase + 62u] = float16_t(omc2 * omc2 * omc);
-            s_layer0[rowBase + 63u] = float16_t(1.0);
+            s_layer[rowBase + 21u] = packHalf2x16(vec2(0.282095, 0.488603 * N.y));
+            s_layer[rowBase + 22u] = packHalf2x16(vec2(0.488603 * N.z, 0.488603 * N.x));
+            s_layer[rowBase + 23u] = packHalf2x16(vec2(1.092548 * N.x * N.y, 1.092548 * N.y * N.z));
+            s_layer[rowBase + 24u] = packHalf2x16(vec2(0.315392 * (3.0 * N.z * N.z - 1.0), 1.092548 * N.x * N.z));
+            s_layer[rowBase + 25u] = packHalf2x16(vec2(0.546274 * (N.x * N.x - N.y * N.y), V.x));
+            s_layer[rowBase + 26u] = packHalf2x16(vec2(V.y, V.z));
+            s_layer[rowBase + 27u] = packHalf2x16(vec2(R.x, R.y));
+            s_layer[rowBase + 28u] = packHalf2x16(vec2(R.z, ndotv));
+            s_layer[rowBase + 29u] = packHalf2x16(vec2(rough, rough * rough));
+            s_layer[rowBase + 30u] = packHalf2x16(vec2(specRatio, 1.0 - specRatio));
+            s_layer[rowBase + 31u] = packHalf2x16(vec2(omc2 * omc2 * omc, 1.0));
         }
     } else {
-        if (halfLane == 0u) {
-            s_pixelMeta[metaSlot] = 0xFFFFFFFFu;
-        }
-        uint colStart = halfLane * 32u;
-        for (uint c = 0u; c < 32u; ++c) {
-            s_layer0[rowBase + colStart + c] = float16_t(0.0);
+        uint colStart = halfLane * 16u;
+        for (uint c = 0u; c < 16u; ++c) {
+            s_layer[rowBase + colStart + c] = 0u;
         }
     }
     subgroupMemoryBarrierShared();
     subgroupBarrier();
 
-    uint sgUTileOff  = sg * 128u;
-    uint sgAccOff    = sg * 256u;
+    uint sgAccOff = sg * 256u;
     // Workaround for AMD LLPC 26.11.1 dropping OpConstantComposite zero-init on f32 WMMA accumulators.
     float zAcc = float(pc.width == 0xFFFFFFFFu);
 
+#define NRC_FLUSH_ACC_TILE(accTile, colIdx, bOffU32) \
+    do { \
+        coopMatStore((accTile), s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor); \
+        subgroupMemoryBarrierShared(); \
+        subgroupBarrier(); \
+        for (uint e_ = 0u; e_ < 4u; ++e_) { \
+            uint idx2_ = tid * 4u + e_; \
+            uint r_ = idx2_ >> 3u; \
+            uint cp_ = idx2_ & 7u; \
+            vec2 bias_ = unpackHalf2x16(weightsU32[(bOffU32) + (colIdx) * 8u + cp_]); \
+            float v0_ = s_fAcc[sgAccOff + idx2_ * 2u + 0u] + bias_.x; \
+            float v1_ = s_fAcc[sgAccOff + idx2_ * 2u + 1u] + bias_.y; \
+            v0_ = (v0_ > 0.0) ? v0_ : (0.01 * v0_); \
+            v1_ = (v1_ > 0.0) ? v1_ : (0.01 * v1_); \
+            s_layer[sgLayerOff + r_ * 32u + (colIdx) * 8u + cp_] = packHalf2x16(vec2(v0_, v1_)); \
+        } \
+        subgroupMemoryBarrierShared(); \
+        subgroupBarrier(); \
+    } while (false)
+
     // ==========================================
-    // 3. LAYER 0: 64 -> 64 WMMA (packed 16x16 uint tiles + FP32 accumulator)
+    // 3. LAYER 0: 64 -> 64 WMMA (in-place s_layer + direct SSBO weights)
     // ==========================================
-    for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c0 =
+    {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_0 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_1 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_2 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_3 =
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
+        const uint w0U32 = NRC_W0_OFFSET >> 1u;
+        const uint b0U32 = NRC_B0_OFFSET >> 1u;
         for (uint k = 0u; k < 4u; ++k) {
-            uint wOff = NRC_W0_OFFSET + (k * 16u * 64u) + (col * 16u);
-            for (uint e = 0u; e < 4u; ++e) {
-                uint uIdx = tid * 4u + e;
-                uint r = uIdx >> 3u;
-                uint c2 = (uIdx & 7u) * 2u;
-                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                    float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2]),
-                    float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2 + 1u])));
-                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                    float(weights[wOff + r * 64u + c2]),
-                    float(weights[wOff + r * 64u + c2 + 1u])));
-            }
-            subgroupMemoryBarrierShared();
-            subgroupBarrier();
-
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
-            c0 = coopMatMulAdd(aTile, bTile, c0);
-            subgroupBarrier();
+            coopMatLoad(aTile, s_layer, sgLayerOff + k * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            uint wRowOff = w0U32 + k * 512u;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile0;
+            coopMatLoad(bTile0, weightsU32, wRowOff + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_0 = coopMatMulAdd(aTile, bTile0, c_0);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile1;
+            coopMatLoad(bTile1, weightsU32, wRowOff + 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_1 = coopMatMulAdd(aTile, bTile1, c_1);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile2;
+            coopMatLoad(bTile2, weightsU32, wRowOff + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_2 = coopMatMulAdd(aTile, bTile2, c_2);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile3;
+            coopMatLoad(bTile3, weightsU32, wRowOff + 24u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_3 = coopMatMulAdd(aTile, bTile3, c_3);
         }
+        subgroupBarrier();
 
-        coopMatStore(c0, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
-        for (uint e = 0u; e < 8u; ++e) {
-            uint idx = tid * 8u + e;
-            uint r = idx >> 4u;
-            uint c = idx & 15u;
-            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B0_OFFSET + col * 16u + c]);
-            s_layer1[sgLayerOff + r * 64u + col * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
-        }
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
+        NRC_FLUSH_ACC_TILE(c_0, 0u, b0U32);
+        NRC_FLUSH_ACC_TILE(c_1, 1u, b0U32);
+        NRC_FLUSH_ACC_TILE(c_2, 2u, b0U32);
+        NRC_FLUSH_ACC_TILE(c_3, 3u, b0U32);
     }
 
     // ==========================================
     // 4. LAYER 1: 64 -> 64 WMMA
     // ==========================================
-    for (uint col = 0u; col < 4u; ++col) {
-        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c1 =
+    {
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_0 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_1 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_2 =
+            coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c_3 =
             coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
+        const uint w1U32 = NRC_W1_OFFSET >> 1u;
+        const uint b1U32 = NRC_B1_OFFSET >> 1u;
         for (uint k = 0u; k < 4u; ++k) {
-            uint wOff = NRC_W1_OFFSET + (k * 16u * 64u) + (col * 16u);
-            for (uint e = 0u; e < 4u; ++e) {
-                uint uIdx = tid * 4u + e;
-                uint r = uIdx >> 3u;
-                uint c2 = (uIdx & 7u) * 2u;
-                s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                    float(s_layer1[sgLayerOff + r * 64u + k * 16u + c2]),
-                    float(s_layer1[sgLayerOff + r * 64u + k * 16u + c2 + 1u])));
-                s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                    float(weights[wOff + r * 64u + c2]),
-                    float(weights[wOff + r * 64u + c2 + 1u])));
-            }
-            subgroupMemoryBarrierShared();
-            subgroupBarrier();
-
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-            coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
-            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-            coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
-            c1 = coopMatMulAdd(aTile, bTile, c1);
-            subgroupBarrier();
+            coopMatLoad(aTile, s_layer, sgLayerOff + k * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            uint wRowOff = w1U32 + k * 512u;
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile0;
+            coopMatLoad(bTile0, weightsU32, wRowOff + 0u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_0 = coopMatMulAdd(aTile, bTile0, c_0);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile1;
+            coopMatLoad(bTile1, weightsU32, wRowOff + 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_1 = coopMatMulAdd(aTile, bTile1, c_1);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile2;
+            coopMatLoad(bTile2, weightsU32, wRowOff + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_2 = coopMatMulAdd(aTile, bTile2, c_2);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile3;
+            coopMatLoad(bTile3, weightsU32, wRowOff + 24u, 32u, gl_CooperativeMatrixLayoutRowMajor);
+            c_3 = coopMatMulAdd(aTile, bTile3, c_3);
         }
+        subgroupBarrier();
 
-        coopMatStore(c1, s_fAcc, sgAccOff, 16u, gl_CooperativeMatrixLayoutRowMajor);
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
-        for (uint e = 0u; e < 8u; ++e) {
-            uint idx = tid * 8u + e;
-            uint r = idx >> 4u;
-            uint c = idx & 15u;
-            float v = s_fAcc[sgAccOff + idx] + float(weights[NRC_B1_OFFSET + col * 16u + c]);
-            s_layer0[sgLayerOff + r * 64u + col * 16u + c] = float16_t((v > 0.0) ? v : (0.01 * v));
-        }
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
+        NRC_FLUSH_ACC_TILE(c_0, 0u, b1U32);
+        NRC_FLUSH_ACC_TILE(c_1, 1u, b1U32);
+        NRC_FLUSH_ACC_TILE(c_2, 2u, b1U32);
+        NRC_FLUSH_ACC_TILE(c_3, 3u, b1U32);
     }
 
+#undef NRC_FLUSH_ACC_TILE
+
     // ==========================================
-    // 5. LAYER 2: 64 -> 16 WMMA (Output layer in-place s_layer0)
+    // 5. LAYER 2: 64 -> 16 WMMA (Output layer in-place s_layer)
     // ==========================================
     coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c2 =
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(zAcc);
 
+    const uint w2U32 = NRC_W2_OFFSET >> 1u;
     for (uint k = 0u; k < 4u; ++k) {
-        uint wOff = NRC_W2_OFFSET + (k * 16u * 16u);
-        for (uint e = 0u; e < 4u; ++e) {
-            uint uIdx = tid * 4u + e;
-            uint r = uIdx >> 3u;
-            uint c2_col = (uIdx & 7u) * 2u;
-            s_uTileA[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2_col]),
-                float(s_layer0[sgLayerOff + r * 64u + k * 16u + c2_col + 1u])));
-            s_uTileB[sgUTileOff + uIdx] = packHalf2x16(vec2(
-                float(weights[wOff + uIdx * 2u]),
-                float(weights[wOff + uIdx * 2u + 1u])));
-        }
-        subgroupMemoryBarrierShared();
-        subgroupBarrier();
-
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> aTile;
-        coopMatLoad(aTile, s_uTileA, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(aTile, s_layer, sgLayerOff + k * 8u, 32u, gl_CooperativeMatrixLayoutRowMajor);
 
         coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> bTile;
-        coopMatLoad(bTile, s_uTileB, sgUTileOff, 8u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(bTile, weightsU32, w2U32 + k * 128u, 8u, gl_CooperativeMatrixLayoutRowMajor);
 
         c2 = coopMatMulAdd(aTile, bTile, c2);
-        subgroupBarrier();
     }
     subgroupBarrier();
 
@@ -345,78 +306,82 @@ void main() {
 
     // 6. Direct image resolve (1-SPP unique-pixel fast path) or Q16.16 atomic accumulation fallback
     if (tid < 16u) {
-        uint slot = sgMetaOff + tid;
-        uint meta = s_pixelMeta[slot];
-        if (meta != 0xFFFFFFFFu) {
-            uint pixelIdx = meta & 0x7FFFFFFFu;
-            bool isSpec = (meta & 0x80000000u) != 0u;
-            uint outRow = sgAccOff + tid * 16u;
-            vec3 rawPred = vec3(
-                s_fAcc[outRow + 0u] + float(weights[NRC_B2_OFFSET + 0u]),
-                s_fAcc[outRow + 1u] + float(weights[NRC_B2_OFFSET + 1u]),
-                s_fAcc[outRow + 2u] + float(weights[NRC_B2_OFFSET + 2u])
-            );
-            if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
-            if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
-            if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
-            float maxRad = (pc.maxRadiance > 0.0) ? pc.maxRadiance : 10.0;
-            vec3 predRadiance = nrcClampChromaticity(rawPred, maxRad);
-            vec3 radiance = nrcClampChromaticity(s_throughput[slot] * predRadiance, maxRad);
+        uint qIdxOut = queryBase + tid;
+        if (qIdxOut < actualCount) {
+            uint pixelIdx = floatBitsToUint(queries[qIdxOut].dir_pixelIndex.w);
+            if (pixelIdx < pc.width * pc.height) {
+                bool isSpec = (queries[qIdxOut].normal_flags.w > 0.5);
+                vec3 tp = queries[qIdxOut].throughput.xyz;
+                vec2 b2_01 = unpackHalf2x16(weightsU32[(NRC_B2_OFFSET >> 1u) + 0u]);
+                vec2 b2_23 = unpackHalf2x16(weightsU32[(NRC_B2_OFFSET >> 1u) + 1u]);
+                uint outRow = sgAccOff + tid * 16u;
+                vec3 rawPred = vec3(
+                    s_fAcc[outRow + 0u] + b2_01.x,
+                    s_fAcc[outRow + 1u] + b2_01.y,
+                    s_fAcc[outRow + 2u] + b2_23.x
+                );
+                if (isnan(rawPred.x) || isinf(rawPred.x)) rawPred.x = 0.0;
+                if (isnan(rawPred.y) || isinf(rawPred.y)) rawPred.y = 0.0;
+                if (isnan(rawPred.z) || isinf(rawPred.z)) rawPred.z = 0.0;
+                float maxRad = (pc.maxRadiance > 0.0) ? pc.maxRadiance : 10.0;
+                vec3 predRadiance = nrcClampChromaticity(rawPred, maxRad);
+                vec3 radiance = nrcClampChromaticity(tp * predRadiance, maxRad);
 
-            if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
-            if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;
-            if (isnan(radiance.z) || isinf(radiance.z)) radiance.z = 0.0;
+                if (isnan(radiance.x) || isinf(radiance.x)) radiance.x = 0.0;
+                if (isnan(radiance.y) || isinf(radiance.y)) radiance.y = 0.0;
+                if (isnan(radiance.z) || isinf(radiance.z)) radiance.z = 0.0;
 
-            uint resolveFlags = floatBitsToUint(pc.invWorldExtent.w);
-            if ((resolveFlags & 0x80000000u) != 0u) {
-                vec3 radPos = max(radiance, vec3(0.0));
-                if (dot(radPos, vec3(1.0)) > 0.0) {
-                    ivec2 pixelCoord = ivec2(int(pixelIdx % pc.width), int(pixelIdx / pc.width));
-                    uint capMl = resolveFlags & 0xFFu;
-                    if (capMl == 0u) {
-                        vec4 prev = imageLoad(uAccumImage, pixelCoord);
-                        imageStore(uAccumImage, pixelCoord, vec4(prev.rgb + radPos, prev.a));
-                    } else {
-                        if ((capMl & 1u) == 0u || (capMl & 2u) != 0u) {
+                uint resolveFlags = floatBitsToUint(pc.invWorldExtent.w);
+                if ((resolveFlags & 0x80000000u) != 0u) {
+                    vec3 radPos = max(radiance, vec3(0.0));
+                    if (dot(radPos, vec3(1.0)) > 0.0) {
+                        ivec2 pixelCoord = ivec2(int(pixelIdx % pc.width), int(pixelIdx / pc.width));
+                        uint capMl = resolveFlags & 0xFFu;
+                        if (capMl == 0u) {
                             vec4 prev = imageLoad(uAccumImage, pixelCoord);
                             imageStore(uAccumImage, pixelCoord, vec4(prev.rgb + radPos, prev.a));
-                        }
-                        bool isV4 = (capMl & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
-                        bool isSplit4 = (capMl & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u;
-                        if ((capMl & 1u) != 0u && (isV4 || !isSplit4)) {
-                            if (!isSpec) {
-                                vec3 contribDiff = isV4
-                                    ? demodulateMlSafe(radPos, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
-                                    : radPos;
-                                vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
-                                imageStore(uMlDiffuseImage, pixelCoord, vec4(prevDiff.rgb + contribDiff, prevDiff.a));
-                            } else {
-                                vec3 contribSpec = isV4
-                                    ? demodulateMlSafe(radPos, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
-                                    : radPos;
-                                vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
-                                imageStore(uMlSpecularImage, pixelCoord, vec4(prevSpec.rgb + contribSpec, prevSpec.a));
+                        } else {
+                            if ((capMl & 1u) == 0u || (capMl & 2u) != 0u) {
+                                vec4 prev = imageLoad(uAccumImage, pixelCoord);
+                                imageStore(uAccumImage, pixelCoord, vec4(prev.rgb + radPos, prev.a));
                             }
-                        }
-                        if (isSplit4) {
-                            if (!isSpec) {
-                                vec4 prevIndDiff = imageLoad(uIndirectDiffuseImage, pixelCoord);
-                                imageStore(uIndirectDiffuseImage, pixelCoord, vec4(prevIndDiff.rgb + radPos, prevIndDiff.a));
-                            } else {
-                                vec4 prevIndSpec = imageLoad(uIndirectSpecularImage, pixelCoord);
-                                imageStore(uIndirectSpecularImage, pixelCoord, vec4(prevIndSpec.rgb + radPos, prevIndSpec.a));
+                            bool isV4 = (capMl & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
+                            bool isSplit4 = (capMl & ML_CAPTURE_SPLIT_4SIG_BIT) != 0u;
+                            if ((capMl & 1u) != 0u && (isV4 || !isSplit4)) {
+                                if (!isSpec) {
+                                    vec3 contribDiff = isV4
+                                        ? demodulateMlSafe(radPos, imageLoad(uMlAlbedoRoughnessImage, pixelCoord).rgb)
+                                        : radPos;
+                                    vec4 prevDiff = imageLoad(uMlDiffuseImage, pixelCoord);
+                                    imageStore(uMlDiffuseImage, pixelCoord, vec4(prevDiff.rgb + contribDiff, prevDiff.a));
+                                } else {
+                                    vec3 contribSpec = isV4
+                                        ? demodulateMlSafe(radPos, imageLoad(uMlSpecAlbedoImage, pixelCoord).rgb)
+                                        : radPos;
+                                    vec4 prevSpec = imageLoad(uMlSpecularImage, pixelCoord);
+                                    imageStore(uMlSpecularImage, pixelCoord, vec4(prevSpec.rgb + contribSpec, prevSpec.a));
+                                }
+                            }
+                            if (isSplit4) {
+                                if (!isSpec) {
+                                    vec4 prevIndDiff = imageLoad(uIndirectDiffuseImage, pixelCoord);
+                                    imageStore(uIndirectDiffuseImage, pixelCoord, vec4(prevIndDiff.rgb + radPos, prevIndDiff.a));
+                                } else {
+                                    vec4 prevIndSpec = imageLoad(uIndirectSpecularImage, pixelCoord);
+                                    imageStore(uIndirectSpecularImage, pixelCoord, vec4(prevIndSpec.rgb + radPos, prevIndSpec.a));
+                                }
                             }
                         }
                     }
+                } else {
+                    bool splitSpec = (pc.worldMin.w > 0.5);
+                    uint base = splitSpec ? (pixelIdx * 6u + (isSpec ? 3u : 0u)) : (pixelIdx * 3u);
+                    // Q16.16 fixed-point scaling (65536.0)
+                    uvec3 fixedRad = uvec3(clamp(radiance, vec3(0.0), vec3(65535.0)) * 65536.0 + 0.5);
+                    if (fixedRad.x > 0u) atomicAdd(nrcAtomicBuffer[base + 0u], fixedRad.x);
+                    if (fixedRad.y > 0u) atomicAdd(nrcAtomicBuffer[base + 1u], fixedRad.y);
+                    if (fixedRad.z > 0u) atomicAdd(nrcAtomicBuffer[base + 2u], fixedRad.z);
                 }
-            } else {
-                bool splitSpec = (pc.worldMin.w > 0.5);
-                uint base = splitSpec ? (pixelIdx * 6u + (isSpec ? 3u : 0u)) : (pixelIdx * 3u);
-                // Q16.16 fixed-point scaling (65536.0)
-                uvec3 fixedRad = uvec3(clamp(radiance, vec3(0.0), vec3(65535.0)) * 65536.0 + 0.5);
-                if (fixedRad.x > 0u) atomicAdd(nrcAtomicBuffer[base + 0u], fixedRad.x);
-                if (fixedRad.y > 0u) atomicAdd(nrcAtomicBuffer[base + 1u], fixedRad.y);
-                if (fixedRad.z > 0u) atomicAdd(nrcAtomicBuffer[base + 2u], fixedRad.z);
             }
         }
     }

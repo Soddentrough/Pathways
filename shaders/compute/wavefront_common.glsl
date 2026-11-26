@@ -559,60 +559,47 @@ struct RayGeometry {
     vec4 originPackedDir; // xyz: origin, w: uintBitsToFloat(packOct32(direction)) (16 bytes)
 };
 
-// 32-byte packed pre-interpolated ray hit (written by intersect/classify, read by shade)
+// 16-byte packed geometric ray hit (written by intersect/classify, read by shade)
 struct RayHit {
-    vec4 hitData0;
-    // x: hitT (float)
-    // y: uintBitsToFloat(packOct32(hitNormal))
-    // z: uintBitsToFloat(packHalf2x16(fract(hitUv)))
-    // w: uintBitsToFloat(packedInfo)
-    // packedInfo:
-    // bits 0..15: matId (16 bits)
-    // bits 16..17: hitType (2 bits: 0: triangle, 1: sphere, 2: miss)
-    // bit 18: tanSign (1 bit: 0: positive +1.0, 1: negative -1.0)
-    // bits 19..31: tanAngle13 (13 bits: angle in [0, 8191])
-    uvec4 hitData1;
-    // x: instanceId
-    // y: primitiveId
-    // z: baryPacked
-    // w: flags
+    uvec4 hitData;
+    // x: floatBitsToUint(hitT)
+    // y: instanceId (0xFFFFFFFFu on miss)
+    // z: primitiveId (global index in triangles[]; 0xFFFFFFFFu on miss)
+    // w: baryPacked = packUnorm2x16(bary.xy)
 };
 
-RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign, Hit hitAtom) {
+RayHit packRayHitGeom(float hitT, uint instIdx, uint triIdx, vec2 bary) {
     RayHit hit;
-    uint tSignBit = (tanSign < 0.0) ? 1u : 0u;
-    uint angleCode = packTangentAngle13(hitNormal, geomTan);
-    uint packedInfo = (matId & 0xFFFFu) | ((hitType & 0x3u) << 16u) | (tSignBit << 18u) | ((angleCode & 0x1FFFu) << 19u);
-    vec2 wrappedUv = hitUv - floor(hitUv);
-    hit.hitData0 = vec4(hitT,
-                        uintBitsToFloat(packOct32(hitNormal)),
-                        uintBitsToFloat(packHalf2x16(wrappedUv)),
-                        uintBitsToFloat(packedInfo));
-    hit.hitData1 = uvec4(hitAtom.instanceId, hitAtom.primitiveId, hitAtom.baryPacked, hitAtom.flags);
+    hit.hitData = uvec4(floatBitsToUint(hitT), instIdx, triIdx, packUnorm2x16(bary));
     return hit;
 }
 
-RayHit packRayHit(float hitT, uint matId, uint hitType, vec3 hitNormal, vec2 hitUv, vec3 geomTan, float tanSign) {
-    return packRayHit(hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign, invalidHit());
+RayHit packRayHitMiss(float hitT) {
+    RayHit hit;
+    hit.hitData = uvec4(floatBitsToUint(hitT), 0xFFFFFFFFu, 0xFFFFFFFFu, 0u);
+    return hit;
 }
 
-void unpackRayHit(RayHit hit, out float hitT, out uint matId, out uint hitType, out vec3 hitNormal, out vec2 hitUv, out vec3 geomTan, out float tanSign) {
-    hitT = hit.hitData0.x;
-    hitNormal = unpackOct32(floatBitsToUint(hit.hitData0.y));
-    hitUv = unpackHalf2x16(floatBitsToUint(hit.hitData0.z));
-    uint packedInfo = floatBitsToUint(hit.hitData0.w);
-    matId = packedInfo & 0xFFFFu;
-    hitType = (packedInfo >> 16u) & 0x3u;
-    tanSign = ((packedInfo >> 18u) & 1u) != 0u ? -1.0 : 1.0;
-    geomTan = unpackTangentAngle13(hitNormal, (packedInfo >> 19u) & 0x1FFFu);
+bool rayHitIsMiss(in RayHit hit) {
+    return hit.hitData.z == 0xFFFFFFFFu;
 }
 
-Hit getRayHitAtom(RayHit hit) {
+vec3 transformNormalByMat3(in mat3 m, in vec3 localN) {
+    vec3 c0 = cross(m[1], m[2]);
+    vec3 c1 = cross(m[2], m[0]);
+    vec3 c2 = cross(m[0], m[1]);
+    float detSign = (dot(m[0], c0) < 0.0) ? -1.0 : 1.0;
+    vec3 wn = mat3(c0, c1, c2) * localN;
+    float lenSq = dot(wn, wn);
+    return (lenSq > 0.0) ? (wn * (detSign * inversesqrt(lenSq))) : vec3(0.0, 1.0, 0.0);
+}
+
+Hit getRayHitAtom(in RayHit hit) {
     Hit h;
-    h.instanceId = hit.hitData1.x;
-    h.primitiveId = hit.hitData1.y;
-    h.baryPacked = hit.hitData1.z;
-    h.flags = hit.hitData1.w;
+    h.instanceId = hit.hitData.y;
+    h.primitiveId = hit.hitData.z;
+    h.baryPacked = hit.hitData.w;
+    h.flags = 0u;
     return h;
 }
 
@@ -710,7 +697,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
             vec3 xVirt_ = origin + primDir_ * reflDist_; \
             vec3 prevXVirt_ = xVirt_; \
-            InstanceGPU rInst_; if (!(isMiss) && (hit.hitData1.w & 1u) == 0u && hit.hitData1.y != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData1.x]).transform != rInst_.invTransform)) { \
+            InstanceGPU rInst_; if (!(isMiss) && hit.hitData.z != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData.y]).transform != rInst_.invTransform)) { \
                 vec3 rLocalPos_ = (inverse(rInst_.transform) * vec4((pt), 1.0)).xyz; \
                 vec3 rPrevWorld_ = (rInst_.invTransform * vec4(rLocalPos_, 1.0)).xyz; \
                 vec3 rDeltaWorld_ = (pt) - rPrevWorld_; \

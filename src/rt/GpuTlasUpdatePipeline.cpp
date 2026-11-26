@@ -68,7 +68,7 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
         64
     );
 
-    // 2. Device-local GPU Instance Data Buffer (96 bytes per ASInstanceGPUData, updated via frame-slot staging)
+    // 2. Pure DEVICE_LOCAL GPU Instance Data Buffer (96 bytes per ASInstanceGPUData, updated via frame-slot staging)
     VkDeviceSize inputBufferSize = sizeof(ASInstanceGPUData) * instanceCount;
     m_tlasInputInstancesBuffer = std::make_unique<Buffer>(
         m_allocator, inputBufferSize,
@@ -76,7 +76,7 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
 
     // 3. Device-local Scratch Buffer (aligned to 256 bytes)
@@ -105,9 +105,6 @@ void GpuTlasUpdatePipeline::initBuffers(const std::vector<ASInstanceInput>& asIn
         m_cpuInputInstances[i].blasAddress = asInstances[i].blasAddress;
         m_cpuInputInstances[i].pad0 = 0;
         m_cpuInputInstances[i].pad1 = 0;
-    }
-    if (m_tlasInputInstancesBuffer) {
-        m_tlasInputInstancesBuffer->copyFrom(m_cpuInputInstances.data(), inputBufferSize);
     }
     m_stagingInputInstances = {};
     m_needsGpuUpdate = false;

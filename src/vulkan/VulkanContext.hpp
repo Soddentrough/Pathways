@@ -158,6 +158,7 @@ public:
     }
     bool hasHdrMetadata() const { return m_hasHdrMetadata; }
     bool hasFullScreenExclusive() const { return m_hasFullScreenExclusive; }
+    bool hasMemoryBudget() const { return m_hasMemoryBudget; }
     PFN_vkSetHdrMetadataEXT getSetHdrMetadataEXT() const { return pfnVkSetHdrMetadataEXT; }
 #ifdef _WIN32
     PFN_vkAcquireFullScreenExclusiveModeEXT getAcquireFullScreenExclusiveModeEXT() const { return pfnVkAcquireFullScreenExclusiveModeEXT; }
@@ -244,6 +245,7 @@ private:
     bool m_hasMutableDescriptorType = false;
     bool m_hasHdrMetadata = false;
     bool m_hasFullScreenExclusive = false;
+    bool m_hasMemoryBudget = false;
     PFN_vkSetHdrMetadataEXT pfnVkSetHdrMetadataEXT = nullptr;
 #ifdef _WIN32
     PFN_vkAcquireFullScreenExclusiveModeEXT pfnVkAcquireFullScreenExclusiveModeEXT = nullptr;

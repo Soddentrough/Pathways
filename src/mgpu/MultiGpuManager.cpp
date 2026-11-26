@@ -2346,6 +2346,10 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
     }
     node->cameraUBOs[slot]->copyFrom(&uboSecCopy, sizeof(CameraUniform));
 
+    if (m_config.secondary_sort_mode == SecondarySortMode::DirectionalDGC && node->wavefrontPipeline) {
+        node->wavefrontPipeline->ensureSecondaryIndexQueue();
+    }
+
     // 3. Record secondary GPU commands
     VkCommandBuffer cmd = node->commandBuffers[slot];
     vkResetCommandBuffer(cmd, 0);

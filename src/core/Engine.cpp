@@ -2492,6 +2492,9 @@ void Engine::renderFrame() {
     if (isRestirActive()) {
         ensureWavefrontRestirPipelines();
     }
+    if (m_config.secondary_sort_mode == SecondarySortMode::DirectionalDGC && m_wavefrontPipeline) {
+        m_wavefrontPipeline->ensureSecondaryIndexQueue();
+    }
 
     // Lazy reservoir allocation: the grid only exists while ReSTIR has been
     // enabled at least once, keeping 152 B/pixel (DI 64B + GI 64B + X1 ctx 24B) out of the idle footprint.

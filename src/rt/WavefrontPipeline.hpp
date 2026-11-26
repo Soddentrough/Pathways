@@ -165,6 +165,11 @@ public:
         const std::vector<char>& shadeDielectricNrcCode,
         const std::vector<char>& shadeDielectricSecNrcCode);
 
+    void ensureSecondaryIndexQueue();
+    [[nodiscard]] bool hasSecondaryIndexQueue() const noexcept {
+        return m_secondaryIndexQueue[0] != nullptr && m_secondaryIndexQueue[1] != nullptr;
+    }
+
     bool hasAlphaIntersectPipeline() const noexcept { return m_intersectAlphaPipeline != VK_NULL_HANDLE; }
     bool hasTailMegakernelPipeline() const noexcept { return m_tailMegakernelPipeline != VK_NULL_HANDLE; }
     bool hasRestirPipelines() const noexcept { return !m_restirPrimaryMatPipelines.empty(); }
@@ -377,9 +382,10 @@ private:
 
     std::unique_ptr<DGCManager> m_dgcManager;
     std::unique_ptr<Image> m_dummyStorageImage;
-    std::unique_ptr<Buffer> m_dummyReservoir; // 128B fallback target for ReSTIR reservoir bindings 32/36
+    std::unique_ptr<Buffer> m_dummyReservoir; // 128B fallback target for ReSTIR reservoir bindings 32/36 & inactive binding 19
     bool m_dummyImageTransitioned = false;
     bool m_supportsSubgroupSizeControl = true;
+    bool m_secondaryIndexQueueEnabled = false;
     uint32_t m_warmupSppOverride = 0;
 };
 

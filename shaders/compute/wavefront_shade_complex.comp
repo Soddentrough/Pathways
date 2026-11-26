@@ -197,12 +197,8 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT;
-        uint matId, hitType;
-        vec3 hitNormal, geomTan;
-        vec2 hitUv;
-        float tanSign;
-        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
+        float hitT = uintBitsToFloat(hit.hitData.x);
+        bool isMiss = rayHitIsMiss(hit);
 
         f16vec3 throughput;
         uint seed, pixelIndex;
@@ -231,7 +227,7 @@ void main() {
 #endif
 #endif
 
-        if (hitType == 2u) {
+        if (isMiss) {
 #if ENABLE_RESTIR_PT && !IS_SECONDARY_BOUNCE
             if (enableRestirFlag && bounce == 0u && pc.sppSampleIndex == 0u) {
                 giCurrentData[pixelIndex].y = 0u;
@@ -315,6 +311,21 @@ void main() {
             }
 #endif
         } else {
+            uint triIdx = hit.hitData.z;
+            uint instIdx = hit.hitData.y;
+            vec2 hitBary = unpackUnorm2x16(hit.hitData.w);
+            Triangle hitTri = triangles[triIdx];
+            InstanceGPU hitInst = instances[instIdx];
+            uint matId = hitTri.materialId + hitInst.materialOffset;
+            vec3 hitNormal = transformNormalByMat3(mat3(hitInst.transform), getTriangleNormal(hitTri, hitBary));
+            vec2 hitUv = getTriangleUV(hitTri, hitBary);
+            uint hitLodHalf = hitTri.tanSigns >> 16u;
+            bool isUnindexedTriEmitter = (hitTri.padding0 == TRI_LIGHT_NONE);
+#if !IS_SECONDARY_BOUNCE
+            vec3 geomTan = normalize(mat3(hitInst.transform) * getTriangleTangent(hitTri, hitBary));
+            float tanSign = getTriangleTangentSign(hitTri);
+#endif
+
             vec3 hitPoint = origin + hitT * rayDir;
             RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
             RECORD_DIFFUSE_HIT_DIST(pixelIndex, hitT, false);
@@ -348,12 +359,12 @@ void main() {
 #endif
             uint inPdfCode = unpackRayPdfCode(state);
             float rayConeBaseLod = hasSampledTex
-                ? computeRayConeBaseLod(hit.hitData1.w >> 16u, hitT, rayDir, hitNormal,
+                ? computeRayConeBaseLod(hitLodHalf, hitT, rayDir, hitNormal,
                                         2.0 * abs(ubo.projInverse[1][1]) / float(max(pc.height, 1u)),
                                         bounce, inPdfCode)
                 : -16.0;
 #if !IS_SECONDARY_BOUNCE
-            if (bounce == 0u && hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+            if (bounce == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = SAMPLE_SCENE_TEXTURE_LOD(mat.normalTex, hitUv, rayConeBaseLod).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
@@ -465,8 +476,7 @@ void main() {
 #endif
             float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
                 ? 0.0
-                : ((bounce == 0u) ? 1.0 : emitterHitMisWeightScaled(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale));
-            bool isUnindexedTriEmitter = (hitType == 0u) && (triangles[hit.hitData1.y].padding0 == TRI_LIGHT_NONE);
+                : ((bounce == 0u) ? 1.0 : emitterHitMisWeightScaled(0u, triIdx, instIdx, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale));
 #if ENABLE_RESTIR_GI && IS_SECONDARY_BOUNCE
             if (giCaptureSelf && isUnindexedTriEmitter) {
                 if (length(emissive) > 1e-3 && emitMisW > 0.0) {

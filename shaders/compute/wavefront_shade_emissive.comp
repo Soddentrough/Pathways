@@ -40,10 +40,6 @@ layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
 };
 
-layout(std430, binding = 4) readonly buffer MaterialsBuffer {
-    Material materials[];
-};
-
 layout(std430, binding = 5) readonly buffer LightsBuffer {
     Light lights[];
 };
@@ -131,12 +127,8 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT;
-        uint matId, hitType;
-        vec3 hitNormal, geomTan;
-        vec2 hitUv;
-        float tanSign;
-        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
+        float hitT = uintBitsToFloat(hit.hitData.x);
+        bool isMiss = rayHitIsMiss(hit);
 
         f16vec3 throughputHalf;
         uint seed, pixelIndex;
@@ -169,7 +161,7 @@ void main() {
         vec3 accumRadiance = vec3(0.0);
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
 
-        if (hitType == 2u) {
+        if (isMiss) {
             // Sky miss fallback
             vec3 skyColor;
             if (pc.hasEnvMap == 1u) {
@@ -235,18 +227,29 @@ void main() {
             RECORD_SPECULAR_VMV(pixelIndex, origin + rayDir * 1000.0, 10000.0, true);
             RECORD_DIFFUSE_HIT_DIST(pixelIndex, 10000.0, true);
         } else {
+            uint triIdx = hit.hitData.z;
+            uint instIdx = hit.hitData.y;
+            vec2 hitBary = unpackUnorm2x16(hit.hitData.w);
+            Triangle hitTri = triangles[triIdx];
+            InstanceGPU hitInst = instances[instIdx];
+            uint matId = hitTri.materialId + hitInst.materialOffset;
+            vec3 hitNormal = transformNormalByMat3(mat3(hitInst.transform), getTriangleNormal(hitTri, hitBary));
+            vec2 hitUv = getTriangleUV(hitTri, hitBary);
+
             vec3 hitPoint = origin + rayDir * hitT;
             RECORD_SPECULAR_VMV(pixelIndex, hitPoint, hitT, false);
             RECORD_DIFFUSE_HIT_DIST(pixelIndex, hitT, false);
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             if (!frontFace) hitNormal = -hitNormal;
 
-            Material mat = materials[matId];
-            vec3 emissive = mat.emissive.rgb;
+            ShadeMaterial sm = shadeMaterials[matId];
+            vec3 emissive = sm.emissive_spec.rgb;
+            uint emissiveTex = smGetEmissiveTex(sm);
+            uint matType = smGetTypeFlags(sm);
 
-            if ((mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u && mat.emissiveTex > 0u && mat.emissiveTex <= 512u) {
+            if ((matType & MATERIAL_FLAG_HOLO_VIDEO) != 0u && emissiveTex > 0u && emissiveTex <= 512u) {
                 // High-End Cyberpunk Volumetric Hologram Shading:
-                vec3 vidSample = SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
+                vec3 vidSample = SAMPLE_SCENE_TEXTURE(emissiveTex, hitUv).rgb;
                 uint holoFrame = ((ubo.flags & (1u << 13)) != 0u) ? (ubo.frameIndex & 0xFFFFFu) : 0u;
                 float time = float(holoFrame) * 0.01666667;
 
@@ -283,10 +286,10 @@ void main() {
                 float glitchPulse = smoothstep(0.986, 0.990, sin(time * 19.0 + hitPoint.y * 23.0)) * 0.08;
 
                 emissive = tonemappedVid * (1.0 + glitchPulse) + holoPedestal + rimGlow;
-            } else if (mat.emissiveTex > 0u && mat.emissiveTex <= 512u && (mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) == 0u) {
+            } else if (emissiveTex > 0u && emissiveTex <= 512u && (matType & MATERIAL_FLAG_PROCEDURAL_HOLO) == 0u) {
                 // Flat 2D plane with emission (lower level billboards)
-                emissive *= SAMPLE_SCENE_TEXTURE(mat.emissiveTex, hitUv).rgb;
-            } else if ((mat.type & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {
+                emissive *= SAMPLE_SCENE_TEXTURE(emissiveTex, hitUv).rgb;
+            } else if ((matType & MATERIAL_FLAG_PROCEDURAL_HOLO) != 0u) {
                 vec3 hitPoint = origin + rayDir * hitT;
                 uint holoFrame = ((ubo.flags & (1u << 13)) != 0u) ? (ubo.frameIndex & 0xFFFFFu) : 0u;
                 float time = float(holoFrame) * 0.01666667;
@@ -314,7 +317,7 @@ void main() {
             }
 #endif
             float emitMisW = (pc.currentBounce == 0u) ? 1.0
-                : emitterHitMisWeightScaled(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale);
+                : emitterHitMisWeightScaled(0u, triIdx, instIdx, origin, rayDir, hitT, inPdfCode, pc.numLights, emitLightScale);
             vec3 emissiveContrib = throughput * emissive * emitMisW;
             if (pc.currentBounce > 0u) {
                 float effClamp = (!isSpecularPath && inPdfCode == 0u && pc.currentBounce >= 2u)
@@ -329,7 +332,7 @@ void main() {
             if (pc.captureMlData == 0u || (pc.captureMlData & 2u) != 0u) {
                 vec4 prev = imageLoad(uAccumImage, pixelCoord);
                 bool dynamicVideoBypass = (ubo.flags & (1u << 12)) != 0u;
-                float isDynamicVideo = (pc.currentBounce == 0u && dynamicVideoBypass && (mat.emissiveTex == 1u || (mat.type & MATERIAL_FLAG_HOLO_VIDEO) != 0u)) ? 1.0 : prev.a;
+                float isDynamicVideo = (pc.currentBounce == 0u && dynamicVideoBypass && (emissiveTex == 1u || (matType & MATERIAL_FLAG_HOLO_VIDEO) != 0u)) ? 1.0 : prev.a;
                 imageStore(uAccumImage, pixelCoord, vec4(addFp16Stochastic(prev.rgb, accumRadiance, seed), isDynamicVideo));
             }
             if (pc.captureMlData != 0u) {

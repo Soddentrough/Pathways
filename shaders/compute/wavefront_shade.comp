@@ -124,12 +124,8 @@ void main() {
 
         vec3 origin = geom.originPackedDir.xyz;
         vec3 rayDir = unpackOct32(floatBitsToUint(geom.originPackedDir.w));
-        float hitT;
-        uint matId, hitType;
-        vec3 hitNormal, geomTan;
-        vec2 hitUv;
-        float tanSign;
-        unpackRayHit(hit, hitT, matId, hitType, hitNormal, hitUv, geomTan, tanSign);
+        float hitT = uintBitsToFloat(hit.hitData.x);
+        bool isMiss = rayHitIsMiss(hit);
 
         f16vec3 throughputHalf;
         uint seed, pixelIndex;
@@ -143,7 +139,7 @@ void main() {
         float invSpp = (ubo.spp > 0u) ? (1.0 / float(ubo.spp)) : 1.0;
 
         // 0. Check if secondary ray hit sky / environment (Miss)
-        if (hitType == 2u) {
+        if (isMiss) {
             vec3 skyColor;
             if (pc.hasEnvMap == 1u) {
                 vec2 envUv = directionToEquirectangular(rayDir);
@@ -197,6 +193,17 @@ void main() {
             }
             // Ray terminates here (survivesToNext remains false)
         } else {
+            uint triIdx = hit.hitData.z;
+            uint instIdx = hit.hitData.y;
+            vec2 hitBary = unpackUnorm2x16(hit.hitData.w);
+            Triangle hitTri = triangles[triIdx];
+            InstanceGPU hitInst = instances[instIdx];
+            uint matId = hitTri.materialId + hitInst.materialOffset;
+            vec3 hitNormal = transformNormalByMat3(mat3(hitInst.transform), getTriangleNormal(hitTri, hitBary));
+            vec2 hitUv = getTriangleUV(hitTri, hitBary);
+            vec3 geomTan = normalize(mat3(hitInst.transform) * getTriangleTangent(hitTri, hitBary));
+            float tanSign = getTriangleTangentSign(hitTri);
+
             vec3 hitPoint = origin + hitT * rayDir;
             bool frontFace = dot(rayDir, hitNormal) < 0.0;
             hitNormal = frontFace ? hitNormal : -hitNormal;
@@ -204,7 +211,7 @@ void main() {
             Material mat = materials[matId];
 
             // Tangent frame & Normal mapping: load tangents only when normal texture is active
-            if (hitType == 0u && mat.normalTex > 0u && mat.normalTex <= 512u) {
+            if (mat.normalTex > 0u && mat.normalTex <= 512u) {
                 vec3 normalMap = SAMPLE_SCENE_TEXTURE(mat.normalTex, hitUv).rgb * 2.0 - 1.0;
                 normalMap.xy *= mat.normalScale;
                 normalMap = normalize(normalMap);
@@ -264,7 +271,7 @@ void main() {
                 }
                 float emitMisW = shouldSuppressCausticEmitterHit(causticApplied, isSpecularPath, inPdfCode, bounce)
                     ? 0.0
-                    : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(hitType, hit.hitData1.y, hit.hitData1.x, origin, rayDir, hitT, inPdfCode, pc.numLights));
+                    : ((bounce == 0u) ? 1.0 : emitterHitMisWeight(0u, triIdx, instIdx, origin, rayDir, hitT, inPdfCode, pc.numLights));
                 if (length(emissive) > 1e-3 && emitMisW > 0.0) {
                     vec3 emissiveContrib = throughput * emissive * emitMisW;
                     if (bounce > 0u) {
@@ -362,7 +369,7 @@ void main() {
                     float clearcoatAlpha = clearcoatRoughness * clearcoatRoughness;
 
                     vec3 surfTan = geomTan - dot(geomTan, hitNormal) * hitNormal;
-                    if (hitType != 0u || dot(surfTan, surfTan) <= 1e-6) {
+                    if (dot(surfTan, surfTan) <= 1e-6) {
                         vec3 b1, b2;
                         buildOrthonormalBasis(hitNormal, b1, b2);
                         surfTan = b1;

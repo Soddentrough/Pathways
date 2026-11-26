@@ -171,6 +171,12 @@ private:
     EnvImportanceTable m_envImportanceTable{};
     bool m_envIsExplicitOrDome = false;
     float m_activeEnvIntensity = 1.0f;
+    struct StagedBufferUpload {
+        Buffer* dst = nullptr;
+        const void* data = nullptr;
+        VkDeviceSize size = 0;
+    };
+    void uploadBuffersStaged(const std::vector<StagedBufferUpload>& uploads);
     void uploadEnvImportanceBuffer();
     std::array<std::unique_ptr<Buffer>, 2> m_lightStaging;
     std::array<std::unique_ptr<Buffer>, 2> m_lightTreeStaging;

@@ -521,6 +521,9 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
             m_hasComputeShaderDerivatives = true;
         }
 #endif
+        if (std::strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+            m_hasMemoryBudget = true;
+        }
 #ifdef _WIN32
         if (std::strcmp(ext.extensionName, "VK_KHR_external_memory_win32") == 0) {
             m_hasExternalMemoryWin32 = true;
@@ -1133,6 +1136,9 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         deviceExtensions.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
     }
 #endif
+    if (m_hasMemoryBudget) {
+        deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
 #ifdef _WIN32
     if (m_hasExternalMemoryWin32) {
         deviceExtensions.push_back("VK_KHR_external_memory_win32");
@@ -1352,12 +1358,16 @@ void VulkanContext::initVMA() {
     allocatorCreateInfo.instance = m_instance;
     allocatorCreateInfo.pVulkanFunctions = &vulkanFunctions;
     allocatorCreateInfo.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    if (m_hasMemoryBudget) {
+        allocatorCreateInfo.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
 
     VkResult res = vmaCreateAllocator(&allocatorCreateInfo, &m_allocator);
     if (res != VK_SUCCESS) {
         throw std::runtime_error("Failed to initialize Vulkan Memory Allocator (VMA)!");
     }
-    Logger::info("VMA Allocator initialized successfully.");
+    Logger::info("VMA Allocator initialized successfully (VK_EXT_memory_budget: {}).",
+                 m_hasMemoryBudget ? "enabled" : "disabled");
 }
 
 void VulkanContext::initPipelineCache() {

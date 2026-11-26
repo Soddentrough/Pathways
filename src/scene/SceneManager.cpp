@@ -448,13 +448,10 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     VkDeviceSize matSize = std::max(sizeof(MaterialGPU) * m_sceneData.materials.size(), sizeof(MaterialGPU));
     m_materialBuffer = std::make_unique<Buffer>(
         m_allocator, matSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
-    if (!m_sceneData.materials.empty()) {
-        m_materialBuffer->copyFrom(m_sceneData.materials.data(), sizeof(MaterialGPU) * m_sceneData.materials.size());
-    }
 
     std::vector<uint32_t> matArchetypes(m_sceneData.materials.size());
     for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
@@ -463,13 +460,10 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     VkDeviceSize archSize = std::max(sizeof(uint32_t) * matArchetypes.size(), sizeof(uint32_t));
     m_materialArchetypeBuffer = std::make_unique<Buffer>(
         m_allocator, archSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
-    if (!matArchetypes.empty()) {
-        m_materialArchetypeBuffer->copyFrom(matArchetypes.data(), sizeof(uint32_t) * matArchetypes.size());
-    }
 
     std::vector<ShadeMaterialGPU> shadeMaterials(m_sceneData.materials.size());
     for (size_t i = 0; i < m_sceneData.materials.size(); ++i) {
@@ -478,20 +472,17 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
     VkDeviceSize shadeMatSize = std::max(sizeof(ShadeMaterialGPU) * shadeMaterials.size(), sizeof(ShadeMaterialGPU));
     m_shadeMaterialBuffer = std::make_unique<Buffer>(
         m_allocator, shadeMatSize,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
-    if (!shadeMaterials.empty()) {
-        m_shadeMaterialBuffer->copyFrom(shadeMaterials.data(), sizeof(ShadeMaterialGPU) * shadeMaterials.size());
-    }
 
     VkDeviceSize lightSize = std::max(sizeof(LightGPU) * m_sceneData.lights.size(), sizeof(LightGPU));
     m_lightBuffer = std::make_unique<Buffer>(
         m_allocator, lightSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
     if (!m_sceneData.lights.empty()) {
         buildLightAliasTable(m_sceneData.lights);
@@ -499,7 +490,6 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
         if (!computeLightTreePaths(m_sceneData.lightTreeNodes, m_sceneData.lights)) {
             Logger::warn("Light tree deeper than 32 levels: tree pdf evaluation unavailable for some lights");
         }
-        m_lightBuffer->copyFrom(m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size());
     }
 
     VkDeviceSize lightTreeSize = std::max(sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size(),
@@ -508,16 +498,111 @@ void SceneManager::uploadGpuBuffers(SceneGeometryPipeline* geomPipeline) {
         m_allocator, lightTreeSize,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+        0
     );
-    if (!m_sceneData.lightTreeNodes.empty()) {
-        m_lightTreeBuffer->copyFrom(m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size());
+
+    std::vector<StagedBufferUpload> stagedUploads;
+    if (!m_sceneData.materials.empty()) {
+        stagedUploads.push_back({ m_materialBuffer.get(), m_sceneData.materials.data(), sizeof(MaterialGPU) * m_sceneData.materials.size() });
     }
+    if (!matArchetypes.empty()) {
+        stagedUploads.push_back({ m_materialArchetypeBuffer.get(), matArchetypes.data(), sizeof(uint32_t) * matArchetypes.size() });
+    }
+    if (!shadeMaterials.empty()) {
+        stagedUploads.push_back({ m_shadeMaterialBuffer.get(), shadeMaterials.data(), sizeof(ShadeMaterialGPU) * shadeMaterials.size() });
+    }
+    if (!m_sceneData.lights.empty()) {
+        stagedUploads.push_back({ m_lightBuffer.get(), m_sceneData.lights.data(), sizeof(LightGPU) * m_sceneData.lights.size() });
+    }
+    if (!m_sceneData.lightTreeNodes.empty()) {
+        stagedUploads.push_back({ m_lightTreeBuffer.get(), m_sceneData.lightTreeNodes.data(), sizeof(LightTreeNodeGPU) * m_sceneData.lightTreeNodes.size() });
+    }
+    uploadBuffersStaged(stagedUploads);
+
     m_lightStaging = {};
     m_lightTreeStaging = {};
     m_cpuDynamicLights.clear();
     m_cpuDynamicLightTree.clear();
     m_dynamicLightsDirty = false;
+}
+
+void SceneManager::uploadBuffersStaged(const std::vector<StagedBufferUpload>& uploads) {
+    if (m_device == VK_NULL_HANDLE || m_allocator == VK_NULL_HANDLE ||
+        m_queue == VK_NULL_HANDLE || m_commandPool == VK_NULL_HANDLE) {
+        return;
+    }
+
+    struct ResolvedUpload {
+        VkBuffer dstBuffer = VK_NULL_HANDLE;
+        const void* data = nullptr;
+        VkDeviceSize size = 0;
+        VkDeviceSize srcOffset = 0;
+    };
+    std::vector<ResolvedUpload> resolved;
+    resolved.reserve(uploads.size());
+
+    VkDeviceSize totalStagingBytes = 0;
+    for (const auto& u : uploads) {
+        if (!u.dst || !u.data || u.size == 0 || u.size > u.dst->getSize()) {
+            continue;
+        }
+        VkDeviceSize alignedOffset = (totalStagingBytes + 15u) & ~VkDeviceSize(15u);
+        resolved.push_back({ u.dst->getBuffer(), u.data, u.size, alignedOffset });
+        totalStagingBytes = alignedOffset + u.size;
+    }
+    if (resolved.empty() || totalStagingBytes == 0) {
+        return;
+    }
+
+    Buffer staging(
+        m_allocator, totalStagingBytes,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+    );
+    uint8_t* mapped = static_cast<uint8_t*>(staging.map());
+    for (const auto& r : resolved) {
+        std::memcpy(mapped + r.srcOffset, r.data, static_cast<size_t>(r.size));
+    }
+    staging.flush(0, totalStagingBytes);
+    staging.unmap();
+
+    VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    allocInfo.commandPool = m_commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(m_device, &allocInfo, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    for (const auto& r : resolved) {
+        VkBufferCopy copyRegion{ r.srcOffset, 0, r.size };
+        vkCmdCopyBuffer(cmd, staging.getBuffer(), r.dstBuffer, 1, &copyRegion);
+    }
+
+    VkMemoryBarrier2 barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo dep{ VK_STRUCTURE_TYPE_DEPENDENCY_INFO };
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dep);
+
+    vkEndCommandBuffer(cmd);
+
+    VkCommandBufferSubmitInfo cmdSubmitInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO };
+    cmdSubmitInfo.commandBuffer = cmd;
+    VkSubmitInfo2 submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO_2 };
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdSubmitInfo;
+    vkQueueSubmit2(m_queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(m_queue);
+    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
 }
 
 void SceneManager::updateDynamicLights(SceneData& sceneData, bool immediateHostCopy) {
@@ -528,15 +613,22 @@ void SceneManager::updateDynamicLights(SceneData& sceneData, bool immediateHostC
     m_numLights = static_cast<uint32_t>(sceneData.lights.size());
 
     if (immediateHostCopy) {
+        std::vector<StagedBufferUpload> uploads;
         VkDeviceSize lightBytes = sizeof(LightGPU) * sceneData.lights.size();
         if (lightBytes <= m_lightBuffer->getSize()) {
-            m_lightBuffer->copyFrom(sceneData.lights.data(), lightBytes);
+            uploads.push_back({ m_lightBuffer.get(), sceneData.lights.data(), lightBytes });
         }
         if (m_lightTreeBuffer && !sceneData.lightTreeNodes.empty()) {
             VkDeviceSize treeBytes = sizeof(LightTreeNodeGPU) * sceneData.lightTreeNodes.size();
             if (treeBytes <= m_lightTreeBuffer->getSize()) {
-                m_lightTreeBuffer->copyFrom(sceneData.lightTreeNodes.data(), treeBytes);
+                uploads.push_back({ m_lightTreeBuffer.get(), sceneData.lightTreeNodes.data(), treeBytes });
             }
+        }
+        if (!uploads.empty()) {
+            if (m_device != VK_NULL_HANDLE && m_queue != VK_NULL_HANDLE) {
+                vkQueueWaitIdle(m_queue);
+            }
+            uploadBuffersStaged(uploads);
         }
         m_dynamicLightsDirty = false;
     } else {

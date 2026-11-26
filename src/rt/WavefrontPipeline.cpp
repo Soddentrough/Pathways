@@ -34,6 +34,21 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
 
     m_maxCapacity = (maxBatchPixels > 0) ? std::min(m_width * m_height, maxBatchPixels) : (m_width * m_height);
 
+    // Allocate fallback dummy storage image and 128B dummy buffer BEFORE
+    // updateQueueDescriptors() so inactive optional bindings (19, 32, 36) have a valid target.
+    m_dummyStorageImage = std::make_unique<Image>(
+        m_device, m_allocator, 16, 16,
+        VK_FORMAT_R16G16B16A16_SFLOAT,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+    );
+    m_dummyImageTransitioned = false;
+
+    m_dummyReservoir = std::make_unique<Buffer>(
+        m_allocator, 128,
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VMA_MEMORY_USAGE_GPU_ONLY
+    );
+
     createDescriptorLayout();
     allocateDescriptorSets();
     allocateQueues(m_maxCapacity);
@@ -51,23 +66,6 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
     for (int i = 0; i < 2; ++i) {
         vkCreateQueryPool(m_device, &qpInfo, nullptr, &m_queryPools[i]);
     }
-
-    m_dummyStorageImage = std::make_unique<Image>(
-        m_device, m_allocator, 16, 16,
-        VK_FORMAT_R16G16B16A16_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
-    );
-    m_dummyImageTransitioned = false;
-
-    // Dedicated fallback target for ReSTIR reservoir bindings (32/36) when no
-    // real grid is bound. Previously these aliased the queue-counters buffer —
-    // one refactor away from reservoir writes corrupting dispatch bookkeeping
-    // (review 2026-10-10 §7).
-    m_dummyReservoir = std::make_unique<Buffer>(
-        m_allocator, 128,
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VMA_MEMORY_USAGE_GPU_ONLY
-    );
 
     Logger::info("Pure WavefrontPipeline created successfully (capacity: {} rays, Wave32 mode, DGC enabled, Material Pipelines: {}, Streamlined Secondary: {}).",
                  m_maxCapacity, (m_shadeDiffusePipeline != VK_NULL_HANDLE ? "enabled" : "disabled"),
@@ -241,8 +239,8 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
     // RayState = 16 bytes (packed throughput, flags, seed, pixelIndex)
     VkDeviceSize stateQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
 
-    // RayHit = 32 bytes (16B packed hit attributes + 16B Hit atom)
-    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
+    // RayHit = 16 bytes (4B hitT + 4B instanceId + 4B primitiveId + 4B baryPacked)
+    VkDeviceSize hitQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 16;
 
     // PackedShadowRay = 32 bytes (packed originDist + dirPixelRad)
     VkDeviceSize shadowQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 32;
@@ -261,7 +259,11 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
         m_rayHitQueue[slot] = std::make_unique<Buffer>(m_allocator, hitQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
         m_shadowQueue[slot] = std::make_unique<Buffer>(m_allocator, shadowQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
         m_materialIndexQueue[slot] = std::make_unique<Buffer>(m_allocator, matIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
-        m_secondaryIndexQueue[slot] = std::make_unique<Buffer>(m_allocator, secIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        if (m_secondaryIndexQueueEnabled) {
+            m_secondaryIndexQueue[slot] = std::make_unique<Buffer>(m_allocator, secIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        } else {
+            m_secondaryIndexQueue[slot].reset();
+        }
 
         // QueueCounters = 256 bytes (pure DEVICE_LOCAL so shaders never atomicAdd across PCIe)
         m_queueCounters[slot] = std::make_unique<Buffer>(
@@ -298,7 +300,8 @@ void WavefrontPipeline::updateQueueDescriptors() {
         };
         VkDescriptorBufferInfo hitInfo{ m_rayHitQueue[slot]->getBuffer(), 0, m_rayHitQueue[slot]->getSize() };
         VkDescriptorBufferInfo matIndexInfo{ m_materialIndexQueue[slot]->getBuffer(), 0, m_materialIndexQueue[slot]->getSize() };
-        VkDescriptorBufferInfo secIndexInfo{ m_secondaryIndexQueue[slot]->getBuffer(), 0, m_secondaryIndexQueue[slot]->getSize() };
+        Buffer* secIndexBuf = m_secondaryIndexQueue[slot] ? m_secondaryIndexQueue[slot].get() : m_dummyReservoir.get();
+        VkDescriptorBufferInfo secIndexInfo{ secIndexBuf->getBuffer(), 0, secIndexBuf->getSize() };
         VkDescriptorBufferInfo countersInfo{ m_queueCounters[slot]->getBuffer(), 0, m_queueCounters[slot]->getSize() };
         VkDescriptorBufferInfo shadowQueueInfo{ m_shadowQueue[slot]->getBuffer(), 0, m_shadowQueue[slot]->getSize() };
         VkDescriptorBufferInfo dgcStreamInfo{ m_dgcStream[slot]->getBuffer(), 0, m_dgcStream[slot]->getSize() };
@@ -510,6 +513,29 @@ void WavefrontPipeline::updateSceneDescriptors(uint32_t frameSlot,
     }
 }
 
+
+void WavefrontPipeline::ensureSecondaryIndexQueue() {
+    if (m_secondaryIndexQueueEnabled && hasSecondaryIndexQueue()) {
+        return;
+    }
+    if (m_device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(m_device);
+    }
+    m_secondaryIndexQueueEnabled = true;
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                               VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    VkDeviceSize secIndexQueueSize = static_cast<VkDeviceSize>(m_maxCapacity) * 8 * sizeof(uint32_t);
+    for (uint32_t slot = 0; slot < 2; ++slot) {
+        m_secondaryIndexQueue[slot] = std::make_unique<Buffer>(
+            m_allocator, secIndexQueueSize, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+    }
+    updateQueueDescriptors();
+    Logger::info("WavefrontPipeline: lazily allocated SecondaryIndexQueue ({:.2f} MiB total across 2 slots for Directional DGC).",
+                 static_cast<double>(secIndexQueueSize * 2u) / (1024.0 * 1024.0));
+}
 
 void WavefrontPipeline::resize(uint32_t width, uint32_t height, uint32_t maxBatchPixels) {
     if (m_width == width && m_height == height && m_maxBatchPixels == maxBatchPixels) return;
@@ -1028,6 +1054,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
         bool useMaterialSort = (sceneData.sortMode != 0 && m_shadeDiffusePipeline != VK_NULL_HANDLE && !m_primaryMatPipelines.empty());
         uint32_t effectiveSecondarySortMode = (!useMaterialSort && sceneData.secondarySortMode == 1u) ? 0u : sceneData.secondarySortMode;
+        if (effectiveSecondarySortMode == 1u && !hasSecondaryIndexQueue()) {
+            Logger::warn("WavefrontPipeline: secondarySortMode=1 requested without SecondaryIndexQueue; falling back to mode 0.");
+            effectiveSecondarySortMode = 0u;
+        }
 
         uint32_t batchPixels = curBatchW * curBatchH;
         uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
@@ -1589,14 +1619,14 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
         }
 
         const double matIdxBytes = isMaterialMode ? 4.0 : 0.0;
-        double shadeRead = bp.activeCount * (64.0 + matIdxBytes);
+        double shadeRead = bp.activeCount * (48.0 + matIdxBytes);
         double shadeWrite = (bp.shadowCount * 32.0) + (bp.nextCount * 32.0);
         double shadowRead = bp.shadowCount * 32.0;
         double intersectTraffic = 0.0;
         if (tailBounce > 0 && b + 1 == tailBounce) {
             intersectTraffic = bp.nextCount * 32.0;
         } else if (b + 1 < effectiveBounces && bp.intersectMs >= 0.0) {
-            intersectTraffic = bp.nextCount * (48.0 + matIdxBytes);
+            intersectTraffic = bp.nextCount * (32.0 + matIdxBytes);
         }
         totalTrafficBytes += (shadeRead + shadeWrite + shadowRead + intersectTraffic);
 
@@ -1604,7 +1634,7 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     }
 
     uint32_t primaryRays = (m_width * m_height);
-    totalTrafficBytes += primaryRays * (64.0 + (isMaterialMode ? 4.0 : 0.0));
+    totalTrafficBytes += primaryRays * (48.0 + (isMaterialMode ? 4.0 : 0.0));
     data.estimatedVramTrafficMb = totalTrafficBytes / (1024.0 * 1024.0);
 
     return data;
