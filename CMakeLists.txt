@@ -174,6 +174,11 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/fsr3_blend.comp
     ${SHADER_DIR}/compute/ffx_rr_prep.comp
     ${SHADER_DIR}/compute/ffx_rr_compose.comp
+    ${SHADER_DIR}/compute/reblur_preblur.comp
+    ${SHADER_DIR}/compute/reblur_temporal.comp
+    ${SHADER_DIR}/compute/reblur_history_fix.comp
+    ${SHADER_DIR}/compute/reblur_atrous.comp
+    ${SHADER_DIR}/compute/reblur_stabilize.comp
     ${SHADER_DIR}/compute/caustic_photon_trace.comp
     ${SHADER_DIR}/compute/caustic_splat.comp
     ${SHADER_DIR}/compute/caustic_filter.comp
@@ -309,6 +314,8 @@ endif()
 # Engine core static library (shared across pathways executable and all CTests)
 set(ENGINE_CORE_SOURCES ${SRC_FILES})
 list(REMOVE_ITEM ENGINE_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+list(APPEND ENGINE_CORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/rt/ReblurDenoiserPipeline.cpp")
+list(REMOVE_DUPLICATES ENGINE_CORE_SOURCES)
 
 add_library(pathways_engine_core STATIC
     ${ENGINE_CORE_SOURCES}

@@ -47,7 +47,8 @@ enum class SecondarySortMode {
 enum class DenoiserMode {
     None = 0,               // Raw stochastic path traced output (unfiltered progressive)
     Upways = 1,             // Upways Neural Reconstruction & Super-Resolution (Wave32 WMMA)
-    FfxRayRegeneration = 2  // AMD FidelityFX Ray Regeneration 1.2.1 (4-Signal)
+    FfxRayRegeneration = 2, // AMD FidelityFX Ray Regeneration 1.2.1 (4-Signal)
+    Reblur = 3              // Analytical NRD ReBLUR-grade Spatiotemporal Denoiser (6-Pass, All Vulkan GPUs)
 };
 
 enum class FsrVersion : uint32_t {

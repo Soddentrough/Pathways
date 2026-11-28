@@ -632,6 +632,7 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
     (void)accumulatedSamples;
 
     glm::vec2 jitter(0.0f);
+    UpwaysCameraMotion cameraMotion{};
 
     if (camera) {
         if (resetHistory) {
@@ -644,6 +645,14 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
             enableJitter, fullInW, fullInH, 0, false, jitterSeqLen
         );
         jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
+
+        const glm::mat4 currView = camera->getViewMatrix();
+        const glm::mat4 prevView = resetHistory ? currView : camera->getPrevViewMatrix();
+        const float tanHalfFovY = std::tan(0.5f * glm::radians(camera->getFov()));
+        const float aspectRatio = (camera->getAspect() > 1e-4f)
+            ? camera->getAspect()
+            : ((fullInH > 0u) ? (static_cast<float>(fullInW) / static_cast<float>(fullInH)) : 1.0f);
+        cameraMotion = makeUpwaysCameraMotion(currView, prevView, tanHalfFovY, aspectRatio);
     }
 
     UpwaysBandParams bandParams{};
@@ -658,7 +667,7 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
 
     m_upwaysPipeline->recordFrame(
         cmd, frameIndex, resetHistory, jitter,
-        coupledWithExternalUpscaler, config.upways_heuristic_fallback, 1.0f, bandParams
+        coupledWithExternalUpscaler, config.upways_heuristic_fallback, 1.0f, bandParams, cameraMotion
     );
     return true;
 }

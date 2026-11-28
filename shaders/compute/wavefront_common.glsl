@@ -695,12 +695,14 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
 }
 
 // Record First-Bounce Specular Virtual Motion Vector & Disparity (VMV)
-// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage (legacy)
-// or write-only uMlSpecVmvImage (compact live) for E-SVGF/Upways.
-// Projects the planar virtual image point x_virt = x_primary + d_refl * r_primary along the primary viewing ray.
+// Asynchronously emits secondary hit kinematics and depth to uMlSpecularMotionImage (legacy/4-sig)
+// or uMlSpecVmvImage (compact live) for ReBLUR/Upways.
+// Uses exact bounce-0 signed surface curvature (handed off via uMlSpecVmvImage.x with .y == 0u)
+// to compute the NRD thin-lens virtual image point x_virt = x_primary + d_virt * r_primary along
+// the primary viewing ray, while retaining true reflDist for HitT bilateral filtering.
 #define RECORD_SPECULAR_VMV(pixelIdx, pt, hitDist, isMiss) \
     do { \
-        if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u) { \
+        if (pc.currentBounce == 1u && isSpecularPath && pc.captureMlData != 0u && pc.sppSampleIndex == 0u) { \
             ivec2 pCoord_ = ivec2(int((pixelIdx) % pc.width), int((pixelIdx) / pc.width)); \
             wfStoreIndirectSpecularHitDist(pCoord_, float(hitDist), (isMiss), pc.captureMlData, pc.sppSampleIndex); \
             const bool isCompact_ = (pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u; \
@@ -715,10 +717,16 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
             } \
             if (!skipVmv_) { \
                 float reflDist_ = (isMiss) ? 1000.0 : clamp(float(hitDist), 0.0, 10000.0); \
+                uvec2 prevVmv_ = imageLoad(uMlSpecVmvImage, pCoord_).xy; \
+                float curvTerm_ = (prevVmv_.y == 0u) ? unpackHalf2x16(prevVmv_.x).x : 0.0; \
+                float denom_ = 1.0 + reflDist_ * curvTerm_; \
+                float dVirt_ = (curvTerm_ >= 0.0) \
+                    ? (reflDist_ / denom_) \
+                    : ((denom_ > 0.25) ? min(reflDist_ / denom_, 4.0 * reflDist_) : 0.0); \
                 vec3 toSurf_ = origin - ubo.position.xyz; \
                 float surfDist_ = length(toSurf_); \
                 vec3 primDir_ = (surfDist_ > 1e-4) ? (toSurf_ / surfDist_) : normalize((pt) - ubo.position.xyz); \
-                vec3 xVirt_ = origin + primDir_ * reflDist_; \
+                vec3 xVirt_ = origin + primDir_ * dVirt_; \
                 vec3 prevXVirt_ = xVirt_; \
                 InstanceGPU rInst_; if (!(isMiss) && hit.hitData.z != 0xFFFFFFFFu && ((rInst_ = instances[hit.hitData.y]).transform != rInst_.invTransform)) { \
                     vec3 rLocalPos_ = (inverse(rInst_.transform) * vec4((pt), 1.0)).xyz; \
@@ -728,7 +736,7 @@ void unpackRayState(RayState s, out f16vec3 throughput, out uint seed, out uint 
                     float axisLenSq_ = dot(reflAxis_, reflAxis_); \
                     vec3 nMirror_ = (axisLenSq_ > 1e-6) ? (reflAxis_ * inversesqrt(axisLenSq_)) : vec3(0.0, 1.0, 0.0); \
                     vec3 virtDelta_ = rDeltaWorld_ - 2.0 * dot(rDeltaWorld_, nMirror_) * nMirror_; \
-                    prevXVirt_ = xVirt_ - virtDelta_; \
+                    prevXVirt_ = xVirt_ - virtDelta_ * (dVirt_ / max(reflDist_, 1e-4)); \
                 } \
                 vec4 cClip_ = ubo.unjitteredViewProj * vec4(xVirt_, 1.0); \
                 vec4 pClip_ = ubo.prevViewProj * vec4(prevXVirt_, 1.0); \

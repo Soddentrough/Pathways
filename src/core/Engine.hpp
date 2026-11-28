@@ -24,6 +24,7 @@
 #include "rt/RayTracingOrchestrator.hpp"
 #include "rt/PostProcessPipeline.hpp"
 #include "rt/DenoiserPipeline.hpp"
+#include "rt/ReblurDenoiserPipeline.hpp"
 #include "core/InputController.hpp"
 #include "core/HwMonitor.hpp"
 #include "rt/TrainingCaptureManager.hpp"
@@ -157,11 +158,15 @@ private:
     std::unique_ptr<Camera> m_camera;
     std::unique_ptr<CameraPath> m_cameraPath;
 
-    // E-SVGF denoiser camera jitter state (UV units), refreshed each frame from
-    // the Halton sub-pixel jitter applied by Camera::getUniformData()
+    // Analytical ReBLUR & FFX RR denoiser camera jitter/projection state (UV units),
+    // kept in lockstep with Camera::advanceFrame()
     glm::vec2 m_denoiseJitterUv{0.0f, 0.0f};
     glm::vec2 m_prevDenoiseJitterUv{0.0f, 0.0f};
+    float m_prevTanHalfFovY = 0.41421356f;
+    float m_prevAspectRatio = 16.0f / 9.0f;
+    bool m_hasPrevReblurCamera = false;
     DenoiserPipeline::CameraMatrices buildDenoiserCameraMatrices(uint32_t width, uint32_t height) const;
+    ReblurDenoiserPipeline::CameraMatrices buildReblurCameraMatrices(uint32_t width, uint32_t height, bool upscalerCoupled) const;
     float m_cameraPathTime = 0.0f;
     std::unique_ptr<class GuiManager> m_gui;
     std::unique_ptr<class MultiGpuManager> m_mgpu;
@@ -332,10 +337,12 @@ private:
     void updateFsrDescriptors();
     void updateFsr3Descriptors();
 
-    // E-SVGF & AMD FSR Ray Regeneration Denoiser Subsystem (lazily allocated)
+    // AMD FSR Ray Regeneration & Analytical ReBLUR Denoiser Subsystems (lazily allocated)
     std::unique_ptr<DenoiserPipeline> m_denoiser;
+    std::unique_ptr<ReblurDenoiserPipeline> m_reblurDenoiser;
     void ensureNrcInitialized();
     void ensureDenoiserInitialized();
+    void ensureReblurDenoiserInitialized();
     void ensureWavefrontAlphaPipeline();
     void ensureWavefrontTailMegakernelPipeline();
     void ensureWavefrontRestirPipelines();

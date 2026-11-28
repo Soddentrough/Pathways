@@ -333,7 +333,8 @@ void Config::printUsage(const char* progName) {
               << "  --restir-m-cap <int>    ReSTIR PT temporal reuse M-cap (default: 60)\n"
               << "  --debug-view <name>     Reservoir debug overlay (requires --restir): restir-m | restir-w |\n"
               << "                          restir-light | restir-indirect-m | restir-indirect-w | restir-coverage | none\n"
-              << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
+              << "  --denoiser <mode>       Real-time denoiser: 'reblur' (Analytical 6-pass NRD ReBLUR), 'upways' (Wave32 WMMA), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
+              << "  --reblur                Shortcut to enable Analytical ReBLUR real-time denoiser\n"
               << "  --upways                Shortcut to enable Upways real-time denoiser\n"
               << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n"
               << "  --upways-version <v>    Upways runtime version: 'auto' [default] (5.0 when V5 weights present, else 4.0), '4'/'v4', or '5'/'v5'\n"
@@ -848,7 +849,12 @@ Config Config::parse(int argc, char* argv[]) {
         if (arg == "--denoiser" && i + 1 < argc) {
             std::string mode = argv[++i];
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "upways") {
+            if (mode == "reblur" || mode == "analytical") {
+                if (cfg.upscaler_mode != UpscalerMode::Upways) {
+                    cfg.upways_superres = false;
+                }
+                cfg.denoiser_mode = DenoiserMode::Reblur;
+            } else if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
                     cfg.upways_superres = false;
                 }
@@ -863,14 +869,19 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, rayregen, or none.");
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected reblur, upways, rayregen, or none.");
             }
             continue;
         }
         if (arg.starts_with("--denoiser=")) {
             std::string mode = arg.substr(arg.find('=') + 1);
             std::transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
-            if (mode == "upways") {
+            if (mode == "reblur" || mode == "analytical") {
+                if (cfg.upscaler_mode != UpscalerMode::Upways) {
+                    cfg.upways_superres = false;
+                }
+                cfg.denoiser_mode = DenoiserMode::Reblur;
+            } else if (mode == "upways") {
                 if (cfg.upscaler_mode != UpscalerMode::Upways) {
                     cfg.upways_superres = false;
                 }
@@ -885,7 +896,7 @@ Config Config::parse(int argc, char* argv[]) {
             } else if (mode == "none" || mode == "off") {
                 cfg.denoiser_mode = DenoiserMode::None;
             } else {
-                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected upways, rayregen, or none.");
+                throw std::runtime_error("Unsupported denoiser mode '" + mode + "'. Expected reblur, upways, rayregen, or none.");
             }
             continue;
         }
@@ -962,6 +973,10 @@ Config Config::parse(int argc, char* argv[]) {
         }
 
         // Standalone shortcuts:
+        if (arg == "--reblur") {
+            cfg.denoiser_mode = DenoiserMode::Reblur;
+            continue;
+        }
         if (arg == "--upways") {
             cfg.denoiser_mode = DenoiserMode::Upways;
             continue;
@@ -1858,6 +1873,7 @@ Config Config::parse(int argc, char* argv[]) {
         cfg.enable_nrc = false;
         cfg.enable_caustics = false;
         cfg.enable_delta_unroll = false;
+        cfg.denoiser_mode = DenoiserMode::None;
         cfg.accum_format = AccumFormat::RGBA32_SFLOAT;
         cfg.explicit_accum_format = true;
         Logger::info("Config: --reference ground-truth mode (BSDF-only for hittable lights, NEE only for unhittable lights, no clamps, no ReSTIR, FP32 accumulation)");

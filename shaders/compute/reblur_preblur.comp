@@ -1,0 +1,380 @@
+#version 460
+
+// =============================================================================
+// ReBLUR Pass 0: Safe Albedo Demodulation, AREA_3X3 HitT Reconstruction,
+//                Remodulated-Space Energy-Preserving Firefly Diffusion &
+//                World-Space Normal/Depth (compact FP16-packed LDS < 11 KB)
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REBLUR_USE_CAMERA_UBO
+#include "reblur_common.glsl"
+
+layout(set = 0, binding = 1,  rgba16f) readonly  uniform image2D uInNormalDepth;
+layout(set = 0, binding = 2,  rgba16f) readonly  uniform image2D uInAlbedoRoughness;
+layout(set = 0, binding = 3,  rgba16f) readonly  uniform image2D uInSpecAlbedo;
+layout(set = 0, binding = 4,  rgba16f) readonly  uniform image2D uInSkip;
+layout(set = 0, binding = 5,  rgba16f) readonly  uniform image2D uInDirectDiffuse;
+layout(set = 0, binding = 6,  rgba16f) readonly  uniform image2D uInIndirectDiffuse;
+layout(set = 0, binding = 7,  rgba16f) readonly  uniform image2D uInDirectSpecular;
+layout(set = 0, binding = 8,  rgba16f) readonly  uniform image2D uInIndirectSpecular;
+layout(set = 0, binding = 9,  rgba16f) readonly  uniform image2D uInSpecularMotion;
+
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D uOutPreDiff;
+layout(set = 0, binding = 11, rgba16f) writeonly uniform image2D uOutPreSpec;
+layout(set = 0, binding = 12, rgba16f) writeonly uniform image2D uOutWorldND;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint pad0;
+    uint pad1;
+} pc;
+
+// 18x18 compact FP16-packed LDS (~10.9 KB total for high CU occupancy on RDNA 4)
+#define TILE_DIM    18
+#define TILE_STRIDE 19
+
+shared uvec2 s_worldND[TILE_DIM][TILE_STRIDE]; // fp16x4: worldN.xyz, linearDepth
+shared uvec2 s_diff[TILE_DIM][TILE_STRIDE];    // fp16x4: demodDiff.rgb, rawDiffHitT
+shared uvec2 s_spec[TILE_DIM][TILE_STRIDE];    // fp16x4: demodSpec.rgb, rawSpecHitT
+shared uvec2 s_aux[TILE_DIM][TILE_STRIDE];     // fp16x4: remodDiffLum, remodSpecLum, rough, float(flags)
+
+void loadTexelToLDS(ivec2 globalCoord, int lx, int ly) {
+    vec4 nd = imageLoad(uInNormalDepth, globalCoord);
+    float z = reblurSanitizeScalar(nd.w, 10000.0);
+    bool isSky = reblurIsSky(z);
+
+    if (isSky) {
+        s_worldND[ly][lx] = reblurPackHalf4(vec4(0.0, 1.0, 0.0, 10000.0));
+        s_diff[ly][lx]    = uvec2(0u);
+        s_spec[ly][lx]    = uvec2(0u);
+        s_aux[ly][lx]     = reblurPackHalf4(vec4(0.0, 0.0, 1.0, 1.0)); // flag bit 0 = sky
+        return;
+    }
+
+    vec4 ar    = imageLoad(uInAlbedoRoughness, globalCoord);
+    vec4 sa    = imageLoad(uInSpecAlbedo, globalCoord);
+    vec4 skip  = imageLoad(uInSkip, globalCoord);
+    vec4 dd    = imageLoad(uInDirectDiffuse, globalCoord);
+    vec4 id    = imageLoad(uInIndirectDiffuse, globalCoord);
+    vec4 ds    = imageLoad(uInDirectSpecular, globalCoord);
+    vec4 ispec = imageLoad(uInIndirectSpecular, globalCoord);
+    vec4 sm    = imageLoad(uInSpecularMotion, globalCoord);
+
+    vec3 worldN = vec3(0.0, 1.0, 0.0);
+    vec3 viewN = nd.xyz;
+    float nLen = length(viewN);
+    if (nLen > 1e-4 && !any(isnan(viewN)) && !any(isinf(viewN))) {
+        worldN = normalize(mat3(uCam.viewToWorld) * (viewN / nLen));
+    }
+
+    float rough = clamp(reblurSanitizeScalar(ar.a, 1.0), 0.0, 1.0);
+    vec3 rawDiffAlb = reblurSanitizeRgb(ar.rgb);
+    vec3 rawSpecAlb = reblurSanitizeRgb(sa.rgb);
+    vec3 skipRgb    = reblurSanitizeRgb(skip.rgb);
+    float skipArch  = reblurSanitizeScalar(skip.a, 0.0);
+
+    bool isEmissive = (
+        reblurLuminance(skipRgb) > 1e-3 ||
+        skipArch > 0.85 ||
+        (dot(rawDiffAlb, rawDiffAlb) <= 1e-5 && dot(rawSpecAlb, rawSpecAlb) <= 1e-5)
+    );
+    bool isTransmissive = (reblurSanitizeScalar(sm.z, 0.0) < 0.0);
+    bool isMirrorOrGlass = (rough < 0.04) || isTransmissive;
+
+    vec3 effDiffAlb = reblurEffectiveAlbedo(rawDiffAlb, z);
+    vec3 effSpecAlb = reblurEffectiveAlbedo(rawSpecAlb, z);
+
+    vec3 rawDiffSum = reblurSanitizeRgb(dd.rgb) + reblurSanitizeRgb(id.rgb);
+    vec3 rawSpecSum = reblurSanitizeRgb(ds.rgb) + reblurSanitizeRgb(ispec.rgb);
+
+    vec3 demodDiff = min(rawDiffSum / effDiffAlb, vec3(REBLUR_MAX_FP16));
+    vec3 demodSpec = min(rawSpecSum / effSpecAlb, vec3(REBLUR_MAX_FP16));
+
+    // Evaluate firefly luminance in physical REMODULATED space so dark albedo channels
+    // (e.g. red wall G=0.05) never inflate luminance by 13-20x and crush valid indirect bounce energy.
+    float remodDiffLum = min(reblurLuminance(rawDiffSum), REBLUR_MAX_FP16);
+    float remodSpecLum = min(reblurLuminance(rawSpecSum), REBLUR_MAX_FP16);
+
+    float rawDiffHitT = clamp(reblurSanitizeScalar(id.a, 0.0), 0.0, 10000.0);
+    float isHit       = clamp(reblurSanitizeScalar(ispec.a, 0.0), 0.0, 10000.0);
+    float smHit       = clamp(reblurSanitizeScalar(sm.a, 0.0), 0.0, 10000.0);
+    float rawSpecHitT = max(isHit, smHit);
+
+    uint flags = (isEmissive ? 2u : 0u) | (isMirrorOrGlass ? 4u : 0u) | (isTransmissive ? 8u : 0u);
+
+    s_worldND[ly][lx] = reblurPackHalf4(vec4(worldN, z));
+    s_diff[ly][lx]    = reblurPackHalf4(vec4(demodDiff, rawDiffHitT));
+    s_spec[ly][lx]    = reblurPackHalf4(vec4(demodSpec, rawSpecHitT));
+    s_aux[ly][lx]     = reblurPackHalf4(vec4(remodDiffLum, remodSpecLum, rough, float(flags)));
+}
+
+void main() {
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    uint linearIdx = gl_LocalInvocationIndex;
+    int tx = int(linearIdx & 15u);
+    int ty = int(linearIdx >> 4u);
+    ivec2 coord = tileOrigin + ivec2(tx, ty);
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    // 1. Cooperative 18x18 LDS load (256 interior + 68 border apron texels)
+    loadTexelToLDS(clamp(coord, ivec2(0), imgMax), tx + 1, ty + 1);
+    if (linearIdx < 68u) {
+        int lx, ly;
+        if (linearIdx < 18u) {
+            ly = 0;
+            lx = int(linearIdx);
+        } else if (linearIdx < 36u) {
+            ly = 17;
+            lx = int(linearIdx - 18u);
+        } else {
+            uint u = linearIdx - 36u;
+            ly = 1 + int(u >> 1u);
+            lx = ((u & 1u) == 0u) ? 0 : 17;
+        }
+        ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
+        loadTexelToLDS(apronCoord, lx, ly);
+    }
+    barrier();
+
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) {
+        return;
+    }
+
+    int clx = tx + 1;
+    int cly = ty + 1;
+
+    vec4 cWorldND = reblurUnpackHalf4(s_worldND[cly][clx]);
+    vec4 cDiff    = reblurUnpackHalf4(s_diff[cly][clx]);
+    vec4 cSpec    = reblurUnpackHalf4(s_spec[cly][clx]);
+    vec4 cAux     = reblurUnpackHalf4(s_aux[cly][clx]);
+
+    float cRemodDiffLum = cAux.x;
+    float cRemodSpecLum = cAux.y;
+    float cRough        = cAux.z;
+    uint  cFlags        = uint(round(cAux.w));
+
+    bool isSky          = (cFlags & 1u) != 0u;
+    bool isEmissive     = (cFlags & 2u) != 0u;
+    bool isMirrorOrGlass = (cFlags & 4u) != 0u;
+    bool isTransmissive = (cFlags & 8u) != 0u;
+
+    imageStore(uOutWorldND, coord, cWorldND);
+
+    if (isSky) {
+        imageStore(uOutPreDiff, coord, vec4(0.0));
+        imageStore(uOutPreSpec, coord, vec4(0.0));
+        return;
+    }
+
+    vec2 res = vec2(float(pc.width), float(pc.height));
+    vec3 cViewPos = reblurUnprojectToView(coord, cWorldND.w, uCam.tanHalfFovY, uCam.aspectRatio, res);
+    vec3 nVkView  = reblurWorldNormalToVkView(cWorldND.xyz, uCam.viewToWorld);
+
+    // 2. Single-pass AREA_3X3 bilateral HitT reconstruction + remodulated-space neighbor stats
+    float diffHitAcc = 0.0, diffHitW = 0.0;
+    float specHitAcc = 0.0, specHitW = 0.0;
+
+    float m1D = 0.0, m2D = 0.0, maxNbrD = 0.0;
+    float m1S = 0.0, m2S = 0.0, maxNbrS = 0.0;
+    float validNbrD = 0.0;
+    float validNbrS = 0.0;
+
+    bool needDiffHitRecon = (cDiff.a <= 1e-4);
+    bool needSpecHitRecon = (cSpec.a <= 1e-4);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clx + dx;
+            int ny = cly + dy;
+
+            vec4 nAux = reblurUnpackHalf4(s_aux[ny][nx]);
+            uint nFlags = uint(round(nAux.w));
+            if ((nFlags & 1u) != 0u) continue; // skip sky
+
+            vec4 nWorldND = reblurUnpackHalf4(s_worldND[ny][nx]);
+            float nDot = dot(cWorldND.xyz, nWorldND.xyz);
+            if (nDot <= 0.70) continue;
+
+            ivec2 nCoord = clamp(coord + ivec2(dx, dy), ivec2(0), imgMax);
+            vec3 nViewPos = reblurUnprojectToView(nCoord, nWorldND.w, uCam.tanHalfFovY, uCam.aspectRatio, res);
+            float wZ = reblurEvaluatePlaneDepthWeight(cViewPos, nViewPos, nVkView, 2.5, 1, uCam.tanHalfFovY, res.y);
+            if (wZ < 0.10) continue;
+
+            float nRough = nAux.z;
+            float wR = exp2(-abs(cRough - nRough) * (REBLUR_LOG2E / 0.15));
+            float wGeom = nDot * nDot * wZ;
+
+            if (needDiffHitRecon) {
+                float nDiffHit = reblurUnpackHalf4(s_diff[ny][nx]).a;
+                if (nDiffHit > 1e-4) {
+                    diffHitAcc += nDiffHit * wGeom;
+                    diffHitW   += wGeom;
+                }
+            }
+            if (needSpecHitRecon && wR > 0.20) {
+                float nSpecHit = reblurUnpackHalf4(s_spec[ny][nx]).a;
+                if (nSpecHit > 1e-4) {
+                    float wGeomSpec = wGeom * wR;
+                    specHitAcc += nSpecHit * wGeomSpec;
+                    specHitW   += wGeomSpec;
+                }
+            }
+
+            bool nEmissive = (nFlags & 2u) != 0u;
+            if (nEmissive == isEmissive) {
+                float lumD = nAux.x;
+                m1D += lumD;
+                m2D += lumD * lumD;
+                maxNbrD = max(maxNbrD, lumD);
+                validNbrD += 1.0;
+
+                if (wR > 0.25) {
+                    float lumS = nAux.y;
+                    m1S += lumS;
+                    m2S += lumS * lumS;
+                    maxNbrS = max(maxNbrS, lumS);
+                    validNbrS += 1.0;
+                }
+            }
+        }
+    }
+
+    float reconDiffHitT = needDiffHitRecon ? ((diffHitW > 1e-4) ? (diffHitAcc / diffHitW) : 0.0) : cDiff.a;
+    float reconSpecHitT = needSpecHitRecon ? ((specHitW > 1e-4) ? (specHitAcc / specHitW) : 0.0) : cSpec.a;
+
+    // 3. Conservative energy-preserving firefly diffusion in remodulated luminance space
+    //    (bypassed on emissive, transmissive glass & mirror rough < 0.04)
+    vec3 outDiff = cDiff.rgb;
+    vec3 outSpec = cSpec.rgb;
+
+    if (!isEmissive && !isTransmissive && validNbrD >= 3.0) {
+        float invN = 1.0 / validNbrD;
+        float muD = m1D * invN;
+        float sigD = sqrt(max(0.0, m2D * invN - muD * muD));
+        float threshD = max(muD + 6.0 * max(sigD, 0.05 * muD), 24.0);
+
+        if (cRemodDiffLum > threshD && cRemodDiffLum > 1e-4) {
+            float softLum = threshD + (cRemodDiffLum - threshD) / (1.0 + (cRemodDiffLum - threshD) / max(threshD, 1.0));
+            outDiff *= (softLum / cRemodDiffLum);
+        } else if (maxNbrD > threshD) {
+            vec3 diffusedD = vec3(0.0);
+            float spreadCap = max(threshD - cRemodDiffLum, 0.0);
+            float invCurrZ = 1.0 / max(cWorldND.w, 0.05);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = clx + dx;
+                    int ny = cly + dy;
+                    vec4 nAux = reblurUnpackHalf4(s_aux[ny][nx]);
+                    uint nFlags = uint(round(nAux.w));
+                    if ((nFlags & 11u) != 0u) continue; // skip sky, emissive, transmissive
+                    float nLum = nAux.x;
+                    if (nLum <= threshD) continue;
+                    vec4 nWND = reblurUnpackHalf4(s_worldND[ny][nx]);
+                    if (dot(cWorldND.xyz, nWND.xyz) <= 0.70) continue;
+                    if (abs(cWorldND.w - nWND.w) * invCurrZ > 0.10) continue;
+                    vec3 nCol = reblurUnpackHalf4(s_diff[ny][nx]).rgb;
+                    float softN = threshD + (nLum - threshD) / (1.0 + (nLum - threshD) / max(threshD, 1.0));
+                    float excessFrac = min(nLum - softN, 2.0 * threshD) * 0.125 / max(nLum, 1e-4);
+                    diffusedD += nCol * excessFrac;
+                }
+            }
+            float addRemodRatio = reblurLuminance(diffusedD) / max(reblurLuminance(outDiff) + 1e-4, 1e-4);
+            float addLumEst = cRemodDiffLum * addRemodRatio;
+            if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                diffusedD *= (spreadCap / addLumEst);
+            }
+            outDiff += diffusedD;
+        }
+    }
+
+    if (!isEmissive && validNbrS >= 3.0) {
+        float invN = 1.0 / validNbrS;
+        float muS = m1S * invN;
+        float sigS = sqrt(max(0.0, m2S * invN - muS * muS));
+
+        if (!isMirrorOrGlass) {
+            float threshS = max(muS + 6.0 * max(sigS, 0.05 * muS), 32.0);
+            if (cRemodSpecLum > threshS && cRemodSpecLum > 1e-4) {
+                float softLum = threshS + (cRemodSpecLum - threshS) / (1.0 + (cRemodSpecLum - threshS) / max(threshS, 1.0));
+                outSpec *= (softLum / cRemodSpecLum);
+            } else if (maxNbrS > threshS) {
+                vec3 diffusedS = vec3(0.0);
+                float spreadCap = max(threshS - cRemodSpecLum, 0.0);
+                float invCurrZ = 1.0 / max(cWorldND.w, 0.05);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = clx + dx;
+                        int ny = cly + dy;
+                        vec4 nAux = reblurUnpackHalf4(s_aux[ny][nx]);
+                        uint nFlags = uint(round(nAux.w));
+                        if ((nFlags & 15u) != 0u) continue; // skip sky, emissive, mirror, transmissive
+                        float nLum = nAux.y;
+                        if (nLum <= threshS) continue;
+                        if (abs(cRough - nAux.z) > 0.15) continue;
+                        vec4 nWND = reblurUnpackHalf4(s_worldND[ny][nx]);
+                        if (dot(cWorldND.xyz, nWND.xyz) <= 0.70) continue;
+                        if (abs(cWorldND.w - nWND.w) * invCurrZ > 0.10) continue;
+                        vec3 nCol = reblurUnpackHalf4(s_spec[ny][nx]).rgb;
+                        float softN = threshS + (nLum - threshS) / (1.0 + (nLum - threshS) / max(threshS, 1.0));
+                        float excessFrac = min(nLum - softN, 2.0 * threshS) * 0.125 / max(nLum, 1e-4);
+                        diffusedS += nCol * excessFrac;
+                    }
+                }
+                float addRemodRatio = reblurLuminance(diffusedS) / max(reblurLuminance(outSpec) + 1e-4, 1e-4);
+                float addLumEst = cRemodSpecLum * addRemodRatio;
+                if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                    diffusedS *= (spreadCap / addLumEst);
+                }
+                outSpec += diffusedS;
+            }
+        } else if (muS < 4.0) {
+            // Isolated 1-pixel bounce-2 firefly guard on mirrors & glass:
+            // real reflected ceiling lights have muS ~ 15.0 (100% untouched), while isolated
+            // 50-188 1-spp sparkles on dark floor reflections / glass rims are cleanly diffused.
+            float threshIso = max(muS + 6.0 * max(sigS, 0.10 * muS), 12.0);
+            if (cRemodSpecLum > threshIso && cRemodSpecLum > 1e-4) {
+                float softLum = threshIso + (cRemodSpecLum - threshIso) / (1.0 + (cRemodSpecLum - threshIso) / max(threshIso, 1.0));
+                outSpec *= (softLum / cRemodSpecLum);
+            } else if (maxNbrS > threshIso) {
+                vec3 diffusedIso = vec3(0.0);
+                float spreadCap = max(threshIso - cRemodSpecLum, 0.0);
+                float invCurrZ = 1.0 / max(cWorldND.w, 0.05);
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        int nx = clx + dx;
+                        int ny = cly + dy;
+                        vec4 nAux = reblurUnpackHalf4(s_aux[ny][nx]);
+                        uint nFlags = uint(round(nAux.w));
+                        if ((nFlags & 3u) != 0u) continue; // skip sky & emissive
+                        if ((nFlags & 4u) == 0u) continue; // match mirror/glass class
+                        float nLum = nAux.y;
+                        if (nLum <= threshIso) continue;
+                        vec4 nWND = reblurUnpackHalf4(s_worldND[ny][nx]);
+                        if (dot(cWorldND.xyz, nWND.xyz) <= 0.70) continue;
+                        if (abs(cWorldND.w - nWND.w) * invCurrZ > 0.10) continue;
+                        vec3 nCol = reblurUnpackHalf4(s_spec[ny][nx]).rgb;
+                        float softN = threshIso + (nLum - threshIso) / (1.0 + (nLum - threshIso) / max(threshIso, 1.0));
+                        float excessFrac = min(nLum - softN, 2.0 * threshIso) * 0.125 / max(nLum, 1e-4);
+                        diffusedIso += nCol * excessFrac;
+                    }
+                }
+                float addRemodRatio = reblurLuminance(diffusedIso) / max(reblurLuminance(outSpec) + 1e-4, 1e-4);
+                float addLumEst = cRemodSpecLum * addRemodRatio;
+                if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                    diffusedIso *= (spreadCap / addLumEst);
+                }
+                outSpec += diffusedIso;
+            }
+        }
+    }
+
+    imageStore(uOutPreDiff, coord, vec4(clamp(outDiff, 0.0, REBLUR_MAX_FP16), clamp(reconDiffHitT, 0.0, 10000.0)));
+    imageStore(uOutPreSpec, coord, vec4(clamp(outSpec, 0.0, REBLUR_MAX_FP16), clamp(reconSpecHitT, 0.0, 10000.0)));
+}

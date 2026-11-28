@@ -170,6 +170,9 @@ void main() {
         SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
         wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
         wNrm      = normalizeNormalV5(vec3(sanitizeFloat(wg.r, 0.0), sanitizeFloat(wg.g, 0.0), sanitizeFloat(wg.b, 1.0)));
+        if (pc.camMotionParams.y > 0.5) {
+            wNrm  = normalizeNormalV5(rotateByQuatV5(pc.prevToCurrViewQuat, wNrm));
+        }
         wDepth    = clamp(sanitizeFloat(wg.a, 10000.0), 0.0, 10000.0);
         wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
     }
@@ -204,7 +207,19 @@ void main() {
     float dzEdge     = isSky ? 0.0 : clamp(safeLog1pF(maxRelDz * 32.0), 0.0, 4.0);
     float structEdge = isSky ? 0.0 : clamp(safeLog1pF(maxDn * 16.0 + maxDsd * 8.0 + maxDalb * 4.0 + validSurf * maxDwd * 3.0), 0.0, 4.0);
 
-    float depthRelDiff = clamp((linDepth - wDepth) / max(linDepth, 1e-2), -1.0, 1.0);
+    float expectedPrevZ = linDepth;
+    if (pc.camMotionParams.y > 0.5 && !isSky) {
+        int fullLrH = int(max(pc.fullLrHeight, pc.lrHeight));
+        vec2 currFullUV = (vec2(float(p.x), float(p.y + int(pc.bandLrY0))) + vec2(0.5)) / vec2(float(W), float(fullLrH));
+        vec2 ndc = currFullUV * 2.0 - vec2(1.0);
+        float tanHalfFovY = pc.currToPrevTransView.w;
+        float aspect = pc.camMotionParams.x;
+        vec3 currViewPos = vec3(ndc.x * aspect * tanHalfFovY * linDepth, -ndc.y * tanHalfFovY * linDepth, -linDepth);
+        vec4 invQ = vec4(-pc.prevToCurrViewQuat.xyz, pc.prevToCurrViewQuat.w);
+        vec3 prevViewPos = rotateByQuatV5(invQ, currViewPos) + pc.currToPrevTransView.xyz;
+        expectedPrevZ = max(-prevViewPos.z, 1e-2);
+    }
+    float depthRelDiff = clamp((expectedPrevZ - wDepth) / max(expectedPrevZ, 1e-2), -1.0, 1.0);
     float nrmDot       = clamp(dot(viewNormal, wNrm), -1.0, 1.0);
     float effMv        = max(sqrt(dot(surfMv, surfMv) + 1e-12), sqrt(dot(specMv, specMv) + 1e-12));
     float specInvEnc   = (abs(specInvZ) > 1e-5) ? (specInvZ * 4.0) : (4.0 / (1.0 + linDepth));

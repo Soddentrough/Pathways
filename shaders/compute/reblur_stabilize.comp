@@ -1,0 +1,226 @@
+#version 460
+
+// =============================================================================
+// ReBLUR Pass 5: Albedo Remodulation, Reinhard Tone-Space 3x3 Blackman-Harris
+//                Unjittering, 5-Tap Catmull-Rom History Reprojection & YCoCg
+//                Variance AABB Temporal Stabilization
+//                - Smooth mirrors (rough < 0.04) bypass surface-MV stabilization
+//                  to eliminate convex-mirror reflection forward-drag/smearing
+//                - Bypassed entirely when upscalerCoupled != 0 (FSR 3.1 TAAU)
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REBLUR_USE_CAMERA_UBO
+#include "reblur_common.glsl"
+
+layout(set = 0, binding = 1,  rgba16f) readonly  uniform image2D   uInCleanDiff;
+layout(set = 0, binding = 2,  rgba16f) readonly  uniform image2D   uInCleanSpec;
+layout(set = 0, binding = 3,  rgba16f) readonly  uniform image2D   uInAlbedoRoughness;
+layout(set = 0, binding = 4,  rgba16f) readonly  uniform image2D   uInSpecAlbedo;
+layout(set = 0, binding = 5,  rgba16f) readonly  uniform image2D   uInSkip;
+layout(set = 0, binding = 6,  rgba16f) readonly  uniform image2D   uInCurrWorldND;
+layout(set = 0, binding = 7,  rgba16f) readonly  uniform image2D   uInMotionVectors;
+layout(set = 0, binding = 8,  rgba16f) readonly  uniform image2D   uInHistMeta;
+layout(set = 0, binding = 9)           uniform sampler2D           uPrevStabHistory;
+
+layout(set = 0, binding = 10, rgba16f) writeonly uniform image2D   uOutStabHistory;
+layout(set = 0, binding = 11)          writeonly uniform image2D   uOutDenoised;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint resetHistory;
+    uint upscalerCoupled;
+} pc;
+
+#define TILE_DIM    18
+#define TILE_STRIDE 19
+
+shared uvec2 s_hdr[TILE_DIM][TILE_STRIDE]; // fp16x4: remodulated HDR rgb, roughness (< 0 if sky)
+
+vec4 evaluateRemodulated(ivec2 p) {
+    float z = reblurSanitizeScalar(imageLoad(uInCurrWorldND, p).w, 10000.0);
+    bool isSky = reblurIsSky(z);
+    vec3 skip = reblurSanitizeRgb(imageLoad(uInSkip, p).rgb);
+    if (isSky) {
+        return vec4(min(skip, vec3(REBLUR_MAX_FP16)), -1.0);
+    }
+
+    vec4 ar = imageLoad(uInAlbedoRoughness, p);
+    vec4 sa = imageLoad(uInSpecAlbedo, p);
+    vec3 effDiffAlb = reblurEffectiveAlbedo(ar.rgb, z);
+    vec3 effSpecAlb = reblurEffectiveAlbedo(sa.rgb, z);
+    float rough = clamp(reblurSanitizeScalar(ar.a, 1.0), 0.0, 1.0);
+
+    vec3 diffClean = reblurSanitizeRgb(imageLoad(uInCleanDiff, p).rgb);
+    vec3 specClean = reblurSanitizeRgb(imageLoad(uInCleanSpec, p).rgb);
+    vec3 hdr = min(skip + diffClean * effDiffAlb + specClean * effSpecAlb, vec3(REBLUR_MAX_FP16));
+    return vec4(hdr, rough);
+}
+
+// 5-tap Jimenez Catmull-Rom bicubic filter using hardware bilinear texture fetches.
+vec3 sampleCatmullRom5Tap(vec2 uv, vec2 res) {
+    vec2 samplePos = uv * res;
+    vec2 texPos1   = floor(samplePos - 0.5) + 0.5;
+    vec2 f         = samplePos - texPos1;
+
+    vec2 w0  = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1  = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2  = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3  = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 invRes   = 1.0 / res;
+    vec2 texPos0  = (texPos1 - 1.0) * invRes;
+    vec2 texPos3  = (texPos1 + 2.0) * invRes;
+    vec2 texPos12 = (texPos1 + offset12) * invRes;
+
+    float wtCenter = w12.x * w12.y;
+    float wtTop    = w12.x * w0.y;
+    float wtLeft   = w0.x  * w12.y;
+    float wtRight  = w3.x  * w12.y;
+    float wtBottom = w12.x * w3.y;
+
+    vec3 result = vec3(0.0);
+    result += reblurSanitizeRgb(textureLod(uPrevStabHistory, vec2(texPos12.x, texPos0.y),  0.0).rgb) * wtTop;
+    result += reblurSanitizeRgb(textureLod(uPrevStabHistory, vec2(texPos0.x,  texPos12.y), 0.0).rgb) * wtLeft;
+    result += reblurSanitizeRgb(textureLod(uPrevStabHistory, vec2(texPos12.x, texPos12.y), 0.0).rgb) * wtCenter;
+    result += reblurSanitizeRgb(textureLod(uPrevStabHistory, vec2(texPos3.x,  texPos12.y), 0.0).rgb) * wtRight;
+    result += reblurSanitizeRgb(textureLod(uPrevStabHistory, vec2(texPos12.x, texPos3.y),  0.0).rgb) * wtBottom;
+
+    float wSum = wtCenter + wtTop + wtLeft + wtRight + wtBottom;
+    return max(result / max(wSum, 1e-4), vec3(0.0));
+}
+
+void main() {
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    uint linearIdx = gl_LocalInvocationIndex;
+    int tx = int(linearIdx & 15u);
+    int ty = int(linearIdx >> 4u);
+    ivec2 coord = tileOrigin + ivec2(tx, ty);
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    // Upscaler-coupled fast path (uniform branch): output remodulated HDR directly
+    // without unjittering or temporal stabilization (FSR 3.1 performs TAAU).
+    if (pc.upscalerCoupled != 0u) {
+        if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) {
+            return;
+        }
+        vec3 hdr = evaluateRemodulated(coord).rgb;
+        imageStore(uOutStabHistory, coord, vec4(hdr, 1.0));
+        imageStore(uOutDenoised,    coord, vec4(hdr, 1.0));
+        return;
+    }
+
+    // 1. Cooperative 18x18 compact FP16 LDS load of remodulated HDR frame (~2.7 KB)
+    s_hdr[ty + 1][tx + 1] = reblurPackHalf4(evaluateRemodulated(clamp(coord, ivec2(0), imgMax)));
+    if (linearIdx < 68u) {
+        int lx, ly;
+        if (linearIdx < 18u) {
+            ly = 0;
+            lx = int(linearIdx);
+        } else if (linearIdx < 36u) {
+            ly = 17;
+            lx = int(linearIdx - 18u);
+        } else {
+            uint u = linearIdx - 36u;
+            ly = 1 + int(u >> 1u);
+            lx = ((u & 1u) == 0u) ? 0 : 17;
+        }
+        ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
+        s_hdr[ly][lx] = reblurPackHalf4(evaluateRemodulated(apronCoord));
+    }
+    barrier();
+
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) {
+        return;
+    }
+
+    int clx = tx + 1;
+    int cly = ty + 1;
+    vec4  centerSample = reblurUnpackHalf4(s_hdr[cly][clx]);
+    vec3  centerHdr    = centerSample.rgb;
+    float centerRough  = centerSample.a; // < 0.0 means sky
+    bool  isMirror     = (centerRough >= 0.0 && centerRough < 0.04);
+
+    vec2 res = vec2(float(pc.width), float(pc.height));
+    vec2 currJitterPx = uCam.currJitterUv * res;
+    bool hasJitter = (dot(currJitterPx, currJitterPx) > 1e-6);
+
+    // 2. Reinhard tone-space 3x3 Blackman-Harris unjittering + 3x3 YCoCg variance AABB
+    //    Reinhard compression prevents bright HDR highlights (e.g. 17.0 mirror ceiling light)
+    //    from bleeding halos onto dark neighbors while staying energy-neutral on walls.
+    vec3  unjitTcAcc = vec3(0.0);
+    float bhWSum     = 0.0;
+    vec3  ycocgM1    = vec3(0.0);
+    vec3  ycocgM2    = vec3(0.0);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec3 nbrHdr = reblurUnpackHalf4(s_hdr[cly + dy][clx + dx]).rgb;
+            vec3 nbrTc  = reblurTonemap(nbrHdr);
+            vec3 nbrYcc = reblurRgbToYCoCg(nbrTc);
+            ycocgM1 += nbrYcc;
+            ycocgM2 += nbrYcc * nbrYcc;
+
+            if (hasJitter) {
+                vec2 deltaPx = vec2(float(dx), float(dy)) + currJitterPx;
+                float w = reblurBlackmanHarrisWeight(deltaPx);
+                unjitTcAcc += nbrTc * w;
+                bhWSum     += w;
+            }
+        }
+    }
+
+    vec3 unjitTc   = hasJitter ? (unjitTcAcc / max(bhWSum, 1e-4)) : reblurTonemap(centerHdr);
+    vec3 unjitCurr = hasJitter ? reblurInverseTonemap(unjitTc) : centerHdr;
+
+    // On smooth mirrors (rough < 0.04), bypass Pass 5 surface-MV stabilization completely!
+    // Pass 1 already temporally denoised specular using curvature-aware VMV; surface-MV
+    // reprojection here would drag curved reflections forward along vSurface.
+    if (isMirror) {
+        vec3 outMirror = clamp(unjitCurr, 0.0, REBLUR_MAX_FP16);
+        imageStore(uOutStabHistory, coord, vec4(outMirror, 1.0));
+        imageStore(uOutDenoised,    coord, vec4(outMirror, 1.0));
+        return;
+    }
+
+    vec3 ycocgMean  = ycocgM1 * (1.0 / 9.0);
+    vec3 ycocgSigma = sqrt(max(ycocgM2 * (1.0 / 9.0) - ycocgMean * ycocgMean, vec3(0.0)));
+    vec3 currYcc    = reblurRgbToYCoCg(unjitTc);
+    vec3 aabbMin    = min(ycocgMean - 1.25 * ycocgSigma, currYcc);
+    vec3 aabbMax    = max(ycocgMean + 1.25 * ycocgSigma, currYcc);
+
+    // 3. Catmull-Rom reprojection of unjittered stabilization history at currUV - vSurface
+    vec2 currUV = (vec2(coord) + 0.5) / res;
+    vec2 vSurface = reblurSanitizeVec2(imageLoad(uInMotionVectors, coord).xy);
+    vec2 prevUnjitUV = currUV - vSurface;
+
+    vec3  outHdr = unjitCurr;
+    float disocc = 1.0;
+
+    if (pc.resetHistory == 0u &&
+        prevUnjitUV.x >= 0.0 && prevUnjitUV.x <= 1.0 &&
+        prevUnjitUV.y >= 0.0 && prevUnjitUV.y <= 1.0)
+    {
+        vec4 meta = imageLoad(uInHistMeta, coord);
+        disocc = clamp(1.0 - min(meta.r, meta.g) * 0.25, 0.0, 1.0);
+
+        vec3 prevHistRgb = sampleCatmullRom5Tap(prevUnjitUV, res);
+        vec3 prevHistTc  = reblurTonemap(prevHistRgb);
+        vec3 prevHistYcc = reblurRgbToYCoCg(prevHistTc);
+        vec3 clippedYcc  = reblurClipAABB(aabbMin, aabbMax, prevHistYcc, currYcc);
+        vec3 clippedTc   = max(reblurYCoCgToRgb(clippedYcc), vec3(0.0));
+
+        float alpha = clamp(0.10 + 0.15 * disocc, 0.06, 1.0);
+        vec3 blendedTc = mix(clippedTc, unjitTc, alpha);
+        outHdr = reblurInverseTonemap(blendedTc);
+    }
+
+    outHdr = clamp(outHdr, 0.0, REBLUR_MAX_FP16);
+    imageStore(uOutStabHistory, coord, vec4(outHdr, 1.0 - disocc));
+    imageStore(uOutDenoised,    coord, vec4(outHdr, 1.0));
+}

@@ -46,7 +46,7 @@ void writeQuadSlot(int qx, int qy, int corner, int W1, uvec2 f0, uvec2 f1, uvec2
 #endif
 
 void evalWarpGeomTap(
-    vec4 pg, bool inOk, float bw, float linDepth, vec3 viewNormal,
+    vec4 pg, bool inOk, float bw, float expectedPrevZ, vec3 viewNormal,
     bool evalSpec, float relThreshS, out float wD, out float wS
 ) {
     float pDepth = ((floatBitsToUint(pg.a) & 0x7FFFFFFFu) < 0x7F800000u) ? clamp(pg.a, 0.0, 10000.0) : 10000.0;
@@ -54,7 +54,12 @@ void evalWarpGeomTap(
     vec3  pNrmR  = clamp(pg.rgb, vec3(-1.0), vec3(1.0));
     float len2   = dot(pNrmR, pNrmR);
     vec3  pNrm   = (len2 > 1e-10) ? (pNrmR * inversesqrt(len2)) : vec3(0.0, 0.0, 1.0);
-    float relE   = abs(pDepth - linDepth) / max(max(linDepth, pDepth), 1e-3);
+    if (pc.camMotionParams.y > 0.5) {
+        vec3 rotN = rotateByQuatUpways(pc.prevToCurrViewQuat, pNrm);
+        float rLen2 = dot(rotN, rotN);
+        pNrm = (rLen2 > 1e-10) ? (rotN * inversesqrt(rLen2)) : vec3(0.0, 0.0, 1.0);
+    }
+    float relE   = abs(pDepth - expectedPrevZ) / max(max(expectedPrevZ, pDepth), 1e-3);
     float ndot   = max(dot(viewNormal, pNrm), 0.0);
     float ndot2  = ndot * ndot;
     wD = vOk * exp2(-max(relE - 0.06, 0.0) * 17.3123405) * (ndot2 * ndot2);
@@ -316,6 +321,16 @@ void main() {
                          && (sCoord.y >= -1.0) && (sCoord.y < float(H));
     bool  sameMv         = inBndD && inBndS && all(equal(effSpecMv, surfaceMv));
     float relThreshS     = 0.06 + 0.05 * min(specDeltaPx, 6.0);
+    float expectedPrevZ  = linDepth;
+    if (pc.camMotionParams.y > 0.5 && !isSky) {
+        vec2  ndc         = currUV * 2.0 - vec2(1.0);
+        float tanHalfFovY = pc.currToPrevTransView.w;
+        float aspect      = pc.camMotionParams.x;
+        vec3  currViewPos = vec3(ndc.x * aspect * tanHalfFovY * linDepth, -ndc.y * tanHalfFovY * linDepth, -linDepth);
+        vec4  invQ        = vec4(-pc.prevToCurrViewQuat.xyz, pc.prevToCurrViewQuat.w);
+        vec3  prevViewPos = rotateByQuatUpways(invQ, currViewPos) + pc.currToPrevTransView.xyz;
+        expectedPrevZ     = max(-prevViewPos.z, 1e-2);
+    }
 
     vec3  yDiffPrev   = vec3(0.0);
     float prevNDiff   = 0.0;
@@ -348,10 +363,10 @@ void main() {
         vec4 pg1 = imageLoad(uPrevGeomLr, tc1);
         vec4 pg2 = imageLoad(uPrevGeomLr, tc2);
         vec4 pg3 = imageLoad(uPrevGeomLr, tc3);
-        evalWarpGeomTap(pg0, ok0, bw0, linDepth, viewNormal, sameMv, relThreshS, wD0, wS0);
-        evalWarpGeomTap(pg1, ok1, bw1, linDepth, viewNormal, sameMv, relThreshS, wD1, wS1);
-        evalWarpGeomTap(pg2, ok2, bw2, linDepth, viewNormal, sameMv, relThreshS, wD2, wS2);
-        evalWarpGeomTap(pg3, ok3, bw3, linDepth, viewNormal, sameMv, relThreshS, wD3, wS3);
+        evalWarpGeomTap(pg0, ok0, bw0, expectedPrevZ, viewNormal, sameMv, relThreshS, wD0, wS0);
+        evalWarpGeomTap(pg1, ok1, bw1, expectedPrevZ, viewNormal, sameMv, relThreshS, wD1, wS1);
+        evalWarpGeomTap(pg2, ok2, bw2, expectedPrevZ, viewNormal, sameMv, relThreshS, wD2, wS2);
+        evalWarpGeomTap(pg3, ok3, bw3, expectedPrevZ, viewNormal, sameMv, relThreshS, wD3, wS3);
 
         float sumTapW  = wD0 + wD1 + wD2 + wD3;
         float sumTapWS = wS0 + wS1 + wS2 + wS3;
@@ -425,10 +440,10 @@ void main() {
         vec4 pg1_s = imageLoad(uPrevGeomLr, tc1);
         vec4 pg2_s = imageLoad(uPrevGeomLr, tc2);
         vec4 pg3_s = imageLoad(uPrevGeomLr, tc3);
-        evalWarpGeomTap(pg0_s, ok0, bw0, linDepth, viewNormal, true, relThreshS, dummyD0, wS0);
-        evalWarpGeomTap(pg1_s, ok1, bw1, linDepth, viewNormal, true, relThreshS, dummyD1, wS1);
-        evalWarpGeomTap(pg2_s, ok2, bw2, linDepth, viewNormal, true, relThreshS, dummyD2, wS2);
-        evalWarpGeomTap(pg3_s, ok3, bw3, linDepth, viewNormal, true, relThreshS, dummyD3, wS3);
+        evalWarpGeomTap(pg0_s, ok0, bw0, expectedPrevZ, viewNormal, true, relThreshS, dummyD0, wS0);
+        evalWarpGeomTap(pg1_s, ok1, bw1, expectedPrevZ, viewNormal, true, relThreshS, dummyD1, wS1);
+        evalWarpGeomTap(pg2_s, ok2, bw2, expectedPrevZ, viewNormal, true, relThreshS, dummyD2, wS2);
+        evalWarpGeomTap(pg3_s, ok3, bw3, expectedPrevZ, viewNormal, true, relThreshS, dummyD3, wS3);
 
         float sumTapWS = wS0 + wS1 + wS2 + wS3;
         if (sumTapWS > 1e-4) {

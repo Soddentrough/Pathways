@@ -25,7 +25,7 @@
 #include "rgb9e5.glsl"
 
 // -----------------------------------------------------------------------------
-// Push Constants (80 bytes exact)
+// Push Constants (128 bytes exact)
 // -----------------------------------------------------------------------------
 layout(push_constant) uniform UpwaysPC {
     uint  lrWidth;        // 0
@@ -48,6 +48,9 @@ layout(push_constant) uniform UpwaysPC {
     uint  fullHrHeight;   // 68 (full HR frame height)
     uint  keepHrYStart;   // 72 (first band-local HR row written to uOutputColor)
     uint  keepHrYEnd;     // 76 (exclusive band-local HR row written to uOutputColor)
+    vec4  prevToCurrViewQuat;   // 80  (xyzw unit quat rotating prev view -> curr view)
+    vec4  currToPrevTransView;  // 96  (xyz = (prevView * inverse(currView))[3].xyz, w = tanHalfFovY)
+    vec4  camMotionParams;      // 112 (x = aspectRatio, y = camMotionValid [1.0 when live camera], z/w = 0)
 } pc;
 
 const uint UPWAYS_FLAG_RESET_HISTORY      = 1u;
@@ -140,6 +143,11 @@ vec3 sanitizeRgb(vec3 c) {
 
 float sanitizeFloat(float v, float fallback) {
     return ((floatBitsToUint(v) & 0x7FFFFFFFu) < 0x7F800000u) ? v : fallback;
+}
+
+vec3 rotateByQuatUpways(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
 }
 
 bool isSkyOrEmissiveOnly(float linearDepth, float matClass, vec3 aDiff, vec3 aSpec) {

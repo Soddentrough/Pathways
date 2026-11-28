@@ -1363,7 +1363,8 @@ void UpwaysV5Engine::recordFrame(
     bool coupledWithExternalUpscaler,
     bool zeroResidualMode,
     float exposureScale,
-    const UpwaysBandParams& band
+    const UpwaysBandParams& band,
+    const UpwaysCameraMotion& cameraMotion
 ) {
     (void)exposureScale;
     if (!isInitialized()) {
@@ -1411,6 +1412,9 @@ void UpwaysV5Engine::recordFrame(
     pc.fullHrHeight = (band.fullHrHeight > 0u) ? band.fullHrHeight : m_outputHeight;
     pc.keepHrYStart = band.keepHrYStart;
     pc.keepHrYEnd = (band.keepHrYEnd > 0u) ? band.keepHrYEnd : m_outputHeight;
+    pc.prevToCurrViewQuat = cameraMotion.prevToCurrViewQuat;
+    pc.currToPrevTransView = cameraMotion.currToPrevTransView;
+    pc.camMotionParams = cameraMotion.camMotionParams;
 
     const uint32_t qSlot = m_querySlot;
     const uint32_t qBase = qSlot * QUERIES_PER_SLOT;

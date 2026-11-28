@@ -395,10 +395,12 @@ void RayTracingOrchestrator::recordRayTracing(
                                      config.upscaler_mode == UpscalerMode::Upways ||
                                      config.upways_superres);
         const bool isFfxRrActive = (config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        const bool isReblurActive = (config.denoiser_mode == DenoiserMode::Reblur);
+        const bool isSplit4SigDenoiser = (isFfxRrActive || isReblurActive);
         const bool isTrainingCapture = !config.capture_training_data_dir.empty();
-        bool isDenoisingActive = (isFfxRrActive || isUpwaysActive);
-        const bool needSplit4SigBuffers = (isFfxRrActive || config.capture_channels >= 44u);
-        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive &&
+        bool isDenoisingActive = (isSplit4SigDenoiser || isUpwaysActive);
+        const bool needSplit4SigBuffers = (isSplit4SigDenoiser || config.capture_channels >= 44u);
+        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isSplit4SigDenoiser &&
                                       (mlIrradianceImage != nullptr) &&
                                       (mlPrimaryGuideImage != nullptr) &&
                                       (mlSurfaceMvImage != nullptr) &&
@@ -413,11 +415,13 @@ void RayTracingOrchestrator::recordRayTracing(
 
         // Compact live mode only needs to zero-clear sparse/additive compact targets
         // (classify overwrites every primary guide & surface MV pixel);
-        // legacy training / FFX Ray Regeneration keeps the 64 B/px cleared float targets.
+        // legacy training / FFX Ray Regeneration / ReBLUR keeps the 64 B/px cleared float targets.
+        // Always clear mlSpecVmvImage whenever needMlBuffers is true so wavefront_classify.comp
+        // curvature handoff works cleanly in both 4-signal and compact-live modes.
         bool needMlBuffers = isDenoisingActive || isTrainingCapture || needSplit4SigBuffers;
         if (needMlBuffers) {
+            VkClearColorValue clearUintZero{};
             if (useCompactMlLive) {
-                VkClearColorValue clearUintZero{};
                 vkCmdClearColorImage(cmd, mlIrradianceImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
                 vkCmdClearColorImage(cmd, mlDiffHitDistImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
                 vkCmdClearColorImage(cmd, mlSpecVmvImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
@@ -434,6 +438,9 @@ void RayTracingOrchestrator::recordRayTracing(
                 }
                 if (mlSpecAlbedoImage) {
                     vkCmdClearColorImage(cmd, mlSpecAlbedoImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearZero, 1, &clearRange);
+                }
+                if (mlSpecVmvImage) {
+                    vkCmdClearColorImage(cmd, mlSpecVmvImage->getImage(), VK_IMAGE_LAYOUT_GENERAL, &clearUintZero, 1, &clearRange);
                 }
             }
         }
@@ -482,6 +489,7 @@ void RayTracingOrchestrator::recordRayTracing(
                 addClearBarrier(mlSpecularImage);
                 addClearBarrier(mlSkipImage);
                 addClearBarrier(mlSpecAlbedoImage);
+                addClearBarrier(mlSpecVmvImage);
             }
         }
         if (needSplit4SigBuffers) {
@@ -567,23 +575,23 @@ void RayTracingOrchestrator::recordRayTracing(
         bool needNormals = (config.upscaler_mode == UpscalerMode::Upways ||
                             config.upscaler_mode == UpscalerMode::FSR ||
                             config.denoiser_mode == DenoiserMode::Upways ||
-                            config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                            isSplit4SigDenoiser ||
                             config.enable_caustics ||
                             isTrainingCapture);
         bool needNdStore = (!useCompactMlLive && needNormals) ||
                            (config.upscaler_mode == UpscalerMode::FSR) ||
-                           isFfxRrActive ||
+                           isSplit4SigDenoiser ||
                            config.enable_caustics ||
                            isTrainingCapture;
         bool needMvStore = (!useCompactMlLive && needNormals) ||
                            (config.upscaler_mode == UpscalerMode::FSR) ||
-                           isFfxRrActive ||
+                           isSplit4SigDenoiser ||
                            params.isRestirActive ||
                            config.enable_caustics ||
                            isTrainingCapture;
-        bool captureMl = (isUpwaysActive || isFfxRrActive || isTrainingCapture);
+        bool captureMl = (isUpwaysActive || isSplit4SigDenoiser || isTrainingCapture);
         bool captureMlV4 = (isUpwaysActive || config.capture_channels >= 32u);
-        const bool captureSplit4Sig = (isFfxRrActive || config.capture_channels >= 44u);
+        const bool captureSplit4Sig = (isSplit4SigDenoiser || config.capture_channels >= 44u);
         wfSceneData.captureMlData = (captureMl ? 1u : 0u)
                                   | (((captureMl || captureSplit4Sig) && keepAccumWithMl) ? 2u : 0u)
                                   | (captureMlV4 ? 4u : 0u)

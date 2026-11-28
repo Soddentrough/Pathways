@@ -1,0 +1,433 @@
+#version 460
+#extension GL_KHR_shader_subgroup_vote : require
+
+// =============================================================================
+// ReBLUR Pass 2: Disocclusion Multi-Scale History Fix (N < 4) +
+//                Fused 18x18 Compact-LDS Step-1 A-Trous & 3x3 Variance Pre-Filter
+//   - Eliminates the redundant 40 B/px settled-tile copy into m_pingPong[0]
+//   - Settled tiles (N >= 4) evaluate step=1 3x3 A-Trous + variance pre-filter
+//     entirely from compact FP16-packed LDS (< 11 KB, 6x fewer VRAM reads)
+//   - Disoccluded pixels (N < 4) perform multi-scale bilateral gather (s=4,2,1)
+//     blended by (1 - N/4), seeding spatial variance (mirrors & glass bypassed)
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REBLUR_USE_CAMERA_UBO
+#include "reblur_common.glsl"
+
+layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D uInHistDiff;
+layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D uInHistSpec;
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uInHistMeta;
+layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D uCurrWorldND;
+layout(set = 0, binding = 5, rgba16f) readonly  uniform image2D uAlbedoRoughness;
+layout(set = 0, binding = 6, rg16f)   readonly  uniform image2D uHistHitT;
+
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D uOutDiff;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutSpec;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint pad0;
+    uint pad1;
+} pc;
+
+// 18x18 compact FP16-packed LDS (~10.9 KB total)
+#define TILE_DIM    18
+#define TILE_STRIDE 19
+
+shared uvec2 s_diff[TILE_DIM][TILE_STRIDE]; // fp16x4: rgb, packedVarD (sign = zeroDiffAlb)
+shared uvec2 s_spec[TILE_DIM][TILE_STRIDE]; // fp16x4: rgb, varS
+shared uvec2 s_wnd[TILE_DIM][TILE_STRIDE];  // fp16x4: worldN.xyz, depth
+shared uvec2 s_aux[TILE_DIM][TILE_STRIDE];  // fp16x4: rough, diffHitT, packedSpecHitT, nDiff
+
+void loadTileLDS(ivec2 globalCoord, int lx, int ly) {
+    vec4 wnd = imageLoad(uCurrWorldND, globalCoord);
+    s_wnd[ly][lx] = reblurPackHalf4(wnd);
+    if (reblurIsSky(wnd.w)) {
+        s_diff[ly][lx] = uvec2(0u);
+        s_spec[ly][lx] = uvec2(0u);
+        s_aux[ly][lx]  = reblurPackHalf4(vec4(1.0, 0.0, 0.0, 32.0));
+        return;
+    }
+    vec4 d  = imageLoad(uInHistDiff, globalCoord);
+    vec4 s  = imageLoad(uInHistSpec, globalCoord);
+    vec4 mt = imageLoad(uInHistMeta, globalCoord);
+    vec2 ht = imageLoad(uHistHitT, globalCoord).rg;
+    float r = clamp(reblurSanitizeScalar(imageLoad(uAlbedoRoughness, globalCoord).a, 1.0), 0.0, 1.0);
+
+    s_diff[ly][lx] = reblurPackHalf4(d);
+    s_spec[ly][lx] = reblurPackHalf4(s);
+    s_aux[ly][lx]  = reblurPackHalf4(vec4(r, ht.x, ht.y, mt.r));
+}
+
+void main() {
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    uint linearIdx = gl_LocalInvocationIndex;
+    int tx = int(linearIdx & 15u);
+    int ty = int(linearIdx >> 4u);
+    ivec2 coord = tileOrigin + ivec2(tx, ty);
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+    bool inBounds = (coord.x < int(pc.width)) && (coord.y < int(pc.height));
+
+    // 1. Cooperative 18x18 LDS load (covers both step=1 A-Trous & s=1 of history fix)
+    loadTileLDS(clamp(coord, ivec2(0), imgMax), tx + 1, ty + 1);
+    if (linearIdx < 68u) {
+        int lx, ly;
+        if (linearIdx < 18u) {
+            ly = 0;
+            lx = int(linearIdx);
+        } else if (linearIdx < 36u) {
+            ly = 17;
+            lx = int(linearIdx - 18u);
+        } else {
+            uint u = linearIdx - 36u;
+            ly = 1 + int(u >> 1u);
+            lx = ((u & 1u) == 0u) ? 0 : 17;
+        }
+        ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
+        loadTileLDS(apronCoord, lx, ly);
+    }
+    barrier();
+
+    int clx = tx + 1;
+    int cly = ty + 1;
+
+    vec4 cWND  = reblurUnpackHalf4(s_wnd[cly][clx]);
+    vec4 cDiff = reblurUnpackHalf4(s_diff[cly][clx]);
+    vec4 cSpec = reblurUnpackHalf4(s_spec[cly][clx]);
+    vec4 cAux  = reblurUnpackHalf4(s_aux[cly][clx]);
+
+    bool  isSky          = reblurIsSky(cWND.w);
+    float cRough         = cAux.x;
+    float cDiffHitT      = max(cAux.y, 0.0);
+    float cRawSpecHit    = cAux.z;
+    bool  isTransmissive = (!isSky) && (cRawSpecHit < 0.0) && (cRough >= 0.15);
+    bool  isMirror       = (!isSky) && (cRough < 0.02);
+    bool  cZeroDiff      = (cDiff.a < 0.0);
+    float cVarD          = abs(reblurSanitizeScalar(cDiff.a, 0.0));
+    float cVarS          = max(reblurSanitizeScalar(cSpec.a, 0.0), 0.0);
+    vec3  cDiffRgb       = reblurSanitizeRgb(cDiff.rgb);
+    vec3  cSpecRgb       = reblurSanitizeRgb(cSpec.rgb);
+
+    vec4 meta = inBounds ? imageLoad(uInHistMeta, coord) : vec4(32.0, 16.0, 0.0, 0.0);
+    float nDiff = meta.r;
+    float nSpec = meta.g;
+
+    // Fast-path sky-only subgroup exit
+    if (subgroupAll((!inBounds) || isSky)) {
+        if (inBounds) {
+            imageStore(uOutDiff, coord, vec4(0.0));
+            imageStore(uOutSpec, coord, vec4(0.0));
+        }
+        return;
+    }
+
+    if (!inBounds) {
+        return;
+    }
+    if (isSky) {
+        imageStore(uOutDiff, coord, vec4(0.0));
+        imageStore(uOutSpec, coord, vec4(0.0));
+        return;
+    }
+
+    vec2 res = vec2(float(pc.width), float(pc.height));
+    vec3 cViewPos = reblurUnprojectToView(coord, cWND.w, uCam.tanHalfFovY, uCam.aspectRatio, res);
+    vec3 nVkView  = reblurWorldNormalToVkView(cWND.xyz, uCam.viewToWorld);
+
+    // Precompute linear tangent-plane projection coefficients
+    float kx = uCam.aspectRatio * uCam.tanHalfFovY * nVkView.x;
+    float ky = uCam.tanHalfFovY * nVkView.y;
+    float scaleX = (2.0 * kx) / res.x;
+    float scaleY = (2.0 * ky) / res.y;
+    float bias = nVkView.z - kx - ky;
+    float centerPlaneDot = dot(cViewPos, nVkView);
+    float pixelFootprint = 2.0 * cViewPos.z * uCam.tanHalfFovY / max(res.y, 1.0);
+    float fp16Floor = max(cViewPos.z * 0.0009765625, 1e-4);
+
+    bool needFixDiff = (nDiff < 4.0);
+    bool needFixSpec = (nSpec < 4.0) && (cRough >= 0.04) && !isTransmissive;
+
+    // =========================================================================
+    // Branch A: Settled tiles (subgroupAll: nDiff >= 4 && nSpec >= 4)
+    //           Fused 18x18 LDS Step-1 3x3 A-Trous + 3x3 Gaussian Variance Pre-Filter
+    // =========================================================================
+    bool settledLane = (!needFixDiff && !needFixSpec);
+    if (subgroupAll(settledLane)) {
+        bool skipDiff = (cVarD <= 3e-6);
+        // On smooth mirrors (cRough < 0.02), allow tight edge-stopped 3x3 LDS polish ONLY when
+        // variance is elevated (e.g. lower floor reflection), preserving crisp ceiling-light edges.
+        bool mirrorPolish = isMirror && (cVarS > 0.01);
+        bool skipSpec = (isMirror && !mirrorPolish) || (cVarS <= 1e-6);
+
+        if (subgroupAll(skipDiff && skipSpec)) {
+            imageStore(uOutDiff, coord, vec4(cDiffRgb, cZeroDiff ? -max(cVarD, 2e-6) : cVarD));
+            imageStore(uOutSpec, coord, vec4(cSpecRgb, cVarS));
+            return;
+        }
+
+        // 3x3 Gaussian variance pre-filter straight from LDS
+        const float GAUSS_1D[3] = float[3](0.25, 0.5, 0.25);
+        float filtVarD = cVarD;
+        float filtVarS = cVarS;
+        if (!skipDiff || !skipSpec) {
+            float vAccD = 0.0, vAccS = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                float gy = GAUSS_1D[dy + 1];
+                for (int dx = -1; dx <= 1; ++dx) {
+                    float g = GAUSS_1D[dx + 1] * gy;
+                    if (!skipDiff) vAccD += abs(reblurUnpackHalf4(s_diff[cly + dy][clx + dx]).a) * g;
+                    if (!skipSpec) vAccS += max(reblurUnpackHalf4(s_spec[cly + dy][clx + dx]).a, 0.0) * g;
+                }
+            }
+            if (!skipDiff) filtVarD = vAccD;
+            if (!skipSpec) filtVarS = vAccS;
+        }
+
+        const float centerW = 0.140625; // (3/8)^2
+        float invDepthTol = 1.0 / max(2.0 * pixelFootprint, fp16Floor);
+
+        // Diffuse step=1 from LDS
+        vec3  outDiffRgb = cDiffRgb;
+        float outDiffVar = cVarD;
+        if (!skipDiff) {
+            float diffHitFactor = (cDiffHitT > 1e-4)
+                ? clamp(cDiffHitT / max(cDiffHitT + cWND.w * 0.5, 1e-3), 0.15, 1.0)
+                : 1.0;
+            float effPhiLumD = 4.0 * mix(0.65, 1.15, diffHitFactor) * mix(1.25, 0.85, clamp(nDiff / 32.0, 0.0, 1.0));
+            float cLumD = reblurLuminance(cDiffRgb);
+
+            vec3  radAcc = cDiffRgb * centerW;
+            float wAcc   = centerW;
+            float varAcc = (centerW * centerW) * cVarD;
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                float wKy = REBLUR_ATROUS_1D[dy + 1];
+                int tapY = clamp(coord.y + dy, 0, imgMax.y);
+                float planeY = (float(tapY) + 0.5) * scaleY + bias;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    vec4 tapWND = reblurUnpackHalf4(s_wnd[cly + dy][clx + dx]);
+                    if (reblurIsSky(tapWND.w)) continue;
+
+                    float cosA = max(dot(cWND.xyz, tapWND.xyz), 0.0);
+                    if (cosA <= 0.15) continue;
+
+                    int tapX = clamp(coord.x + dx, 0, imgMax.x);
+                    float depthArg = abs(tapWND.w * ((float(tapX) + 0.5) * scaleX + planeY) - centerPlaneDot) * invDepthTol;
+                    if (depthArg >= 8.0) continue;
+
+                    vec4 tapData = reblurUnpackHalf4(s_diff[cly + dy][clx + dx]);
+                    if ((tapData.a < 0.0) != cZeroDiff) continue;
+
+                    vec3  tapRgb = reblurSanitizeRgb(tapData.rgb);
+                    float tapVar = abs(tapData.a);
+                    float lumArg = abs(cLumD - reblurLuminance(tapRgb)) / (effPhiLumD * sqrt(max(max(filtVarD, tapVar * 0.5), 1e-5)) + 1e-4);
+
+                    float w = (REBLUR_ATROUS_1D[dx + 1] * wKy) * reblurPow32(cosA) * exp2(-(depthArg + lumArg) * REBLUR_LOG2E);
+                    radAcc += tapRgb * w;
+                    wAcc   += w;
+                    varAcc += (w * w) * tapVar;
+                }
+            }
+            float invW = 1.0 / max(wAcc, 1e-4);
+            outDiffRgb = clamp(radAcc * invW, 0.0, REBLUR_MAX_FP16);
+            outDiffVar = clamp(varAcc * invW * invW, 0.0, REBLUR_MAX_FP16);
+        }
+
+        // Specular step=1 from LDS (tight on transmissive glass & noisy smooth-mirror floor)
+        vec3  outSpecRgb = cSpecRgb;
+        float outSpecVar = cVarS;
+        if (!subgroupAll(skipSpec) && !skipSpec) {
+            float cSpecHitT   = abs(cRawSpecHit);
+            float effRough    = (isTransmissive || mirrorPolish) ? 0.04 : cRough;
+            float effPhiNSpec = min(32.0 / max(effRough * effRough, 0.05), 256.0);
+            float effPhiLumS  = mirrorPolish ? 1.25 : (isTransmissive ? 1.5 : (3.0 * mix(0.70, 1.35, cRough)));
+            float phiRough    = max(0.08 + 0.15 * cRough, 0.06);
+            float cLumS       = reblurLuminance(cSpecRgb);
+            float minCosA     = mirrorPolish ? 0.96 : 0.25;
+
+            vec3  specAcc = cSpecRgb * centerW;
+            float wAcc    = centerW;
+            float varAcc  = (centerW * centerW) * cVarS;
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                float wKy = REBLUR_ATROUS_1D[dy + 1];
+                int tapY = clamp(coord.y + dy, 0, imgMax.y);
+                float planeY = (float(tapY) + 0.5) * scaleY + bias;
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    vec4 tapWND = reblurUnpackHalf4(s_wnd[cly + dy][clx + dx]);
+                    if (reblurIsSky(tapWND.w)) continue;
+
+                    float cosA = max(dot(cWND.xyz, tapWND.xyz), 0.0);
+                    if (cosA <= minCosA) continue;
+
+                    int tapX = clamp(coord.x + dx, 0, imgMax.x);
+                    float depthArg = abs(tapWND.w * ((float(tapX) + 0.5) * scaleX + planeY) - centerPlaneDot) * invDepthTol;
+                    if (depthArg >= 8.0) continue;
+
+                    vec4  tapAux   = reblurUnpackHalf4(s_aux[cly + dy][clx + dx]);
+                    float tapRough = tapAux.x;
+                    if (mirrorPolish) {
+                        if (tapRough >= 0.05) continue;
+                        float tapHitS = abs(tapAux.z);
+                        if (cSpecHitT > 1e-3 && tapHitS > 1e-3) {
+                            float relH = abs(cSpecHitT - tapHitS) / max(max(cSpecHitT, tapHitS), 0.1);
+                            if (relH >= 0.15) continue;
+                        }
+                    }
+                    float roughArg = abs(cRough - tapRough) / phiRough;
+
+                    vec4  tapData = reblurUnpackHalf4(s_spec[cly + dy][clx + dx]);
+                    vec3  tapRgb  = reblurSanitizeRgb(tapData.rgb);
+                    float tapVar  = max(tapData.a, 0.0);
+                    float lumArg  = abs(cLumS - reblurLuminance(tapRgb)) / (effPhiLumS * sqrt(max(max(filtVarS, tapVar * 0.5), 1e-5)) + 1e-4);
+                    if (mirrorPolish && lumArg >= 3.0) continue;
+
+                    float w = (REBLUR_ATROUS_1D[dx + 1] * wKy) * pow(cosA, effPhiNSpec) * exp2(-(depthArg + roughArg + lumArg) * REBLUR_LOG2E);
+                    specAcc += tapRgb * w;
+                    wAcc    += w;
+                    varAcc  += (w * w) * tapVar;
+                }
+            }
+            float invW = 1.0 / max(wAcc, 1e-4);
+            float roughFade = mirrorPolish
+                ? (0.65 * smoothstep(0.01, 0.15, cVarS))
+                : (isTransmissive ? 0.5 : smoothstep(0.02, 0.04, cRough));
+            outSpecRgb = clamp(mix(cSpecRgb, specAcc * invW, roughFade), 0.0, REBLUR_MAX_FP16);
+            outSpecVar = clamp(mix(cVarS, varAcc * invW * invW, roughFade), 0.0, REBLUR_MAX_FP16);
+        }
+
+        float packedOutVarD = cZeroDiff ? -max(outDiffVar, 2e-6) : outDiffVar;
+        imageStore(uOutDiff, coord, vec4(outDiffRgb, packedOutVarD));
+        imageStore(uOutSpec, coord, vec4(outSpecRgb, outSpecVar));
+        return;
+    }
+
+    // =========================================================================
+    // Branch B: Disoccluded tile (some lanes have N < 4)
+    //           Multi-scale bilateral strided gather (s = 4, 2, 1) for N < 4
+    //           and LDS step=1 for settled lanes in mixed tiles
+    // =========================================================================
+    float outDiffVar = cVarD;
+    vec3  outDiffRgb = cDiffRgb;
+    float outSpecVar = cVarS;
+    vec3  outSpecRgb = cSpecRgb;
+
+    if (needFixDiff || needFixSpec) {
+        float phiNSpec = min(32.0 / max(cRough * cRough, 0.08), 128.0);
+        float cDiffLum = reblurLuminance(cDiffRgb);
+        float cSpecLum = reblurLuminance(cSpecRgb);
+
+        vec3  accDiff  = cDiffRgb;
+        float wSumDiff = 1.0;
+        float m1D      = cDiffLum;
+        float m2D      = cDiffLum * cDiffLum;
+
+        vec3  accSpec  = cSpecRgb;
+        float wSumSpec = 1.0;
+        float m1S      = cSpecLum;
+        float m2S      = cSpecLum * cSpecLum;
+
+        const int   STRIDES[3] = int[3](4, 2, 1);
+        const float SCALE_W[3] = float[3](0.35, 0.65, 1.0);
+
+        for (int si = 0; si < 3; ++si) {
+            int s = STRIDES[si];
+            float sWeight = SCALE_W[si];
+            float invDepthTolS = 1.0 / max(2.0 * float(s) * pixelFootprint, fp16Floor);
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    ivec2 tapCoord = clamp(coord + ivec2(dx * s, dy * s), ivec2(0), imgMax);
+
+                    vec4  tapWND;
+                    vec4  tapDiffData;
+                    vec4  tapSpecData;
+                    float tapRough;
+                    float tapNDiff;
+                    float tapNSpec;
+
+                    if (s == 1) {
+                        tapWND      = reblurUnpackHalf4(s_wnd[cly + dy][clx + dx]);
+                        tapDiffData = reblurUnpackHalf4(s_diff[cly + dy][clx + dx]);
+                        tapSpecData = reblurUnpackHalf4(s_spec[cly + dy][clx + dx]);
+                        vec4 tAux   = reblurUnpackHalf4(s_aux[cly + dy][clx + dx]);
+                        tapRough    = tAux.x;
+                        tapNDiff    = tAux.w;
+                        tapNSpec    = tapNDiff;
+                    } else {
+                        tapWND      = imageLoad(uCurrWorldND, tapCoord);
+                        tapDiffData = imageLoad(uInHistDiff, tapCoord);
+                        tapSpecData = needFixSpec ? imageLoad(uInHistSpec, tapCoord) : vec4(0.0);
+                        tapRough    = needFixSpec ? clamp(reblurSanitizeScalar(imageLoad(uAlbedoRoughness, tapCoord).a, 1.0), 0.0, 1.0) : 1.0;
+                        vec4 tMeta  = imageLoad(uInHistMeta, tapCoord);
+                        tapNDiff    = tMeta.r;
+                        tapNSpec    = tMeta.g;
+                    }
+
+                    if (reblurIsSky(tapWND.w)) continue;
+                    float nDot = max(dot(cWND.xyz, tapWND.xyz), 0.0);
+                    if (nDot <= 0.35) continue;
+
+                    float depthArg = abs(tapWND.w * ((float(tapCoord.x) + 0.5) * scaleX + (float(tapCoord.y) + 0.5) * scaleY + bias) - centerPlaneDot) * invDepthTolS;
+                    if (depthArg >= 4.0) continue;
+                    float wZ = exp2(-depthArg * REBLUR_LOG2E);
+
+                    if (needFixDiff && ((tapDiffData.a < 0.0) == cZeroDiff)) {
+                        float histTrust = 0.5 + 0.5 * clamp(tapNDiff * 0.25, 0.0, 1.0);
+                        float w = sWeight * reblurPow32(nDot) * wZ * histTrust;
+                        if (w > 1e-4) {
+                            vec3 tDiff = reblurSanitizeRgb(tapDiffData.rgb);
+                            float tLum = reblurLuminance(tDiff);
+                            accDiff  += tDiff * w;
+                            wSumDiff += w;
+                            m1D      += tLum * w;
+                            m2D      += (tLum * tLum) * w;
+                        }
+                    }
+
+                    if (needFixSpec) {
+                        float wR = exp2(-abs(cRough - tapRough) * (REBLUR_LOG2E / max(0.10 + 0.15 * cRough, 0.08)));
+                        float histTrust = 0.5 + 0.5 * clamp(tapNSpec * 0.25, 0.0, 1.0);
+                        float w = sWeight * pow(nDot, phiNSpec) * wZ * wR * histTrust;
+                        if (w > 1e-4) {
+                            vec3 tSpec = reblurSanitizeRgb(tapSpecData.rgb);
+                            float tLum = reblurLuminance(tSpec);
+                            accSpec  += tSpec * w;
+                            wSumSpec += w;
+                            m1S      += tLum * w;
+                            m2S      += (tLum * tLum) * w;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (needFixDiff) {
+            float invW    = 1.0 / max(wSumDiff, 1e-4);
+            float meanL   = m1D * invW;
+            float seedVar = max(0.0, m2D * invW - meanL * meanL);
+            float blendD  = clamp(1.0 - nDiff * 0.25, 0.0, 1.0);
+            outDiffRgb    = clamp(mix(cDiffRgb, accDiff * invW, blendD), 0.0, REBLUR_MAX_FP16);
+            outDiffVar    = clamp(mix(cVarD, max(cVarD, seedVar), blendD), 0.0, REBLUR_MAX_FP16);
+        }
+
+        if (needFixSpec) {
+            float invW    = 1.0 / max(wSumSpec, 1e-4);
+            float meanL   = m1S * invW;
+            float seedVar = max(0.0, m2S * invW - meanL * meanL);
+            float blendS  = clamp(1.0 - nSpec * 0.25, 0.0, 1.0);
+            outSpecRgb    = clamp(mix(cSpecRgb, accSpec * invW, blendS), 0.0, REBLUR_MAX_FP16);
+            outSpecVar    = clamp(mix(cVarS, max(cVarS, seedVar), blendS), 0.0, REBLUR_MAX_FP16);
+        }
+    }
+
+    float packedOutVarD = cZeroDiff ? -max(outDiffVar, 2e-6) : outDiffVar;
+    imageStore(uOutDiff, coord, vec4(outDiffRgb, packedOutVarD));
+    imageStore(uOutSpec, coord, vec4(outSpecRgb, outSpecVar));
+}

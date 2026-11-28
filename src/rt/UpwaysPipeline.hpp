@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
 #include <array>
@@ -30,34 +31,74 @@ inline constexpr uint32_t UPWAYS_DEFAULT_BAND_HALO_LR     = 24u;
 inline constexpr float    UPWAYS_DEFAULT_BAND_TOP_FRACTION = 0.50f;
 
 /**
- * Exact 80-byte push constant layout shared across all four Upways 4.0 compute shaders:
+ * Optional camera-motion payload for rotation-compensated prev-view normals
+ * and affine prev-depth prediction in Upways 4.0 / 5.0 prep passes.
+ * Default-constructed state has identity rotation and camMotionValid = 0.0f
+ * so synthetic/offline callers and unit tests stay 100% bit-exact.
+ */
+struct UpwaysCameraMotion {
+    glm::vec4 prevToCurrViewQuat{ 0.0f, 0.0f, 0.0f, 1.0f };  // xyzw unit quat rotating prev view -> curr view
+    glm::vec4 currToPrevTransView{ 0.0f, 0.0f, 0.0f, 0.0f }; // xyz = (prevView * inverse(currView))[3].xyz, w = tanHalfFovY
+    glm::vec4 camMotionParams{ 1.0f, 0.0f, 0.0f, 0.0f };     // x = aspectRatio, y = camMotionValid (1.0 live), z/w = 0
+};
+
+inline UpwaysCameraMotion makeUpwaysCameraMotion(
+    const glm::mat4& currView,
+    const glm::mat4& prevView,
+    float tanHalfFovY,
+    float aspectRatio
+) noexcept {
+    UpwaysCameraMotion m{};
+    if (!(tanHalfFovY > 1e-4f) || !(aspectRatio > 1e-4f) ||
+        !std::isfinite(tanHalfFovY) || !std::isfinite(aspectRatio)) {
+        return m;
+    }
+    const glm::mat3 prevToCurrRot = glm::mat3(currView) * glm::transpose(glm::mat3(prevView));
+    const glm::quat q = glm::normalize(glm::quat_cast(prevToCurrRot));
+    const glm::mat4 currToPrev = prevView * glm::inverse(currView);
+    const glm::vec3 t = glm::vec3(currToPrev[3]);
+    if (!std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) || !std::isfinite(q.w) ||
+        !std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z)) {
+        return m;
+    }
+    m.prevToCurrViewQuat = glm::vec4(q.x, q.y, q.z, q.w);
+    m.currToPrevTransView = glm::vec4(t, tanHalfFovY);
+    m.camMotionParams = glm::vec4(aspectRatio, 1.0f, 0.0f, 0.0f);
+    return m;
+}
+
+/**
+ * Exact 128-byte push constant layout shared across all four Upways 4.0 compute shaders:
  *   upways_denoise_prep.comp, upways_denoiser_wmma.comp,
  *   upways_upscaler_wmma.comp, upways_upscale_resolve.comp.
  */
 struct UpwaysPushConstants {
-    uint32_t lrWidth;
-    uint32_t lrHeight;
-    uint32_t hrWidth;
-    uint32_t hrHeight;
-    float    jitterX;
-    float    jitterY;
-    uint32_t frameIndex;
-    uint32_t flags;
-    uint32_t offX0;
-    uint32_t offHw0;
-    uint32_t offS0;
-    uint32_t offB1;
-    uint32_t offB2;
-    float    exposureScale;
-    uint32_t bandLrY0;
-    uint32_t bandHrY0;
-    uint32_t fullLrHeight;
-    uint32_t fullHrHeight;
-    uint32_t keepHrYStart;
-    uint32_t keepHrYEnd;
+    uint32_t  lrWidth;
+    uint32_t  lrHeight;
+    uint32_t  hrWidth;
+    uint32_t  hrHeight;
+    float     jitterX;
+    float     jitterY;
+    uint32_t  frameIndex;
+    uint32_t  flags;
+    uint32_t  offX0;
+    uint32_t  offHw0;
+    uint32_t  offS0;
+    uint32_t  offB1;
+    uint32_t  offB2;
+    float     exposureScale;
+    uint32_t  bandLrY0;
+    uint32_t  bandHrY0;
+    uint32_t  fullLrHeight;
+    uint32_t  fullHrHeight;
+    uint32_t  keepHrYStart;
+    uint32_t  keepHrYEnd;
+    glm::vec4 prevToCurrViewQuat{ 0.0f, 0.0f, 0.0f, 1.0f };
+    glm::vec4 currToPrevTransView{ 0.0f, 0.0f, 0.0f, 0.0f };
+    glm::vec4 camMotionParams{ 1.0f, 0.0f, 0.0f, 0.0f };
 };
 
-static_assert(sizeof(UpwaysPushConstants) == 80, "UpwaysPushConstants must be exactly 80 bytes");
+static_assert(sizeof(UpwaysPushConstants) == 128, "UpwaysPushConstants must be exactly 128 bytes");
 
 struct UpwaysBandSplit {
     uint32_t fullLrH = 0u;
@@ -350,7 +391,8 @@ public:
         bool coupledWithExternalUpscaler = false,
         bool zeroResidualMode = false,
         float exposureScale = 1.0f,
-        const UpwaysBandParams& band = {}
+        const UpwaysBandParams& band = {},
+        const UpwaysCameraMotion& cameraMotion = {}
     );
 
     [[nodiscard]] Image* getOutputImage() const;

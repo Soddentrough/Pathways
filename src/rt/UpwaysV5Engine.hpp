@@ -19,34 +19,37 @@ class Buffer;
 class Image;
 
 /**
- * Exact 80-byte push constant layout shared across all five Upways 5.0 compute shaders:
+ * Exact 128-byte push constant layout shared across all five Upways 5.0 compute shaders:
  *   upways_v5_prep.comp, upways_v5_unet_wmma.comp, upways_v5_affinity.comp,
  *   upways_v5_upscaler_wmma.comp, upways_v5_resolve.comp.
  */
 struct UpwaysV5PushConstants {
-    uint32_t lrWidth;
-    uint32_t lrHeight;
-    uint32_t hrWidth;
-    uint32_t hrHeight;
-    float    jitterX;
-    float    jitterY;
-    uint32_t frameIndex;
-    uint32_t flags;
-    uint32_t inW;
-    uint32_t inH;
-    uint32_t outW;
-    uint32_t outH;
-    uint32_t off0;
-    uint32_t off1;
-    uint32_t bandLrY0;
-    uint32_t bandHrY0;
-    uint32_t fullLrHeight;
-    uint32_t fullHrHeight;
-    uint32_t keepHrYStart;
-    uint32_t keepHrYEnd;
+    uint32_t  lrWidth;
+    uint32_t  lrHeight;
+    uint32_t  hrWidth;
+    uint32_t  hrHeight;
+    float     jitterX;
+    float     jitterY;
+    uint32_t  frameIndex;
+    uint32_t  flags;
+    uint32_t  inW;
+    uint32_t  inH;
+    uint32_t  outW;
+    uint32_t  outH;
+    uint32_t  off0;
+    uint32_t  off1;
+    uint32_t  bandLrY0;
+    uint32_t  bandHrY0;
+    uint32_t  fullLrHeight;
+    uint32_t  fullHrHeight;
+    uint32_t  keepHrYStart;
+    uint32_t  keepHrYEnd;
+    glm::vec4 prevToCurrViewQuat{ 0.0f, 0.0f, 0.0f, 1.0f };
+    glm::vec4 currToPrevTransView{ 0.0f, 0.0f, 0.0f, 0.0f };
+    glm::vec4 camMotionParams{ 1.0f, 0.0f, 0.0f, 0.0f };
 };
 
-static_assert(sizeof(UpwaysV5PushConstants) == 80, "UpwaysV5PushConstants must be exactly 80 bytes");
+static_assert(sizeof(UpwaysV5PushConstants) == 128, "UpwaysV5PushConstants must be exactly 128 bytes");
 
 struct UpwaysV5Dims {
     uint32_t w0 = 1u, h0 = 1u;
@@ -139,7 +142,8 @@ public:
         bool coupledWithExternalUpscaler = false,
         bool zeroResidualMode = false,
         float exposureScale = 1.0f,
-        const UpwaysBandParams& band = {}
+        const UpwaysBandParams& band = {},
+        const UpwaysCameraMotion& cameraMotion = {}
     );
 
     [[nodiscard]] Image* getOutputImage() const { return m_outputImage.get(); }

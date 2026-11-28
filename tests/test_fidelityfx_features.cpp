@@ -473,6 +473,31 @@ int main(int argc, char** argv) {
         check_true(cRR.denoiser_mode == DenoiserMode::FfxRayRegeneration,
                    "--denoiser rayregen must select DenoiserMode::FfxRayRegeneration");
 
+        const char* argvReblur[] = { "pathways", "--denoiser", "reblur" };
+        Config cReblur = Config::parse(3, const_cast<char**>(argvReblur));
+        check_true(cReblur.denoiser_mode == DenoiserMode::Reblur,
+                   "--denoiser reblur must select DenoiserMode::Reblur");
+
+        const char* argvReblurEq[] = { "pathways", "--denoiser=reblur" };
+        Config cReblurEq = Config::parse(2, const_cast<char**>(argvReblurEq));
+        check_true(cReblurEq.denoiser_mode == DenoiserMode::Reblur,
+                   "--denoiser=reblur must select DenoiserMode::Reblur");
+
+        const char* argvAnalytical[] = { "pathways", "--denoiser", "analytical" };
+        Config cAnalytical = Config::parse(3, const_cast<char**>(argvAnalytical));
+        check_true(cAnalytical.denoiser_mode == DenoiserMode::Reblur,
+                   "--denoiser analytical must select DenoiserMode::Reblur");
+
+        const char* argvReblurShort[] = { "pathways", "--reblur" };
+        Config cReblurShort = Config::parse(2, const_cast<char**>(argvReblurShort));
+        check_true(cReblurShort.denoiser_mode == DenoiserMode::Reblur,
+                   "--reblur shortcut must select DenoiserMode::Reblur");
+
+        const char* argvReblurRef[] = { "pathways", "--denoiser", "reblur", "--reference" };
+        Config cReblurRef = Config::parse(4, const_cast<char**>(argvReblurRef));
+        check_true(cReblurRef.denoiser_mode == DenoiserMode::None,
+                   "--reference must force DenoiserMode::None even when --denoiser reblur is passed");
+
         auto expectRejected = [](std::initializer_list<const char*> args, const std::string& label) {
             std::vector<char*> argv;
             for (const char* a : args) argv.push_back(const_cast<char*>(a));
@@ -652,6 +677,10 @@ int main(int argc, char** argv) {
         "07c1_fsr3_upways_denoiser", supportsUpways ? "FSR 3.1 + Upways Denoiser" : "FSR 3.1 + Upways (Gated -> Off)", "--upscaler fsr3 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
     FeatureRunResult fsr4UpwaysDenRun = runFeatureConfig(
         "07c2_fsr4_upways_denoiser", supportsUpways ? "FSR 4.1 ML + Upways Denoiser" : "FSR 4.1 ML + Upways (Gated -> Off)", "--upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &refPixels, refW, refH);
+    FeatureRunResult reblurDenRun = runFeatureConfig(
+        "07d_reblur_denoiser", "Denoiser: ReBLUR (Native 1.0x)", "--upscaler none --denoiser reblur --spp 1", &refPixels, refW, refH);
+    FeatureRunResult fsr3ReblurDenRun = runFeatureConfig(
+        "07d1_fsr3_reblur_denoiser", "FSR 3.1 + ReBLUR Denoiser", "--upscaler fsr3 --render-scale 0.67 --denoiser reblur --spp 1", &refPixels, refW, refH);
 
     // 10. Render ReSTIR PT & Real-Time Caustics
     FeatureRunResult restirRun = runFeatureConfig(
@@ -671,7 +700,7 @@ int main(int argc, char** argv) {
     std::vector<FeatureRunResult> allRuns = {
         raw1SppRun, baseMcRun, fsr3Run, fsr4Run, upwaysSrRun,
         rayRegenRun, upwaysDenRun, fsr3UpwaysDenRun,
-        fsr4UpwaysDenRun,
+        fsr4UpwaysDenRun, reblurDenRun, fsr3ReblurDenRun,
         nrcRun, restirRun, causticsRun, combinedRun
     };
 
@@ -738,6 +767,15 @@ int main(int argc, char** argv) {
                    "When Vulkan Denoiser provider is absent, --denoiser rayregen must be rejected and report 'None', got '" + rayRegenRun.reportedDenoiser + "'");
     }
     check_true(nrcRun.reportedNrc, "Radiance Cache run must report enable_nrc == true");
+    check_true(reblurDenRun.reportedDenoiser == "ReBLUR",
+               "Analytical ReBLUR run (--denoiser reblur) must report denoiser_mode == 'ReBLUR' on all Vulkan GPUs, got '" + reblurDenRun.reportedDenoiser + "'");
+    if (hasUpscalerProvider) {
+        check_true(fsr3ReblurDenRun.reportedUpscaler == "FSR 3.1" && fsr3ReblurDenRun.reportedDenoiser == "ReBLUR",
+                   "FSR 3.1 + ReBLUR Denoiser must report upscaler_mode == 'FSR 3.1' and denoiser_mode == 'ReBLUR'");
+    } else {
+        check_true(fsr3ReblurDenRun.reportedUpscaler == "None" && fsr3ReblurDenRun.reportedDenoiser == "ReBLUR",
+                   "Without amd_fidelityfx_upscaler_vk, FSR 3.1 + ReBLUR must still report denoiser_mode == 'ReBLUR'");
+    }
     if (supportsUpways) {
         check_true(upwaysSrRun.reportedUpscaler == "Upways", "Upways SR run must report upscaler_mode == 'Upways'");
         check_true(upwaysDenRun.reportedDenoiser == "Upways", "Upways Denoiser run must report denoiser_mode == 'Upways'");
@@ -781,6 +819,13 @@ int main(int argc, char** argv) {
     }
 
     // Assertions: Surface-Guided & ML Edge Retention
+    check_true(reblurDenRun.visual.gradientEnergyRatio >= 0.70,
+               "Analytical ReBLUR native denoiser must keep >= 70% of reference gradient energy on edge pixels (blur guard) (got " +
+               std::to_string(reblurDenRun.visual.gradientEnergyRatio) + ")");
+    check_true(reblurDenRun.visual.laplacianNoiseVar < raw1SppRun.visual.laplacianNoiseVar * 0.20,
+               "Analytical ReBLUR denoiser must reduce 1-SPP high-frequency noise variance by >80%");
+    check_true(reblurDenRun.denoiserSrMs < 3.5,
+               "Analytical ReBLUR denoiser pass time at 720p must be < 3.5 ms (got " + std::to_string(reblurDenRun.denoiserSrMs) + " ms)");
     if (supportsUpways) {
         check_true(upwaysDenRun.visual.gradientEnergyRatio >= 0.70,
                    "Surface-guided native denoiser (Upways) must keep >= 70% of reference gradient energy on edge pixels (blur guard)");
@@ -886,9 +931,11 @@ int main(int argc, char** argv) {
             "10d_motion_fsr4_upways", "Motion: FSR 4.1 ML + Upways", "--camera-motion --upscaler fsr4 --render-scale 0.67 --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
         FeatureRunResult motionUpwaysDen = runFeatureConfig(
             "10f_motion_upways_den", "Motion: Upways Denoiser (1.0x)", "--camera-motion --upscaler none --denoiser upways --spp 1", &mRefPixels, mRefW, mRefH, 12);
+        FeatureRunResult motionReblurDen = runFeatureConfig(
+            "10g_motion_reblur_den", "Motion: ReBLUR Denoiser (1.0x)", "--camera-motion --upscaler none --denoiser reblur --spp 1", &mRefPixels, mRefW, mRefH, 12);
 
         std::vector<FeatureRunResult> motionRuns = {
-            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionUpwaysDen
+            motionRaw1Spp, motionUpwaysSr, motionFsr4Upways, motionUpwaysDen, motionReblurDen
         };
         for (const auto& mr : motionRuns) {
             std::cout << "  -> " << std::left << std::setw(30) << mr.name
@@ -908,6 +955,15 @@ int main(int argc, char** argv) {
                        mr.name + " must keep >= " + std::to_string(minMotionGradRatio) +
                        " reference gradient energy under motion (blur guard) (GradRatio=" + std::to_string(mr.visual.gradientEnergyRatio) + ")");
         }
+        check_true(motionReblurDen.reportedDenoiser == "ReBLUR",
+                   "Motion ReBLUR Denoiser (1.0x) must report denoiser_mode == 'ReBLUR', got '" + motionReblurDen.reportedDenoiser + "'");
+        check_true(motionReblurDen.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.25 &&
+                   motionReblurDen.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 4.0,
+                   "Motion ReBLUR Denoiser (1.0x) must strongly reduce 1-SPP noise (<25% var) and boost PSNR (>+4.0 dB) under continuous camera motion (NoiseVar=" +
+                   std::to_string(motionReblurDen.visual.laplacianNoiseVar) + ", raw=" +
+                   std::to_string(motionRaw1Spp.visual.laplacianNoiseVar) + ", PSNR=" +
+                   std::to_string(motionReblurDen.visual.psnrVsRefDb) + " dB, raw=" +
+                   std::to_string(motionRaw1Spp.visual.psnrVsRefDb) + " dB)");
         if (supportsUpways) {
             check_true(motionUpwaysSr.visual.laplacianNoiseVar < motionRaw1Spp.visual.laplacianNoiseVar * 0.45 &&
                        motionUpwaysSr.visual.psnrVsRefDb > motionRaw1Spp.visual.psnrVsRefDb + 2.5,

@@ -11,6 +11,7 @@
 #include "rt/GpuTlasUpdatePipeline.hpp"
 #include "rt/WavefrontPipeline.hpp"
 #include "rt/DenoiserPipeline.hpp"
+#include "rt/ReblurDenoiserPipeline.hpp"
 #include "rt/SuperResolutionManager.hpp"
 #include "rt/UpwaysPipeline.hpp"
 #include "rt/Fsr3Upscaler.hpp"
@@ -45,6 +46,9 @@ void TelemetryReporter::dumpOutputFiles() {
 
     if (m_engine->m_denoiser && m_engine->m_denoiser->isInitialized()) {
         m_engine->m_denoiser->collectQueryResults();
+    }
+    if (m_engine->m_reblurDenoiser && m_engine->m_reblurDenoiser->isInitialized()) {
+        m_engine->m_reblurDenoiser->collectQueryResults();
     }
 
     // Drain remaining in-flight queries after vkDeviceWaitIdle
@@ -146,6 +150,9 @@ void TelemetryReporter::dumpOutputFiles() {
     } else if (m_engine->m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
                m_engine->m_denoiser && m_engine->m_denoiser->getDenoisedImage()) {
         hdrSourceImage = m_engine->m_denoiser->getDenoisedImage();
+    } else if (m_engine->m_config.denoiser_mode == DenoiserMode::Reblur &&
+               m_engine->m_reblurDenoiser && m_engine->m_reblurDenoiser->getDenoisedImage()) {
+        hdrSourceImage = m_engine->m_reblurDenoiser->getDenoisedImage();
     }
     if (!m_engine->m_config.dump_hdr_path.empty() && hdrSourceImage) {
         VkBuffer hdrBandStitchBuf = VK_NULL_HANDLE;
@@ -556,6 +563,29 @@ FrameStats TelemetryReporter::getStats() const {
         stats.denoiser_profiler_stats.temporal_ms = passMs[0];
         stats.denoiser_profiler_stats.total_pass_ms = sumPass;
         stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
+    } else if (m_engine->m_config.denoiser_mode == DenoiserMode::Reblur &&
+               m_engine->m_reblurDenoiser && m_engine->m_reblurDenoiser->isInitialized()) {
+        const auto& passMs = m_engine->m_reblurDenoiser->getPassTimingsMs();
+        stats.denoiser_mode_str = "ReBLUR";
+        stats.denoise_pass_names = {
+            "reblurPreblur", "reblurTemporal", "reblurHistoryFix", "reblurAtrous", "reblurStabilize"
+        };
+        double sumPass = 0.0;
+        for (int p = 0; p < 5; ++p) {
+            stats.denoise_pass_ms[p] = passMs[p];
+            sumPass += passMs[p];
+        }
+        const double totalMs = (passMs[5] > 0.0001) ? passMs[5] : sumPass;
+        stats.denoiser_profiler_stats.valid = (totalMs > 0.0001) || (stats.upways_time_ms > 0.0001);
+        stats.denoiser_profiler_stats.mode = "reblur";
+        stats.denoiser_profiler_stats.neural_guide_ms = passMs[0];
+        stats.denoiser_profiler_stats.temporal_ms = passMs[1];
+        stats.denoiser_profiler_stats.atrous_step2_ms = passMs[2];
+        stats.denoiser_profiler_stats.atrous_step6_ms = passMs[3];
+        stats.denoiser_profiler_stats.upscale_resolve_ms = passMs[4];
+        stats.denoiser_profiler_stats.history_copy_ms = 0.0;
+        stats.denoiser_profiler_stats.total_pass_ms = totalMs;
+        stats.denoiser_profiler_stats.outer_envelope_ms = stats.upways_time_ms;
     } else {
         stats.denoiser_mode_str = "None";
     }
@@ -798,6 +828,9 @@ FrameStats TelemetryReporter::getStats() const {
         case DenoiserMode::FfxRayRegeneration:
             stats.denoiser_mode_str = stats.supports_fsr_rr ? "FFX Ray Regeneration" : "None";
             break;
+        case DenoiserMode::Reblur:
+            stats.denoiser_mode_str = "ReBLUR";
+            break;
         case DenoiserMode::None: default: stats.denoiser_mode_str = "None"; break;
     }
     stats.enable_nrc = m_engine->m_config.enable_nrc;
@@ -899,9 +932,10 @@ FrameStats TelemetryReporter::getStats() const {
 
         const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
         const bool tallyIsFfxRr = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::FfxRayRegeneration);
+        const bool tallyIsReblur = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::Reblur);
 
         s.pipeline_stages.denoiser_upscale_ms = tally.getAvgDenoiserUpscaleMs();
-        s.pipeline_stages.denoiser_mode = tallyIsUpways ? "upways" : (tallyIsFfxRr ? "ffx_ray_regeneration" : "none");
+        s.pipeline_stages.denoiser_mode = tallyIsUpways ? "upways" : (tallyIsFfxRr ? "ffx_ray_regeneration" : (tallyIsReblur ? "reblur" : "none"));
         for (size_t p = 0; p < 6; ++p) {
             s.pipeline_stages.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(p);
         }
@@ -937,6 +971,21 @@ FrameStats TelemetryReporter::getStats() const {
                 }
                 stats.denoiser_profiler_stats.temporal_ms = stats.denoise_pass_ms[0];
                 stats.denoiser_profiler_stats.total_pass_ms = sumPass;
+                stats.denoiser_profiler_stats.outer_envelope_ms = tally.getAvgDenoiserUpscaleMs();
+                stats.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
+            } else if (tallyIsReblur && stats.denoiser_profiler_stats.mode == "reblur") {
+                double sumPass = 0.0;
+                for (int p = 0; p < 5; ++p) {
+                    stats.denoise_pass_ms[p] = tally.getAvgDenoisePassMs(static_cast<size_t>(p));
+                    sumPass += stats.denoise_pass_ms[p];
+                }
+                const double totalMs = (tally.getAvgDenoisePassMs(5) > 0.0001) ? tally.getAvgDenoisePassMs(5) : sumPass;
+                stats.denoiser_profiler_stats.neural_guide_ms = stats.denoise_pass_ms[0];
+                stats.denoiser_profiler_stats.temporal_ms = stats.denoise_pass_ms[1];
+                stats.denoiser_profiler_stats.atrous_step2_ms = stats.denoise_pass_ms[2];
+                stats.denoiser_profiler_stats.atrous_step6_ms = stats.denoise_pass_ms[3];
+                stats.denoiser_profiler_stats.upscale_resolve_ms = stats.denoise_pass_ms[4];
+                stats.denoiser_profiler_stats.total_pass_ms = totalMs;
                 stats.denoiser_profiler_stats.outer_envelope_ms = tally.getAvgDenoiserUpscaleMs();
                 stats.upways_time_ms = tally.getAvgDenoiserUpscaleMs();
             }
@@ -1062,6 +1111,16 @@ void TelemetryReporter::recordFrameTally(double frameTimeMs, double primRtMs, do
             denoisePasses[p] = pm[p];
         }
         numDenoisePasses = 3;
+    } else if (key.denoiser == DenoiserMode::Reblur &&
+               m_engine->m_reblurDenoiser && m_engine->m_reblurDenoiser->isInitialized()) {
+        const auto& pm = m_engine->m_reblurDenoiser->getPassTimingsMs();
+        for (int p = 0; p < 6; ++p) {
+            denoisePasses[p] = pm[p];
+        }
+        numDenoisePasses = 6;
+        if (denoiserUpscaleMs <= 0.0001 && pm[5] > 0.0001) {
+            denoiserUpscaleMs = pm[5];
+        }
     }
 
     auto updateAsMetrics = [this](ConfigStatsTally& t) {
@@ -1236,6 +1295,7 @@ void TelemetryReporter::printExecutionSummary() const {
 
         const bool tallyIsUpways = (tally.key.denoiser == DenoiserMode::Upways || tally.key.upscaler == UpscalerMode::Upways);
         const bool tallyIsFfxRr = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::FfxRayRegeneration);
+        const bool tallyIsReblur = !tallyIsUpways && (tally.key.denoiser == DenoiserMode::Reblur);
 
         if (tallyIsUpways && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
             const double p1 = tally.getAvgDenoisePassMs(0);
@@ -1260,6 +1320,27 @@ void TelemetryReporter::printExecutionSummary() const {
             Logger::info("          * Pass 1 (4-Signal + Guide Prep):            {:.3f} ms", p1);
             Logger::info("          * Pass 2 (FFX Denoiser 1.2.1):                 {:.3f} ms", p2);
             Logger::info("          * Pass 3 (Signal Compose -> Accum):            {:.3f} ms", p3);
+            if (coupledWithFsr) {
+                const double fsrMs = std::max(0.0, avgDenoiseSrMs - passSum);
+                Logger::info("      - AMD {} Super-Resolution Upscaler:       {:.3f} ms",
+                             tally.key.fsr_version == FsrVersion::Fsr4 ? "FSR 4.1 ML" : "FSR 3.1   ", fsrMs);
+            }
+        } else if (tallyIsReblur && (avgDenoiseSrMs > 0.0005 || tally.denoisePassSampleCount > 0)) {
+            const double p0 = tally.getAvgDenoisePassMs(0);
+            const double p1 = tally.getAvgDenoisePassMs(1);
+            const double p2 = tally.getAvgDenoisePassMs(2);
+            const double p3 = tally.getAvgDenoisePassMs(3);
+            const double p4 = tally.getAvgDenoisePassMs(4);
+            const double passSum = p0 + p1 + p2 + p3 + p4;
+            const bool coupledWithFsr = (tally.key.upscaler == UpscalerMode::FSR && passSum > 0.0005);
+            const double reblurTotalMs = coupledWithFsr ? passSum : avgDenoiseSrMs;
+            Logger::info("      - Analytical ReBLUR 6-Pass Denoiser:           {:.3f} ms (Sub-Pass Sum: {:.3f} ms)",
+                         reblurTotalMs, passSum);
+            Logger::info("          * Pass 0 (PreBlur, Demod & HitT Recon):    {:.3f} ms", p0);
+            Logger::info("          * Pass 1 (Temporal + Curvature Spec VMV):  {:.3f} ms", p1);
+            Logger::info("          * Pass 2 (Disocclusion History Fix):       {:.3f} ms", p2);
+            Logger::info("          * Pass 3-4 (5x HitT-Guided A-Trous):       {:.3f} ms", p3);
+            Logger::info("          * Pass 5 (Remodulate & Stabilize):         {:.3f} ms", p4);
             if (coupledWithFsr) {
                 const double fsrMs = std::max(0.0, avgDenoiseSrMs - passSum);
                 Logger::info("      - AMD {} Super-Resolution Upscaler:       {:.3f} ms",

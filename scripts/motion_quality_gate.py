@@ -20,6 +20,10 @@ Checks enforced:
      - upways5_1spp:     Explicit V5 ("5.0"), PSNR_ub >= 25.0 dB,
                          HDR relMSE <= 0.05 (when EXR readable),
                          white_wall LocStd <= 0.003, MirZero% < 0.5%, 0 VVL errors
+     - reblur_1spp:      Analytical ReBLUR ("ReBLUR"), PSNR_ub >= 27.5 dB,
+                         HDR relMSE <= 0.035 (when EXR readable),
+                         white_wall LocStd <= 0.002, mirror_sphere LocStd <= 0.0190,
+                         MirZero% < 0.5%, 0 VVL errors
 
 Usage:
   python3 scripts/motion_quality_gate.py [--binary PATH] [--gpu 1]
@@ -72,6 +76,11 @@ THRESHOLDS = {
     "upways_max_white_wall_loc_std": 0.003, # V5 <= 0.003 (V4 was 0.0062, V5 ~0.0011)
     "upways_max_mirror_zero_pct": 0.5,      # no black crescent on mirror
     "upways_expected_version": "5.0",       # Auto must select V5, never dead-head V4
+    "reblur_min_psnr_ub": 27.5,             # ReBLUR >= 27.5 dB vs unbiased 4-bounce GT (tighten after GPU 1 run)
+    "reblur_max_hdr_relmse": 0.035,         # ReBLUR <= 0.035 HDR relMSE
+    "reblur_max_white_wall_loc_std": 0.002, # ReBLUR <= 0.002 white wall LocStd
+    "reblur_max_mirror_loc_std": 0.0190,    # ReBLUR <= 0.0190 mirror sphere LocStd (GT=0.0307, Upways V5=0.0207)
+    "reblur_max_mirror_zero_pct": 0.5,      # no black crescent on mirror
 }
 
 
@@ -555,6 +564,7 @@ def main():
         ("restir_nrc_1spp",  ["--spp", "1", "--restir", "--nrc"]),
         ("upways_auto_1spp", ["--spp", "1", "--denoiser", "upways"]),
         ("upways5_1spp",     ["--spp", "1", "--denoiser", "upways", "--upways-version", "5"]),
+        ("reblur_1spp",      ["--spp", "1", "--denoiser", "reblur"]),
     ]
 
     for mode_name, extra_args in motion_modes:
@@ -660,6 +670,42 @@ def main():
                 checks, mode_name, "mirror_zero_pct_bound",
                 mir_zero < THRESHOLDS["upways_max_mirror_zero_pct"],
                 f"MirZero%={mir_zero:.3f}% < {THRESHOLDS['upways_max_mirror_zero_pct']:.2f}%",
+            )
+
+        elif mode_name == "reblur_1spp":
+            record_check(
+                checks, mode_name, "denoiser_is_reblur",
+                st is not None and st["denoiser_mode"] == "ReBLUR",
+                f"denoiser_mode={st['denoiser_mode'] if st else None}",
+            )
+            record_check(
+                checks, mode_name, "psnr_ub_floor",
+                full["psnr"] >= THRESHOLDS["reblur_min_psnr_ub"],
+                f"PSNR_ub={full['psnr']:.2f} dB >= {THRESHOLDS['reblur_min_psnr_ub']:.1f} dB",
+            )
+            if hdr is not None and "relmse" in hdr:
+                record_check(
+                    checks, mode_name, "hdr_relmse_ceiling",
+                    hdr["relmse"] <= THRESHOLDS["reblur_max_hdr_relmse"],
+                    f"HDR relMSE={hdr['relmse']:.4f} <= {THRESHOLDS['reblur_max_hdr_relmse']:.3f}",
+                )
+            ww_loc_std = r_rois["white_wall"]["local_std"]
+            record_check(
+                checks, mode_name, "white_wall_loc_std_ceiling",
+                ww_loc_std <= THRESHOLDS["reblur_max_white_wall_loc_std"],
+                f"white_wall LocStd={ww_loc_std:.5f} <= {THRESHOLDS['reblur_max_white_wall_loc_std']:.4f}",
+            )
+            mir_loc_std = r_rois["mirror_sphere"]["local_std"]
+            record_check(
+                checks, mode_name, "mirror_sphere_loc_std_ceiling",
+                mir_loc_std <= THRESHOLDS["reblur_max_mirror_loc_std"],
+                f"mirror_sphere LocStd={mir_loc_std:.5f} <= {THRESHOLDS['reblur_max_mirror_loc_std']:.4f}",
+            )
+            mir_zero = r_rois["mirror_sphere"]["zero_pct"]
+            record_check(
+                checks, mode_name, "mirror_zero_pct_bound",
+                mir_zero < THRESHOLDS["reblur_max_mirror_zero_pct"],
+                f"MirZero%={mir_zero:.3f}% < {THRESHOLDS['reblur_max_mirror_zero_pct']:.2f}%",
             )
 
     # ------------------------------------------------------------------

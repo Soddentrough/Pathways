@@ -77,6 +77,8 @@ struct ConfigKey {
             denoiserStr = " [Upways]";
         } else if (denoiser == DenoiserMode::FfxRayRegeneration) {
             denoiserStr = " [FFX Ray Regeneration]";
+        } else if (denoiser == DenoiserMode::Reblur) {
+            denoiserStr = " [ReBLUR]";
         }
         std::string upscalerStr = "";
         std::string mgpuUpscaleStr = "";

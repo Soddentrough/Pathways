@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <thread>
 #include <bit>
+#include <cmath>
 #include <cstring>
 
 #ifdef _WIN32
@@ -333,6 +334,7 @@ Engine::~Engine() {
     syncRayTracingPointers();
     destroyGBufferResources();
     m_denoiser.reset();
+    m_reblurDenoiser.reset();
     m_superResolution.reset();
     m_causticsPipeline.reset();
     m_renderTargets.reset();
@@ -1057,6 +1059,26 @@ void Engine::ensureDenoiserInitialized() {
     }
 }
 
+void Engine::ensureReblurDenoiserInitialized() {
+    if (m_reblurDenoiser) return;
+    try {
+        m_reblurDenoiser = std::make_unique<ReblurDenoiserPipeline>(
+            m_context->getDevice(), m_context->getPhysicalDevice(), m_context->getAllocator(),
+            m_context->getGraphicsQueue(),
+            [this](const std::string& name) { return loadShaderSPIRV(name); },
+            m_context->hasSubgroupSizeControl(),
+            m_context->getPipelineCache()
+        );
+        m_reblurDenoiser->resize(m_config.getRenderWidth(), m_config.getRenderHeight(), m_config.accum_format, m_commandBuffers[0]);
+        m_reblurDenoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+    } catch (const std::exception& e) {
+        if (m_config.denoiser_mode == DenoiserMode::Reblur) {
+            throw std::runtime_error(std::string("ReblurDenoiserPipeline requested but initialization failed: ") + e.what());
+        }
+        Logger::warn("ReblurDenoiserPipeline initialization failed: {}", e.what());
+    }
+}
+
 void Engine::ensureWavefrontAlphaPipeline() {
     if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasAlphaIntersectPipeline()) return;
     try {
@@ -1220,13 +1242,17 @@ void Engine::initPipelines() {
     // 8. G-Buffer Resources (Surface Normals/Depth & Demodulated ML Guides)
     createGBufferResources();
 
-    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration || m_config.capture_channels >= 44u) {
+    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+        m_config.denoiser_mode == DenoiserMode::Reblur ||
+        m_config.capture_channels >= 44u) {
         ensureSplitSignalResources();
     }
 
-    // 8b. AMD FSR Ray Regeneration Denoiser Pipeline (lazily allocated when enabled)
+    // 8b. AMD FSR Ray Regeneration & Analytical ReBLUR Denoiser Pipelines (lazily allocated when enabled)
     if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
         ensureDenoiserInitialized();
+    } else if (m_config.denoiser_mode == DenoiserMode::Reblur) {
+        ensureReblurDenoiserInitialized();
     }
 
     // 9. Super-Resolution & Neural Reconstruction Subsystem (Upways & AMD FSR)
@@ -1292,6 +1318,10 @@ void Engine::updateAllImageDescriptors() {
         m_denoiser->invalidateDescriptors();
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
     }
+    if (m_reblurDenoiser) {
+        m_reblurDenoiser->invalidateDescriptors();
+        m_reblurDenoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+    }
 
     updateWavefrontSceneDescriptors();
     updateUpwaysDescriptors();
@@ -1312,6 +1342,9 @@ void Engine::createGBufferResources() {
     syncRenderTargetPointers();
     if (m_denoiser) {
         m_denoiser->invalidateDescriptors();
+    }
+    if (m_reblurDenoiser) {
+        m_reblurDenoiser->invalidateDescriptors();
     }
     updateMergeDescriptors();
 }
@@ -1337,6 +1370,9 @@ void Engine::ensureSplitSignalResources() {
     if (m_denoiser) {
         m_denoiser->invalidateDescriptors();
     }
+    if (m_reblurDenoiser) {
+        m_reblurDenoiser->invalidateDescriptors();
+    }
     updateWavefrontSceneDescriptors();
 }
 
@@ -1347,6 +1383,9 @@ void Engine::destroySplitSignalResources() {
     syncRenderTargetPointers();
     if (m_denoiser) {
         m_denoiser->invalidateDescriptors();
+    }
+    if (m_reblurDenoiser) {
+        m_reblurDenoiser->invalidateDescriptors();
     }
     updateWavefrontSceneDescriptors();
 }
@@ -1423,6 +1462,9 @@ void Engine::updateFsrDescriptors() {
         if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
             m_denoiser && m_denoiser->getDenoisedImage()) {
             colorIn = m_denoiser->getDenoisedImage();
+        } else if (m_config.denoiser_mode == DenoiserMode::Reblur &&
+                   m_reblurDenoiser && m_reblurDenoiser->getDenoisedImage()) {
+            colorIn = m_reblurDenoiser->getDenoisedImage();
         } else if (m_config.denoiser_mode == DenoiserMode::Upways &&
                    m_superResolution->getUpwaysPipeline() &&
                    m_superResolution->getUpwaysPipeline()->getOutputImage()) {
@@ -1834,6 +1876,9 @@ void Engine::renderFrame() {
         if (m_denoiser && m_denoiser->isInitialized()) {
             m_denoiser->collectQueryResults();
         }
+        if (m_reblurDenoiser && m_reblurDenoiser->isInitialized()) {
+            m_reblurDenoiser->collectQueryResults();
+        }
         bool isMgpuActive = m_mgpu && m_mgpu->isMultiGpuActive();
 
         if (!completedSlotSkipped) {
@@ -2012,6 +2057,7 @@ void Engine::renderFrame() {
 
     const bool wantSplitSignals =
         (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) ||
+        (m_config.denoiser_mode == DenoiserMode::Reblur) ||
         (m_config.capture_channels >= 44u);
     if (wantSplitSignals && (!m_renderTargets || !m_renderTargets->hasSplitSignalResources())) {
         vkDeviceWaitIdle(device);
@@ -2036,6 +2082,21 @@ void Engine::renderFrame() {
     } else if (!wantDenoiserPipeline && m_denoiser) {
         vkDeviceWaitIdle(device);
         m_denoiser.reset();
+        updateFsrDescriptors();
+    }
+
+    const bool wantReblurPipeline =
+        (m_config.denoiser_mode == DenoiserMode::Reblur) &&
+        m_config.upscaler_mode != UpscalerMode::Upways;
+    if (wantReblurPipeline && !m_reblurDenoiser) {
+        vkDeviceWaitIdle(device);
+        ensureReblurDenoiserInitialized();
+        m_context->savePipelineCache();
+        updateFsrDescriptors();
+        m_resetAccumulation = true;
+    } else if (!wantReblurPipeline && m_reblurDenoiser) {
+        vkDeviceWaitIdle(device);
+        m_reblurDenoiser.reset();
         updateFsrDescriptors();
     }
 
@@ -2243,6 +2304,14 @@ void Engine::renderFrame() {
             if (m_denoiser->getWidth() != denoiseW || m_denoiser->getHeight() != denoiseH) {
                 m_denoiser->resize(denoiseW, denoiseH, m_config.accum_format, m_commandBuffers[0]);
                 m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+            }
+        }
+        if (m_reblurDenoiser && scalingOrUpscalerChanged) {
+            uint32_t denoiseW = m_config.getRenderWidth();
+            uint32_t denoiseH = m_config.getRenderHeight();
+            if (m_reblurDenoiser->getWidth() != denoiseW || m_reblurDenoiser->getHeight() != denoiseH) {
+                m_reblurDenoiser->resize(denoiseW, denoiseH, m_config.accum_format, m_commandBuffers[0]);
+                m_reblurDenoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
             }
         }
 
@@ -2497,6 +2566,7 @@ void Engine::renderFrame() {
                                     m_config.upscaler_mode == UpscalerMode::FSR ||
                                     m_config.denoiser_mode == DenoiserMode::Upways ||
                                     m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                    m_config.denoiser_mode == DenoiserMode::Reblur ||
                                     isRestirActive() ||
                                     m_config.enable_caustics ||
                                     !m_config.capture_training_data_dir.empty());
@@ -2584,13 +2654,16 @@ void Engine::renderFrame() {
     bool fsrJitterActive = (m_config.upscaler_mode == UpscalerMode::FSR) &&
                            !(m_config.fsr_version == FsrVersion::Fsr4 && (!m_context || !m_context->supportsFsr4()));
     bool upwaysSuperResActive = m_config.isUpwaysSuperResActive();
-    bool enableJitter = !isStationaryAccum && (fsrJitterActive || upwaysSuperResActive);
+    bool analyticalJitterActive = (m_config.denoiser_mode == DenoiserMode::Reblur ||
+                                   m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+    bool enableJitter = !isStationaryAccum && (fsrJitterActive || upwaysSuperResActive || analyticalJitterActive);
     uint32_t jitterSeqLen = (m_config.upscaler_mode == UpscalerMode::FSR)
         ? getFsrJitterPhaseCount(renderW, m_config.width)
-        : 32u;
+        : (analyticalJitterActive ? 16u : 32u);
 
     if (hardReset && m_camera) {
         m_camera->resetPrevViewProj();
+        m_hasPrevReblurCamera = false;
     }
     uint32_t uboSpp = (m_wavefrontPipeline && m_wavefrontPipeline->getWarmupSppOverride() > 0)
         ? m_wavefrontPipeline->getWarmupSppOverride()
@@ -2600,17 +2673,15 @@ void Engine::renderFrame() {
                                                  jitterSeqLen);
     m_cameraUBOs[m_currentFrame]->copyFrom(&ubo, sizeof(CameraUniform));
 
-    // Track sub-pixel camera jitter in UV units for the E-SVGF / FFX denoiser
-    // (motion vectors are jitter-free; the denoiser cancels jitter explicitly)
-    if (enableJitter && renderW > 0 && renderH > 0) {
-        m_denoiseJitterUv = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y) / glm::vec2(renderW, renderH);
-        m_prevDenoiseJitterUv = (m_frameIndex > 0)
-            ? getHaltonJitter(m_frameIndex - 1, jitterSeqLen) / glm::vec2(renderW, renderH)
-            : glm::vec2(0.0f);
-    } else {
-        m_denoiseJitterUv = glm::vec2(0.0f);
-        m_prevDenoiseJitterUv = glm::vec2(0.0f);
+    // Track exact sub-pixel camera jitter in UV units across frames for ReBLUR / FFX RR
+    // (motion vectors are jitter-free; denoiser cancels currJitterUv - prevJitterUv explicitly)
+    const glm::vec2 currJitterUv = (enableJitter && renderW > 0 && renderH > 0)
+        ? (glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y) / glm::vec2(renderW, renderH))
+        : glm::vec2(0.0f);
+    if (!m_hasPrevReblurCamera || hardReset) {
+        m_prevDenoiseJitterUv = currJitterUv;
     }
+    m_denoiseJitterUv = currJitterUv;
 
     uint32_t groupsX = (m_config.width + 15) / 16;
     uint32_t groupsY = (m_config.height + 15) / 16;
@@ -2746,6 +2817,7 @@ void Engine::renderFrame() {
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, m_queryPool, qBase + 1);
 
         bool needDecoupledPost = (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                  m_config.denoiser_mode == DenoiserMode::Reblur ||
                                   m_config.denoiser_mode == DenoiserMode::Upways ||
                                   m_config.upscaler_mode == UpscalerMode::Upways ||
                                   m_config.upscaler_mode == UpscalerMode::FSR);
@@ -2772,12 +2844,13 @@ void Engine::renderFrame() {
 
             vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3);
         } else {
-            // Decoupled Path (Used when FFX Ray Regeneration, Upways, or FSR is active or RT was skipped)
+            // Decoupled Path (Used when FFX Ray Regeneration, ReBLUR, Upways, or FSR is active or RT was skipped)
             // Running Average Accumulation Pass
-            // Skipped when Upways or FFX Ray Regeneration is active because they consume raw split diffuse/specular directly.
+            // Skipped when Upways, ReBLUR, or FFX Ray Regeneration is active because they consume raw split signals directly.
             const bool isDenoisedWithoutRunningAvg =
                 (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
-                (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
+                ((m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                  m_config.denoiser_mode == DenoiserMode::Reblur) &&
                  m_config.capture_training_data_dir.empty());
             if (!skipRayTracing && !isDenoisedWithoutRunningAvg && m_postProcess && m_postProcess->hasRunningAvgPipeline()) {
                 PostProcessPipeline::RunningAvgPushConstants avgPC{};
@@ -2793,12 +2866,16 @@ void Engine::renderFrame() {
             bool resetTemporal = hardReset || m_temporalResetRequested;
             m_temporalResetRequested = false;
 
-            // AMD FSR Ray Regeneration Denoiser (runs at internal renderW x renderH)
+            // AMD FSR Ray Regeneration / Analytical ReBLUR Denoisers (run at internal renderW x renderH)
             bool ffxRrRun = false;
+            bool reblurRun = false;
             const bool useDenoiserPipeline = (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
                                              m_config.upscaler_mode != UpscalerMode::Upways;
+            const bool useReblurPipeline = (m_config.denoiser_mode == DenoiserMode::Reblur) &&
+                                           m_config.upscaler_mode != UpscalerMode::Upways;
             const bool anyDenoiseOrUpscale =
                 (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
+                (useReblurPipeline && m_reblurDenoiser && m_reblurDenoiser->isInitialized()) ||
                 (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
                 (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
 
@@ -2817,11 +2894,23 @@ void Engine::renderFrame() {
                     buildDenoiserCameraMatrices(renderW, renderH)
                 );
                 ffxRrRun = true;
+            } else if (useReblurPipeline && m_reblurDenoiser && m_reblurDenoiser->isInitialized()) {
+                const bool coupledWithFsr = (m_config.upscaler_mode == UpscalerMode::FSR);
+                m_reblurDenoiser->recordDenoise(
+                    cmd, m_currentFrame, resetTemporal,
+                    m_normalDepthImage, m_motionVectorImage, m_mlSpecularMotionImage,
+                    m_mlAlbedoRoughnessImage, m_mlSpecAlbedoImage,
+                    m_mlSkipImage,
+                    m_mlDirectDiffuseImage, m_mlIndirectDiffuseImage,
+                    m_mlDirectSpecularImage, m_mlIndirectSpecularImage,
+                    buildReblurCameraMatrices(renderW, renderH, coupledWithFsr)
+                );
+                reblurRun = true;
             }
 
             // Upways Neural Denoiser & Super-Resolution (Wave32 WMMA)
             bool upwaysRun = false;
-            if (!ffxRrRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
+            if (!ffxRrRun && !reblurRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
                 if (m_superResolution) {
                     upwaysRun = m_superResolution->dispatchUpways(
                         cmd, resetTemporal, m_config, m_camera.get(),
@@ -2842,6 +2931,9 @@ void Engine::renderFrame() {
                     bool denoisedInput = false;
                     if (ffxRrRun && m_denoiser && m_denoiser->getDenoisedImage()) {
                         fsrInputImage = m_denoiser->getDenoisedImage();
+                        denoisedInput = true;
+                    } else if (reblurRun && m_reblurDenoiser && m_reblurDenoiser->getDenoisedImage()) {
+                        fsrInputImage = m_reblurDenoiser->getDenoisedImage();
                         denoisedInput = true;
                     } else if (upwaysRun && m_superResolution->getUpwaysPipeline() && m_superResolution->getUpwaysPipeline()->getOutputImage()) {
                         fsrInputImage = m_superResolution->getUpwaysPipeline()->getOutputImage();
@@ -2876,6 +2968,9 @@ void Engine::renderFrame() {
                 tonemapConstants.totalSamples = 1u;
             } else if (ffxRrRun) {
                 tmSet = m_denoiser->getTonemapDescSet();
+                tonemapConstants.totalSamples = 1u;
+            } else if (reblurRun) {
+                tmSet = m_reblurDenoiser->getTonemapDescSet();
                 tonemapConstants.totalSamples = 1u;
             } else if (m_superResolution && m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution->getFsrUpscaler()) {
                 tmSet = m_superResolution->getTonemapFsrDescSet();
@@ -2933,11 +3028,15 @@ void Engine::renderFrame() {
 
         const bool useDenoiserPipeline = (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration) &&
                                          m_config.upscaler_mode != UpscalerMode::Upways;
+        const bool useReblurPipeline = (m_config.denoiser_mode == DenoiserMode::Reblur) &&
+                                       m_config.upscaler_mode != UpscalerMode::Upways;
         const bool anyDenoiseOrUpscale =
             (useDenoiserPipeline && m_denoiser && m_denoiser->isInitialized()) ||
+            (useReblurPipeline && m_reblurDenoiser && m_reblurDenoiser->isInitialized()) ||
             (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) ||
             (m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution);
         const bool needDecoupledMgpuPost = (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                            m_config.denoiser_mode == DenoiserMode::Reblur ||
                                             m_config.denoiser_mode == DenoiserMode::Upways ||
                                             m_config.upscaler_mode == UpscalerMode::Upways ||
                                             m_config.upscaler_mode == UpscalerMode::FSR);
@@ -3077,10 +3176,11 @@ void Engine::renderFrame() {
             }
         }
 
-        // Post-processing passes on activeCmd: FFX RR / Upways / FSR / Tonemap
+        // Post-processing passes on activeCmd: FFX RR / ReBLUR / Upways / FSR / Tonemap
         if (hasPostSubmission) {
-        // AMD FSR Ray Regeneration Denoiser (runs at internal renderW x renderH)
+        // AMD FSR Ray Regeneration / Analytical ReBLUR Denoisers (run at internal renderW x renderH)
         bool ffxRrRun = false;
+        bool reblurRun = false;
 
         if (anyDenoiseOrUpscale) {
             vkCmdWriteTimestamp2(activeCmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4);
@@ -3097,6 +3197,18 @@ void Engine::renderFrame() {
                 buildDenoiserCameraMatrices(renderW, renderH)
             );
             ffxRrRun = true;
+        } else if (useReblurPipeline && m_reblurDenoiser && m_reblurDenoiser->isInitialized()) {
+            const bool coupledWithFsr = (m_config.upscaler_mode == UpscalerMode::FSR);
+            m_reblurDenoiser->recordDenoise(
+                activeCmd, m_currentFrame, resetTemporal,
+                m_normalDepthImage, m_motionVectorImage, m_mlSpecularMotionImage,
+                m_mlAlbedoRoughnessImage, m_mlSpecAlbedoImage,
+                m_mlSkipImage,
+                m_mlDirectDiffuseImage, m_mlIndirectDiffuseImage,
+                m_mlDirectSpecularImage, m_mlIndirectSpecularImage,
+                buildReblurCameraMatrices(renderW, renderH, coupledWithFsr)
+            );
+            reblurRun = true;
         }
 
         bool upwaysRun = false;
@@ -3144,7 +3256,7 @@ void Engine::renderFrame() {
             upwaysRun = bandPrimaryUpwaysOk || (m_superResolution && m_superResolution->getUpwaysPipeline() != nullptr);
         } else {
             m_lastFrameWasUpwaysBandParallel = false;
-            if (!ffxRrRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
+            if (!ffxRrRun && !reblurRun && (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways)) {
                 if (m_superResolution) {
                     upwaysRun = m_superResolution->dispatchUpways(
                         activeCmd, resetTemporal, m_config, m_camera.get(),
@@ -3163,6 +3275,9 @@ void Engine::renderFrame() {
                 bool denoisedInput = false;
                 if (ffxRrRun && m_denoiser && m_denoiser->getDenoisedImage()) {
                     fsrInputImage = m_denoiser->getDenoisedImage();
+                    denoisedInput = true;
+                } else if (reblurRun && m_reblurDenoiser && m_reblurDenoiser->getDenoisedImage()) {
+                    fsrInputImage = m_reblurDenoiser->getDenoisedImage();
                     denoisedInput = true;
                 } else if (upwaysRun && m_superResolution->getUpwaysPipeline() && m_superResolution->getUpwaysPipeline()->getOutputImage()) {
                     fsrInputImage = m_superResolution->getUpwaysPipeline()->getOutputImage();
@@ -3197,6 +3312,9 @@ void Engine::renderFrame() {
             tonemapConstants.totalSamples = 1u;
         } else if (ffxRrRun) {
             tmSet = m_denoiser->getTonemapDescSet();
+            tonemapConstants.totalSamples = 1u;
+        } else if (reblurRun) {
+            tmSet = m_reblurDenoiser->getTonemapDescSet();
             tonemapConstants.totalSamples = 1u;
         } else if (m_superResolution && m_config.upscaler_mode == UpscalerMode::FSR && m_superResolution->getFsrUpscaler()) {
             tmSet = m_superResolution->getTonemapFsrDescSet();
@@ -3444,6 +3562,10 @@ void Engine::renderFrame() {
     }
 
     if (m_camera && !sceneLoadingActive) {
+        m_prevDenoiseJitterUv = m_denoiseJitterUv;
+        m_prevTanHalfFovY = std::tan(glm::radians(m_camera->getFov()) * 0.5f);
+        m_prevAspectRatio = m_camera->getAspect();
+        m_hasPrevReblurCamera = true;
         m_camera->advanceFrame();
     }
 
@@ -3559,6 +3681,30 @@ DenoiserPipeline::CameraMatrices Engine::buildDenoiserCameraMatrices(uint32_t wi
     return cm;
 }
 
+ReblurDenoiserPipeline::CameraMatrices Engine::buildReblurCameraMatrices(
+    uint32_t width, uint32_t height, bool upscalerCoupled
+) const {
+    (void)width;
+    (void)height;
+    ReblurDenoiserPipeline::CameraMatrices cm{};
+    if (!m_camera) return cm;
+
+    cm.view = m_camera->getViewMatrix();
+    cm.prevView = m_camera->getPrevViewMatrix();
+    cm.viewInverse = glm::inverse(cm.view);
+    cm.prevViewInverse = glm::inverse(cm.prevView);
+    cm.currJitterUv = m_denoiseJitterUv;
+    cm.prevJitterUv = m_prevDenoiseJitterUv;
+    const float currTanHalfFovY = std::tan(glm::radians(m_camera->getFov()) * 0.5f);
+    const float currAspect = m_camera->getAspect();
+    cm.tanHalfFovY = currTanHalfFovY;
+    cm.aspectRatio = currAspect;
+    cm.prevTanHalfFovY = m_hasPrevReblurCamera ? m_prevTanHalfFovY : currTanHalfFovY;
+    cm.prevAspectRatio = m_hasPrevReblurCamera ? m_prevAspectRatio : currAspect;
+    cm.upscalerCoupled = upscalerCoupled;
+    return cm;
+}
+
 void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate) {
     if (m_config.headless || !m_swapchain) return;
     if (newWidth == 0 || newHeight == 0) return;
@@ -3631,7 +3777,9 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     // recreated swapchain/G-buffer targets before m_superResolution->resize() runs.
     updateUpwaysDescriptors();
     destroySplitSignalResources();
-    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration || m_config.capture_channels >= 44u) {
+    if (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+        m_config.denoiser_mode == DenoiserMode::Reblur ||
+        m_config.capture_channels >= 44u) {
         ensureSplitSignalResources();
     }
     if (m_superResolution) {
@@ -3653,6 +3801,10 @@ void Engine::onResize(uint32_t newWidth, uint32_t newHeight, bool forceRecreate)
     if (m_denoiser) {
         m_denoiser->resize(m_config.getRenderWidth(), m_config.getRenderHeight(), m_config.accum_format, m_commandBuffers[0]);
         m_denoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
+    }
+    if (m_reblurDenoiser) {
+        m_reblurDenoiser->resize(m_config.getRenderWidth(), m_config.getRenderHeight(), m_config.accum_format, m_commandBuffers[0]);
+        m_reblurDenoiser->initTonemapDescriptors(m_postProcess.get(), m_outputImage);
     }
     if (m_causticsPipeline) {
         m_causticsPipeline->resize(getEffectiveGbufferWidth(), getEffectiveGbufferHeight(), [this](auto recordFn) {
@@ -4066,6 +4218,9 @@ void Engine::run() {
             m_camera->resetMoved();
             m_camera->resetPrevViewProj();
         }
+        m_hasPrevReblurCamera = false;
+        m_denoiseJitterUv = glm::vec2(0.0f);
+        m_prevDenoiseJitterUv = glm::vec2(0.0f);
         m_cameraPathTime = 0.0f;
         m_coasterSimTime = 0.0f;
         m_cameraMovedLastFrame = false;

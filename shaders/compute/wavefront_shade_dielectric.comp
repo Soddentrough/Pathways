@@ -303,6 +303,10 @@ bool writeDielectricPsrSurfaceGuides(
             float psrRough = 0.12;
             if (repIsEmissive) {
                 forceDiffusePath = true;
+                if (isCompact) {
+                    repDemodDiff = vec3(1.0);
+                    repDemodSpec = vec3(1.0);
+                }
             } else {
                 if ((captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u && repMat.emissiveTex > 0u) {
                     repAlbedo = clamp(repAlbedo + repEmissive, vec3(0.0), vec3(1.0));
@@ -784,10 +788,11 @@ void main() {
                                 : uvec2(0u);
                             bool isV4Capture = (pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u;
 #if !IS_SECONDARY_BOUNCE
+                            bool isCompact = (pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u;
                             bool isMlDenoiser = (pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) != 0u;
                             bool hasGbufferTargets = (pc.captureMlData != 0u) || ((ubo.flags & ((1u << 9) | (1u << 14))) != 0u);
                             bool domReflect0 = cannotRefract || (reflectProb >= 0.5);
-                            bool enablePsrGuides = (bounce == 0u) && (pc.sppSampleIndex == 0u) && (reflected0 == domReflect0) && !isV4Capture && hasGbufferTargets;
+                            bool enablePsrGuides = (bounce == 0u) && (pc.sppSampleIndex == 0u) && (reflected0 == domReflect0) && (!isV4Capture || isCompact) && hasGbufferTargets;
                             mat3 currPsrXform = reflected0
                                 ? buildReflectionMatrix(hitNormal)
                                 : (isThinWalled ? mat3(1.0) : buildRotationMatrixFromTo(nextDirection, rayDir));
@@ -835,7 +840,7 @@ void main() {
                                         if ((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u) {
                                             if ((pc.captureMlData & ML_CAPTURE_ENABLED_BIT) != 0u) {
 #if !IS_SECONDARY_BOUNCE
-                                                if (bounce == 0u && !reflected0 && !hadInternalReflect) {
+                                                if (bounce == 0u && ((!reflected0 && !hadInternalReflect) || enablePsrGuides)) {
                                                     wfAddCompactMlSkip(pixelCoord, skyContrib);
                                                 } else
 #endif
@@ -1180,7 +1185,7 @@ void main() {
 #if !IS_SECONDARY_BOUNCE
                             // Deterministic dominant-lobe PSR fallback trace on bounce-0 when the stochastic
                             // delta path diverged from the dominant reflection/refraction lobe before exporting guides.
-                            if (bounce == 0u && pc.sppSampleIndex == 0u && !psrWroteGuides && !isV4Capture && hasGbufferTargets) {
+                            if (bounce == 0u && pc.sppSampleIndex == 0u && !psrWroteGuides && (!isV4Capture || isCompact) && hasGbufferTargets) {
                                 vec3 gDir = rayDir;
                                 vec3 gOrigin = hitPoint;
                                 mat3 gPsrXform = mat3(1.0);

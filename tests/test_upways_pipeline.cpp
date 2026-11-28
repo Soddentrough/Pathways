@@ -1,4 +1,5 @@
 #include "rt/UpwaysPipeline.hpp"
+#include "rt/UpwaysV5Engine.hpp"
 #include "rt/PostProcessPipeline.hpp"
 #include "rt/upways_weights.hpp"
 #include "rt/upways_default_weights.hpp"
@@ -600,9 +601,10 @@ int main(int argc, char** argv) {
     std::cout << "  Pathways: Upways 4.0/5.0 Pipeline Unit & GPU Test       " << std::endl;
     std::cout << "==========================================================" << std::endl;
 
-    // 1. Push Constant Layout & Flags (80 B immutable ABI)
-    std::cout << "[TEST 1] UpwaysPushConstants ABI (80 B) & Flags..." << std::endl;
-    check_true(sizeof(UpwaysPushConstants) == 80, "UpwaysPushConstants must be 80 bytes");
+    // 1. Push Constant Layout & Flags (128 B ABI with camera-rotation/depth-delta motion fields)
+    std::cout << "[TEST 1] UpwaysPushConstants & UpwaysV5PushConstants ABI (128 B) & Flags..." << std::endl;
+    check_true(sizeof(UpwaysPushConstants) == 128, "UpwaysPushConstants must be 128 bytes");
+    check_true(sizeof(UpwaysV5PushConstants) == 128, "UpwaysV5PushConstants must be 128 bytes");
     check_true(offsetof(UpwaysPushConstants, lrWidth) == 0, "lrWidth offset == 0");
     check_true(offsetof(UpwaysPushConstants, lrHeight) == 4, "lrHeight offset == 4");
     check_true(offsetof(UpwaysPushConstants, hrWidth) == 8, "hrWidth offset == 8");
@@ -623,6 +625,12 @@ int main(int argc, char** argv) {
     check_true(offsetof(UpwaysPushConstants, fullHrHeight) == 68, "fullHrHeight offset == 68");
     check_true(offsetof(UpwaysPushConstants, keepHrYStart) == 72, "keepHrYStart offset == 72");
     check_true(offsetof(UpwaysPushConstants, keepHrYEnd) == 76, "keepHrYEnd offset == 76");
+    check_true(offsetof(UpwaysPushConstants, prevToCurrViewQuat) == 80, "prevToCurrViewQuat offset == 80");
+    check_true(offsetof(UpwaysPushConstants, currToPrevTransView) == 96, "currToPrevTransView offset == 96");
+    check_true(offsetof(UpwaysPushConstants, camMotionParams) == 112, "camMotionParams offset == 112");
+    check_true(offsetof(UpwaysV5PushConstants, prevToCurrViewQuat) == 80, "V5 prevToCurrViewQuat offset == 80");
+    check_true(offsetof(UpwaysV5PushConstants, currToPrevTransView) == 96, "V5 currToPrevTransView offset == 96");
+    check_true(offsetof(UpwaysV5PushConstants, camMotionParams) == 112, "V5 camMotionParams offset == 112");
     check_true(UPWAYS_FLAG_RESET_HISTORY == 1u, "UPWAYS_FLAG_RESET_HISTORY == 1");
     check_true(UPWAYS_FLAG_ENABLE_SUPERRES == 2u, "UPWAYS_FLAG_ENABLE_SUPERRES == 2");
     check_true(UPWAYS_FLAG_ZERO_RESIDUAL_MODE == 4u, "UPWAYS_FLAG_ZERO_RESIDUAL_MODE == 4");

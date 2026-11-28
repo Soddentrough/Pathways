@@ -24,7 +24,7 @@
 #include "rgb9e5.glsl"
 
 // -----------------------------------------------------------------------------
-// Push Constants (80 bytes exact, shared across all Upways 5.0 shaders)
+// Push Constants (128 bytes exact, shared across all Upways 5.0 shaders)
 // -----------------------------------------------------------------------------
 layout(push_constant) uniform UpwaysV5PC {
     uint  lrWidth;        // 0  (active band/full LR width)
@@ -47,6 +47,9 @@ layout(push_constant) uniform UpwaysV5PC {
     uint  fullHrHeight;   // 68 (full HR frame height)
     uint  keepHrYStart;   // 72 (first band-local output row for band pack / uOutputColor)
     uint  keepHrYEnd;     // 76 (exclusive band-local output row)
+    vec4  prevToCurrViewQuat;   // 80  (xyzw unit quat rotating prev view -> curr view)
+    vec4  currToPrevTransView;  // 96  (xyz = (prevView * inverse(currView))[3].xyz, w = tanHalfFovY)
+    vec4  camMotionParams;      // 112 (x = aspectRatio, y = camMotionValid [1.0 when live camera], z/w = 0)
 } pc;
 
 const uint UPWAYS_V5_FLAG_RESET_HISTORY      = 1u;
@@ -178,6 +181,11 @@ float sanitizeFloat(float v, float fallback) {
 vec3 normalizeNormalV5(vec3 n) {
     float l2 = dot(n, n);
     return (l2 > 1e-10) ? (n * inversesqrt(l2)) : vec3(0.0, 0.0, 1.0);
+}
+
+vec3 rotateByQuatV5(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
 }
 
 bool isSkyOrEmissiveOnly(float linearDepth, float matClass, vec3 aDiff, vec3 aSpec) {
@@ -486,7 +494,9 @@ void demodulateAndFoldV5(
     } else {
         aDiffEff = aDiff;
         aSpecEff = aSpec;
-        skipEff  = sanitizeRgb(skipRad);
+        skipEff  = (isSky && transBit)
+            ? clampFp16Rgb(irrD + irrS + sanitizeRgb(skipRad))
+            : sanitizeRgb(skipRad);
     }
 }
 

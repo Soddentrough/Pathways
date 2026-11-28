@@ -1,0 +1,232 @@
+#version 460
+#extension GL_KHR_shader_subgroup_vote : require
+
+// =============================================================================
+// ReBLUR Passes 3-4: Fast HitT + Roughness + Variance-Guided A-Trous Pyramid
+//   - Dispatched 3x ping-pong (stepSize = 2, 4, 8; step=1 fused into Pass 2 LDS)
+//   - Alternating 5-tap axial (+) / diagonal (x) wavelet stencil
+//   - Zero uAlbedoRoughness tap loads in diffuse loop (zeroDiff packed in varD sign)
+//   - subgroupAll skip on sky, mirrors (rough < 0.02), transmissive glass & matte spec
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REBLUR_USE_CAMERA_UBO
+#include "reblur_common.glsl"
+
+layout(set = 0, binding = 1, rgba16f) readonly  uniform image2D uInDiff;
+layout(set = 0, binding = 2, rgba16f) readonly  uniform image2D uInSpec;
+layout(set = 0, binding = 3, rgba16f) readonly  uniform image2D uCurrWorldND;
+layout(set = 0, binding = 4, rgba16f) readonly  uniform image2D uAlbedoRoughness;
+layout(set = 0, binding = 5, rg16f)   readonly  uniform image2D uHistHitT;
+layout(set = 0, binding = 6, rgba16f) readonly  uniform image2D uHistMeta;
+
+layout(set = 0, binding = 7, rgba16f) writeonly uniform image2D uOutDiff;
+layout(set = 0, binding = 8, rgba16f) writeonly uniform image2D uOutSpec;
+
+layout(push_constant) uniform PushConstants {
+    uint  width;
+    uint  height;
+    int   stepSize;      // 2, 4, 8 (step=1 fused into Pass 2 LDS)
+    uint  passIndex;     // 0 (s=2 +), 1 (s=4 x), 2 (s=8 +)
+    float phiNormal;     // 32.0
+    float phiPlaneDepth; // 2.0
+    float phiLumDiff;    // 4.0
+    float phiLumSpec;    // 3.0
+} pc;
+
+const ivec2 AXIAL_TAPS[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+const ivec2 DIAG_TAPS[4]  = ivec2[4](ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+    bool inBounds = (coord.x < int(pc.width)) && (coord.y < int(pc.height));
+    ivec2 safeCoord = clamp(coord, ivec2(0), imgMax);
+
+    vec4 cWorldND = imageLoad(uCurrWorldND, safeCoord);
+    vec4 inDiff   = imageLoad(uInDiff, safeCoord);
+    vec4 inSpec   = imageLoad(uInSpec, safeCoord);
+
+    bool  isSky     = reblurIsSky(cWorldND.w);
+    bool  cZeroDiff = (inDiff.a < 0.0);
+    float cVarD     = abs(reblurSanitizeScalar(inDiff.a, 0.0));
+    float cVarS     = max(reblurSanitizeScalar(inSpec.a, 0.0), 0.0);
+
+    vec2  rawHitT        = isSky ? vec2(0.0) : imageLoad(uHistHitT, safeCoord).rg;
+    float cRough         = isSky ? 1.0 : clamp(reblurSanitizeScalar(imageLoad(uAlbedoRoughness, safeCoord).a, 1.0), 0.0, 1.0);
+    bool  isMirror       = (!isSky) && (cRough < 0.02);
+    // Transmissive glass PSR encodes rawHitT.y < 0.0 while PSR back-wall has cRough >= 0.15:
+    // skip coarse specular blur (step >= 2) to keep Fresnel glass highlights razor-sharp!
+    bool  isTransmissive = (!isSky) && (rawHitT.y < 0.0) && (cRough >= 0.15);
+
+    bool skipDiff = isSky || (cVarD <= 3e-6);
+    bool skipSpec = isSky || isMirror || isTransmissive || (cVarS <= 1e-6);
+
+    // Subgroup-uniform bypass on sky, pure mirrors, glass specular, and zero-variance tiles
+    if (subgroupAll((!inBounds) || (skipDiff && skipSpec))) {
+        if (inBounds) {
+            vec3 cDRgb = reblurSanitizeRgb(inDiff.rgb);
+            vec3 cSRgb = reblurSanitizeRgb(inSpec.rgb);
+            imageStore(uOutDiff, coord, vec4(cDRgb, cZeroDiff ? -max(cVarD, 2e-6) : cVarD));
+            imageStore(uOutSpec, coord, vec4(cSRgb, cVarS));
+        }
+        return;
+    }
+
+    if (!inBounds) {
+        return;
+    }
+
+    vec3 cDiffRgb = reblurSanitizeRgb(inDiff.rgb);
+    vec3 cSpecRgb = reblurSanitizeRgb(inSpec.rgb);
+
+    if (skipDiff && skipSpec) {
+        imageStore(uOutDiff, coord, vec4(cDiffRgb, cZeroDiff ? -max(cVarD, 2e-6) : cVarD));
+        imageStore(uOutSpec, coord, vec4(cSpecRgb, cVarS));
+        return;
+    }
+
+    vec2  hitT     = abs(rawHitT);
+    float nDiff    = imageLoad(uHistMeta, coord).r;
+    vec2  res      = vec2(float(pc.width), float(pc.height));
+    vec3  cViewPos = reblurUnprojectToView(coord, cWorldND.w, uCam.tanHalfFovY, uCam.aspectRatio, res);
+    vec3  nVkView  = reblurWorldNormalToVkView(cWorldND.xyz, uCam.viewToWorld);
+
+    // Precompute linear tangent-plane projection coefficients (2 FMAs per tap)
+    float kx = uCam.aspectRatio * uCam.tanHalfFovY * nVkView.x;
+    float ky = uCam.tanHalfFovY * nVkView.y;
+    float scaleX = (2.0 * kx) / res.x;
+    float scaleY = (2.0 * ky) / res.y;
+    float bias = nVkView.z - kx - ky;
+    float centerPlaneDot = dot(cViewPos, nVkView);
+    float pixelFootprint = 2.0 * cViewPos.z * uCam.tanHalfFovY / max(res.y, 1.0);
+    float fp16Floor = max(cViewPos.z * 0.0009765625, 1e-4);
+
+    const float centerW = 0.140625; // (3/8)^2
+    const bool  useDiag = ((pc.passIndex & 1u) != 0u);
+    const float kTap    = (pc.stepSize <= 4) ? 0.09375 : 0.0625;
+
+    // =========================================================================
+    // 1. HitT + Variance-Guided Diffuse 5-Tap Alternating A-Trous
+    //    (ZERO uAlbedoRoughness tap loads; zeroDiffAlb read from tapData.a sign)
+    // =========================================================================
+    vec3  outDiffRgb = cDiffRgb;
+    float outDiffVar = cVarD;
+    if (!skipDiff) {
+        float diffHitFactor = (hitT.x > 1e-4)
+            ? clamp(hitT.x / max(hitT.x + cWorldND.w * 0.5, 1e-3), 0.15, 1.0)
+            : 1.0;
+        int effDiffStep = (pc.stepSize <= 2)
+            ? pc.stepSize
+            : max(2, int(round(float(pc.stepSize) * mix(0.55, 1.0, diffHitFactor))));
+        float effPhiLumD = pc.phiLumDiff
+            * mix(0.65, 1.15, diffHitFactor)
+            * mix(1.25, 0.85, clamp(nDiff / 32.0, 0.0, 1.0));
+        float invDepthTolD = 1.0 / max(pc.phiPlaneDepth * float(effDiffStep) * pixelFootprint, fp16Floor);
+        float cLumD = reblurLuminance(cDiffRgb);
+
+        vec3  radAcc = cDiffRgb * centerW;
+        float wAcc   = centerW;
+        float varAcc = (centerW * centerW) * cVarD;
+
+        for (int i = 0; i < 4; ++i) {
+            ivec2 off = useDiag ? DIAG_TAPS[i] : AXIAL_TAPS[i];
+            int tapX = clamp(coord.x + off.x * effDiffStep, 0, imgMax.x);
+            int tapY = clamp(coord.y + off.y * effDiffStep, 0, imgMax.y);
+            ivec2 tapCoord = ivec2(tapX, tapY);
+
+            vec4 tapWND = imageLoad(uCurrWorldND, tapCoord);
+            if (reblurIsSky(tapWND.w)) continue;
+
+            float cosA = max(dot(cWorldND.xyz, tapWND.xyz), 0.0);
+            if (cosA <= 0.15) continue;
+
+            float tapPlaneDot = tapWND.w * ((float(tapX) + 0.5) * scaleX + (float(tapY) + 0.5) * scaleY + bias);
+            float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolD;
+            if (depthArg >= 8.0) continue;
+
+            vec4 tapData = imageLoad(uInDiff, tapCoord);
+            if ((tapData.a < 0.0) != cZeroDiff) continue;
+
+            vec3  tapRgb = reblurSanitizeRgb(tapData.rgb);
+            float tapVar = abs(reblurSanitizeScalar(tapData.a, 0.0));
+            float lumArg = abs(cLumD - reblurLuminance(tapRgb)) / (effPhiLumD * sqrt(max(max(cVarD, tapVar * 0.5), 1e-5)) + 1e-4);
+
+            float w = kTap * reblurPow32(cosA) * exp2(-(depthArg + lumArg) * REBLUR_LOG2E);
+            radAcc += tapRgb * w;
+            wAcc   += w;
+            varAcc += (w * w) * tapVar;
+        }
+
+        float invW = 1.0 / max(wAcc, 1e-4);
+        outDiffRgb = clamp(radAcc * invW, 0.0, REBLUR_MAX_FP16);
+        outDiffVar = clamp(varAcc * invW * invW, 0.0, REBLUR_MAX_FP16);
+    }
+
+    // =========================================================================
+    // 2. HitT + Roughness-Guided Specular 5-Tap Alternating A-Trous
+    //    (subgroupAll skip avoids specular loads/ALU across matte wall tiles)
+    // =========================================================================
+    vec3  outSpecRgb = cSpecRgb;
+    float outSpecVar = cVarS;
+    if (!subgroupAll(skipSpec) && !skipSpec) {
+        float hitFactorS = (hitT.y > 1e-4)
+            ? clamp(hitT.y / max(hitT.y + cWorldND.w, 1e-3), 0.05, 1.0)
+            : 0.5;
+        float lobeFactor = hitFactorS * clamp(cRough * cRough * 2.0, 0.05, 1.0);
+        int effSpecStep  = max(1, int(round(float(pc.stepSize) * mix(0.25, 1.0, lobeFactor))));
+
+        float effPhiNSpec = min(pc.phiNormal / max(cRough * cRough, 0.05), 256.0);
+        float effPhiLumS  = pc.phiLumSpec * mix(0.70, 1.35, cRough);
+        float phiRough    = max(0.08 + 0.15 * cRough, 0.06);
+        float invDepthTolS = 1.0 / max(pc.phiPlaneDepth * float(effSpecStep) * pixelFootprint, fp16Floor);
+        float cLumS = reblurLuminance(cSpecRgb);
+
+        vec3  specAcc = cSpecRgb * centerW;
+        float wAcc    = centerW;
+        float varAcc  = (centerW * centerW) * cVarS;
+
+        for (int i = 0; i < 4; ++i) {
+            ivec2 off = useDiag ? DIAG_TAPS[i] : AXIAL_TAPS[i];
+            int tapX = clamp(coord.x + off.x * effSpecStep, 0, imgMax.x);
+            int tapY = clamp(coord.y + off.y * effSpecStep, 0, imgMax.y);
+            ivec2 tapCoord = ivec2(tapX, tapY);
+
+            vec4 tapWND = imageLoad(uCurrWorldND, tapCoord);
+            if (reblurIsSky(tapWND.w)) continue;
+
+            float cosA = max(dot(cWorldND.xyz, tapWND.xyz), 0.0);
+            if (cosA <= 0.25) continue;
+
+            float tapPlaneDot = tapWND.w * ((float(tapX) + 0.5) * scaleX + (float(tapY) + 0.5) * scaleY + bias);
+            float depthArg = abs(tapPlaneDot - centerPlaneDot) * invDepthTolS;
+            if (depthArg >= 8.0) continue;
+
+            float tapRough = clamp(reblurSanitizeScalar(imageLoad(uAlbedoRoughness, tapCoord).a, 1.0), 0.0, 1.0);
+            float roughArg = abs(cRough - tapRough) / phiRough;
+
+            vec4  tapData = imageLoad(uInSpec, tapCoord);
+            vec3  tapRgb  = reblurSanitizeRgb(tapData.rgb);
+            float tapVar  = max(reblurSanitizeScalar(tapData.a, 0.0), 0.0);
+            float lumArg  = abs(cLumS - reblurLuminance(tapRgb)) / (effPhiLumS * sqrt(max(max(cVarS, tapVar * 0.5), 1e-5)) + 1e-4);
+
+            float w = kTap * pow(cosA, effPhiNSpec) * exp2(-(depthArg + roughArg + lumArg) * REBLUR_LOG2E);
+            specAcc += tapRgb * w;
+            wAcc    += w;
+            varAcc  += (w * w) * tapVar;
+        }
+
+        float invW = 1.0 / max(wAcc, 1e-4);
+        float roughFade = smoothstep(0.02, 0.04, cRough);
+        if (pc.stepSize >= 8) {
+            roughFade *= smoothstep(0.03, 0.12, cRough);
+        }
+        outSpecRgb = clamp(mix(cSpecRgb, specAcc * invW, roughFade), 0.0, REBLUR_MAX_FP16);
+        outSpecVar = clamp(mix(cVarS, varAcc * invW * invW, roughFade), 0.0, REBLUR_MAX_FP16);
+    }
+
+    float packedOutVarD = cZeroDiff ? -max(outDiffVar, 2e-6) : outDiffVar;
+    imageStore(uOutDiff, coord, vec4(outDiffRgb, packedOutVarD));
+    imageStore(uOutSpec, coord, vec4(outSpecRgb, outSpecVar));
+}

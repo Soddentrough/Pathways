@@ -122,7 +122,28 @@ inline TriangleShadeGPU createTriangleShadeGPU(const TriangleGPU& tri) {
 
     s.materialId = tri.materialId;
     s.padding0   = tri.padding[0];
-    s.reserved0  = 0;
+
+    // Exact per-triangle object-space signed mean curvature (+1/R convex, 0 planar, -1/R concave)
+    // for curvature-aware thin-lens specular Virtual Motion Vectors (VMV).
+    glm::vec3 e1 = p1 - p0;
+    glm::vec3 e2 = p2 - p0;
+    glm::vec3 nf = glm::cross(e1, e2);
+    float a2 = glm::length(nf);
+    float kappaObj = 0.0f;
+    if (a2 > 1e-10f) {
+        glm::vec3 nHat = nf / a2;
+        auto safeNorm = [&nHat](const glm::vec4& nv) -> glm::vec3 {
+            glm::vec3 v(nv);
+            float len = glm::length(v);
+            return (len > 1e-6f) ? (v / len) : nHat;
+        };
+        glm::vec3 n0 = safeNorm(tri.v0.normal);
+        glm::vec3 dn1 = safeNorm(tri.v1.normal) - n0;
+        glm::vec3 dn2 = safeNorm(tri.v2.normal) - n0;
+        kappaObj = (glm::dot(dn1, glm::cross(e2, nHat)) + glm::dot(dn2, glm::cross(nHat, e1))) / (2.0f * a2);
+        kappaObj = std::isfinite(kappaObj) ? std::clamp(kappaObj, -1e4f, 1e4f) : 0.0f;
+    }
+    s.reserved0  = glm::floatBitsToUint(kappaObj);
 
     return s;
 }

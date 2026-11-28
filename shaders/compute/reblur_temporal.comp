@@ -1,0 +1,611 @@
+#version 460
+
+// =============================================================================
+// ReBLUR Pass 1: Temporal Accumulation with World-Space Normal + mvZ
+//                Disocclusion, Exact Jittered-Grid Reprojection, Curvature-Aware
+//                Dual Specular VMV Track, Unbiased Static Fast-History Antilag &
+//                Compact FP16-Packed LDS (< 10 KB)
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#define REBLUR_USE_CAMERA_UBO
+#include "reblur_common.glsl"
+
+layout(set = 0, binding = 1,  rgba16f) readonly  uniform image2D uPreDiff;
+layout(set = 0, binding = 2,  rgba16f) readonly  uniform image2D uPreSpec;
+layout(set = 0, binding = 3,  rgba16f) readonly  uniform image2D uCurrWorldND;
+layout(set = 0, binding = 4,  rgba16f) readonly  uniform image2D uPrevWorldND;
+layout(set = 0, binding = 5,  rgba16f) readonly  uniform image2D uMotionVectors;
+layout(set = 0, binding = 6,  rgba16f) readonly  uniform image2D uSpecularMotion;
+layout(set = 0, binding = 7,  rgba16f) readonly  uniform image2D uAlbedoRoughness;
+
+layout(set = 0, binding = 8,  rgba16f) readonly  uniform image2D uPrevHistDiff;
+layout(set = 0, binding = 9,  rgba16f) readonly  uniform image2D uPrevHistSpec;
+layout(set = 0, binding = 10, rgba16f) readonly  uniform image2D uPrevHistMoments;
+layout(set = 0, binding = 11, rgba16f) readonly  uniform image2D uPrevHistMeta;
+layout(set = 0, binding = 12, rg16f)   readonly  uniform image2D uPrevHistHitT;
+
+layout(set = 0, binding = 13, rgba16f) writeonly uniform image2D uOutHistDiff;
+layout(set = 0, binding = 14, rgba16f) writeonly uniform image2D uOutHistSpec;
+layout(set = 0, binding = 15, rgba16f) writeonly uniform image2D uOutHistMoments;
+layout(set = 0, binding = 16, rgba16f) writeonly uniform image2D uOutHistMeta;
+layout(set = 0, binding = 17, rg16f)   writeonly uniform image2D uOutHistHitT;
+
+layout(push_constant) uniform PushConstants {
+    uint  width;
+    uint  height;
+    uint  resetHistory;
+    uint  upscalerCoupled;
+    float maxDiffHistory; // 32.0
+    float maxSpecHistory; // 16.0
+    float pad0;
+    float pad1;
+} pc;
+
+// Compact FP16-packed 18x18 LDS (~9.6 KB total for 2x RDNA 4 CU occupancy)
+#define TILE_DIM    18
+#define TILE_STRIDE 19
+
+shared uvec2 s_preDiff[TILE_DIM][TILE_STRIDE];
+shared uvec2 s_preSpec[TILE_DIM][TILE_STRIDE];
+shared uvec2 s_worldND[TILE_DIM][TILE_STRIDE];
+shared uint  s_roughZero[TILE_DIM][TILE_STRIDE]; // low 16: fp16 rough, high 16: zeroDiffAlb flag
+
+void loadTileLDS(ivec2 globalCoord, int lx, int ly) {
+    vec4 wnd = imageLoad(uCurrWorldND, globalCoord);
+    s_worldND[ly][lx] = reblurPackHalf4(wnd);
+    if (reblurIsSky(wnd.w)) {
+        s_preDiff[ly][lx]   = uvec2(0u);
+        s_preSpec[ly][lx]   = uvec2(0u);
+        s_roughZero[ly][lx] = packHalf2x16(vec2(1.0, 0.0));
+        return;
+    }
+    vec4 ar = imageLoad(uAlbedoRoughness, globalCoord);
+    float rough = clamp(reblurSanitizeScalar(ar.a, 1.0), 0.0, 1.0);
+    float zeroDiff = (dot(ar.rgb, ar.rgb) <= 1e-5) ? 1.0 : 0.0;
+    s_preDiff[ly][lx]   = reblurPackHalf4(imageLoad(uPreDiff, globalCoord));
+    s_preSpec[ly][lx]   = reblurPackHalf4(imageLoad(uPreSpec, globalCoord));
+    s_roughZero[ly][lx] = packHalf2x16(vec2(rough, zeroDiff));
+}
+
+bool validateSurfaceTap(
+    vec3 currWorldN,
+    float expectedPrevZ,
+    float grazingFactor,
+    bool isDynamic,
+    vec4 qWorldND)
+{
+    if (reblurIsSky(qWorldND.w)) {
+        return false;
+    }
+    float nDot = dot(currWorldN, qWorldND.xyz);
+    float nThresh = isDynamic ? 0.55 : 0.85;
+    if (nDot < nThresh) {
+        return false;
+    }
+    float zTol = (isDynamic ? 0.15 : 0.06) * grazingFactor;
+    float relZ = abs(expectedPrevZ - qWorldND.w) / max(expectedPrevZ, 0.05);
+    return (relZ < zTol);
+}
+
+bool validateSpecVmvTap(
+    vec3 currWorldN,
+    float expectedPrevZ,
+    float grazingFactor,
+    float currSpecHitT,
+    float currRough,
+    vec4 qWorldND,
+    float qRawHitS)
+{
+    if (reblurIsSky(qWorldND.w)) {
+        return false;
+    }
+    bool qIsLowRough = (qRawHitS < 0.0);
+    float qPrevSpecHitT = abs(qRawHitS);
+
+    if (currRough < 0.04) {
+        // Curved mirrors (e.g. mirror sphere): stay strictly on low-roughness reflector surface
+        // while relaxing normal/depth tolerance across curved VMV offsets.
+        if (!qIsLowRough) {
+            return false;
+        }
+        if (dot(currWorldN, qWorldND.xyz) < 0.40) {
+            return false;
+        }
+        float relZ = abs(expectedPrevZ - qWorldND.w) / max(expectedPrevZ, 0.05);
+        if (relZ >= 0.25 * grazingFactor) {
+            return false;
+        }
+        if (currSpecHitT > 1e-3 && qPrevSpecHitT > 1e-3) {
+            float relH = abs(currSpecHitT - qPrevSpecHitT) / max(max(currSpecHitT, qPrevSpecHitT), 0.1);
+            if (relH >= 0.35) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (dot(currWorldN, qWorldND.xyz) < 0.80) {
+        return false;
+    }
+    float relZ = abs(expectedPrevZ - qWorldND.w) / max(expectedPrevZ, 0.05);
+    if (relZ >= 0.12 * grazingFactor) {
+        return false;
+    }
+    if (currRough < 0.30 && currSpecHitT > 1e-3 && qPrevSpecHitT > 1e-3) {
+        float relH = abs(currSpecHitT - qPrevSpecHitT) / max(max(currSpecHitT, qPrevSpecHitT), 0.1);
+        if (relH >= 0.30) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    uint linearIdx = gl_LocalInvocationIndex;
+    int tx = int(linearIdx & 15u);
+    int ty = int(linearIdx >> 4u);
+    ivec2 coord = tileOrigin + ivec2(tx, ty);
+    ivec2 imgMax = ivec2(int(pc.width) - 1, int(pc.height) - 1);
+
+    // 1. Cooperative 18x18 LDS load
+    loadTileLDS(clamp(coord, ivec2(0), imgMax), tx + 1, ty + 1);
+    if (linearIdx < 68u) {
+        int lx, ly;
+        if (linearIdx < 18u) {
+            ly = 0;
+            lx = int(linearIdx);
+        } else if (linearIdx < 36u) {
+            ly = 17;
+            lx = int(linearIdx - 18u);
+        } else {
+            uint u = linearIdx - 36u;
+            ly = 1 + int(u >> 1u);
+            lx = ((u & 1u) == 0u) ? 0 : 17;
+        }
+        ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
+        loadTileLDS(apronCoord, lx, ly);
+    }
+    barrier();
+
+    if (coord.x >= int(pc.width) || coord.y >= int(pc.height)) {
+        return;
+    }
+
+    int clx = tx + 1;
+    int cly = ty + 1;
+
+    vec4  cWorldND    = reblurUnpackHalf4(s_worldND[cly][clx]);
+    vec3  currWorldN  = cWorldND.xyz;
+    float currZ       = cWorldND.w;
+    vec2  cRoughZero  = unpackHalf2x16(s_roughZero[cly][clx]);
+    float currRough   = cRoughZero.x;
+    bool  cZeroDiff   = (cRoughZero.y > 0.5);
+
+    vec4  cPreDiff    = reblurUnpackHalf4(s_preDiff[cly][clx]);
+    vec4  cPreSpec    = reblurUnpackHalf4(s_preSpec[cly][clx]);
+    vec3  currDiff    = reblurSanitizeRgb(cPreDiff.rgb);
+    vec3  currSpec    = reblurSanitizeRgb(cPreSpec.rgb);
+    float currDiffHit = max(reblurSanitizeScalar(cPreDiff.a, 0.0), 0.0);
+    float currSpecHit = max(reblurSanitizeScalar(cPreSpec.a, 0.0), 0.0);
+
+    // Sky fast-path: mark converged so Pass 2 skips sky tiles
+    if (reblurIsSky(currZ)) {
+        imageStore(uOutHistDiff,    coord, vec4(0.0));
+        imageStore(uOutHistSpec,    coord, vec4(0.0));
+        imageStore(uOutHistMoments, coord, vec4(0.0));
+        imageStore(uOutHistMeta,    coord, vec4(pc.maxDiffHistory, pc.maxSpecHistory, 0.0, 0.0));
+        imageStore(uOutHistHitT,    coord, vec4(0.0));
+        return;
+    }
+
+    // 2. 3x3 bilateral neighborhood RGB + luminance statistics (from compact LDS)
+    vec3  diffM1Rgb = currDiff;
+    vec3  diffM2Rgb = currDiff * currDiff;
+    vec3  specM1Rgb = currSpec;
+    vec3  specM2Rgb = currSpec * currSpec;
+    float currDiffLum = reblurLuminance(currDiff);
+    float currSpecLum = reblurLuminance(currSpec);
+    float diffM1Lum = currDiffLum;
+    float diffM2Lum = currDiffLum * currDiffLum;
+    float specM1Lum = currSpecLum;
+    float specM2Lum = currSpecLum * currSpecLum;
+    float validD = 1.0;
+    float validS = 1.0;
+
+    float invCurrZ = 1.0 / max(currZ, 0.05);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            int nx = clx + dx;
+            int ny = cly + dy;
+            vec4 nWND = reblurUnpackHalf4(s_worldND[ny][nx]);
+            if (reblurIsSky(nWND.w)) continue;
+            if (dot(currWorldN, nWND.xyz) <= 0.70) continue;
+            if (abs(currZ - nWND.w) * invCurrZ > 0.10) continue;
+
+            vec3 nD = reblurSanitizeRgb(reblurUnpackHalf4(s_preDiff[ny][nx]).rgb);
+            float nDL = reblurLuminance(nD);
+            diffM1Rgb += nD;
+            diffM2Rgb += nD * nD;
+            diffM1Lum += nDL;
+            diffM2Lum += nDL * nDL;
+            validD += 1.0;
+
+            float nRough = unpackHalf2x16(s_roughZero[ny][nx]).x;
+            if (abs(currRough - nRough) <= 0.20) {
+                vec3 nS = reblurSanitizeRgb(reblurUnpackHalf4(s_preSpec[ny][nx]).rgb);
+                float nSL = reblurLuminance(nS);
+                specM1Rgb += nS;
+                specM2Rgb += nS * nS;
+                specM1Lum += nSL;
+                specM2Lum += nSL * nSL;
+                validS += 1.0;
+            }
+        }
+    }
+
+    float invValidD = 1.0 / validD;
+    vec3  diffMeanRgb = diffM1Rgb * invValidD;
+    vec3  diffSigmaRgb = sqrt(max(diffM2Rgb * invValidD - diffMeanRgb * diffMeanRgb, vec3(0.0)));
+    float diffMeanLum = diffM1Lum * invValidD;
+    float spatialVarDiff = max(0.0, diffM2Lum * invValidD - diffMeanLum * diffMeanLum);
+
+    float invValidS = 1.0 / validS;
+    vec3  specMeanRgb = specM1Rgb * invValidS;
+    vec3  specSigmaRgb = sqrt(max(specM2Rgb * invValidS - specMeanRgb * specMeanRgb, vec3(0.0)));
+    float specMeanLum = specM1Lum * invValidS;
+    float spatialVarSpec = max(0.0, specM2Lum * invValidS - specMeanLum * specMeanLum);
+
+    // 3. Exact jittered-grid surface reprojection & affine dynamic-object check
+    vec2 res = vec2(float(pc.width), float(pc.height));
+    vec2 currUV = (vec2(coord) + 0.5) / res;
+
+    vec4 mv4 = imageLoad(uMotionVectors, coord);
+    vec2 mvSurface = reblurSanitizeVec2(mv4.xy);
+    float mvZ = reblurSanitizeScalar(mv4.z, 0.0); // prevZ - currZ
+
+    vec2 jitterDelta = uCam.currJitterUv - uCam.prevJitterUv;
+    vec2 prevUV = currUV - mvSurface + jitterDelta;
+
+    vec2 currUnjitUV = currUV + uCam.currJitterUv;
+    vec3 currViewPos = reblurUnprojectUvToView(currUnjitUV, currZ, uCam.tanHalfFovY, uCam.aspectRatio);
+    vec4 prevViewPos = uCam.currViewToPrevView * vec4(currViewPos, 1.0);
+    float prevAspect = (uCam.prevAspectRatio > 1e-4) ? uCam.prevAspectRatio : uCam.aspectRatio;
+    float prevTanFov = (uCam.prevTanHalfFovY > 1e-4) ? uCam.prevTanHalfFovY : uCam.tanHalfFovY;
+    vec2 expectedPrevNDC = prevViewPos.xy / (vec2(prevAspect, 1.0) * prevTanFov * max(prevViewPos.z, 1e-4));
+    vec2 expectedPrevUnjitUV = expectedPrevNDC * 0.5 + 0.5;
+    vec2 actualPrevUnjitUV = currUnjitUV - mvSurface;
+    float mvDiscrepancyPx = length((actualPrevUnjitUV - expectedPrevUnjitUV) * res);
+    bool isDynamic = (mvDiscrepancyPx > 2.0);
+
+    float expectedPrevZ = currZ + mvZ;
+    if (expectedPrevZ <= 1e-3) {
+        expectedPrevZ = max(prevViewPos.z, 1e-3);
+    }
+
+    vec3 currViewNGlm = transpose(mat3(uCam.viewToWorld)) * currWorldN;
+    float grazingFactor = 1.0 + 3.0 * (1.0 - clamp(abs(currViewNGlm.z), 0.0, 1.0));
+
+    // 4. Surface-MV history gather
+    bool  validSurf     = false;
+    vec3  surfPrevDiff  = vec3(0.0);
+    vec3  surfPrevSpec  = vec3(0.0);
+    vec4  surfPrevMom   = vec4(0.0);
+    vec4  surfPrevMeta  = vec4(0.0);
+    vec2  surfPrevHitT  = vec2(0.0);
+    bool  surfSpecHitOk = true;
+
+    vec2 shiftPx = (prevUV - currUV) * res;
+    bool zeroShift = (dot(shiftPx, shiftPx) <= 1e-4);
+
+    if (pc.resetHistory == 0u &&
+        prevUV.x >= 0.0 && prevUV.x <= 1.0 &&
+        prevUV.y >= 0.0 && prevUV.y <= 1.0)
+    {
+        if (zeroShift) {
+            vec4 qWND = imageLoad(uPrevWorldND, coord);
+            if (validateSurfaceTap(currWorldN, expectedPrevZ, grazingFactor, isDynamic, qWND)) {
+                validSurf    = true;
+                surfPrevDiff = reblurSanitizeRgb(imageLoad(uPrevHistDiff, coord).rgb);
+                surfPrevSpec = reblurSanitizeRgb(imageLoad(uPrevHistSpec, coord).rgb);
+                surfPrevMom  = imageLoad(uPrevHistMoments, coord);
+                surfPrevMeta = imageLoad(uPrevHistMeta, coord);
+                surfPrevHitT = abs(imageLoad(uPrevHistHitT, coord).rg);
+            }
+        } else {
+            vec2 prevSub = prevUV * res - 0.5;
+            ivec2 p00 = ivec2(floor(prevSub));
+            vec2 f = prevSub - vec2(p00);
+
+            float wSum = 0.0;
+            vec3 dAcc = vec3(0.0);
+            vec3 sAcc = vec3(0.0);
+            vec4 mAcc = vec4(0.0);
+            vec4 mtAcc = vec4(0.0);
+            vec2 hAcc = vec2(0.0);
+
+            for (int dy = 0; dy <= 1; ++dy) {
+                for (int dx = 0; dx <= 1; ++dx) {
+                    ivec2 tc = clamp(p00 + ivec2(dx, dy), ivec2(0), imgMax);
+                    float bw = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
+                    if (bw <= 1e-4) continue;
+
+                    vec4 qWND = imageLoad(uPrevWorldND, tc);
+                    if (validateSurfaceTap(currWorldN, expectedPrevZ, grazingFactor, isDynamic, qWND)) {
+                        wSum  += bw;
+                        dAcc  += reblurSanitizeRgb(imageLoad(uPrevHistDiff, tc).rgb) * bw;
+                        sAcc  += reblurSanitizeRgb(imageLoad(uPrevHistSpec, tc).rgb) * bw;
+                        mAcc  += imageLoad(uPrevHistMoments, tc) * bw;
+                        mtAcc += imageLoad(uPrevHistMeta, tc) * bw;
+                        hAcc  += abs(imageLoad(uPrevHistHitT, tc).rg) * bw;
+                    }
+                }
+            }
+
+            if (wSum > 1e-4) {
+                float invW = 1.0 / wSum;
+                validSurf    = true;
+                surfPrevDiff = dAcc * invW;
+                surfPrevSpec = sAcc * invW;
+                surfPrevMom  = mAcc * invW;
+                surfPrevMeta = mtAcc * invW;
+                surfPrevHitT = hAcc * invW;
+            } else {
+                ivec2 nearCoord = clamp(ivec2(floor(prevUV * res)), ivec2(0), imgMax);
+                vec4 qWND = imageLoad(uPrevWorldND, nearCoord);
+                if (validateSurfaceTap(currWorldN, expectedPrevZ, grazingFactor, isDynamic, qWND)) {
+                    validSurf    = true;
+                    surfPrevDiff = reblurSanitizeRgb(imageLoad(uPrevHistDiff, nearCoord).rgb);
+                    surfPrevSpec = reblurSanitizeRgb(imageLoad(uPrevHistSpec, nearCoord).rgb);
+                    surfPrevMom  = imageLoad(uPrevHistMoments, nearCoord);
+                    surfPrevMeta = imageLoad(uPrevHistMeta, nearCoord);
+                    surfPrevHitT = abs(imageLoad(uPrevHistHitT, nearCoord).rg);
+                }
+            }
+        }
+    }
+
+    if (validSurf && currRough < 0.25 && currSpecHit > 1e-3 && surfPrevHitT.y > 1e-3) {
+        float relH = abs(currSpecHit - surfPrevHitT.y) / max(max(currSpecHit, surfPrevHitT.y), 0.1);
+        surfSpecHitOk = (relH < 0.30);
+    }
+
+    // 5. Diffuse temporal accumulation + unbiased static fast-history antilag
+    vec3  accDiff     = currDiff;
+    float varDiff     = spatialVarDiff;
+    float accM1d      = currDiffLum;
+    float accM2d      = currDiffLum * currDiffLum + spatialVarDiff;
+    float nDiff       = 1.0;
+    float fastDiffLum = diffMeanLum;
+    float accDiffHit  = currDiffHit;
+
+    if (validSurf) {
+        float prevNDiff    = max(reblurSanitizeScalar(surfPrevMeta.r, 1.0), 1.0);
+        float prevFastDiff = max(reblurSanitizeScalar(surfPrevMeta.b, diffMeanLum), 0.0);
+        float prevM1d      = max(reblurSanitizeScalar(surfPrevMom.x, diffMeanLum), 0.0);
+        float prevM2d      = max(reblurSanitizeScalar(surfPrevMom.y, prevM1d * prevM1d), prevM1d * prevM1d);
+
+        // Update fast EMA from 3x3 bilateral mean (not noisy 1-spp center) to eliminate spurious antilag trips
+        fastDiffLum = mix(prevFastDiff, diffMeanLum, 0.25);
+
+        float tempSigD = sqrt(max(0.0, prevM2d - prevM1d * prevM1d));
+        float refSigD  = max(max(tempSigD, sqrt(spatialVarDiff)), 0.12 * max(fastDiffLum, prevM1d) + 0.02);
+        float lagD     = abs(fastDiffLum - prevM1d) / refSigD;
+        float antilagD = clamp((lagD - 2.25) / 2.25, 0.0, 0.85);
+
+        if (antilagD > 1e-3) {
+            prevNDiff = mix(prevNDiff, 2.0, antilagD);
+        }
+
+        // Only apply 3x3 single-frame AABB clamp on dynamic objects (static geometry stays unbiased!)
+        vec3 histDiff = surfPrevDiff;
+        if (isDynamic && validD >= 3.0) {
+            float clampMixD = max(antilagD, 0.65);
+            float gammaD = mix(3.5, 1.5, clampMixD);
+            vec3 clampMin = max(diffMeanRgb - gammaD * diffSigmaRgb, vec3(0.0));
+            vec3 clampMax = diffMeanRgb + gammaD * diffSigmaRgb;
+            histDiff = mix(histDiff, clamp(histDiff, clampMin, clampMax), clampMixD * 0.85);
+        }
+
+        float maxDiffN = isDynamic ? min(pc.maxDiffHistory, 12.0) : pc.maxDiffHistory;
+        nDiff = min(prevNDiff + 1.0, maxDiffN);
+        float alphaD = 1.0 / max(nDiff, 1.0);
+
+        accDiff = mix(histDiff, currDiff, alphaD);
+        accM1d  = mix(prevM1d, currDiffLum, alphaD);
+        accM2d  = mix(prevM2d, currDiffLum * currDiffLum, alphaD);
+        float rawVarD = max(0.0, accM2d - accM1d * accM1d);
+        float spatBlendD = clamp(1.0 - (nDiff - 1.0) / 3.0, 0.0, 1.0);
+        varDiff = mix(rawVarD, max(rawVarD, spatialVarDiff), spatBlendD);
+
+        if (currDiffHit > 1e-4 && surfPrevHitT.x > 1e-4) {
+            accDiffHit = mix(surfPrevHitT.x, currDiffHit, alphaD);
+        } else {
+            accDiffHit = max(currDiffHit, surfPrevHitT.x);
+        }
+    }
+
+    // 6. Dual Surface + Curvature-Aware Specular VMV reprojection track
+    vec4  specMot        = imageLoad(uSpecularMotion, coord);
+    bool  isTransmissive = (reblurSanitizeScalar(specMot.z, 0.0) < 0.0);
+    vec2  vSpec          = reblurSanitizeVec2(specMot.rg);
+    float specReflDist   = max(max(reblurSanitizeScalar(specMot.a, 0.0), 0.0), currSpecHit);
+    bool  hasValidVmv    = (!isTransmissive) && (specReflDist > 1e-4);
+    float vmvTrust       = hasValidVmv ? (1.0 - smoothstep(0.12, 0.35, currRough)) : 0.0;
+
+    vec2  prevUVSpec     = currUV - vSpec + jitterDelta;
+    bool  separateVmv    = (vmvTrust > 0.01) && (length((vSpec - mvSurface) * res) > 0.05);
+
+    bool  validVmv       = false;
+    vec3  vmvPrevSpec    = vec3(0.0);
+    vec2  vmvPrevMom     = vec2(0.0);
+    float vmvPrevNSpec   = 1.0;
+    float vmvPrevFast    = currSpecLum;
+    float vmvPrevHitT    = 0.0;
+
+    if (pc.resetHistory == 0u && separateVmv &&
+        prevUVSpec.x >= 0.0 && prevUVSpec.x <= 1.0 &&
+        prevUVSpec.y >= 0.0 && prevUVSpec.y <= 1.0)
+    {
+        vec2 prevSub = prevUVSpec * res - 0.5;
+        ivec2 p00 = ivec2(floor(prevSub));
+        vec2 f = prevSub - vec2(p00);
+
+        float wSum = 0.0;
+        vec3  sAcc = vec3(0.0);
+        vec2  mAcc = vec2(0.0);
+        float nAcc = 0.0;
+        float fAcc = 0.0;
+        float hAcc = 0.0;
+
+        for (int dy = 0; dy <= 1; ++dy) {
+            for (int dx = 0; dx <= 1; ++dx) {
+                ivec2 tc = clamp(p00 + ivec2(dx, dy), ivec2(0), imgMax);
+                float bw = ((dx == 0) ? (1.0 - f.x) : f.x) * ((dy == 0) ? (1.0 - f.y) : f.y);
+                if (bw <= 1e-4) continue;
+
+                vec4  qWND     = imageLoad(uPrevWorldND, tc);
+                float qRawHitS = imageLoad(uPrevHistHitT, tc).g;
+                if (validateSpecVmvTap(currWorldN, expectedPrevZ, grazingFactor, currSpecHit, currRough, qWND, qRawHitS)) {
+                    wSum += bw;
+                    sAcc += reblurSanitizeRgb(imageLoad(uPrevHistSpec, tc).rgb) * bw;
+                    mAcc += imageLoad(uPrevHistMoments, tc).zw * bw;
+                    vec4 qMeta = imageLoad(uPrevHistMeta, tc);
+                    nAcc += max(reblurSanitizeScalar(qMeta.g, 1.0), 1.0) * bw;
+                    fAcc += max(reblurSanitizeScalar(qMeta.a, currSpecLum), 0.0) * bw;
+                    hAcc += abs(qRawHitS) * bw;
+                }
+            }
+        }
+
+        if (wSum > 1e-4) {
+            float invW   = 1.0 / wSum;
+            validVmv     = true;
+            vmvPrevSpec  = sAcc * invW;
+            vmvPrevMom   = mAcc * invW;
+            vmvPrevNSpec = nAcc * invW;
+            vmvPrevFast  = fAcc * invW;
+            vmvPrevHitT  = hAcc * invW;
+        }
+    }
+
+    // Fuse Surface-MV & Specular-VMV tracks.
+    // CRITICAL: On curved mirrors (currRough < 0.04) with separate VMV, NEVER fall back
+    // to surfPrevSpec (vSurface drags reflections forward); reset nSpec=1 if VMV misses.
+    bool  validSpec     = false;
+    vec3  prevSpecRGB   = vec3(0.0);
+    vec2  prevSpecMom   = vec2(0.0);
+    float prevNSpec     = 1.0;
+    float prevFastSpec  = (currRough < 0.04) ? currSpecLum : specMeanLum;
+    float prevSpecHitT  = 0.0;
+
+    bool allowSurfFallback = !(separateVmv && currRough < 0.04);
+    bool surfTrackUsable   = validSurf && allowSurfFallback && (surfSpecHitOk || !separateVmv || currRough >= 0.25);
+
+    if (validVmv && surfTrackUsable) {
+        validSpec    = true;
+        prevSpecRGB  = mix(surfPrevSpec, vmvPrevSpec, vmvTrust);
+        prevSpecMom  = mix(surfPrevMom.zw, vmvPrevMom, vmvTrust);
+        prevNSpec    = mix(max(reblurSanitizeScalar(surfPrevMeta.g, 1.0), 1.0), vmvPrevNSpec, vmvTrust);
+        prevFastSpec = mix(max(reblurSanitizeScalar(surfPrevMeta.a, prevFastSpec), 0.0), vmvPrevFast, vmvTrust);
+        prevSpecHitT = mix(surfPrevHitT.y, vmvPrevHitT, vmvTrust);
+    } else if (validVmv) {
+        validSpec    = true;
+        prevSpecRGB  = vmvPrevSpec;
+        prevSpecMom  = vmvPrevMom;
+        prevNSpec    = vmvPrevNSpec;
+        prevFastSpec = vmvPrevFast;
+        prevSpecHitT = vmvPrevHitT;
+    } else if (surfTrackUsable) {
+        validSpec    = true;
+        prevSpecRGB  = surfPrevSpec;
+        prevSpecMom  = surfPrevMom.zw;
+        prevNSpec    = max(reblurSanitizeScalar(surfPrevMeta.g, 1.0), 1.0);
+        prevFastSpec = max(reblurSanitizeScalar(surfPrevMeta.a, prevFastSpec), 0.0);
+        prevSpecHitT = surfPrevHitT.y;
+        if (separateVmv && vmvTrust > 0.5) {
+            prevNSpec = min(prevNSpec, 2.0);
+        }
+    }
+
+    // Fast high-contrast luma-jump rejection on smooth mirrors driven by 3x3 specMeanLum
+    // (not noisy 1-spp currSpecLum): snaps immediately on real moving reflected light edges
+    // while preserving converged temporal history on 1-spp floor sparkles.
+    if (validSpec && currRough < 0.04) {
+        float prevSpecLum = reblurLuminance(prevSpecRGB);
+        if (abs(specMeanLum - prevSpecLum) > max(2.5, 2.5 * min(specMeanLum, prevSpecLum))) {
+            validSpec = false;
+        }
+    }
+
+    // 7. Specular temporal accumulation + unbiased fast-history antilag
+    vec3  accSpec     = currSpec;
+    float varSpec     = spatialVarSpec;
+    float accM1s      = currSpecLum;
+    float accM2s      = currSpecLum * currSpecLum + spatialVarSpec;
+    float nSpec       = 1.0;
+    float fastSpecLum = specMeanLum;
+    float accSpecHit  = currSpecHit;
+
+    if (validSpec) {
+        float prevM1s = max(reblurSanitizeScalar(prevSpecMom.x, fastSpecLum), 0.0);
+        float prevM2s = max(reblurSanitizeScalar(prevSpecMom.y, prevM1s * prevM1s), prevM1s * prevM1s);
+
+        fastSpecLum = mix(prevFastSpec, specMeanLum, 0.25);
+
+        float tempSigS = sqrt(max(0.0, prevM2s - prevM1s * prevM1s));
+        float refSigS  = max(max(tempSigS, sqrt(spatialVarSpec)), 0.12 * max(fastSpecLum, prevM1s) + 0.02);
+        float lagS     = abs(fastSpecLum - prevM1s) / refSigS;
+        float antilagS = clamp((lagS - 2.00) / 2.00, 0.0, 0.90);
+
+        if (antilagS > 1e-3) {
+            prevNSpec = mix(prevNSpec, 1.5, antilagS);
+        }
+
+        vec3 histSpec = prevSpecRGB;
+        // Only apply 3x3 AABB clamp on dynamic non-mirror specular (static stays unbiased!)
+        if (isDynamic && currRough >= 0.04 && validS >= 3.0) {
+            float clampMixS = max(antilagS, 0.55);
+            float gammaS = mix(3.5, 1.5, clampMixS);
+            vec3 clampMin = max(specMeanRgb - gammaS * specSigmaRgb, vec3(0.0));
+            vec3 clampMax = specMeanRgb + gammaS * specSigmaRgb;
+            histSpec = mix(histSpec, clamp(histSpec, clampMin, clampMax), clampMixS * 0.85);
+        }
+
+        float maxSpecN = isDynamic ? min(pc.maxSpecHistory, 8.0) : pc.maxSpecHistory;
+        nSpec = min(prevNSpec + 1.0, maxSpecN);
+        float alphaS = 1.0 / max(nSpec, 1.0);
+
+        accSpec = mix(histSpec, currSpec, alphaS);
+        accM1s  = mix(prevM1s, currSpecLum, alphaS);
+        accM2s  = mix(prevM2s, currSpecLum * currSpecLum, alphaS);
+        float rawVarS = max(0.0, accM2s - accM1s * accM1s);
+        float spatBlendS = clamp(1.0 - (nSpec - 1.0) / 3.0, 0.0, 1.0);
+        varSpec = mix(rawVarS, max(rawVarS, spatialVarSpec), spatBlendS);
+
+        if (currSpecHit > 1e-4 && prevSpecHitT > 1e-4) {
+            accSpecHit = mix(prevSpecHitT, currSpecHit, alphaS);
+        } else {
+            accSpecHit = max(currSpecHit, prevSpecHitT);
+        }
+    }
+
+    // 8. Pack sign-bit metadata with zero extra bandwidth:
+    //    - uOutHistDiff.a < 0.0 => zeroDiffAlb (eliminates uAlbedoRoughness tap loads in A-Trous diffuse!)
+    //    - uOutHistHitT.g < 0.0 => lowRough (< 0.15) OR transmissive glass PSR
+    float clampedVarD = clamp(varDiff, 0.0, REBLUR_MAX_FP16);
+    float packedVarD  = cZeroDiff ? -max(clampedVarD, 2e-6) : clampedVarD;
+
+    bool  flagLowRoughOrGlass = (currRough < 0.15) || isTransmissive;
+    float clampedSpecHit      = clamp(accSpecHit, 0.0, 10000.0);
+    float packedSpecHit       = flagLowRoughOrGlass ? -max(clampedSpecHit, 2e-4) : clampedSpecHit;
+
+    imageStore(uOutHistDiff,    coord, vec4(clamp(accDiff, 0.0, REBLUR_MAX_FP16), packedVarD));
+    imageStore(uOutHistSpec,    coord, vec4(clamp(accSpec, 0.0, REBLUR_MAX_FP16), clamp(varSpec, 0.0, REBLUR_MAX_FP16)));
+    imageStore(uOutHistMoments, coord, clamp(vec4(accM1d, accM2d, accM1s, accM2s), 0.0, REBLUR_MAX_FP16));
+    imageStore(uOutHistMeta,    coord, vec4(nDiff, nSpec, clamp(fastDiffLum, 0.0, REBLUR_MAX_FP16), clamp(fastSpecLum, 0.0, REBLUR_MAX_FP16)));
+    imageStore(uOutHistHitT,    coord, vec4(clamp(accDiffHit, 0.0, 10000.0), packedSpecHit, 0.0, 0.0));
+}

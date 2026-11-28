@@ -751,6 +751,13 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                         ImGui::TextDisabled("    - Pass 2 (FP8 U-Net): %.3f ms", dp.neural_guide_ms);
                         ImGui::TextDisabled("    - Pass 3 (Subpixel): %.3f ms", dp.upscale_resolve_ms);
                         ImGui::TextDisabled("    - History Copy:      %.3f ms", dp.history_copy_ms);
+                    } else if (dp.mode == "reblur") {
+                        ImGui::Text("  ReBLUR Analytical:     %.3f ms", totMs);
+                        ImGui::TextDisabled("    - PreBlur + HitT:    %.3f ms", dp.neural_guide_ms);
+                        ImGui::TextDisabled("    - Temporal + VMV:    %.3f ms", dp.temporal_ms);
+                        ImGui::TextDisabled("    - History Fix:       %.3f ms", dp.atrous_step2_ms);
+                        ImGui::TextDisabled("    - 5x A-Trous:        %.3f ms", dp.atrous_step6_ms);
+                        ImGui::TextDisabled("    - Stabilize:         %.3f ms", dp.upscale_resolve_ms);
                     } else {
                         ImGui::Text("  Denoiser / Upscaler:   %.3f ms", totMs);
                     }
@@ -836,6 +843,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::Text("Denoising:    Upways %s WMMA (%s)", verStr, stats.upways_precision_str.c_str());
             } else if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::Text("Denoising:    AMD FSR Ray Regeneration (4-Signal)");
+            } else if (config.denoiser_mode == DenoiserMode::Reblur) {
+                ImGui::Text("Denoising:    Analytical ReBLUR (6-Pass, All GPUs)");
             } else {
                 ImGui::Text("Denoising:    Off (Pure Monte Carlo)");
             }
@@ -1314,12 +1323,15 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             drawQuickDenoiserBtn(DenoiserMode::None, "Off (MC)", true,
                 "Unbiased pure Monte Carlo path tracing with progressive temporal accumulation.");
             ImGui::SameLine();
-            drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen", stats.supports_fsr_rr,
-                stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)."
-                                      : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active).");
+            drawQuickDenoiserBtn(DenoiserMode::Reblur, "ReBLUR", true,
+                "Analytical NRD ReBLUR-grade 6-pass spatiotemporal denoiser (works on all Vulkan 1.4 GPUs; supports Native 1.0x and FSR coupling).");
             ImGui::SameLine();
             drawQuickDenoiserBtn(DenoiserMode::Upways, "Upways", stats.supports_upways_wmma,
                 "Upways 4.0 / 5.0 Pure-ML WMMA Spatiotemporal Backbone (FP8 E4M3 / INT8 QAT): runs standalone at render-res alongside FSR / Native 1.0x, or coupled with Upways Continuous Subpixel SR.");
+            ImGui::SameLine();
+            drawQuickDenoiserBtn(DenoiserMode::FfxRayRegeneration, "Ray Regen", stats.supports_fsr_rr,
+                stats.supports_fsr_rr ? "AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)."
+                                      : "Unavailable on Vulkan: FidelityFX SDK 2.4.0 does not ship amd_fidelityfx_denoiser_vk (stub active).");
 
             if (config.denoiser_mode != DenoiserMode::None || config.upscaler_mode == UpscalerMode::Upways) {
                 uint32_t rW = config.getRenderWidth();
@@ -1339,6 +1351,14 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
                                        "Active Denoiser: Upways %s WMMA [%s] Neural Denoiser (Native %ux%u)",
                                        activeVer, stats.upways_precision_str.c_str(), rW, rH);
+                } else if (config.denoiser_mode == DenoiserMode::Reblur && config.upscaler_mode == UpscalerMode::FSR) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
+                                       "Active Denoiser: Analytical ReBLUR 6-Pass (%ux%u, Jitter-Preserving -> %s)",
+                                       rW, rH, isFsr4Selected ? "FSR 4.1.2 ML" : "FSR 3.1.6");
+                } else if (config.denoiser_mode == DenoiserMode::Reblur) {
+                    ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
+                                       "Active Denoiser: Analytical ReBLUR 6-Pass (Native %ux%u)",
+                                       rW, rH);
                 }
             }
 
@@ -2064,7 +2084,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
             static const char* denoiserModeLabels[] = {
                 "Off (Pure Monte Carlo)",
                 "Upways Neural Reconstructor (Wave32 WMMA)",
-                "AMD FSR Ray Regeneration (1.2.1 4-Signal)"
+                "AMD FSR Ray Regeneration (1.2.1 4-Signal)",
+                "Analytical ReBLUR (6-Pass Spatiotemporal)"
             };
             int denoiserIdx = static_cast<int>(config.denoiser_mode);
             if (denoiserIdx < 0 || denoiserIdx >= IM_ARRAYSIZE(denoiserModeLabels)) {
@@ -2101,11 +2122,16 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                 ImGui::SetTooltip("Real-time spatiotemporal reconstruction filter:\n"
                                   "- Off: Unbiased pure Monte Carlo with progressive accumulation.\n"
                                   "- Upways: Decoupled WMMA multi-scale backbone (FP8 E4M3 / INT8 QAT / FP16) + continuous subpixel resolve.\n"
-                                  "- AMD FSR Ray Regeneration (1.2.1): 4-Signal AMD FidelityFX Denoiser provider.");
+                                  "- AMD FSR Ray Regeneration (1.2.1): 4-Signal AMD FidelityFX Denoiser provider.\n"
+                                  "- Analytical ReBLUR: 6-pass NRD ReBLUR-grade analytical spatiotemporal denoiser (all Vulkan 1.4 GPUs).");
             }
             if (config.denoiser_mode == DenoiserMode::FfxRayRegeneration) {
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.95f, 0.55f, 1.0f));
                 ImGui::TextWrapped("Active Denoiser: AMD FSR Ray Regeneration 1.2.1 (Vulkan SDK Denoiser Provider)");
+                ImGui::PopStyleColor();
+            } else if (config.denoiser_mode == DenoiserMode::Reblur) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.95f, 0.55f, 1.0f));
+                ImGui::TextWrapped("Active Denoiser: Analytical ReBLUR (6-Pass Spatiotemporal, All Vulkan GPUs)");
                 ImGui::PopStyleColor();
             }
 
