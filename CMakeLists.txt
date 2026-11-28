@@ -170,6 +170,7 @@ set(SHADER_FILES
     ${SHADER_DIR}/compute/upways_v5_affinity.comp
     ${SHADER_DIR}/compute/upways_v5_upscaler_wmma.comp
     ${SHADER_DIR}/compute/upways_v5_resolve.comp
+    ${SHADER_DIR}/compute/upways_v5_stabilize.comp
     ${SHADER_DIR}/compute/ffx_sdk_prep.comp
     ${SHADER_DIR}/compute/fsr3_blend.comp
     ${SHADER_DIR}/compute/ffx_rr_prep.comp

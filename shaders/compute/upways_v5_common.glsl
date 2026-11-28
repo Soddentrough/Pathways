@@ -34,7 +34,7 @@ layout(push_constant) uniform UpwaysV5PC {
     float jitterX;        // 16 (LR pixels, Camera::ubo.jitterOffset.x)
     float jitterY;        // 20 (LR pixels, Camera::ubo.jitterOffset.y)
     uint  frameIndex;     // 24
-    uint  flags;          // 28: bit 0=RESET, bit 1=SR, bit 2=ZERO_RESIDUAL, bit 3=FUSED_BAND_PACK
+    uint  flags;          // 28: bit 0=RESET, bit 1=SR, bit 2=ZERO_RESIDUAL, bit 3=FUSED_BAND_PACK, bit 4=RUN_STABILIZE
     uint  inW;            // 32 (stage input width)
     uint  inH;            // 36 (stage input height)
     uint  outW;           // 40 (stage output width)
@@ -49,13 +49,20 @@ layout(push_constant) uniform UpwaysV5PC {
     uint  keepHrYEnd;     // 76 (exclusive band-local output row)
     vec4  prevToCurrViewQuat;   // 80  (xyzw unit quat rotating prev view -> curr view)
     vec4  currToPrevTransView;  // 96  (xyz = (prevView * inverse(currView))[3].xyz, w = tanHalfFovY)
-    vec4  camMotionParams;      // 112 (x = aspectRatio, y = camMotionValid [1.0 when live camera], z/w = 0)
+    vec4  camMotionParams;      // 112 (x = aspectRatio, y = camMotionValid [1.0 live], z = prevJitterX, w = prevJitterY [LR px])
 } pc;
 
 const uint UPWAYS_V5_FLAG_RESET_HISTORY      = 1u;
 const uint UPWAYS_V5_FLAG_ENABLE_SUPERRES    = 2u;
 const uint UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE = 4u;
 const uint UPWAYS_V5_FLAG_FUSED_BAND_PACK    = 8u;
+const uint UPWAYS_V5_FLAG_RUN_STABILIZE      = 16u;
+
+const float UPWAYS_V5_LOG2E = 1.4426950408889634;
+
+bool isUpwaysLiveCamV5() {
+    return (pc.camMotionParams.y > 0.5) && ((pc.flags & UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE) == 0u);
+}
 
 // -----------------------------------------------------------------------------
 // Weight Offsets (190,208 B total: 150,016 B 8-bit PW + 40,192 B FP32)
@@ -526,6 +533,282 @@ bool computeBandWarpCoord(
         && all(lessThan(prevFullUV, vec2(1.0)))
         && (localCoord.y >= -0.5)
         && (localCoord.y < float(prevDims.y) - 0.5);
+}
+
+// -----------------------------------------------------------------------------
+// P2A Runtime Stabilization Helpers (gated on isUpwaysLiveCamV5())
+// -----------------------------------------------------------------------------
+
+// Jitter-delta-compensated band warp: Pathways motion vectors are jitter-free, so
+// reprojecting from curr jittered grid to prev jittered grid adds (currJit - prevJit).
+bool computeBandWarpCoordJitterV5(
+    ivec2 localPos,
+    vec2 mvUv,
+    int bandW,
+    int bandH,
+    ivec2 prevDims,
+    uint bandY0,
+    uint fullH_u,
+    bool allowSample,
+    bool cancelJitterDelta,
+    out vec2 localCoord
+) {
+    int fullH = int(max(fullH_u, uint(bandH)));
+    vec2 fullSizeF = vec2(float(bandW), float(fullH));
+    vec2 currFullUV = (vec2(float(localPos.x), float(localPos.y + int(bandY0))) + vec2(0.5)) / fullSizeF;
+    vec2 prevFullUV = currFullUV - vec2(sanitizeFloat(mvUv.x, 0.0), sanitizeFloat(mvUv.y, 0.0));
+    if (cancelJitterDelta) {
+        vec2 currJitPx = vec2(sanitizeFloat(pc.jitterX, 0.0), sanitizeFloat(pc.jitterY, 0.0));
+        vec2 prevJitPx = vec2(sanitizeFloat(pc.camMotionParams.z, 0.0), sanitizeFloat(pc.camMotionParams.w, 0.0));
+        prevFullUV += (currJitPx - prevJitPx) / fullSizeF;
+    }
+    float sx = float(prevDims.x) / float(max(bandW, 1));
+    float sy = float(prevDims.y) / float(max(bandH, 1));
+    localCoord = vec2(
+        prevFullUV.x * float(bandW) * sx,
+        (prevFullUV.y * float(fullH) - float(bandY0)) * sy
+    ) - vec2(0.5);
+    return allowSample
+        && all(greaterThanEqual(prevFullUV, vec2(0.0)))
+        && all(lessThan(prevFullUV, vec2(1.0)))
+        && (localCoord.y >= -0.5)
+        && (localCoord.y < float(prevDims.y) - 0.5);
+}
+
+// Affine previous-frame linear depth prediction + dynamic-object discrepancy check.
+float computeExpectedPrevZV5(
+    ivec2 localPos,
+    int bandW,
+    int bandH,
+    float linDepth,
+    vec2 surfMv,
+    bool useJitter,
+    out bool isDynamic
+) {
+    isDynamic = false;
+    if (pc.camMotionParams.y <= 0.5 || linDepth >= 9999.0) {
+        return linDepth;
+    }
+    int fullLrH = int(max(pc.fullLrHeight, uint(bandH)));
+    vec2 fullSizeF = vec2(float(bandW), float(fullLrH));
+    vec2 currFullUV = (vec2(float(localPos.x), float(localPos.y + int(pc.bandLrY0))) + vec2(0.5)) / fullSizeF;
+    vec2 currRayUV = currFullUV;
+    if (useJitter) {
+        vec2 currJitPx = vec2(sanitizeFloat(pc.jitterX, 0.0), sanitizeFloat(pc.jitterY, 0.0));
+        currRayUV += currJitPx / fullSizeF;
+    }
+    vec2 ndc = currRayUV * 2.0 - vec2(1.0);
+    float tanHalfFovY = max(pc.currToPrevTransView.w, 1e-4);
+    float aspect = max(pc.camMotionParams.x, 1e-4);
+    vec3 currViewPos = vec3(ndc.x * aspect * tanHalfFovY * linDepth, -ndc.y * tanHalfFovY * linDepth, -linDepth);
+    vec4 invQ = vec4(-pc.prevToCurrViewQuat.xyz, pc.prevToCurrViewQuat.w);
+    vec3 prevViewPos = rotateByQuatV5(invQ, currViewPos) + pc.currToPrevTransView.xyz;
+    float expectedPrevZ = max(-prevViewPos.z, 1e-2);
+    if (useJitter) {
+        vec2 expectedPrevNDC = vec2(
+            prevViewPos.x / (aspect * tanHalfFovY * expectedPrevZ),
+            -prevViewPos.y / (tanHalfFovY * expectedPrevZ)
+        );
+        vec2 expectedPrevRayUV = expectedPrevNDC * 0.5 + vec2(0.5);
+        vec2 actualPrevRayUV = currRayUV - surfMv;
+        vec2 dispPx = (actualPrevRayUV - expectedPrevRayUV) * fullSizeF;
+        isDynamic = (dot(dispPx, dispPx) > 4.0);
+    }
+    return expectedPrevZ;
+}
+
+// Decode uPrevGeomLr texel (sign-bit in .a flags low-roughness reflector or dielectric glass).
+void decodePrevGeomV5(
+    vec4 pg,
+    bool rotateToCurr,
+    out vec3 prevNrm,
+    out float prevDepth,
+    out bool prevLowRough
+) {
+    float rawA = sanitizeFloat(pg.a, 10000.0);
+    prevLowRough = (rawA < 0.0);
+    prevDepth = clamp(abs(rawA), 0.0, 10000.0);
+    vec3 n = normalizeNormalV5(vec3(
+        sanitizeFloat(pg.r, 0.0),
+        sanitizeFloat(pg.g, 0.0),
+        sanitizeFloat(pg.b, 1.0)
+    ));
+    if (rotateToCurr) {
+        n = normalizeNormalV5(rotateByQuatV5(pc.prevToCurrViewQuat, n));
+    }
+    prevNrm = n;
+}
+
+float computeGrazingFactorV5(vec3 currViewNormal) {
+    return 1.0 + 3.0 * (1.0 - clamp(abs(currViewNormal.z), 0.0, 1.0));
+}
+
+bool validateSurfaceTapV5(
+    vec3 currViewNormal,
+    float expectedPrevZ,
+    float grazingFactor,
+    bool isDynamic,
+    bool isDiel,
+    vec4 prevGeom,
+    out vec3 prevNrm,
+    out float prevDepth
+) {
+    bool prevLowRough;
+    decodePrevGeomV5(prevGeom, true, prevNrm, prevDepth, prevLowRough);
+    if (prevDepth >= 9999.0 || prevDepth <= 1e-4) {
+        return false;
+    }
+    if (isDiel) {
+        // Dielectric PSR stores stochastic per-ray virtViewN/virtDepth (reflection vs refraction):
+        // gate strictly on prevLowRough silhouette class so glass never bleeds matte background
+        // while preserving 100% temporal accumulation across Fresnel/refraction flips.
+        return prevLowRough;
+    }
+    float nDot = dot(currViewNormal, prevNrm);
+    float nThresh = isDynamic ? 0.55 : 0.85;
+    if (nDot < nThresh) {
+        return false;
+    }
+    float zTol = (isDynamic ? 0.15 : 0.06) * grazingFactor;
+    float relZ = abs(expectedPrevZ - prevDepth) / max(expectedPrevZ, 0.05);
+    return (relZ < zTol);
+}
+
+bool validateSpecVmvTapV5(
+    vec3 currViewNormal,
+    float expectedPrevZ,
+    float grazingFactor,
+    float currRough,
+    bool isDiel,
+    vec4 prevGeom
+) {
+    vec3 prevNrm;
+    float prevDepth;
+    bool prevLowRough;
+    decodePrevGeomV5(prevGeom, true, prevNrm, prevDepth, prevLowRough);
+    if (prevDepth >= 9999.0 || prevDepth <= 1e-4) {
+        return false;
+    }
+    if (isDiel) {
+        return prevLowRough;
+    }
+    if (currRough < 0.04) {
+        // Curved mirrors: strictly stay on low-roughness reflector pixels (never bleed matte floor/wall),
+        // while relaxing normal & depth tolerances across curved VMV offsets.
+        if (!prevLowRough) {
+            return false;
+        }
+        if (dot(currViewNormal, prevNrm) < 0.40) {
+            return false;
+        }
+        float relZ = abs(expectedPrevZ - prevDepth) / max(expectedPrevZ, 0.05);
+        return (relZ < 0.25 * grazingFactor);
+    }
+    if (dot(currViewNormal, prevNrm) < 0.80) {
+        return false;
+    }
+    float relZ = abs(expectedPrevZ - prevDepth) / max(expectedPrevZ, 0.05);
+    return (relZ < 0.12 * grazingFactor);
+}
+
+// Compute renormalized 4-tap geometry-validated bilinear weights for surface reprojection.
+vec4 evalValidatedSurfWeightsV5(
+    BilinearTaps bt,
+    vec4 g00, vec4 g10, vec4 g01, vec4 g11,
+    vec3 currViewNormal,
+    float expectedPrevZ,
+    float grazingFactor,
+    bool isDynamic,
+    bool isDiel,
+    out vec3 wNrm,
+    out float wDepth,
+    out float wSum
+) {
+    vec3  n0, n1, n2, n3;
+    float d0, d1, d2, d3;
+    float w0 = validateSurfaceTapV5(currViewNormal, expectedPrevZ, grazingFactor, isDynamic, isDiel, g00, n0, d0) ? bt.w.x : 0.0;
+    float w1 = validateSurfaceTapV5(currViewNormal, expectedPrevZ, grazingFactor, isDynamic, isDiel, g10, n1, d1) ? bt.w.y : 0.0;
+    float w2 = validateSurfaceTapV5(currViewNormal, expectedPrevZ, grazingFactor, isDynamic, isDiel, g01, n2, d2) ? bt.w.z : 0.0;
+    float w3 = validateSurfaceTapV5(currViewNormal, expectedPrevZ, grazingFactor, isDynamic, isDiel, g11, n3, d3) ? bt.w.w : 0.0;
+    wSum = w0 + w1 + w2 + w3;
+    if (wSum > 1e-4) {
+        float invW = 1.0 / wSum;
+        vec4 rw = vec4(w0, w1, w2, w3) * invW;
+        wNrm   = normalizeNormalV5(rw.x * n0 + rw.y * n1 + rw.z * n2 + rw.w * n3);
+        wDepth = rw.x * d0 + rw.y * d1 + rw.z * d2 + rw.w * d3;
+        return rw;
+    }
+    wNrm   = currViewNormal;
+    wDepth = expectedPrevZ;
+    return vec4(0.0);
+}
+
+// Compute renormalized 4-tap geometry-validated bilinear weights for specular VMV reprojection.
+vec4 evalValidatedSpecWeightsV5(
+    BilinearTaps bt,
+    vec4 g00, vec4 g10, vec4 g01, vec4 g11,
+    vec3 currViewNormal,
+    float expectedPrevZ,
+    float grazingFactor,
+    float currRough,
+    bool isDiel,
+    out float wSum
+) {
+    float w0 = validateSpecVmvTapV5(currViewNormal, expectedPrevZ, grazingFactor, currRough, isDiel, g00) ? bt.w.x : 0.0;
+    float w1 = validateSpecVmvTapV5(currViewNormal, expectedPrevZ, grazingFactor, currRough, isDiel, g10) ? bt.w.y : 0.0;
+    float w2 = validateSpecVmvTapV5(currViewNormal, expectedPrevZ, grazingFactor, currRough, isDiel, g01) ? bt.w.z : 0.0;
+    float w3 = validateSpecVmvTapV5(currViewNormal, expectedPrevZ, grazingFactor, currRough, isDiel, g11) ? bt.w.w : 0.0;
+    wSum = w0 + w1 + w2 + w3;
+    if (wSum > 1e-4) {
+        return vec4(w0, w1, w2, w3) * (1.0 / wSum);
+    }
+    return vec4(0.0);
+}
+
+// Reversible Reinhard tone-space mapping for HDR-safe unjittering & AABB clipping.
+vec3 upwaysTonemapV5(vec3 c) {
+    vec3 safe = max(c, vec3(0.0));
+    return safe / (1.0 + upwaysLuma(safe));
+}
+
+vec3 upwaysInverseTonemapV5(vec3 tc) {
+    vec3 safe = max(tc, vec3(0.0));
+    return safe / max(1.0 - upwaysLuma(safe), 1e-4);
+}
+
+vec3 upwaysRgbToYCoCgV5(vec3 c) {
+    float co = c.r - c.b;
+    float t  = c.b + co * 0.5;
+    float cg = c.g - t;
+    float y  = t + cg * 0.5;
+    return vec3(y, co, cg);
+}
+
+vec3 upwaysYCoCgToRgbV5(vec3 ycocg) {
+    float t = ycocg.x - ycocg.z * 0.5;
+    float g = ycocg.z + t;
+    float b = t - ycocg.y * 0.5;
+    float r = b + ycocg.y;
+    return vec3(r, g, b);
+}
+
+// Ray-AABB clip from history sample toward neighborhood center in YCoCg space.
+vec3 upwaysClipAABBV5(vec3 aabbMin, vec3 aabbMax, vec3 hist, vec3 center) {
+    vec3 pClip = 0.5 * (aabbMax + aabbMin);
+    vec3 eClip = 0.5 * (aabbMax - aabbMin) + vec3(1e-5);
+    vec3 vClip = hist - pClip;
+    vec3 vUnit = vClip / eClip;
+    vec3 aUnit = abs(vUnit);
+    float maxUnit = max(aUnit.x, max(aUnit.y, aUnit.z));
+    if (maxUnit > 1.0) {
+        return pClip + vClip / maxUnit;
+    }
+    return hist;
+}
+
+// Sharp positive non-ringing Blackman-Harris approximation for 3x3 subpixel unjittering.
+float upwaysBlackmanHarrisWeightV5(vec2 deltaPx) {
+    return exp2(-3.2 * UPWAYS_V5_LOG2E * dot(deltaPx, deltaPx));
 }
 
 #endif // UPWAYS_V5_COMMON_GLSL

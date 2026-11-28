@@ -66,8 +66,9 @@ void main() {
     int  H     = int(pc.lrHeight);
     int  wgX   = int(gl_WorkGroupID.x * 16u);
     int  wgY   = int(gl_WorkGroupID.y * 8u);
-    uint t     = gl_LocalInvocationIndex; // 0..127
-    bool reset = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+    uint t       = gl_LocalInvocationIndex; // 0..127
+    bool reset   = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+    bool liveCam = isUpwaysLiveCamV5();
 
     // 1. Cooperatively populate 18x10 L0 halo (180 entries across 128 threads)
     for (uint pass = 0u; pass < 2u; ++pass) {
@@ -97,13 +98,45 @@ void main() {
 
             ivec2 prevDims = imageSize(uPrevDiffLr);
             vec2 coordD;
-            bool inD = computeBandWarpCoord(q, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
+            bool inD = computeBandWarpCoordJitterV5(
+                q, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, liveCam, coordD
+            );
             vec3 logWd = vec3(0.0);
             if (inD) {
-                vec4 wd4;
-                SAMPLE_IMG_BILINEAR(uPrevDiffLr, coordD, prevDims, wd4);
-                vec3 wDiff = clampFp16Rgb(sanitizeRgb(wd4.rgb));
-                logWd = safeLog1p(wDiff);
+                if (liveCam) {
+                    bool isDynQ = false;
+                    float expPrevZQ = computeExpectedPrevZV5(q, W, H, linDepth, surfMv, true, isDynQ);
+                    float grazQ = computeGrazingFactorV5(viewNormal);
+                    BilinearTaps btQ = computeBilinearTaps(coordD, prevDims);
+                    vec4 g00 = imageLoad(uPrevGeomLr, btQ.i00);
+                    vec4 g10 = imageLoad(uPrevGeomLr, btQ.i10);
+                    vec4 g01 = imageLoad(uPrevGeomLr, btQ.i01);
+                    vec4 g11 = imageLoad(uPrevGeomLr, btQ.i11);
+                    vec3  wnDummy;
+                    float wdDummy, wSumQ;
+                    vec4 rwQ = evalValidatedSurfWeightsV5(
+                        btQ, g00, g10, g01, g11, viewNormal, expPrevZQ, grazQ, isDynQ, isDiel, wnDummy, wdDummy, wSumQ
+                    );
+                    if (wSumQ > 1e-4) {
+                        vec3 wdRgb = vec3(0.0);
+                        if (rwQ.x > 0.0) wdRgb += rwQ.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btQ.i00).rgb));
+                        if (rwQ.y > 0.0) wdRgb += rwQ.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btQ.i10).rgb));
+                        if (rwQ.z > 0.0) wdRgb += rwQ.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btQ.i01).rgb));
+                        if (rwQ.w > 0.0) wdRgb += rwQ.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btQ.i11).rgb));
+                        logWd = safeLog1p(clampFp16Rgb(wdRgb));
+                    } else {
+                        ivec2 nearQ = clamp(ivec2(floor(coordD + 0.5)), ivec2(0), prevDims - ivec2(1));
+                        if (validateSurfaceTapV5(viewNormal, expPrevZQ, grazQ, isDynQ, isDiel, imageLoad(uPrevGeomLr, nearQ), wnDummy, wdDummy)) {
+                            vec3 wDiff = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, nearQ).rgb));
+                            logWd = safeLog1p(wDiff);
+                        }
+                    }
+                } else {
+                    vec4 wd4;
+                    SAMPLE_IMG_BILINEAR(uPrevDiffLr, coordD, prevDims, wd4);
+                    vec3 wDiff = clampFp16Rgb(sanitizeRgb(wd4.rgb));
+                    logWd = safeLog1p(wDiff);
+                }
             }
             storeHalo(ap, linDepth, specDist, viewNormal, albEff, logWd);
         }
@@ -127,7 +160,6 @@ void main() {
     float linDepth, reactiveMask, roughness, matClass;
     bool  transBit;
     unpackCompactPrimary(pg, viewNormal, linDepth, reactiveMask, aDiff, roughness, aSpec, matClass, transBit);
-    imageStore(uCurrGeomLr, p, vec4(viewNormal, linDepth));
 
     vec2 surfMv = vec2(sanitizeFloat(surfMvRaw.x, 0.0), sanitizeFloat(surfMvRaw.y, 0.0));
     bool isSkyPre = isSkyOrEmissiveOnly(linDepth, matClass, aDiff, aSpec);
@@ -142,6 +174,13 @@ void main() {
         rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, isSky, isDiel
     );
 
+    // Under liveCam, pack low-roughness/dielectric class in uCurrGeomLr.a sign-bit
+    // so mirror/glass VMV validation never bleeds matte background texels.
+    float packedGeomDepth = (liveCam && !isSky && (roughness < 0.08 || isDiel))
+        ? -max(linDepth, 1e-3)
+        : linDepth;
+    imageStore(uCurrGeomLr, p, vec4(viewNormal, packedGeomDepth));
+
     // 3. Reconstruct warped history & cardinal edge features
     uint lx  = gl_LocalInvocationID.x;
     uint ly  = gl_LocalInvocationID.y;
@@ -151,35 +190,120 @@ void main() {
     vec3  nrmHalo, albC, logWdC;
     loadHalo(cAp, depHalo, sdHalo, nrmHalo, albC, logWdC);
 
+    bool  isDynamic     = false;
+    float expectedPrevZ = computeExpectedPrevZV5(p, W, H, linDepth, surfMv, liveCam, isDynamic);
+
     ivec2 prevDims = imageSize(uPrevDiffLr);
     vec2 coordD, coordS;
-    bool inD = computeBandWarpCoord(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
-    bool inS = computeBandWarpCoord(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordS);
-    float validSurf = inD ? 1.0 : 0.0;
-    float validVirt = inS ? 1.0 : 0.0;
+    bool inD = computeBandWarpCoordJitterV5(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, liveCam, coordD);
+    bool inS = computeBandWarpCoordJitterV5(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, liveCam, coordS);
+    float validSurf = 0.0;
+    float validVirt = 0.0;
 
     vec3  wSpecSurf = vec3(0.0), wSpecVirt = vec3(0.0);
     vec3  wNrm      = viewNormal;
     float wDepth    = linDepth;
     vec2  wHid      = vec2(0.0);
 
-    if (inD) {
-        vec4 ws4, wg, wh4;
-        SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordD, prevDims, ws4);
-        SAMPLE_IMG_BILINEAR(uPrevGeomLr, coordD, prevDims, wg);
-        SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
-        wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
-        wNrm      = normalizeNormalV5(vec3(sanitizeFloat(wg.r, 0.0), sanitizeFloat(wg.g, 0.0), sanitizeFloat(wg.b, 1.0)));
-        if (pc.camMotionParams.y > 0.5) {
-            wNrm  = normalizeNormalV5(rotateByQuatV5(pc.prevToCurrViewQuat, wNrm));
+    if (liveCam) {
+        float graz = computeGrazingFactorV5(viewNormal);
+        if (inD) {
+            BilinearTaps btD = computeBilinearTaps(coordD, prevDims);
+            vec4 g00 = imageLoad(uPrevGeomLr, btD.i00);
+            vec4 g10 = imageLoad(uPrevGeomLr, btD.i10);
+            vec4 g01 = imageLoad(uPrevGeomLr, btD.i01);
+            vec4 g11 = imageLoad(uPrevGeomLr, btD.i11);
+            float wSumD;
+            vec4 rwD = evalValidatedSurfWeightsV5(
+                btD, g00, g10, g01, g11, viewNormal, expectedPrevZ, graz, isDynamic, isDiel, wNrm, wDepth, wSumD
+            );
+            if (wSumD > 1e-4) {
+                validSurf = 1.0;
+                vec3 wsAcc = vec3(0.0);
+                vec2 whAcc = vec2(0.0);
+                if (rwD.x > 0.0) {
+                    wsAcc += rwD.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i00).rgb));
+                    vec2 h = imageLoad(uPrevHiddenLr, btD.i00).xy;
+                    whAcc += rwD.x * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                }
+                if (rwD.y > 0.0) {
+                    wsAcc += rwD.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i10).rgb));
+                    vec2 h = imageLoad(uPrevHiddenLr, btD.i10).xy;
+                    whAcc += rwD.y * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                }
+                if (rwD.z > 0.0) {
+                    wsAcc += rwD.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i01).rgb));
+                    vec2 h = imageLoad(uPrevHiddenLr, btD.i01).xy;
+                    whAcc += rwD.z * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                }
+                if (rwD.w > 0.0) {
+                    wsAcc += rwD.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i11).rgb));
+                    vec2 h = imageLoad(uPrevHiddenLr, btD.i11).xy;
+                    whAcc += rwD.w * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                }
+                wSpecSurf = clampFp16Rgb(wsAcc);
+                wHid      = clamp(whAcc, vec2(-4.0), vec2(4.0));
+            } else {
+                ivec2 nearD = clamp(ivec2(floor(coordD + 0.5)), ivec2(0), prevDims - ivec2(1));
+                if (validateSurfaceTapV5(viewNormal, expectedPrevZ, graz, isDynamic, isDiel, imageLoad(uPrevGeomLr, nearD), wNrm, wDepth)) {
+                    validSurf = 1.0;
+                    wSpecSurf = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, nearD).rgb));
+                    vec2 h = imageLoad(uPrevHiddenLr, nearD).xy;
+                    wHid = clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                } else {
+                    logWdC = vec3(0.0);
+                    wNrm   = viewNormal;
+                    wDepth = linDepth;
+                }
+            }
         }
-        wDepth    = clamp(sanitizeFloat(wg.a, 10000.0), 0.0, 10000.0);
-        wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
-    }
-    if (inS) {
-        vec4 wsv4;
-        SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
-        wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+        if (inS) {
+            BilinearTaps btS = computeBilinearTaps(coordS, prevDims);
+            vec4 g00 = imageLoad(uPrevGeomLr, btS.i00);
+            vec4 g10 = imageLoad(uPrevGeomLr, btS.i10);
+            vec4 g01 = imageLoad(uPrevGeomLr, btS.i01);
+            vec4 g11 = imageLoad(uPrevGeomLr, btS.i11);
+            float wSumS;
+            vec4 rwS = evalValidatedSpecWeightsV5(
+                btS, g00, g10, g01, g11, viewNormal, expectedPrevZ, graz, roughness, isDiel, wSumS
+            );
+            if (wSumS > 1e-4) {
+                validVirt = 1.0;
+                vec3 wsvAcc = vec3(0.0);
+                if (rwS.x > 0.0) wsvAcc += rwS.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i00).rgb));
+                if (rwS.y > 0.0) wsvAcc += rwS.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i10).rgb));
+                if (rwS.z > 0.0) wsvAcc += rwS.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i01).rgb));
+                if (rwS.w > 0.0) wsvAcc += rwS.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i11).rgb));
+                wSpecVirt = clampFp16Rgb(wsvAcc);
+            } else {
+                ivec2 nearS = clamp(ivec2(floor(coordS + 0.5)), ivec2(0), prevDims - ivec2(1));
+                if (validateSpecVmvTapV5(viewNormal, expectedPrevZ, graz, roughness, isDiel, imageLoad(uPrevGeomLr, nearS))) {
+                    validVirt = 1.0;
+                    wSpecVirt = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, nearS).rgb));
+                }
+            }
+        }
+    } else {
+        validSurf = inD ? 1.0 : 0.0;
+        validVirt = inS ? 1.0 : 0.0;
+        if (inD) {
+            vec4 ws4, wg, wh4;
+            SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordD, prevDims, ws4);
+            SAMPLE_IMG_BILINEAR(uPrevGeomLr, coordD, prevDims, wg);
+            SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
+            wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
+            wNrm      = normalizeNormalV5(vec3(sanitizeFloat(wg.r, 0.0), sanitizeFloat(wg.g, 0.0), sanitizeFloat(wg.b, 1.0)));
+            if (pc.camMotionParams.y > 0.5) {
+                wNrm  = normalizeNormalV5(rotateByQuatV5(pc.prevToCurrViewQuat, wNrm));
+            }
+            wDepth    = clamp(sanitizeFloat(wg.a, 10000.0), 0.0, 10000.0);
+            wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
+        }
+        if (inS) {
+            vec4 wsv4;
+            SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
+            wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+        }
     }
 
     float maxRelDz = 0.0;
@@ -207,18 +331,6 @@ void main() {
     float dzEdge     = isSky ? 0.0 : clamp(safeLog1pF(maxRelDz * 32.0), 0.0, 4.0);
     float structEdge = isSky ? 0.0 : clamp(safeLog1pF(maxDn * 16.0 + maxDsd * 8.0 + maxDalb * 4.0 + validSurf * maxDwd * 3.0), 0.0, 4.0);
 
-    float expectedPrevZ = linDepth;
-    if (pc.camMotionParams.y > 0.5 && !isSky) {
-        int fullLrH = int(max(pc.fullLrHeight, pc.lrHeight));
-        vec2 currFullUV = (vec2(float(p.x), float(p.y + int(pc.bandLrY0))) + vec2(0.5)) / vec2(float(W), float(fullLrH));
-        vec2 ndc = currFullUV * 2.0 - vec2(1.0);
-        float tanHalfFovY = pc.currToPrevTransView.w;
-        float aspect = pc.camMotionParams.x;
-        vec3 currViewPos = vec3(ndc.x * aspect * tanHalfFovY * linDepth, -ndc.y * tanHalfFovY * linDepth, -linDepth);
-        vec4 invQ = vec4(-pc.prevToCurrViewQuat.xyz, pc.prevToCurrViewQuat.w);
-        vec3 prevViewPos = rotateByQuatV5(invQ, currViewPos) + pc.currToPrevTransView.xyz;
-        expectedPrevZ = max(-prevViewPos.z, 1e-2);
-    }
     float depthRelDiff = clamp((expectedPrevZ - wDepth) / max(expectedPrevZ, 1e-2), -1.0, 1.0);
     float nrmDot       = clamp(dot(viewNormal, wNrm), -1.0, 1.0);
     float effMv        = max(sqrt(dot(surfMv, surfMv) + 1e-12), sqrt(dot(specMv, specMv) + 1e-12));

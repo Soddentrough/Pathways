@@ -177,6 +177,8 @@ private:
     VkDescriptorSet m_tonemapFsrDescSet = VK_NULL_HANDLE;
     glm::vec2 m_prevFsrJitter{ 0.0f, 0.0f };
     bool m_hasPrevFsrJitter = false;
+    glm::vec2 m_prevUpwaysJitterPx{ 0.0f, 0.0f };
+    bool m_hasPrevUpwaysJitter = false;
 
     // Cached external frame targets for lazy on-demand pipeline instantiation
     PostProcessPipeline* m_cachedPostProcess = nullptr;

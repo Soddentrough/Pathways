@@ -26,6 +26,7 @@ inline constexpr uint32_t UPWAYS_FLAG_RESET_HISTORY      = 1u;
 inline constexpr uint32_t UPWAYS_FLAG_ENABLE_SUPERRES    = 2u;
 inline constexpr uint32_t UPWAYS_FLAG_ZERO_RESIDUAL_MODE = 4u;
 inline constexpr uint32_t UPWAYS_FLAG_FUSED_BAND_PACK    = 8u;
+inline constexpr uint32_t UPWAYS_FLAG_RUN_STABILIZE      = 16u;
 
 inline constexpr uint32_t UPWAYS_DEFAULT_BAND_HALO_LR     = 24u;
 inline constexpr float    UPWAYS_DEFAULT_BAND_TOP_FRACTION = 0.50f;
@@ -39,14 +40,15 @@ inline constexpr float    UPWAYS_DEFAULT_BAND_TOP_FRACTION = 0.50f;
 struct UpwaysCameraMotion {
     glm::vec4 prevToCurrViewQuat{ 0.0f, 0.0f, 0.0f, 1.0f };  // xyzw unit quat rotating prev view -> curr view
     glm::vec4 currToPrevTransView{ 0.0f, 0.0f, 0.0f, 0.0f }; // xyz = (prevView * inverse(currView))[3].xyz, w = tanHalfFovY
-    glm::vec4 camMotionParams{ 1.0f, 0.0f, 0.0f, 0.0f };     // x = aspectRatio, y = camMotionValid (1.0 live), z/w = 0
+    glm::vec4 camMotionParams{ 1.0f, 0.0f, 0.0f, 0.0f };     // x = aspectRatio, y = camMotionValid (1.0 live), z = prevJitterX, w = prevJitterY (LR pixels)
 };
 
 inline UpwaysCameraMotion makeUpwaysCameraMotion(
     const glm::mat4& currView,
     const glm::mat4& prevView,
     float tanHalfFovY,
-    float aspectRatio
+    float aspectRatio,
+    glm::vec2 prevJitterPx = glm::vec2(0.0f)
 ) noexcept {
     UpwaysCameraMotion m{};
     if (!(tanHalfFovY > 1e-4f) || !(aspectRatio > 1e-4f) ||
@@ -61,9 +63,11 @@ inline UpwaysCameraMotion makeUpwaysCameraMotion(
         !std::isfinite(t.x) || !std::isfinite(t.y) || !std::isfinite(t.z)) {
         return m;
     }
+    const float pjX = std::isfinite(prevJitterPx.x) ? prevJitterPx.x : 0.0f;
+    const float pjY = std::isfinite(prevJitterPx.y) ? prevJitterPx.y : 0.0f;
     m.prevToCurrViewQuat = glm::vec4(q.x, q.y, q.z, q.w);
     m.currToPrevTransView = glm::vec4(t, tanHalfFovY);
-    m.camMotionParams = glm::vec4(aspectRatio, 1.0f, 0.0f, 0.0f);
+    m.camMotionParams = glm::vec4(aspectRatio, 1.0f, pjX, pjY);
     return m;
 }
 
@@ -331,7 +335,7 @@ public:
         uint32_t outputFullHeight = 0u
     );
 
-    // Upways 5.0 Pure-ML (158,400 params / 190,208 B FP8 & INT8, 5 compute shaders)
+    // Upways 5.0 Pure-ML (158,400 params / 190,208 B FP8 & INT8, 5+1 compute shaders)
     UpwaysPipeline(
         VkDevice device,
         VkPhysicalDevice physicalDevice,
@@ -349,7 +353,8 @@ public:
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
         UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8,
-        uint32_t outputFullHeight = 0u
+        uint32_t outputFullHeight = 0u,
+        const std::vector<char>& v5StabilizeSpv = {}
     );
     ~UpwaysPipeline();
 

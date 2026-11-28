@@ -33,7 +33,8 @@ bool isUpwaysCompactLiveConfig(const Config& cfg) {
                                  cfg.upways_superres);
     return isUpwaysActive &&
            cfg.capture_training_data_dir.empty() &&
-           cfg.denoiser_mode != DenoiserMode::FfxRayRegeneration;
+           cfg.denoiser_mode != DenoiserMode::FfxRayRegeneration &&
+           cfg.denoiser_mode != DenoiserMode::Reblur;
 }
 
 bool isUpwaysBandParallelConfig(const Config& cfg, MultiGpuMode mode) {
@@ -1284,7 +1285,8 @@ VkDeviceSize MultiGpuManager::calculateSharedBufferSize(uint32_t width, uint32_t
     const bool isSampleBlendFsr =
         (m_config.upscaler_mode == UpscalerMode::FSR &&
          m_config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
-         m_config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
+         m_config.denoiser_mode != DenoiserMode::FfxRayRegeneration &&
+         m_config.denoiser_mode != DenoiserMode::Reblur);
     if (isSampleBlendFsr) {
         return align64k(static_cast<VkDeviceSize>(width) * height * 8);
     }
@@ -1977,6 +1979,7 @@ bool MultiGpuManager::needSecondaryMlGuides() const {
     return (m_config.upscaler_mode == UpscalerMode::Upways ||
             m_config.denoiser_mode == DenoiserMode::Upways ||
             m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+            m_config.denoiser_mode == DenoiserMode::Reblur ||
             m_config.upways_superres ||
             !m_config.capture_training_data_dir.empty());
 }
@@ -2810,11 +2813,14 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
             wfSceneData.captureMlData = 1u | 4u | 16u | (needCompactNd ? 32u : 0u);
             wfSceneData.gbufferFlags = (1u << 31) | 1u | (needCompactNd ? 2u : 0u) | (needCompactMv ? 4u : 0u);
         } else {
-            bool needMlV4 = needLegacyMl && (m_config.denoiser_mode == DenoiserMode::Upways ||
-                                             m_config.upscaler_mode == UpscalerMode::Upways ||
-                                             m_config.upways_superres ||
-                                             m_config.capture_channels >= 32u);
-            wfSceneData.captureMlData = needLegacyMl ? (3u | (needMlV4 ? 4u : 0u)) : 0u;
+            const bool needMlV4 = needLegacyMl && (m_config.denoiser_mode == DenoiserMode::Upways ||
+                                                   m_config.upscaler_mode == UpscalerMode::Upways ||
+                                                   m_config.upways_superres ||
+                                                   m_config.capture_channels >= 32u);
+            const bool needSplit4Sig = needLegacyMl && !needMlV4 &&
+                                       (m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                        m_config.denoiser_mode == DenoiserMode::Reblur);
+            wfSceneData.captureMlData = needLegacyMl ? (3u | (needMlV4 ? 4u : 0u) | (needSplit4Sig ? 8u : 0u)) : 0u;
             wfSceneData.gbufferFlags = (1u << 31) |
                                        (needNormals ? 1u : 0u) |
                                        ((copyNdImage || packet.enableUpscaler) ? 2u : 0u) |
@@ -2905,7 +2911,8 @@ void MultiGpuManager::executeSecondaryWork(const SecondaryWorkPacket& packet) {
                     isSuperRes,
                     upwaysFmt,
                     targetPrec,
-                    packet.upwaysBand.botHrH
+                    packet.upwaysBand.botHrH,
+                    loadShaderSPIRV("upways_v5_stabilize.comp.spv")
                 );
             } else {
                 node->upwaysPipeline = std::make_unique<UpwaysPipeline>(

@@ -1,0 +1,213 @@
+#version 460
+// Precision-agnostic 1.0x temporal stabilization pass (no FP8 extension required).
+#define UPWAYS_PRECISION_MODE 1
+#include "upways_v5_common.glsl"
+
+// =============================================================================
+// Upways 5.x 1.0x Temporal Stabilization Pass:
+//   - Reinhard tone-space 3x3 Blackman-Harris unjittering at -currJitterPx
+//   - Smooth-mirror (rough < 0.04) bypass (eliminates curved-mirror surface-MV drag)
+//   - 5-tap Jimenez Catmull-Rom reprojection of uPrevColorHr at currUV - surfMv
+//   - 3x3 YCoCg variance AABB ray-clip + disocclusion-adaptive temporal blend
+//   - Fused mGPU Band-Parallel RGB9E5 output packing
+// =============================================================================
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba16f)  readonly  uniform image2D   uCleanRadLr;
+layout(set = 0, binding = 1, rgba32ui) readonly  uniform uimage2D  uMlPrimaryGuide;
+layout(set = 0, binding = 2, r32ui)    readonly  uniform uimage2D  uMlSurfaceMv;
+layout(set = 0, binding = 3)                     uniform sampler2D uPrevColorHr;
+layout(set = 0, binding = 4, rgba16f)  writeonly uniform image2D   uCurrColorHr;
+layout(set = 0, binding = 5, rgba16f)  writeonly uniform image2D   uOutputColor;
+layout(set = 0, binding = 6)           writeonly buffer  BandPackOut { uint rgb9e5[]; } g_bandPackOut;
+
+#define TILE_DIM    18
+#define TILE_STRIDE 19
+
+// Compact FP16-packed 18x18 LDS (~2.7 KB): cleanRad.rgb, roughness (< 0.0 if sky)
+shared uvec2 s_hdr[TILE_DIM][TILE_STRIDE];
+
+vec4 loadCleanHdrAndRough(ivec2 p, out float outDisocc) {
+    vec4 cleanSample = imageLoad(uCleanRadLr, p);
+    vec3 hdr = clampFp16Rgb(sanitizeRgb(cleanSample.rgb));
+    outDisocc = clamp(sanitizeFloat(cleanSample.a, 1.0), 0.0, 1.0);
+
+    uvec4 pg = imageLoad(uMlPrimaryGuide, p);
+    float rawD = unpackHalf2x16(pg.y).x;
+    float linDepth = ((floatBitsToUint(rawD) & 0x7FFFFFFFu) < 0x7F800000u)
+        ? clamp(rawD, 0.0, 10000.0)
+        : 10000.0;
+    float rough = (linDepth >= 9999.0) ? -1.0 : clamp(unpackUnorm4x8(pg.z).a, 0.0, 1.0);
+    return vec4(hdr, rough);
+}
+
+// 5-tap Jimenez Catmull-Rom bicubic filter using hardware linear-clamp texture fetches.
+vec3 sampleCatmullRom5TapV5(vec2 uv, vec2 res) {
+    vec2 samplePos = uv * res;
+    vec2 texPos1   = floor(samplePos - 0.5) + 0.5;
+    vec2 f         = samplePos - texPos1;
+
+    vec2 w0  = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1  = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2  = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3  = f * f * (-0.5 + 0.5 * f);
+
+    vec2 w12      = w1 + w2;
+    vec2 offset12 = w2 / max(w12, vec2(1e-5));
+
+    vec2 invRes   = 1.0 / res;
+    vec2 texPos0  = (texPos1 - 1.0) * invRes;
+    vec2 texPos3  = (texPos1 + 2.0) * invRes;
+    vec2 texPos12 = (texPos1 + offset12) * invRes;
+
+    float wtCenter = w12.x * w12.y;
+    float wtTop    = w12.x * w0.y;
+    float wtLeft   = w0.x  * w12.y;
+    float wtRight  = w3.x  * w12.y;
+    float wtBottom = w12.x * w3.y;
+
+    vec3 result = vec3(0.0);
+    result += sanitizeRgb(textureLod(uPrevColorHr, vec2(texPos12.x, texPos0.y),  0.0).rgb) * wtTop;
+    result += sanitizeRgb(textureLod(uPrevColorHr, vec2(texPos0.x,  texPos12.y), 0.0).rgb) * wtLeft;
+    result += sanitizeRgb(textureLod(uPrevColorHr, vec2(texPos12.x, texPos12.y), 0.0).rgb) * wtCenter;
+    result += sanitizeRgb(textureLod(uPrevColorHr, vec2(texPos3.x,  texPos12.y), 0.0).rgb) * wtRight;
+    result += sanitizeRgb(textureLod(uPrevColorHr, vec2(texPos12.x, texPos3.y),  0.0).rgb) * wtBottom;
+
+    float wSum = wtCenter + wtTop + wtLeft + wtRight + wtBottom;
+    return max(result / max(wSum, 1e-4), vec3(0.0));
+}
+
+void writeStabilizeOutputs(ivec2 coord, vec3 outHdr, float histConf) {
+    imageStore(uCurrColorHr, coord, vec4(outHdr, histConf));
+    imageStore(uOutputColor, coord, vec4(outHdr, 1.0));
+    if ((pc.flags & UPWAYS_V5_FLAG_FUSED_BAND_PACK) != 0u
+        && uint(coord.y) >= pc.keepHrYStart
+        && uint(coord.y) < pc.keepHrYEnd) {
+        uint packIdx = (uint(coord.y) - pc.keepHrYStart) * pc.hrWidth + uint(coord.x);
+        g_bandPackOut.rgb9e5[packIdx] = packRGB9E5(outHdr);
+    }
+}
+
+void main() {
+    int   W      = int(pc.hrWidth);
+    int   H      = int(pc.hrHeight);
+    ivec2 imgMax = ivec2(max(W - 1, 0), max(H - 1, 0));
+
+    ivec2 tileOrigin = ivec2(gl_WorkGroupID.xy) * 16;
+    uint  linearIdx  = gl_LocalInvocationIndex;
+    int   tx         = int(linearIdx & 15u);
+    int   ty         = int(linearIdx >> 4u);
+    ivec2 coord      = tileOrigin + ivec2(tx, ty);
+
+    // 1. Cooperative 18x18 compact FP16 LDS load (256 interior + 68 border apron texels)
+    float centerDisocc = 1.0;
+    s_hdr[ty + 1][tx + 1] = packHalf4(loadCleanHdrAndRough(clamp(coord, ivec2(0), imgMax), centerDisocc));
+    if (linearIdx < 68u) {
+        int lx, ly;
+        if (linearIdx < 18u) {
+            ly = 0;
+            lx = int(linearIdx);
+        } else if (linearIdx < 36u) {
+            ly = 17;
+            lx = int(linearIdx - 18u);
+        } else {
+            uint u = linearIdx - 36u;
+            ly = 1 + int(u >> 1u);
+            lx = ((u & 1u) == 0u) ? 0 : 17;
+        }
+        ivec2 apronCoord = clamp(tileOrigin + ivec2(lx - 1, ly - 1), ivec2(0), imgMax);
+        float apronDisoccUnused;
+        s_hdr[ly][lx] = packHalf4(loadCleanHdrAndRough(apronCoord, apronDisoccUnused));
+    }
+    barrier();
+
+    if (coord.x >= W || coord.y >= H) {
+        return;
+    }
+
+    int   clx          = tx + 1;
+    int   cly          = ty + 1;
+    vec4  centerSample = unpackHalf4(s_hdr[cly][clx]);
+    vec3  centerHdr    = centerSample.rgb;
+    float centerRough  = centerSample.a; // < 0.0 means sky
+    bool  isMirror     = (centerRough >= 0.0 && centerRough < 0.04);
+
+    vec2 currJitterPx = vec2(sanitizeFloat(pc.jitterX, 0.0), sanitizeFloat(pc.jitterY, 0.0));
+    bool hasJitter    = (dot(currJitterPx, currJitterPx) > 1e-6);
+
+    // 2. Reinhard tone-space 3x3 Blackman-Harris unjittering + 3x3 YCoCg variance AABB
+    vec3  unjitTcAcc = vec3(0.0);
+    float bhWSum     = 0.0;
+    vec3  ycocgM1    = vec3(0.0);
+    vec3  ycocgM2    = vec3(0.0);
+
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            vec3 nbrHdr = unpackHalf4(s_hdr[cly + dy][clx + dx]).rgb;
+            vec3 nbrTc  = upwaysTonemapV5(nbrHdr);
+            vec3 nbrYcc = upwaysRgbToYCoCgV5(nbrTc);
+            ycocgM1 += nbrYcc;
+            ycocgM2 += nbrYcc * nbrYcc;
+
+            if (hasJitter) {
+                vec2 deltaPx = vec2(float(dx), float(dy)) + currJitterPx;
+                float w = upwaysBlackmanHarrisWeightV5(deltaPx);
+                unjitTcAcc += nbrTc * w;
+                bhWSum     += w;
+            }
+        }
+    }
+
+    vec3 unjitTc   = hasJitter ? (unjitTcAcc / max(bhWSum, 1e-4)) : upwaysTonemapV5(centerHdr);
+    vec3 unjitCurr = hasJitter ? upwaysInverseTonemapV5(unjitTc) : centerHdr;
+
+    // Smooth mirrors (rough < 0.04): bypass surface-MV stabilization (alpha = 1.0)
+    // so curved mirror reflections are never dragged forward along surfMv.
+    if (isMirror) {
+        vec3 outMirror = clampFp16Rgb(unjitCurr);
+        writeStabilizeOutputs(coord, outMirror, 1.0);
+        return;
+    }
+
+    vec3 ycocgMean  = ycocgM1 * (1.0 / 9.0);
+    vec3 ycocgSigma = sqrt(max(ycocgM2 * (1.0 / 9.0) - ycocgMean * ycocgMean, vec3(0.0)));
+    vec3 currYcc    = upwaysRgbToYCoCgV5(unjitTc);
+    vec3 aabbMin    = min(ycocgMean - 1.25 * ycocgSigma, currYcc);
+    vec3 aabbMax    = max(ycocgMean + 1.25 * ycocgSigma, currYcc);
+
+    // 3. Band-aware 5-tap Catmull-Rom reprojection of uPrevColorHr at currUV - surfMv
+    int  fullH      = int(max(pc.fullHrHeight, pc.hrHeight));
+    vec2 fullSizeF  = vec2(float(W), float(fullH));
+    vec2 localRes   = vec2(float(W), float(H));
+    vec2 currFullUV = (vec2(float(coord.x), float(coord.y + int(pc.bandHrY0))) + vec2(0.5)) / fullSizeF;
+
+    vec2 surfMvRaw  = unpackHalf2x16(imageLoad(uMlSurfaceMv, coord).x);
+    vec2 surfMv     = vec2(sanitizeFloat(surfMvRaw.x, 0.0), sanitizeFloat(surfMvRaw.y, 0.0));
+    vec2 prevFullUV = currFullUV - surfMv;
+    vec2 prevLocPx  = vec2(prevFullUV.x * float(W), prevFullUV.y * float(fullH) - float(pc.bandHrY0));
+    vec2 prevLocUV  = prevLocPx / localRes;
+
+    bool reset        = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
+    bool inBoundsPrev = (!reset)
+                     && all(greaterThanEqual(prevFullUV, vec2(0.0)))
+                     && all(lessThan(prevFullUV, vec2(1.0)))
+                     && (prevLocPx.y >= 0.0)
+                     && (prevLocPx.y < float(H));
+
+    vec3 outHdr = unjitCurr;
+    if (inBoundsPrev) {
+        vec3 prevHistRgb = sampleCatmullRom5TapV5(prevLocUV, localRes);
+        vec3 prevHistTc  = upwaysTonemapV5(prevHistRgb);
+        vec3 prevHistYcc = upwaysRgbToYCoCgV5(prevHistTc);
+        vec3 clippedYcc  = upwaysClipAABBV5(aabbMin, aabbMax, prevHistYcc, currYcc);
+        vec3 clippedTc   = max(upwaysYCoCgToRgbV5(clippedYcc), vec3(0.0));
+
+        float alpha = clamp(0.10 + 0.15 * centerDisocc, 0.06, 1.0);
+        vec3 blendedTc = mix(clippedTc, unjitTc, alpha);
+        outHdr = upwaysInverseTonemapV5(blendedTc);
+    }
+
+    outHdr = clampFp16Rgb(outHdr);
+    writeStabilizeOutputs(coord, outHdr, 1.0 - centerDisocc);
+}

@@ -2654,12 +2654,30 @@ void Engine::renderFrame() {
     bool fsrJitterActive = (m_config.upscaler_mode == UpscalerMode::FSR) &&
                            !(m_config.fsr_version == FsrVersion::Fsr4 && (!m_context || !m_context->supportsFsr4()));
     bool upwaysSuperResActive = m_config.isUpwaysSuperResActive();
+    const bool upwaysStandalone1x =
+        (m_config.denoiser_mode == DenoiserMode::Upways || m_config.upscaler_mode == UpscalerMode::Upways) &&
+        !upwaysSuperResActive &&
+        m_config.upscaler_mode != UpscalerMode::FSR &&
+        !m_config.upways_heuristic_fallback;
+    bool upwaysV5JitterActive = false;
+    if (upwaysStandalone1x) {
+        if (m_config.upways_version == UpwaysVersion::V5) {
+            upwaysV5JitterActive = true;
+        } else if (m_config.upways_version == UpwaysVersion::V4) {
+            upwaysV5JitterActive = false;
+        } else if (m_superResolution && m_superResolution->getUpwaysPipeline()) {
+            upwaysV5JitterActive = (m_superResolution->getUpwaysPipeline()->getVersion() == UpwaysRuntimeVersion::V5);
+        } else {
+            upwaysV5JitterActive =
+                (UpwaysPipeline::resolveVersion(m_config.upways_version, m_config.upways_weights_path) == UpwaysRuntimeVersion::V5);
+        }
+    }
     bool analyticalJitterActive = (m_config.denoiser_mode == DenoiserMode::Reblur ||
                                    m_config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
-    bool enableJitter = !isStationaryAccum && (fsrJitterActive || upwaysSuperResActive || analyticalJitterActive);
+    bool enableJitter = !isStationaryAccum && (fsrJitterActive || upwaysSuperResActive || upwaysV5JitterActive || analyticalJitterActive);
     uint32_t jitterSeqLen = (m_config.upscaler_mode == UpscalerMode::FSR)
         ? getFsrJitterPhaseCount(renderW, m_config.width)
-        : (analyticalJitterActive ? 16u : 32u);
+        : ((analyticalJitterActive || upwaysV5JitterActive) ? 16u : 32u);
 
     if (hardReset && m_camera) {
         m_camera->resetPrevViewProj();
@@ -3199,13 +3217,16 @@ void Engine::renderFrame() {
             ffxRrRun = true;
         } else if (useReblurPipeline && m_reblurDenoiser && m_reblurDenoiser->isInitialized()) {
             const bool coupledWithFsr = (m_config.upscaler_mode == UpscalerMode::FSR);
+            // In mGPU mode, accum_merge.comp merges raw non-demodulated 2-signal diffuse/specular
+            // radiance (m_mlDiffuseImage / m_mlSpecularImage) plus all guide planes across both GPUs;
+            // pass them with null indirect planes so ReBLUR sees the full merged frame without double-counting.
             m_reblurDenoiser->recordDenoise(
                 activeCmd, m_currentFrame, resetTemporal,
                 m_normalDepthImage, m_motionVectorImage, m_mlSpecularMotionImage,
                 m_mlAlbedoRoughnessImage, m_mlSpecAlbedoImage,
                 m_mlSkipImage,
-                m_mlDirectDiffuseImage, m_mlIndirectDiffuseImage,
-                m_mlDirectSpecularImage, m_mlIndirectSpecularImage,
+                m_mlDiffuseImage, nullptr,
+                m_mlSpecularImage, nullptr,
                 buildReblurCameraMatrices(renderW, renderH, coupledWithFsr)
             );
             reblurRun = true;

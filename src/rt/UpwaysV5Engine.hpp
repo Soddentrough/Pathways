@@ -100,7 +100,8 @@ public:
         bool enableSuperRes = false,
         VkFormat imageFormat = VK_FORMAT_R16G16B16A16_SFLOAT,
         UpwaysComputePrecision precision = UpwaysComputePrecision::Fp8,
-        uint32_t outputFullHeight = 0u
+        uint32_t outputFullHeight = 0u,
+        const std::vector<char>& stabilizeSpv = {}
     );
     ~UpwaysV5Engine();
 
@@ -178,7 +179,8 @@ private:
         const std::vector<char>& unetWmmaSpv,
         const std::vector<char>& affinitySpv,
         const std::vector<char>& upscalerWmmaSpv,
-        const std::vector<char>& resolveSpv
+        const std::vector<char>& resolveSpv,
+        const std::vector<char>& stabilizeSpv
     );
     void collectQueryResults(uint32_t targetSlot, bool waitForResult);
 
@@ -260,12 +262,14 @@ private:
     VkImageView m_cachedMlSkipCompactView = VK_NULL_HANDLE;
 
     // Descriptors & pipelines
+    VkSampler             m_linearSampler = VK_NULL_HANDLE;
     VkDescriptorPool      m_descriptorPool = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_prepDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_unetDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_affinityDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_upscalerDescLayout = VK_NULL_HANDLE;
     VkDescriptorSetLayout m_resolveDescLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout m_stabilizeDescLayout = VK_NULL_HANDLE;
 
     std::array<VkDescriptorSet, 2>               m_prepDescSets{};
     std::array<VkDescriptorSet, NUM_UNET_STAGES> m_unetDescSets{};
@@ -274,7 +278,8 @@ private:
     std::array<VkDescriptorSet, 3>               m_affReconDescSets{};  // L3, L2, L1
     std::array<std::array<VkDescriptorSet, 2>, 2> m_affL0DescSets{};    // [curr][pack]
     std::array<VkDescriptorSet, NUM_UPSCALER_STAGES> m_upscalerDescSets{};
-    std::array<std::array<VkDescriptorSet, 2>, 2>    m_resolveDescSets{}; // [curr][pack]
+    std::array<std::array<VkDescriptorSet, 2>, 2>    m_resolveDescSets{};   // [curr][pack]
+    std::array<std::array<VkDescriptorSet, 2>, 2>    m_stabilizeDescSets{}; // [curr][pack]
 
     VkPipelineCache  m_pipelineCache = VK_NULL_HANDLE;
     VkPipelineLayout m_prepPipeLayout = VK_NULL_HANDLE;
@@ -282,6 +287,7 @@ private:
     VkPipelineLayout m_affinityPipeLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_upscalerPipeLayout = VK_NULL_HANDLE;
     VkPipelineLayout m_resolvePipeLayout = VK_NULL_HANDLE;
+    VkPipelineLayout m_stabilizePipeLayout = VK_NULL_HANDLE;
 
     VkPipeline m_prepPipeline = VK_NULL_HANDLE;
     std::array<VkPipeline, NUM_UNET_STAGES>     m_unetPipelines{};
@@ -292,6 +298,7 @@ private:
     VkPipeline m_affStage3Pipeline = VK_NULL_HANDLE;
     std::array<VkPipeline, NUM_UPSCALER_STAGES> m_upscalerPipelines{};
     VkPipeline m_resolvePipeline = VK_NULL_HANDLE;
+    VkPipeline m_stabilizePipeline = VK_NULL_HANDLE;
 
     // Timestamps
     VkQueryPool m_queryPool = VK_NULL_HANDLE;

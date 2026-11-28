@@ -38,6 +38,7 @@ constexpr uint32_t UPWAYS_V5_FLAG_RESET_HISTORY      = 1u;
 constexpr uint32_t UPWAYS_V5_FLAG_ENABLE_SUPERRES    = 2u;
 constexpr uint32_t UPWAYS_V5_FLAG_ZERO_RESIDUAL_MODE = 4u;
 constexpr uint32_t UPWAYS_V5_FLAG_FUSED_BAND_PACK    = 8u;
+constexpr uint32_t UPWAYS_V5_FLAG_RUN_STABILIZE      = 16u;
 
 constexpr uint32_t divCeil(uint32_t a, uint32_t b) noexcept {
     return (a + b - 1u) / b;
@@ -110,7 +111,8 @@ UpwaysV5Engine::UpwaysV5Engine(
     bool enableSuperRes,
     VkFormat imageFormat,
     UpwaysComputePrecision precision,
-    uint32_t outputFullHeight
+    uint32_t outputFullHeight,
+    const std::vector<char>& stabilizeSpv
 )
     : m_device(device)
     , m_physDevice(physicalDevice)
@@ -164,13 +166,31 @@ UpwaysV5Engine::UpwaysV5Engine(
         m_queryPool = VK_NULL_HANDLE;
     }
 
+    VkSamplerCreateInfo samplerInfo{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    samplerInfo.magFilter = VK_FILTER_LINEAR;
+    samplerInfo.minFilter = VK_FILTER_LINEAR;
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0f;
+    samplerInfo.compareEnable = VK_FALSE;
+    samplerInfo.minLod = 0.0f;
+    samplerInfo.maxLod = 0.0f;
+    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    samplerInfo.unnormalizedCoordinates = VK_FALSE;
+    if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_linearSampler) != VK_SUCCESS) {
+        throw std::runtime_error("UpwaysV5Engine: Failed to create linear clamp sampler!");
+    }
+
     initWeights(weightsPath);
     initRenderResources(0x3u);
     initDisplayResources();
     createDescriptorSetLayouts();
     allocateDescriptorSets();
     refreshDescriptors();
-    createPipelines(prepSpv, unetWmmaSpv, affinitySpv, upscalerWmmaSpv, resolveSpv);
+    createPipelines(prepSpv, unetWmmaSpv, affinitySpv, upscalerWmmaSpv, resolveSpv, stabilizeSpv);
 
     Logger::info(
         "UpwaysPipeline 5.0 initialized ({} active params, {} B uploaded {} weights).",
@@ -217,12 +237,14 @@ UpwaysV5Engine::~UpwaysV5Engine() {
         destroyPipe(p);
     }
     destroyPipe(m_resolvePipeline);
+    destroyPipe(m_stabilizePipeline);
 
     destroyPipeLayout(m_prepPipeLayout);
     destroyPipeLayout(m_unetPipeLayout);
     destroyPipeLayout(m_affinityPipeLayout);
     destroyPipeLayout(m_upscalerPipeLayout);
     destroyPipeLayout(m_resolvePipeLayout);
+    destroyPipeLayout(m_stabilizePipeLayout);
 
     if (m_pipelineCache != VK_NULL_HANDLE) {
         vkDestroyPipelineCache(m_device, m_pipelineCache, nullptr);
@@ -235,6 +257,12 @@ UpwaysV5Engine::~UpwaysV5Engine() {
     destroyDescLayout(m_affinityDescLayout);
     destroyDescLayout(m_upscalerDescLayout);
     destroyDescLayout(m_resolveDescLayout);
+    destroyDescLayout(m_stabilizeDescLayout);
+
+    if (m_linearSampler != VK_NULL_HANDLE) {
+        vkDestroySampler(m_device, m_linearSampler, nullptr);
+        m_linearSampler = VK_NULL_HANDLE;
+    }
 
     if (m_queryPool != VK_NULL_HANDLE) {
         vkDestroyQueryPool(m_device, m_queryPool, nullptr);
@@ -610,12 +638,13 @@ void UpwaysV5Engine::createDescriptorSetLayouts() {
     // Pass 2A (upways_v5_unet_wmma.comp): 0..5 SSBOs
     m_unetDescLayout = createLayout(std::vector<VkDescriptorType>(6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER));
 
-    // Pass 2B (upways_v5_affinity.comp): 0..4 SSBOs, 5..17 storage images, 18 SSBO (BandPackOut)
-    std::vector<VkDescriptorType> affinityTypes(19, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
+    // Pass 2B (upways_v5_affinity.comp): 0..4 SSBOs, 5..17 storage images, 18 SSBO (BandPackOut), 19 storage image (uPrevGeomLr)
+    std::vector<VkDescriptorType> affinityTypes(20, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     for (uint32_t i = 0; i < 5u; ++i) {
         affinityTypes[i] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     }
     affinityTypes[18] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    affinityTypes[19] = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     m_affinityDescLayout = createLayout(affinityTypes);
 
     // Pass 3 (upways_v5_upscaler_wmma.comp): 0..3 SSBOs
@@ -628,17 +657,33 @@ void UpwaysV5Engine::createDescriptorSetLayouts() {
     resolveTypes[2] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     resolveTypes[9] = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     m_resolveDescLayout = createLayout(resolveTypes);
+
+    // Pass 4 (1.0x upways_v5_stabilize.comp):
+    //   0=uCleanRadLr, 1=uMlPrimaryGuide, 2=uMlSurfaceMv,
+    //   3=uPrevColorHr (combined linear clamp sampler), 4=uCurrColorHr, 5=uOutputColor, 6=g_bandPackOut
+    std::vector<VkDescriptorType> stabilizeTypes = {
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+    };
+    m_stabilizeDescLayout = createLayout(stabilizeTypes);
 }
 
 void UpwaysV5Engine::allocateDescriptorSets() {
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
+    std::array<VkDescriptorPoolSize, 3> poolSizes{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[0].descriptorCount = 260u;
+    poolSizes[0].descriptorCount = 320u;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[1].descriptorCount = 220u;
+    poolSizes[1].descriptorCount = 256u;
+    poolSizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[2].descriptorCount = 8u;
 
     VkDescriptorPoolCreateInfo poolInfo{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    poolInfo.maxSets = 36u;
+    poolInfo.maxSets = 48u;
     poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
     poolInfo.pPoolSizes = poolSizes.data();
 
@@ -664,6 +709,7 @@ void UpwaysV5Engine::allocateDescriptorSets() {
         for (uint32_t p = 0; p < 2u; ++p) {
             m_affL0DescSets[i][p] = allocSet(m_affinityDescLayout);
             m_resolveDescSets[i][p] = allocSet(m_resolveDescLayout);
+            m_stabilizeDescSets[i][p] = allocSet(m_stabilizeDescLayout);
         }
     }
     for (uint32_t s = 0; s < NUM_UNET_STAGES; ++s) {
@@ -896,7 +942,13 @@ void UpwaysV5Engine::refreshDescriptors() {
             ii[12] = { VK_NULL_HANDLE, fallbackRgba16f, VK_IMAGE_LAYOUT_GENERAL };
         }
 
-        std::array<VkWriteDescriptorSet, 19> writes{};
+        VkDescriptorImageInfo prevGeomIi = {
+            VK_NULL_HANDLE,
+            bindLiveImages ? m_geomHist[prevSlot]->getImageView() : fallbackRgba16f,
+            VK_IMAGE_LAYOUT_GENERAL
+        };
+
+        std::array<VkWriteDescriptorSet, 20> writes{};
         for (uint32_t b = 0; b < 5u; ++b) {
             writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[b].dstSet = dstSet;
@@ -919,6 +971,13 @@ void UpwaysV5Engine::refreshDescriptors() {
         writes[18].descriptorCount = 1u;
         writes[18].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[18].pBufferInfo = &packTargetBi;
+
+        writes[19].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[19].dstSet = dstSet;
+        writes[19].dstBinding = 19u;
+        writes[19].descriptorCount = 1u;
+        writes[19].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[19].pImageInfo = &prevGeomIi;
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
     };
 
@@ -996,6 +1055,44 @@ void UpwaysV5Engine::refreshDescriptors() {
             vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
         }
     }
+
+    // 6. Pass 4 (1.0x): upways_v5_stabilize.comp
+    //    0=uCleanRadLr, 1=uMlPrimaryGuide, 2=uMlSurfaceMv,
+    //    3=uPrevColorHr (combined linear clamp sampler, SHADER_READ_ONLY_OPTIMAL),
+    //    4=uCurrColorHr, 5=uOutputColor, 6=g_bandPackOut
+    if (m_linearSampler != VK_NULL_HANDLE) {
+        for (int curr = 0; curr < 2; ++curr) {
+            const int prev = 1 - curr;
+            std::array<VkDescriptorImageInfo, 6> sii{};
+            sii[0] = { VK_NULL_HANDLE, m_cleanRadLr->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            sii[1] = { VK_NULL_HANDLE, primGuideView, VK_IMAGE_LAYOUT_GENERAL };
+            sii[2] = { VK_NULL_HANDLE, surfaceMvView, VK_IMAGE_LAYOUT_GENERAL };
+            sii[3] = { m_linearSampler, m_colorHr[prev]->getImageView(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            sii[4] = { VK_NULL_HANDLE, m_colorHr[curr]->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+            sii[5] = { VK_NULL_HANDLE, m_outputImage->getImageView(), VK_IMAGE_LAYOUT_GENERAL };
+
+            for (int p = 0; p < 2; ++p) {
+                std::array<VkWriteDescriptorSet, 7> writes{};
+                for (uint32_t b = 0; b < 6u; ++b) {
+                    writes[b].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    writes[b].dstSet = m_stabilizeDescSets[curr][p];
+                    writes[b].dstBinding = b;
+                    writes[b].descriptorCount = 1u;
+                    writes[b].descriptorType = (b == 3u)
+                        ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                        : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                    writes[b].pImageInfo = &sii[b];
+                }
+                writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[6].dstSet = m_stabilizeDescSets[curr][p];
+                writes[6].dstBinding = 6u;
+                writes[6].descriptorCount = 1u;
+                writes[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[6].pBufferInfo = &packBi[p];
+                vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0u, nullptr);
+            }
+        }
+    }
 }
 
 VkShaderModule UpwaysV5Engine::createShaderModule(const std::vector<char>& code) {
@@ -1018,7 +1115,8 @@ void UpwaysV5Engine::createPipelines(
     const std::vector<char>& unetWmmaSpv,
     const std::vector<char>& affinitySpv,
     const std::vector<char>& upscalerWmmaSpv,
-    const std::vector<char>& resolveSpv
+    const std::vector<char>& resolveSpv,
+    const std::vector<char>& stabilizeSpv
 ) {
     auto createPipeLayout = [this](VkDescriptorSetLayout descLayout) {
         VkPushConstantRange pcRange{};
@@ -1103,12 +1201,14 @@ void UpwaysV5Engine::createPipelines(
     m_affinityPipeLayout = createPipeLayout(m_affinityDescLayout);
     m_upscalerPipeLayout = createPipeLayout(m_upscalerDescLayout);
     m_resolvePipeLayout = createPipeLayout(m_resolveDescLayout);
+    m_stabilizePipeLayout = createPipeLayout(m_stabilizeDescLayout);
 
     VkShaderModule prepMod = createShaderModule(prepSpv);
     VkShaderModule unetMod = createShaderModule(unetWmmaSpv);
     VkShaderModule affMod  = createShaderModule(affinitySpv);
     VkShaderModule upMod   = createShaderModule(upscalerWmmaSpv);
     VkShaderModule resMod  = createShaderModule(resolveSpv);
+    VkShaderModule stabMod = !stabilizeSpv.empty() ? createShaderModule(stabilizeSpv) : VK_NULL_HANDLE;
 
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup32Info{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
@@ -1185,12 +1285,18 @@ void UpwaysV5Engine::createPipelines(
         }
 
         m_resolvePipeline = createComputePipe(resMod, m_resolvePipeLayout, true, true, nullptr);
+        if (stabMod != VK_NULL_HANDLE) {
+            m_stabilizePipeline = createComputePipe(stabMod, m_stabilizePipeLayout, true, false, nullptr);
+        }
     } catch (...) {
         vkDestroyShaderModule(m_device, prepMod, nullptr);
         vkDestroyShaderModule(m_device, unetMod, nullptr);
         vkDestroyShaderModule(m_device, affMod, nullptr);
         vkDestroyShaderModule(m_device, upMod, nullptr);
         vkDestroyShaderModule(m_device, resMod, nullptr);
+        if (stabMod != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(m_device, stabMod, nullptr);
+        }
         throw;
     }
 
@@ -1199,6 +1305,9 @@ void UpwaysV5Engine::createPipelines(
     vkDestroyShaderModule(m_device, affMod, nullptr);
     vkDestroyShaderModule(m_device, upMod, nullptr);
     vkDestroyShaderModule(m_device, resMod, nullptr);
+    if (stabMod != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(m_device, stabMod, nullptr);
+    }
 
     if (m_pipelineCache != VK_NULL_HANDLE && !cachePath.empty()) {
         size_t cacheBytes = 0u;
@@ -1229,7 +1338,8 @@ void UpwaysV5Engine::createPipelines(
         std::chrono::steady_clock::now() - tCompileStart
     ).count();
     Logger::info(
-        "UpwaysPipeline 5.0 compiled 22 compute pipelines in {:.1f} ms (disk cache: {}).",
+        "UpwaysPipeline 5.0 compiled {} compute pipelines in {:.1f} ms (disk cache: {}).",
+        (m_stabilizePipeline != VK_NULL_HANDLE) ? 23u : 22u,
         compileMs,
         cachePath.empty() ? "none" : cachePath.filename().string()
     );
@@ -1378,10 +1488,19 @@ void UpwaysV5Engine::recordFrame(
     transitionInitialLayouts(cmd);
 
     const uint32_t curr = m_pingPongIndex & 1u;
+    const uint32_t prev = 1u - curr;
     const bool doReset = resetHistory || !m_historyValid;
     const bool runSuperRes =
         (m_enableSuperRes || m_inputWidth != m_outputWidth || m_inputHeight != m_outputHeight) &&
         !coupledWithExternalUpscaler;
+    const bool liveCam = (cameraMotion.camMotionParams.y > 0.5f) && !zeroResidualMode;
+    const bool runStabilize =
+        !runSuperRes &&
+        !coupledWithExternalUpscaler &&
+        (m_inputWidth == m_outputWidth) &&
+        (m_inputHeight == m_outputHeight) &&
+        liveCam &&
+        (m_stabilizePipeline != VK_NULL_HANDLE);
 
     UpwaysV5PushConstants pc{};
     pc.lrWidth = m_inputWidth;
@@ -1405,6 +1524,9 @@ void UpwaysV5Engine::recordFrame(
     const uint32_t packSlot = useFusedPack ? (band.bandPackSlot & 1u) : 0u;
     if (useFusedPack) {
         pc.flags |= UPWAYS_V5_FLAG_FUSED_BAND_PACK;
+    }
+    if (runStabilize) {
+        pc.flags |= UPWAYS_V5_FLAG_RUN_STABILIZE;
     }
     pc.bandLrY0 = band.bandLrY0;
     pc.bandHrY0 = band.bandHrY0;
@@ -1512,6 +1634,48 @@ void UpwaysV5Engine::recordFrame(
         dispatchStage(
             m_resolvePipeline, m_resolvePipeLayout, m_resolveDescSets[curr][packSlot],
             m_dims.w0, m_dims.h0, m_outputWidth, m_outputHeight
+        );
+
+        if (m_queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 4u);
+        }
+    } else if (runStabilize) {
+        if (m_queryPool != VK_NULL_HANDLE) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, m_queryPool, qBase + 3u);
+        }
+
+        // Transition m_colorHr[prev] GENERAL -> SHADER_READ_ONLY_OPTIMAL for linear sampled Catmull-Rom read.
+        // m_cleanRadLr write->read visibility was already established by emitComputeBarrier() after Stage 3.
+        m_colorHr[prev]->transitionLayout(
+            cmd,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT
+        );
+
+        // Pass 4 (1.0x): upways_v5_stabilize.comp (16x16 workgroup)
+        pc.inW = m_dims.w0;
+        pc.inH = m_dims.h0;
+        pc.outW = m_outputWidth;
+        pc.outH = m_outputHeight;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_stabilizePipeline);
+        vkCmdBindDescriptorSets(
+            cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_stabilizePipeLayout,
+            0u, 1u, &m_stabilizeDescSets[curr][packSlot], 0u, nullptr
+        );
+        vkCmdPushConstants(cmd, m_stabilizePipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0u, sizeof(UpwaysV5PushConstants), &pc);
+        vkCmdDispatch(cmd, divCeil(m_outputWidth, 16u), divCeil(m_outputHeight, 16u), 1u);
+
+        // Transition m_colorHr[prev] back SHADER_READ_ONLY_OPTIMAL -> GENERAL so next frame / SR resolve sees GENERAL
+        m_colorHr[prev]->transitionLayout(
+            cmd,
+            VK_IMAGE_LAYOUT_GENERAL,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT
         );
 
         if (m_queryPool != VK_NULL_HANDLE) {

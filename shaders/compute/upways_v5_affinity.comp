@@ -33,8 +33,11 @@ layout(set = 0, binding = 15, rg16f)    writeonly uniform image2D  uCurrHiddenLr
 layout(set = 0, binding = 16, rgba16f)  writeonly uniform image2D  uCleanRadLr;
 layout(set = 0, binding = 17, rgba16f)  writeonly uniform image2D  uOutputColor;
 layout(set = 0, binding = 18)           writeonly buffer  BandPackOut { uint rgb9e5[]; } g_bandPackOut;
+layout(set = 0, binding = 19, rgba16f)  readonly  uniform image2D  uPrevGeomLr;
 
 // Max apron = 22x14 = 308 pixels (when SPEC_DIL == 3); 8 u32/px = 2,464 dwords = 9,856 B
+// Stage 0 (180 px): reuses unused eD/eS slots (b+3..b+6) for nrm/dep/remodLum/rough/flags.
+// Stage 3 (180 px): packs 180x2 dwords of (nrm, dep) at s_tile[1440..1799] (zero extra LDS!).
 shared uint s_tile[2560];
 
 #define SAMPLE_IMG_BILINEAR(img, coord, dims, tapsOut) \
@@ -60,14 +63,18 @@ void loadPyPixel(uint basePxIdx, bool fromIn1, out vec3 dRgb, out vec4 eD, out v
     eS   = vec4(b0.zw, b1.xy);
 }
 
-void storePyPixel(uint basePxIdx, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS) {
+void storePyPixelMeta(uint basePxIdx, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS, vec2 meta) {
     uint idx2 = basePxIdx * 2u;
     vec4 a0 = vec4(dRgb, eD.x);
     vec4 a1 = vec4(eD.yzw, sRgb.x);
     vec4 b0 = vec4(sRgb.yz, eS.xy);
-    vec4 b1 = vec4(eS.zw, 0.0, 0.0);
+    vec4 b1 = vec4(eS.zw, meta.x, meta.y);
     g_out.p4[idx2 + 0u] = uvec4(packHalf2x16(a0.xy), packHalf2x16(a0.zw), packHalf2x16(a1.xy), packHalf2x16(a1.zw));
     g_out.p4[idx2 + 1u] = uvec4(packHalf2x16(b0.xy), packHalf2x16(b0.zw), packHalf2x16(b1.xy), packHalf2x16(b1.zw));
+}
+
+void storePyPixel(uint basePxIdx, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS) {
+    storePyPixelMeta(basePxIdx, dRgb, eD, sRgb, eS, vec2(0.0));
 }
 
 void storeTileEntry(uint ap, vec3 dRgb, vec4 eD, vec3 sRgb, vec4 eS) {
@@ -90,6 +97,74 @@ void loadTileEntry(uint ap, out vec3 dRgb, out vec4 eD, out vec3 sRgb, out vec4 
     sRgb = vec3(t1.y, t2);
     eD   = vec4(unpackHalf2x16(s_tile[b + 3u]), unpackHalf2x16(s_tile[b + 4u]));
     eS   = vec4(unpackHalf2x16(s_tile[b + 5u]), unpackHalf2x16(s_tile[b + 6u]));
+}
+
+void storeStage0TileEntry(
+    uint ap,
+    vec3 dRgb,
+    vec3 sRgb,
+    vec3 nrm,
+    float dep,
+    float remodDiffLum,
+    float remodSpecLum,
+    float rough,
+    uint qFlags
+) {
+    uint b = ap * 8u;
+    s_tile[b + 0u] = packHalf2x16(dRgb.rg);
+    s_tile[b + 1u] = packHalf2x16(vec2(dRgb.b, sRgb.r));
+    s_tile[b + 2u] = packHalf2x16(sRgb.gb);
+    s_tile[b + 3u] = packHalf2x16(nrm.xy);
+    s_tile[b + 4u] = packHalf2x16(vec2(nrm.z, dep));
+    s_tile[b + 5u] = packHalf2x16(vec2(remodDiffLum, remodSpecLum));
+    s_tile[b + 6u] = packHalf2x16(vec2(rough, float(qFlags)));
+}
+
+void loadStage0TileEntry(
+    uint ap,
+    out vec3 dRgb,
+    out vec3 sRgb,
+    out vec3 nrm,
+    out float dep,
+    out float remodDiffLum,
+    out float remodSpecLum,
+    out float rough,
+    out uint qFlags
+) {
+    uint b  = ap * 8u;
+    vec2 t0 = unpackHalf2x16(s_tile[b + 0u]);
+    vec2 t1 = unpackHalf2x16(s_tile[b + 1u]);
+    vec2 t2 = unpackHalf2x16(s_tile[b + 2u]);
+    vec2 t3 = unpackHalf2x16(s_tile[b + 3u]);
+    vec2 t4 = unpackHalf2x16(s_tile[b + 4u]);
+    vec2 t5 = unpackHalf2x16(s_tile[b + 5u]);
+    vec2 t6 = unpackHalf2x16(s_tile[b + 6u]);
+    dRgb         = vec3(t0, t1.x);
+    sRgb         = vec3(t1.y, t2);
+    nrm          = vec3(t3, t4.x);
+    dep          = t4.y;
+    remodDiffLum = t5.x;
+    remodSpecLum = t5.y;
+    rough        = t6.x;
+    qFlags       = uint(round(max(t6.y, 0.0)));
+}
+
+void storeStage3Geom(uint ap, vec3 nrm, float dep, float rough, bool isDiel) {
+    uint b = 1440u + ap * 2u;
+    s_tile[b + 0u] = packHalf2x16(nrm.xy);
+    s_tile[b + 1u] = packHalf2x16(vec2(nrm.z, dep));
+    s_tile[ap * 8u + 7u] = packHalf2x16(vec2(rough, isDiel ? 1.0 : 0.0));
+}
+
+void loadStage3Geom(uint ap, out vec3 nrm, out float dep, out float rough, out bool isDiel) {
+    uint b  = 1440u + ap * 2u;
+    vec2 g0 = unpackHalf2x16(s_tile[b + 0u]);
+    vec2 g1 = unpackHalf2x16(s_tile[b + 1u]);
+    vec2 g2 = unpackHalf2x16(s_tile[ap * 8u + 7u]);
+    nrm    = vec3(g0, g1.x);
+    dep    = g1.y;
+    rough  = g2.x;
+    isDiel = (g2.y > 0.5);
 }
 
 void softmax13AndAccum(float rawLogits[13], vec3 vals[13], out vec3 outWeighted) {
@@ -144,7 +219,7 @@ uint encodeSrInVec4(vec4 v, vec4 int8Max) {
 #endif
 }
 
-void readCompactDemodFolded(
+void readCompactDemodFoldedEx(
     ivec2 q,
     out vec3 rawDiff,
     out vec3 rawSpec,
@@ -156,7 +231,13 @@ void readCompactDemodFolded(
     out float roughness,
     out vec2 surfMv,
     out vec2 specMv,
-    out bool isSky
+    out float specDist,
+    out bool isSky,
+    out bool isDiel,
+    out bool transBit,
+    out float remodDiffLum,
+    out float remodSpecLum,
+    out bool isEmissive
 ) {
     uvec2 irr        = imageLoad(uMlIrradiance, q).xy;
     uvec4 pg         = imageLoad(uMlPrimaryGuide, q);
@@ -166,29 +247,34 @@ void readCompactDemodFolded(
 
     vec3  aDiff, aSpec;
     float reactiveMask, matClass;
-    bool  transBit;
     unpackCompactPrimary(pg, viewNormal, linDepth, reactiveMask, aDiff, roughness, aSpec, matClass, transBit);
 
     surfMv = vec2(sanitizeFloat(surfMvRaw.x, 0.0), sanitizeFloat(surfMvRaw.y, 0.0));
     bool  isSkyPre = isSkyOrEmissiveOnly(linDepth, matClass, aDiff, aSpec);
-    float specInvZ, specDist;
+    float specInvZ;
     unpackCompactSpecVmv(specVmvRaw, surfMv, linDepth, transBit, isSkyPre, specMv, specInvZ, specDist);
 
-    bool isDiel;
     demodulateAndFoldV5(
         irr, aDiff, aSpec, skipRad, linDepth, matClass, transBit, specInvZ,
         rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, isSky, isDiel
     );
+
+    remodDiffLum = min(upwaysLuma(aDiffEff * rawDiff), 65000.0);
+    remodSpecLum = min(upwaysLuma(aSpecEff * rawSpec), 65000.0);
+    isEmissive   = isSky
+                || (upwaysLuma(skipEff) > 1e-3)
+                || (dot(aDiffEff, aDiffEff) <= 1e-5 && dot(aSpecEff, aSpecEff) <= 1e-5);
 }
 
 void main() {
-    uint t  = gl_LocalInvocationIndex; // 0..127
-    uint lx = gl_LocalInvocationID.x;
-    uint ly = gl_LocalInvocationID.y;
-    int  gx = int(gl_GlobalInvocationID.x);
-    int  gy = int(gl_GlobalInvocationID.y);
-    int  W  = int(pc.outW);
-    int  H  = int(pc.outH);
+    uint t       = gl_LocalInvocationIndex; // 0..127
+    uint lx      = gl_LocalInvocationID.x;
+    uint ly      = gl_LocalInvocationID.y;
+    int  gx      = int(gl_GlobalInvocationID.x);
+    int  gy      = int(gl_GlobalInvocationID.y);
+    int  W       = int(pc.outW);
+    int  H       = int(pc.outH);
+    bool liveCam = isUpwaysLiveCamV5();
 
     // -------------------------------------------------------------------------
     // STAGE 0: Phase 2A L0 Temporal Update + Card4 Pre-filter -> Pyr0
@@ -202,12 +288,24 @@ void main() {
                 uint ay = ap / 18u;
                 uint ax = ap - ay * 18u;
                 ivec2 q = clamp(ivec2(wgX + int(ax) - 1, wgY + int(ay) - 1), ivec2(0), ivec2(W - 1, H - 1));
-                vec3 rD, rS, aDe, aSe, skE, nrm;
-                float dep, rough;
-                vec2 sMv, spMv;
-                bool isSkyQ;
-                readCompactDemodFolded(q, rD, rS, aDe, aSe, skE, nrm, dep, rough, sMv, spMv, isSkyQ);
-                storeTileEntry(ap, rD, vec4(0.0), rS, vec4(0.0));
+                vec3  rD, rS, aDe, aSe, skE, nrm;
+                float dep, rough, specDistQ, remodDL, remodSL;
+                vec2  sMv, spMv;
+                bool  isSkyQ, isDielQ, transQ, isEmissQ;
+                readCompactDemodFoldedEx(
+                    q, rD, rS, aDe, aSe, skE, nrm, dep, rough, sMv, spMv, specDistQ,
+                    isSkyQ, isDielQ, transQ, remodDL, remodSL, isEmissQ
+                );
+                if (liveCam) {
+                    bool isMirOrGlassQ = (!isSkyQ) && ((rough < 0.04) || isDielQ);
+                    uint qFlags = (isSkyQ ? 1u : 0u)
+                                | (isEmissQ ? 2u : 0u)
+                                | (isMirOrGlassQ ? 4u : 0u)
+                                | (isDielQ ? 8u : 0u);
+                    storeStage0TileEntry(ap, rD, rS, nrm, dep, remodDL, remodSL, rough, qFlags);
+                } else {
+                    storeTileEntry(ap, rD, vec4(0.0), rS, vec4(0.0));
+                }
             }
         }
         barrier();
@@ -217,51 +315,404 @@ void main() {
         }
 
         uint cAp = (ly + 1u) * 18u + (lx + 1u);
-        vec3 rawDiff, rawSpec, dDummy, sDummy;
-        vec4 edUnused, esUnused;
-        loadTileEntry(cAp, rawDiff, edUnused, rawSpec, esUnused);
+        ivec2 p  = ivec2(gx, gy);
 
-        int cOffs[4] = int[4](-1, 1, -18, 18);
+        vec3  rD_c, rS_c, aDe, aSe, skE, nrm;
+        float dep, rough, specDist, cRemodDiffLum, cRemodSpecLum;
+        vec2  surfMv, specMv;
+        bool  isSky, isDiel, transBit, isEmissive;
+        readCompactDemodFoldedEx(
+            p, rD_c, rS_c, aDe, aSe, skE, nrm, dep, rough, surfMv, specMv, specDist,
+            isSky, isDiel, transBit, cRemodDiffLum, cRemodSpecLum, isEmissive
+        );
+
+        vec3 rawDiff, rawSpec;
         vec3 card4D = vec3(0.0), card4S = vec3(0.0);
-        for (uint k = 0u; k < 4u; ++k) {
-            vec3 nD, nS;
-            loadTileEntry(uint(int(cAp) + cOffs[k]), nD, edUnused, nS, esUnused);
-            card4D += nD;
-            card4S += nS;
-        }
-        card4D *= 0.25;
-        card4S *= 0.25;
+        float spec3x3MeanLum = upwaysLuma(rS_c);
+        float muSTrim        = cRemodSpecLum;
+        bool isMirrorOrGlass = (!isSky) && ((rough < 0.04) || isDiel);
 
-        ivec2 p = ivec2(gx, gy);
-        vec3 rD_c, rS_c, aDe, aSe, skE, nrm;
-        float dep, rough;
-        vec2 surfMv, specMv;
-        bool isSky;
-        readCompactDemodFolded(p, rD_c, rS_c, aDe, aSe, skE, nrm, dep, rough, surfMv, specMv, isSky);
+        if (liveCam) {
+            vec3  cNrmTile;
+            float cDepTile, cRDLTile, cRSLTile, cRoughTile;
+            uint  cFlagsTile;
+            loadStage0TileEntry(cAp, rawDiff, rawSpec, cNrmTile, cDepTile, cRDLTile, cRSLTile, cRoughTile, cFlagsTile);
+
+            float graz = computeGrazingFactorV5(nrm);
+            float invCurrZ = 1.0 / max(dep, 0.05);
+
+            // 1. 3x3 geometric-neighbor remodulated luminance stats + max-trimmed firefly diffusion
+            float m1D = 0.0, m2D = 0.0, maxNbrD = 0.0, validNbrD = 0.0;
+            float m1S = 0.0, m2S = 0.0, maxNbrS = 0.0, validNbrS = 0.0;
+            float specNbrLumSum = 0.0, maxSpecNbrLum = 0.0, specNbrLumCnt = 0.0;
+
+            if (!isSky) {
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        uint nAp = uint(int(cAp) + dy * 18 + dx);
+                        vec3  nD, nS, nNrm;
+                        float nDep, nRDL, nRSL, nRough;
+                        uint  nFlags;
+                        loadStage0TileEntry(nAp, nD, nS, nNrm, nDep, nRDL, nRSL, nRough, nFlags);
+                        if ((nFlags & 1u) != 0u) continue;
+                        bool nIsDiel = (nFlags & 8u) != 0u;
+                        if (nIsDiel != isDiel) continue;
+                        if (!isDiel) {
+                            if (dot(nrm, nNrm) <= 0.70) continue;
+                            if (abs(dep - nDep) * invCurrZ > 0.10 * graz) continue;
+                        }
+
+                        bool nEmiss = (nFlags & 2u) != 0u;
+                        if (nEmiss == isEmissive) {
+                            m1D += nRDL;
+                            m2D += nRDL * nRDL;
+                            maxNbrD = max(maxNbrD, nRDL);
+                            validNbrD += 1.0;
+
+                            bool nMirOrGlass = (nFlags & 4u) != 0u;
+                            if (isDiel || (abs(rough - nRough) <= 0.15 && (nMirOrGlass == isMirrorOrGlass))) {
+                                m1S += nRSL;
+                                m2S += nRSL * nRSL;
+                                maxNbrS = max(maxNbrS, nRSL);
+                                validNbrS += 1.0;
+                                float nSL = upwaysLuma(nS);
+                                specNbrLumSum += nSL;
+                                maxSpecNbrLum = max(maxSpecNbrLum, nSL);
+                                specNbrLumCnt += 1.0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            float fireflyThreshD = 1e30;
+            if (!isSky && !isEmissive && !isDiel && validNbrD >= 3.0) {
+                float invN = 1.0 / validNbrD;
+                float muD  = m1D * invN;
+                float sigD = sqrt(max(0.0, m2D * invN - muD * muD));
+                fireflyThreshD = max(muD + 6.0 * max(sigD, 0.05 * muD), 24.0);
+                if (cRemodDiffLum > fireflyThreshD && cRemodDiffLum > 1e-4) {
+                    float softLum = fireflyThreshD
+                        + (cRemodDiffLum - fireflyThreshD) / (1.0 + (cRemodDiffLum - fireflyThreshD) / max(fireflyThreshD, 1.0));
+                    rawDiff *= (softLum / cRemodDiffLum);
+                } else if (maxNbrD > fireflyThreshD) {
+                    vec3  diffusedD = vec3(0.0);
+                    float spreadCap = max(fireflyThreshD - cRemodDiffLum, 0.0);
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0) continue;
+                            uint nAp = uint(int(cAp) + dy * 18 + dx);
+                            vec3  nD, nS, nNrm;
+                            float nDep, nRDL, nRSL, nRough;
+                            uint  nFlags;
+                            loadStage0TileEntry(nAp, nD, nS, nNrm, nDep, nRDL, nRSL, nRough, nFlags);
+                            if ((nFlags & 11u) != 0u) continue;
+                            if (nRDL <= fireflyThreshD) continue;
+                            if (dot(nrm, nNrm) <= 0.70) continue;
+                            if (abs(dep - nDep) * invCurrZ > 0.10) continue;
+                            float softN = fireflyThreshD
+                                + (nRDL - fireflyThreshD) / (1.0 + (nRDL - fireflyThreshD) / max(fireflyThreshD, 1.0));
+                            float excessFrac = min(nRDL - softN, 2.0 * fireflyThreshD) * 0.125 / max(nRDL, 1e-4);
+                            diffusedD += nD * excessFrac;
+                        }
+                    }
+                    float addLumEst = upwaysLuma(aDe * diffusedD);
+                    if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                        diffusedD *= (spreadCap / addLumEst);
+                    }
+                    rawDiff = clampFp16Rgb(rawDiff + diffusedD);
+                }
+            }
+
+            float fireflyThreshS = 1e30;
+            if (!isSky && !isEmissive && validNbrS >= 3.0) {
+                // Drop the single brightest neighbor when validNbrS >= 4 so one isolated 1-spp
+                // firefly (~80) never inflates muS >= 4.0 and disables energy diffusion on its 8
+                // dark neighbors (eliminating dark bias on mirror floor & mirror red wall).
+                float muS, sigS;
+                if (validNbrS >= 4.0) {
+                    float invTrim = 1.0 / (validNbrS - 1.0);
+                    muS  = max(m1S - maxNbrS, 0.0) * invTrim;
+                    sigS = sqrt(max(0.0, max(m2S - maxNbrS * maxNbrS, 0.0) * invTrim - muS * muS));
+                } else {
+                    float invN = 1.0 / validNbrS;
+                    muS  = m1S * invN;
+                    sigS = sqrt(max(0.0, m2S * invN - muS * muS));
+                }
+                muSTrim = muS;
+                if (!isMirrorOrGlass) {
+                    fireflyThreshS = max(muS + 6.0 * max(sigS, 0.05 * muS), 32.0);
+                    if (cRemodSpecLum > fireflyThreshS && cRemodSpecLum > 1e-4) {
+                        float softLum = fireflyThreshS
+                            + (cRemodSpecLum - fireflyThreshS) / (1.0 + (cRemodSpecLum - fireflyThreshS) / max(fireflyThreshS, 1.0));
+                        rawSpec *= (softLum / cRemodSpecLum);
+                    } else if (maxNbrS > fireflyThreshS) {
+                        vec3  diffusedS = vec3(0.0);
+                        float spreadCap = max(fireflyThreshS - cRemodSpecLum, 0.0);
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0) continue;
+                                uint nAp = uint(int(cAp) + dy * 18 + dx);
+                                vec3  nD, nS, nNrm;
+                                float nDep, nRDL, nRSL, nRough;
+                                uint  nFlags;
+                                loadStage0TileEntry(nAp, nD, nS, nNrm, nDep, nRDL, nRSL, nRough, nFlags);
+                                if ((nFlags & 15u) != 0u) continue;
+                                if (nRSL <= fireflyThreshS) continue;
+                                if (abs(rough - nRough) > 0.15) continue;
+                                if (dot(nrm, nNrm) <= 0.70) continue;
+                                if (abs(dep - nDep) * invCurrZ > 0.10) continue;
+                                float softN = fireflyThreshS
+                                    + (nRSL - fireflyThreshS) / (1.0 + (nRSL - fireflyThreshS) / max(fireflyThreshS, 1.0));
+                                float excessFrac = min(nRSL - softN, 2.0 * fireflyThreshS) * 0.125 / max(nRSL, 1e-4);
+                                diffusedS += nS * excessFrac;
+                            }
+                        }
+                        float addLumEst = upwaysLuma(aSe * diffusedS);
+                        if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                            diffusedS *= (spreadCap / addLumEst);
+                        }
+                        rawSpec = clampFp16Rgb(rawSpec + diffusedS);
+                    }
+                } else if (muS < 4.0) {
+                    // Isolated 1-spp bounce-2 firefly guard on dark mirror floor reflections & glass rims
+                    // (multi-pixel bright reflected ceiling lights have muS ~ 15.0 and remain 100% untouched).
+                    fireflyThreshS = max(muS + 6.0 * max(sigS, 0.10 * muS), 12.0);
+                    if (cRemodSpecLum > fireflyThreshS && cRemodSpecLum > 1e-4) {
+                        float softLum = fireflyThreshS
+                            + (cRemodSpecLum - fireflyThreshS) / (1.0 + (cRemodSpecLum - fireflyThreshS) / max(fireflyThreshS, 1.0));
+                        rawSpec *= (softLum / cRemodSpecLum);
+                    } else if (maxNbrS > fireflyThreshS) {
+                        vec3  diffusedIso = vec3(0.0);
+                        float spreadCap = max(fireflyThreshS - cRemodSpecLum, 0.0);
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                if (dx == 0 && dy == 0) continue;
+                                uint nAp = uint(int(cAp) + dy * 18 + dx);
+                                vec3  nD, nS, nNrm;
+                                float nDep, nRDL, nRSL, nRough;
+                                uint  nFlags;
+                                loadStage0TileEntry(nAp, nD, nS, nNrm, nDep, nRDL, nRSL, nRough, nFlags);
+                                if ((nFlags & 3u) != 0u) continue;
+                                bool nIsDiel = (nFlags & 8u) != 0u;
+                                if (nIsDiel != isDiel) continue;
+                                if ((nFlags & 4u) == 0u) continue;
+                                if (nRSL <= fireflyThreshS) continue;
+                                if (!isDiel) {
+                                    if (dot(nrm, nNrm) <= 0.70) continue;
+                                    if (abs(dep - nDep) * invCurrZ > 0.10 * graz) continue;
+                                }
+                                float softN = fireflyThreshS
+                                    + (nRSL - fireflyThreshS) / (1.0 + (nRSL - fireflyThreshS) / max(fireflyThreshS, 1.0));
+                                float excessFrac = min(nRSL - softN, 2.0 * fireflyThreshS) * 0.125 / max(nRSL, 1e-4);
+                                diffusedIso += nS * excessFrac;
+                            }
+                        }
+                        float addLumEst = upwaysLuma(aSe * diffusedIso);
+                        if (addLumEst > spreadCap && addLumEst > 1e-4) {
+                            diffusedIso *= (spreadCap / addLumEst);
+                        }
+                        rawSpec = clampFp16Rgb(rawSpec + diffusedIso);
+                    }
+                }
+            }
+
+            // Max-trimmed 3x3 specular luminance mean (drops the single brightest sample in the 3x3):
+            // prevents an isolated 1-spp firefly from tripping gammaS = 0 on itself or its 8 neighbors,
+            // while multi-pixel moving reflected ceiling lights still snap immediately!
+            float cSpecLumPost = upwaysLuma(rawSpec);
+            float sum9SpecLum  = specNbrLumSum + cSpecLumPost;
+            float max9SpecLum  = max(maxSpecNbrLum, cSpecLumPost);
+            spec3x3MeanLum = (specNbrLumCnt >= 2.0)
+                ? (max(sum9SpecLum - max9SpecLum, 0.0) / specNbrLumCnt)
+                : cSpecLumPost;
+
+            // 2. Geometry-aware card4D / card4S (edge-stopped on normal, depth, roughness, and fireflies)
+            int cOffs[4] = int[4](-1, 1, -18, 18);
+            float zTolCard = 0.06 * graz;
+            vec3  accCD = vec3(0.0), accCS = vec3(0.0);
+            float sumWD = 0.0, sumWS = 0.0;
+            if (!isSky) {
+                for (uint k = 0u; k < 4u; ++k) {
+                    vec3  nD, nS, nNrm;
+                    float nDep, nRDL, nRSL, nRough;
+                    uint  nFlags;
+                    loadStage0TileEntry(uint(int(cAp) + cOffs[k]), nD, nS, nNrm, nDep, nRDL, nRSL, nRough, nFlags);
+                    if ((nFlags & 1u) != 0u) continue;
+                    bool nIsDiel = (nFlags & 8u) != 0u;
+                    if (nIsDiel != isDiel) continue;
+
+                    float wGeom = 1.0;
+                    if (!isDiel) {
+                        float nDot = dot(nrm, nNrm);
+                        if (nDot < 0.70) continue;
+                        float relZ = abs(dep - nDep) * invCurrZ;
+                        if (relZ > zTolCard) continue;
+                        float wN = nDot * nDot;
+                        wN = wN * wN;
+                        float wZ = exp2(-(relZ / max(zTolCard * 0.5, 1e-4)) * UPWAYS_V5_LOG2E);
+                        wGeom = wN * wZ;
+                    }
+
+                    if (!isDiel) {
+                        if (nRDL > fireflyThreshD && nRDL > 1e-4) {
+                            float sL = fireflyThreshD + (nRDL - fireflyThreshD) / (1.0 + (nRDL - fireflyThreshD) / max(fireflyThreshD, 1.0));
+                            nD *= (sL / nRDL);
+                        }
+                        accCD += wGeom * nD;
+                        sumWD += wGeom;
+                    }
+
+                    bool nMirOrGlass = (nFlags & 4u) != 0u;
+                    if (isDiel || (abs(rough - nRough) <= 0.15 && (nMirOrGlass == isMirrorOrGlass))) {
+                        if (nRSL > fireflyThreshS && nRSL > 1e-4) {
+                            float sL = fireflyThreshS + (nRSL - fireflyThreshS) / (1.0 + (nRSL - fireflyThreshS) / max(fireflyThreshS, 1.0));
+                            nS *= (sL / nRSL);
+                        }
+                        float wS = wGeom;
+                        if (!isDiel) {
+                            wS *= exp2(-abs(rough - nRough) * (UPWAYS_V5_LOG2E / 0.10));
+                            if (isMirrorOrGlass && muSTrim >= 4.0) {
+                                // Only luma-stop card4S around bright reflected highlights using
+                                // symmetric muSTrim; dark mirror floor stays unbiased (fireflies already clamped).
+                                float lDiff = abs(cRemodSpecLum - nRSL) / max(0.35 * muSTrim + 0.25, 0.25);
+                                wS *= exp2(-lDiff * UPWAYS_V5_LOG2E);
+                            }
+                        }
+                        accCS += wS * nS;
+                        sumWS += wS;
+                    }
+                }
+            }
+            card4D = (sumWD > 1e-4) ? (accCD / sumWD) : rawDiff;
+            card4S = (sumWS > 1e-4) ? (accCS / sumWS) : rawSpec;
+        } else {
+            vec4 edUnused, esUnused;
+            loadTileEntry(cAp, rawDiff, edUnused, rawSpec, esUnused);
+
+            int cOffs[4] = int[4](-1, 1, -18, 18);
+            for (uint k = 0u; k < 4u; ++k) {
+                vec3 nD, nS;
+                loadTileEntry(uint(int(cAp) + cOffs[k]), nD, edUnused, nS, esUnused);
+                card4D += nD;
+                card4S += nS;
+            }
+            card4D *= 0.25;
+            card4S *= 0.25;
+        }
 
         bool reset = (pc.flags & UPWAYS_V5_FLAG_RESET_HISTORY) != 0u;
         ivec2 prevDims = imageSize(uPrevDiffLr);
         vec2 coordD, coordS;
-        bool inD = computeBandWarpCoord(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordD);
-        bool inS = computeBandWarpCoord(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, coordS);
-        float validSurf = inD ? 1.0 : 0.0;
-        float validVirt = inS ? 1.0 : 0.0;
+        bool inD = computeBandWarpCoordJitterV5(p, surfMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, liveCam, coordD);
+        bool inS = computeBandWarpCoordJitterV5(p, specMv, W, H, prevDims, pc.bandLrY0, pc.fullLrHeight, !reset && !isSky, liveCam, coordS);
+        float validSurf = 0.0;
+        float validVirt = 0.0;
+        bool  isDynamic = false;
 
         vec3 wDiff = vec3(0.0), wSpecSurf = vec3(0.0), wSpecVirt = vec3(0.0);
         vec2 wHid  = vec2(0.0);
-        if (inD) {
-            vec4 wd4, ws4, wh4;
-            SAMPLE_IMG_BILINEAR(uPrevDiffLr,   coordD, prevDims, wd4);
-            SAMPLE_IMG_BILINEAR(uPrevSpecLr,   coordD, prevDims, ws4);
-            SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
-            wDiff     = clampFp16Rgb(sanitizeRgb(wd4.rgb));
-            wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
-            wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
-        }
-        if (inS) {
-            vec4 wsv4;
-            SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
-            wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+
+        if (liveCam) {
+            float expectedPrevZ = computeExpectedPrevZV5(p, W, H, dep, surfMv, true, isDynamic);
+            float graz = computeGrazingFactorV5(nrm);
+            if (inD) {
+                BilinearTaps btD = computeBilinearTaps(coordD, prevDims);
+                vec4 g00 = imageLoad(uPrevGeomLr, btD.i00);
+                vec4 g10 = imageLoad(uPrevGeomLr, btD.i10);
+                vec4 g01 = imageLoad(uPrevGeomLr, btD.i01);
+                vec4 g11 = imageLoad(uPrevGeomLr, btD.i11);
+                vec3  wnDummy;
+                float wdDummy, wSumD;
+                vec4 rwD = evalValidatedSurfWeightsV5(
+                    btD, g00, g10, g01, g11, nrm, expectedPrevZ, graz, isDynamic, isDiel, wnDummy, wdDummy, wSumD
+                );
+                if (wSumD > 1e-4) {
+                    validSurf = 1.0;
+                    vec3 wdAcc = vec3(0.0), wsAcc = vec3(0.0);
+                    vec2 whAcc = vec2(0.0);
+                    if (rwD.x > 0.0) {
+                        wdAcc += rwD.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btD.i00).rgb));
+                        wsAcc += rwD.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i00).rgb));
+                        vec2 h = imageLoad(uPrevHiddenLr, btD.i00).xy;
+                        whAcc += rwD.x * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                    }
+                    if (rwD.y > 0.0) {
+                        wdAcc += rwD.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btD.i10).rgb));
+                        wsAcc += rwD.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i10).rgb));
+                        vec2 h = imageLoad(uPrevHiddenLr, btD.i10).xy;
+                        whAcc += rwD.y * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                    }
+                    if (rwD.z > 0.0) {
+                        wdAcc += rwD.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btD.i01).rgb));
+                        wsAcc += rwD.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i01).rgb));
+                        vec2 h = imageLoad(uPrevHiddenLr, btD.i01).xy;
+                        whAcc += rwD.z * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                    }
+                    if (rwD.w > 0.0) {
+                        wdAcc += rwD.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, btD.i11).rgb));
+                        wsAcc += rwD.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btD.i11).rgb));
+                        vec2 h = imageLoad(uPrevHiddenLr, btD.i11).xy;
+                        whAcc += rwD.w * clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                    }
+                    wDiff     = clampFp16Rgb(wdAcc);
+                    wSpecSurf = clampFp16Rgb(wsAcc);
+                    wHid      = clamp(whAcc, vec2(-4.0), vec2(4.0));
+                } else {
+                    ivec2 nearD = clamp(ivec2(floor(coordD + 0.5)), ivec2(0), prevDims - ivec2(1));
+                    if (validateSurfaceTapV5(nrm, expectedPrevZ, graz, isDynamic, isDiel, imageLoad(uPrevGeomLr, nearD), wnDummy, wdDummy)) {
+                        validSurf = 1.0;
+                        wDiff     = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevDiffLr, nearD).rgb));
+                        wSpecSurf = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, nearD).rgb));
+                        vec2 h = imageLoad(uPrevHiddenLr, nearD).xy;
+                        wHid = clamp(vec2(sanitizeFloat(h.x, 0.0), sanitizeFloat(h.y, 0.0)), vec2(-4.0), vec2(4.0));
+                    }
+                }
+            }
+            if (inS) {
+                BilinearTaps btS = computeBilinearTaps(coordS, prevDims);
+                vec4 g00 = imageLoad(uPrevGeomLr, btS.i00);
+                vec4 g10 = imageLoad(uPrevGeomLr, btS.i10);
+                vec4 g01 = imageLoad(uPrevGeomLr, btS.i01);
+                vec4 g11 = imageLoad(uPrevGeomLr, btS.i11);
+                float wSumS;
+                vec4 rwS = evalValidatedSpecWeightsV5(
+                    btS, g00, g10, g01, g11, nrm, expectedPrevZ, graz, rough, isDiel, wSumS
+                );
+                if (wSumS > 1e-4) {
+                    validVirt = 1.0;
+                    vec3 wsvAcc = vec3(0.0);
+                    if (rwS.x > 0.0) wsvAcc += rwS.x * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i00).rgb));
+                    if (rwS.y > 0.0) wsvAcc += rwS.y * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i10).rgb));
+                    if (rwS.z > 0.0) wsvAcc += rwS.z * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i01).rgb));
+                    if (rwS.w > 0.0) wsvAcc += rwS.w * clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, btS.i11).rgb));
+                    wSpecVirt = clampFp16Rgb(wsvAcc);
+                } else {
+                    ivec2 nearS = clamp(ivec2(floor(coordS + 0.5)), ivec2(0), prevDims - ivec2(1));
+                    if (validateSpecVmvTapV5(nrm, expectedPrevZ, graz, rough, isDiel, imageLoad(uPrevGeomLr, nearS))) {
+                        validVirt = 1.0;
+                        wSpecVirt = clampFp16Rgb(sanitizeRgb(imageLoad(uPrevSpecLr, nearS).rgb));
+                    }
+                }
+            }
+        } else {
+            validSurf = inD ? 1.0 : 0.0;
+            validVirt = inS ? 1.0 : 0.0;
+            if (inD) {
+                vec4 wd4, ws4, wh4;
+                SAMPLE_IMG_BILINEAR(uPrevDiffLr,   coordD, prevDims, wd4);
+                SAMPLE_IMG_BILINEAR(uPrevSpecLr,   coordD, prevDims, ws4);
+                SAMPLE_IMG_BILINEAR(uPrevHiddenLr, coordD, prevDims, wh4);
+                wDiff     = clampFp16Rgb(sanitizeRgb(wd4.rgb));
+                wSpecSurf = clampFp16Rgb(sanitizeRgb(ws4.rgb));
+                wHid      = clamp(vec2(sanitizeFloat(wh4.x, 0.0), sanitizeFloat(wh4.y, 0.0)), vec2(-4.0), vec2(4.0));
+            }
+            if (inS) {
+                vec4 wsv4;
+                SAMPLE_IMG_BILINEAR(uPrevSpecLr, coordS, prevDims, wsv4);
+                wSpecVirt = clampFp16Rgb(sanitizeRgb(wsv4.rgb));
+            }
         }
 
         // Read 32-ch DEN_HEAD @ L0 (8 uvec2 FP16/px)
@@ -286,6 +737,48 @@ void main() {
 
         float preD      = 0.5 * zeroCenteredGate(z1.w);
         float preS      = 0.5 * zeroCenteredGate(z2.x);
+
+        if (liveCam && !isSky) {
+            if (!isDiel && rough < 0.04) {
+                // Smooth curved mirrors: never leak wSpecSurf into wSpecVirt when separate VMV is active;
+                // reset on VMV miss instead of dragging reflections along surfMv.
+                vec2 fullSizeF = vec2(float(W), float(max(pc.fullLrHeight, pc.lrHeight)));
+                vec2 mvDiffPx  = (specMv - surfMv) * fullSizeF;
+                bool separateVmv = (specDist > 1e-4) && (dot(mvDiffPx, mvDiffPx) > 0.0025);
+                if (separateVmv) {
+                    betaVirt  = 1.0;
+                    effValidS = validVirt;
+                    wSpecMix  = wSpecVirt;
+                    gammaS    = validVirt * 0.980 * zeroCenteredGate(1.5 * z1.y);
+                } else if (validVirt > 0.5) {
+                    wSpecMix  = wSpecVirt;
+                    effValidS = 1.0;
+                }
+                // 3x3 max-trimmed high-contrast luma-jump snap: snaps immediately on moving reflected
+                // ceiling lights while preserving converged temporal history around 1-spp floor sparkles.
+                // On validated static curved mirrors where snap did not fire, color-gate the gammaS
+                // boost toward 0.90 so reflected color/ceiling boundaries stay sharp while flat
+                // mirror floor/wall reflections exploit P1B's curvature-aware thin-lens VMV.
+                if (effValidS > 0.5) {
+                    float prevSpecLum = upwaysLuma(wSpecMix);
+                    if (abs(spec3x3MeanLum - prevSpecLum) > max(2.5, 2.5 * min(spec3x3MeanLum, prevSpecLum))) {
+                        gammaS = 0.0;
+                    } else if (!isDynamic) {
+                        float colDiff = length(card4S - wSpecMix) / (max(prevSpecLum, spec3x3MeanLum) + 0.15);
+                        float mirrorBoost = smoothstep(0.60, 0.20, colDiff);
+                        gammaS = max(gammaS, mix(gammaS, 0.90, mirrorBoost));
+                    }
+                }
+                // Keep unbiased card4S active on dark mirror floor reflections (muSTrim < 4.0)
+                // while protecting bright reflected ceiling lights from pre-blur.
+                preS *= (1.0 - smoothstep(3.0, 6.0, muSTrim));
+            }
+            if (isDynamic) {
+                gammaD = min(gammaD, 0.90);
+                gammaS = min(gammaS, 0.85);
+            }
+        }
+
         vec3  rawDIn    = mix(rawDiff, card4D, preD);
         vec3  rawSIn    = mix(rawSpec, card4S, preS);
         vec3  mDiff     = mix(rawDIn, wDiff, gammaD);
@@ -296,7 +789,12 @@ void main() {
 
         vec4 e0D = 3.0 * tanh(vec4(z2.w, z3.xyz) * 0.5);
         vec4 e0S = 3.0 * tanh(vec4(z3.w, z4.xyz) * 0.5);
-        storePyPixel(uint(gy * W + gx), clampFp16Rgb(mDiff), e0D, clampFp16Rgb(mSpec), e0S);
+        storePyPixelMeta(
+            uint(gy * W + gx),
+            clampFp16Rgb(mDiff), e0D,
+            clampFp16Rgb(mSpec), e0S,
+            liveCam ? vec2(gammaD, gammaS) : vec2(0.0)
+        );
         return;
     }
 
@@ -460,6 +958,17 @@ void main() {
             vec3 d, s; vec4 ed, es;
             loadPyPixel(uint(q.y * W + q.x), false, d, ed, s, es);
             storeTileEntry(ap, d, ed, s, es);
+            if (liveCam) {
+                uvec4 pgQ = imageLoad(uMlPrimaryGuide, q);
+                vec3  qNrm;
+                float qDep;
+                unpackCompactNormalDepth(pgQ, qNrm, qDep);
+                float qRough  = clamp(unpackUnorm4x8(pgQ.z).a, 0.0, 1.0);
+                bool  qTrans  = (pgQ.y & (1u << 16u)) != 0u;
+                float qMat    = unpackUnorm4x8(pgQ.w).a;
+                bool  qIsDiel = (qDep < 9999.0) && (qTrans || ((qMat > 0.55) && (qMat < 0.79)));
+                storeStage3Geom(ap, qNrm, qDep, qRough, qIsDiel);
+            }
         }
     }
     barrier();
@@ -467,6 +976,16 @@ void main() {
     if (gx >= W || gy >= H) {
         return;
     }
+
+    ivec2 p = ivec2(gx, gy);
+    vec3  rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal;
+    float linDepth, roughness, specDistC, rdlUnused, rslUnused;
+    vec2  surfMv, specMv;
+    bool  isSky, isDiel, transBit, isEmissUnused;
+    readCompactDemodFoldedEx(
+        p, rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal, linDepth, roughness,
+        surfMv, specMv, specDistC, isSky, isDiel, transBit, rdlUnused, rslUnused, isEmissUnused
+    );
 
     uint cAp = (ly + 1u) * 18u + (lx + 1u);
     vec3 cD, cS; vec4 cED, cES;
@@ -487,13 +1006,48 @@ void main() {
     vec3  dTaps[9], sTaps[9];
     float lD[9], lS[9];
     int cOffs[5] = int[5](0, -1, 1, -18, 18); // exact C, L, R, U, D
+    bool  edgeFlag[4] = bool[4](false, false, false, false); // L, R, U, D
+    float grazS3 = computeGrazingFactorV5(viewNormal);
+    float zTolS3 = 0.06 * grazS3;
+    float invZS3 = 1.0 / max(linDepth, 0.05);
+
     for (uint k = 0u; k < 5u; ++k) {
+        uint nAp = uint(int(cAp) + cOffs[k]);
         vec3 nD, nS; vec4 nED, nES;
-        loadTileEntry(uint(int(cAp) + cOffs[k]), nD, nED, nS, nES);
+        loadTileEntry(nAp, nD, nED, nS, nES);
         dTaps[k] = nD; sTaps[k] = nS;
         vec4 dd = nED - cED; vec4 ds = nES - cES;
-        lD[k] = 3.5 * pD9[k] - 2.0 * dot(dd, dd);
-        lS[k] = 3.5 * pS9[k] - 2.0 * dot(ds, ds);
+        float ldVal = 3.5 * pD9[k] - 2.0 * dot(dd, dd);
+        float lsVal = 3.5 * pS9[k] - 2.0 * dot(ds, ds);
+        if (liveCam && !isSky && k > 0u) {
+            vec3  nNrm;
+            float nDep, nRough;
+            bool  nIsDiel;
+            loadStage3Geom(nAp, nNrm, nDep, nRough, nIsDiel);
+            float geomPen = 0.0;
+            if (isDiel) {
+                // Dielectric PSR stores stochastic per-ray virtN/virtDepth: enforce strict glass
+                // silhouette boundary without penalizing internal Fresnel/refraction flips.
+                if (!nIsDiel || nDep >= 9999.0) {
+                    geomPen = 16.0;
+                    edgeFlag[k - 1u] = true;
+                }
+            } else if (nIsDiel || nDep >= 9999.0) {
+                geomPen = 16.0;
+                edgeFlag[k - 1u] = true;
+            } else {
+                float nDot = max(dot(viewNormal, nNrm), 0.0);
+                float relZ = abs(linDepth - nDep) * invZS3;
+                float nPen = (nDot < 0.70) ? (12.0 * (1.0 - nDot)) : (4.0 * (1.0 - nDot));
+                float zPen = min(max(relZ - zTolS3 * 0.5, 0.0) / max(zTolS3, 1e-4) * 6.0, 16.0);
+                geomPen = nPen + zPen;
+                edgeFlag[k - 1u] = (nDot < 0.70) || (relZ > zTolS3);
+            }
+            ldVal -= geomPen;
+            lsVal -= geomPen;
+        }
+        lD[k] = ldVal;
+        lS[k] = lsVal;
     }
 
     int W1 = int(pc.inW);
@@ -501,13 +1055,31 @@ void main() {
     vec2 upScale = vec2(float(W1), float(H1)) / vec2(float(W), float(H));
     BilinearTaps bt = computeBilinearTaps((vec2(gx, gy) + vec2(0.5)) * upScale - vec2(0.5), ivec2(W1, H1));
     ivec2 cCoords[4] = ivec2[4](bt.i00, bt.i10, bt.i01, bt.i11);
+    int baseL1X = gx >> 1;
+    int baseL1Y = gy >> 1;
+    bool oddX = (gx & 1) != 0;
+    bool oddY = (gy & 1) != 0;
+
     for (uint k = 0u; k < 4u; ++k) {
         vec3 pD, pS; vec4 pED, pES;
         loadPyPixel(uint(cCoords[k].y * W1 + cCoords[k].x), true, pD, pED, pS, pES);
         dTaps[5u + k] = pD; sTaps[5u + k] = pS;
         vec4 dd = pED - cED; vec4 ds = pES - cES;
-        lD[5u + k] = 3.5 * pD9[5u + k] - 2.0 * dot(dd, dd);
-        lS[5u + k] = 3.5 * pS9[5u + k] - 2.0 * dot(ds, ds);
+        float ldVal = 3.5 * pD9[5u + k] - 2.0 * dot(dd, dd);
+        float lsVal = 3.5 * pS9[5u + k] - 2.0 * dot(ds, ds);
+        if (liveCam && !isSky) {
+            int sdx = cCoords[k].x - baseL1X;
+            int sdy = cCoords[k].y - baseL1Y;
+            float coarseEdgePen = 0.0;
+            if ((sdx < 0 && edgeFlag[0]) || (sdx > 0 && edgeFlag[1])) coarseEdgePen += 10.0;
+            if ((sdy < 0 && edgeFlag[2]) || (sdy > 0 && edgeFlag[3])) coarseEdgePen += 10.0;
+            if (sdx == 0 && ((oddX && edgeFlag[0]) || (!oddX && edgeFlag[1]))) coarseEdgePen += 6.0;
+            if (sdy == 0 && ((oddY && edgeFlag[2]) || (!oddY && edgeFlag[3]))) coarseEdgePen += 6.0;
+            ldVal -= coarseEdgePen;
+            lsVal -= coarseEdgePen;
+        }
+        lD[5u + k] = ldVal;
+        lS[5u + k] = lsVal;
     }
 
     vec3 wD, wS;
@@ -516,17 +1088,91 @@ void main() {
     vec3 i0D = clampFp16Rgb(mix(cD, wD, gateD0));
     vec3 i0S = clampFp16Rgb(mix(cS, wS, gateS0));
 
-    ivec2 p = ivec2(gx, gy);
-    vec3 rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal;
-    float linDepth, roughness;
-    vec2 surfMv, specMv;
-    bool isSky;
-    readCompactDemodFolded(p, rawDiff, rawSpec, aDiffEff, aSpecEff, skipEff, viewNormal, linDepth, roughness, surfMv, specMv, isSky);
+    // Tight ReBLUR-style symmetric edge-stopped 3x3 LDS mirror polish on smooth mirrors (rough < 0.04):
+    // calms noisy bounce-2 mirror floor reflections (including grazing bottom rim) without dark bias
+    // while preserving razor-sharp reflected ceiling lights.
+    if (liveCam && !isSky && !isDiel && roughness < 0.04) {
+        const float K1D[3] = float[3](0.25, 0.375, 0.25);
+        float cLumS = upwaysLuma(i0S);
+        float m1M = cLumS, m2M = cLumS * cLumS, cntM = 1.0;
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) continue;
+                uint nAp = uint(int(cAp) + dy * 18 + dx);
+                vec3  nNrm;
+                float nDep, nRough;
+                bool  nIsDiel;
+                loadStage3Geom(nAp, nNrm, nDep, nRough, nIsDiel);
+                if (nIsDiel || nDep >= 9999.0 || nRough >= 0.05) continue;
+                if (dot(viewNormal, nNrm) <= 0.90) continue;
+                if (abs(linDepth - nDep) * invZS3 >= zTolS3) continue;
+                vec3 nD_u, nS_m; vec4 nED_u, nES_u;
+                loadTileEntry(nAp, nD_u, nED_u, nS_m, nES_u);
+                float nL = upwaysLuma(nS_m);
+                m1M += nL;
+                m2M += nL * nL;
+                cntM += 1.0;
+            }
+        }
+        float invCntM = 1.0 / cntM;
+        float muM     = m1M * invCntM;
+        float varM    = max(0.0, m2M * invCntM - muM * muM);
+        float stdM    = sqrt(varM);
+        if (varM > 0.01) {
+            float sigmaLum = max(stdM, 0.22 * muM + 0.05);
+            vec3  specAcc  = i0S * 0.140625;
+            float wAcc     = 0.140625;
+            for (int dy = -1; dy <= 1; ++dy) {
+                float ky = K1D[dy + 1];
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    uint nAp = uint(int(cAp) + dy * 18 + dx);
+                    vec3  nNrm;
+                    float nDep, nRough;
+                    bool  nIsDiel;
+                    loadStage3Geom(nAp, nNrm, nDep, nRough, nIsDiel);
+                    if (nIsDiel || nDep >= 9999.0 || nRough >= 0.05) continue;
+                    float cosA = dot(viewNormal, nNrm);
+                    if (cosA <= 0.90) continue;
+                    if (abs(linDepth - nDep) * invZS3 >= zTolS3) continue;
+                    vec3 nD_u, nS_m; vec4 nED_u, nES_u;
+                    loadTileEntry(nAp, nD_u, nED_u, nS_m, nES_u);
+                    float lumArg = abs(cLumS - upwaysLuma(nS_m)) / (1.35 * sigmaLum);
+                    if (lumArg >= 2.2) continue;
+                    float c2  = cosA * cosA;
+                    float c4  = c2 * c2;
+                    float c8  = c4 * c4;
+                    float c16 = c8 * c8;
+                    float w   = (K1D[dx + 1] * ky) * c16 * exp2(-lumArg * UPWAYS_V5_LOG2E);
+                    specAcc += nS_m * w;
+                    wAcc    += w;
+                }
+            }
+            float polishMix = 0.45 * smoothstep(0.01, 0.10, varM);
+            i0S = clampFp16Rgb(mix(i0S, specAcc / max(wAcc, 1e-4), polishMix));
+        }
+    }
+
+    float disoccOut = 1.0;
+    if (liveCam) {
+        vec2 gammas  = unpackHalf2x16(g_in0.p4[uint(gy * W + gx) * 2u + 1u].w);
+        float gammaD = clamp(sanitizeFloat(gammas.x, 0.0), 0.0, 0.99);
+        float gammaS = clamp(sanitizeFloat(gammas.y, 0.0), 0.0, 0.99);
+
+        // Disocclusion-adaptive history feedback writeback: bootstraps spatially-cleaned history
+        // when gamma is low (fresh disocclusion / frame 0) and decays to 0 once converged,
+        // preventing recursive spatial blur or dark-bias compounding while preserving gate==0 identity.
+        float fbD = 0.75 * (1.0 - smoothstep(0.25, 0.85, gammaD));
+        float fbS = 0.75 * (1.0 - smoothstep(0.25, 0.85, gammaS));
+        imageStore(uCurrDiffLr, p, vec4(isSky ? rawDiff : clampFp16Rgb(mix(cD, i0D, fbD)), 1.0));
+        imageStore(uCurrSpecLr, p, vec4(isSky ? rawSpec : clampFp16Rgb(mix(cS, i0S, fbS)), 1.0));
+        disoccOut = isSky ? 0.0 : clamp(1.0 - gammaD, 0.0, 1.0);
+    }
 
     vec3 eDiffClean = isSky ? rawDiff : i0D;
     vec3 eSpecClean = isSky ? rawSpec : i0S;
     vec3 cleanRad   = clampFp16Rgb(aDiffEff * eDiffClean + aSpecEff * eSpecClean + skipEff);
-    imageStore(uCleanRadLr, p, vec4(cleanRad, 1.0));
+    imageStore(uCleanRadLr, p, vec4(cleanRad, disoccOut));
 
     if ((pc.flags & UPWAYS_V5_FLAG_ENABLE_SUPERRES) != 0u) {
         vec3 srFeat = tanh(z7.yzw);
@@ -572,7 +1218,7 @@ void main() {
             g_srIn.act2[bXY + 0u] = srPacked.xy;
             g_srIn.act2[bXY + 1u] = srPacked.zw;
         }
-    } else {
+    } else if ((pc.flags & UPWAYS_V5_FLAG_RUN_STABILIZE) == 0u) {
         imageStore(uOutputColor, p, vec4(cleanRad, 1.0));
         if ((pc.flags & UPWAYS_V5_FLAG_FUSED_BAND_PACK) != 0u
             && uint(gy) >= pc.keepHrYStart

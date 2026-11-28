@@ -137,11 +137,12 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
         bool isSuperRes = (inW < outW || inH < outH);
 
         if (ver == UpwaysRuntimeVersion::V5) {
-            auto prepCode     = m_shaderLoader(std::string("upways_v5_prep") + ext);
-            auto unetCode     = m_shaderLoader(std::string("upways_v5_unet_wmma") + ext);
-            auto affinityCode = m_shaderLoader(std::string("upways_v5_affinity") + ext);
-            auto upscalerCode = m_shaderLoader(std::string("upways_v5_upscaler_wmma") + ext);
-            auto resolveCode  = m_shaderLoader(std::string("upways_v5_resolve") + ext);
+            auto prepCode      = m_shaderLoader(std::string("upways_v5_prep") + ext);
+            auto unetCode      = m_shaderLoader(std::string("upways_v5_unet_wmma") + ext);
+            auto affinityCode  = m_shaderLoader(std::string("upways_v5_affinity") + ext);
+            auto upscalerCode  = m_shaderLoader(std::string("upways_v5_upscaler_wmma") + ext);
+            auto resolveCode   = m_shaderLoader(std::string("upways_v5_resolve") + ext);
+            auto stabilizeCode = m_shaderLoader("upways_v5_stabilize.comp.spv");
 
             m_upwaysPipeline = std::make_unique<UpwaysPipeline>(
                 m_device,
@@ -160,7 +161,8 @@ void SuperResolutionManager::createUpwaysPipelines(const Config& config) {
                 isSuperRes,
                 format,
                 prec,
-                outH
+                outH,
+                stabilizeCode
             );
         } else {
             auto denoisePrepCode    = m_shaderLoader(std::string("upways_denoise_prep") + ext);
@@ -294,6 +296,8 @@ void SuperResolutionManager::destroyUpwaysPipelines() {
     m_tonemapUpwaysBoundOutView.fill(VK_NULL_HANDLE);
     m_tonemapUpwaysBoundStitchBuf.fill(VK_NULL_HANDLE);
     m_tonemapUpwaysBoundStitchSize.fill(0);
+    m_prevUpwaysJitterPx = glm::vec2(0.0f);
+    m_hasPrevUpwaysJitter = false;
 }
 
 void SuperResolutionManager::createUpwaysResources(const Config& config, PostProcessPipeline* postProcess, VkCommandBuffer cmd) {
@@ -341,6 +345,8 @@ void SuperResolutionManager::createUpwaysResources(const Config& config, PostPro
 void SuperResolutionManager::destroyUpwaysResources() {
     m_displayAlbedoImage.reset();
     m_displayNormalsImage.reset();
+    m_prevUpwaysJitterPx = glm::vec2(0.0f);
+    m_hasPrevUpwaysJitter = false;
 }
 
 void SuperResolutionManager::createFsrPipelines(const Config& config) {
@@ -638,13 +644,25 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         if (resetHistory) {
             camera->resetPrevViewProj();
         }
-        bool enableJitter = isSuperRes || coupledWithExternalUpscaler;
-        uint32_t jitterSeqLen = coupledWithExternalUpscaler ? getFsrJitterPhaseCount(fullInW, config.width) : 32u;
+        const bool upwaysV5Standalone1x =
+            !isSuperRes &&
+            !coupledWithExternalUpscaler &&
+            !config.upways_heuristic_fallback &&
+            (m_upwaysPipeline->getVersion() == UpwaysRuntimeVersion::V5);
+        const bool enableJitter = isSuperRes || coupledWithExternalUpscaler || upwaysV5Standalone1x;
+        const uint32_t jitterSeqLen = coupledWithExternalUpscaler
+            ? getFsrJitterPhaseCount(fullInW, config.width)
+            : (upwaysV5Standalone1x ? 16u : 32u);
         CameraUniform ubo = camera->getUniformData(
             frameIndex, 1, config.max_bounces, 0,
             enableJitter, fullInW, fullInH, 0, false, jitterSeqLen
         );
         jitter = glm::vec2(ubo.jitterOffset.x, ubo.jitterOffset.y);
+
+        const glm::vec2 prevJitterPx =
+            (resetHistory || !m_hasPrevUpwaysJitter || !m_upwaysPipeline->isHistoryValid())
+                ? jitter
+                : m_prevUpwaysJitterPx;
 
         const glm::mat4 currView = camera->getViewMatrix();
         const glm::mat4 prevView = resetHistory ? currView : camera->getPrevViewMatrix();
@@ -652,7 +670,13 @@ bool SuperResolutionManager::dispatchUpways(VkCommandBuffer cmd, bool resetHisto
         const float aspectRatio = (camera->getAspect() > 1e-4f)
             ? camera->getAspect()
             : ((fullInH > 0u) ? (static_cast<float>(fullInW) / static_cast<float>(fullInH)) : 1.0f);
-        cameraMotion = makeUpwaysCameraMotion(currView, prevView, tanHalfFovY, aspectRatio);
+        cameraMotion = makeUpwaysCameraMotion(currView, prevView, tanHalfFovY, aspectRatio, prevJitterPx);
+
+        m_prevUpwaysJitterPx = jitter;
+        m_hasPrevUpwaysJitter = true;
+    } else {
+        m_prevUpwaysJitterPx = glm::vec2(0.0f);
+        m_hasPrevUpwaysJitter = false;
     }
 
     UpwaysBandParams bandParams{};

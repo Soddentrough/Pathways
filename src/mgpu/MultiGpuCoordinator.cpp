@@ -97,7 +97,8 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     plan.dispatchHeight = (plan.mgpuBaseH + 1) / 2;
     plan.isSampleBlendFsr3 = (params.config.upscaler_mode == UpscalerMode::FSR &&
                               params.config.mgpu_upscale_mode == MgpuUpscaleMode::SampleBlend &&
-                              params.config.denoiser_mode != DenoiserMode::FfxRayRegeneration);
+                              params.config.denoiser_mode != DenoiserMode::FfxRayRegeneration &&
+                              params.config.denoiser_mode != DenoiserMode::Reblur);
     plan.totalCompositeSpp = 0u;
     plan.secAccumHistory = 0u;
     plan.mergeMode = 0u; // 0 = InterleavedScanline, 1 = CheckerboardTile, 2 = SampleParallel
@@ -112,9 +113,11 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
     const bool isUpwaysActive = (params.config.denoiser_mode == DenoiserMode::Upways ||
                                  params.config.upscaler_mode == UpscalerMode::Upways ||
                                  params.config.upways_superres);
-    const bool isFfxRrActive = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+    const bool isSplitSignalDenoiserActive =
+        (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+         params.config.denoiser_mode == DenoiserMode::Reblur);
     const bool isTrainingCapture = !params.config.capture_training_data_dir.empty();
-    const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive;
+    const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isSplitSignalDenoiserActive;
 
     plan.isUpwaysBandParallel = (plan.activeMode == MultiGpuMode::CheckerboardTile) &&
                                 useCompactMlLive &&
@@ -192,12 +195,14 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
                              params.config.getRenderHeight() < params.config.height);
         bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
         bool upwaysSuperRes = params.config.isUpwaysSuperResActive();
+        bool analyticalJitterActive = (params.config.denoiser_mode == DenoiserMode::Reblur ||
+                                       params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
         bool enableJitter = !isStationaryAccum &&
-                            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes);
+                            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes || analyticalJitterActive);
         if (enableJitter && params.camera) {
             uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
                 ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
-                : 32u;
+                : (analyticalJitterActive ? 16u : 32u);
             uint32_t phaseOffset = plan.isSampleBlendFsr3 ? (jitterSeqLen / 2u) : 0u;
             plan.uboSec = params.camera->getUniformData(params.frameIndex, plan.secSpp, params.activeBounces, params.flags,
                                                        true, plan.mgpuBaseW, plan.mgpuBaseH, phaseOffset, false, jitterSeqLen);
@@ -233,6 +238,7 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         bool needMlGbuffers = (params.config.upscaler_mode == UpscalerMode::Upways ||
                                params.config.denoiser_mode == DenoiserMode::Upways ||
                                params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                               params.config.denoiser_mode == DenoiserMode::Reblur ||
                                !params.config.capture_training_data_dir.empty());
         bool needNormals = (needMlGbuffers ||
                             params.config.enable_restir ||
@@ -271,13 +277,15 @@ MultiGpuFramePlan MultiGpuCoordinator::planAndLaunchSecondary(
         const bool isStationaryAccum = params.config.progressive_accumulation && !hasDenoiser && !fsrUpscaling && !params.cameraMovedLastFrame && (inOutAccumulatedSamples >= 1);
         const bool upwaysSuperRes = (params.config.upscaler_mode == UpscalerMode::Upways) &&
                                     (plan.mgpuBaseW < params.config.width || plan.mgpuBaseH < params.config.height || params.config.upways_superres);
+        const bool analyticalJitterActive = (params.config.denoiser_mode == DenoiserMode::Reblur ||
+                                             params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
         if (plan.isUpwaysBandParallel) {
             jitterSec = glm::vec2(params.ubo.jitterOffset.x, params.ubo.jitterOffset.y);
         } else if (!isStationaryAccum &&
-            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes)) {
+            ((params.config.upscaler_mode == UpscalerMode::FSR) || upwaysSuperRes || analyticalJitterActive)) {
             uint32_t jitterSeqLen = (params.config.upscaler_mode == UpscalerMode::FSR)
                 ? getFsrJitterPhaseCount(plan.mgpuBaseW, params.config.width)
-                : 32u;
+                : (analyticalJitterActive ? 16u : 32u);
             uint32_t phaseOffset = (plan.activeMode == MultiGpuMode::SampleParallel && plan.isSampleBlendFsr3)
                 ? (jitterSeqLen / 2u)
                 : 0u;
@@ -581,11 +589,13 @@ void MultiGpuCoordinator::recordMergePass(
         const bool isUpwaysActive = (params.config.upscaler_mode == UpscalerMode::Upways ||
                                      params.config.denoiser_mode == DenoiserMode::Upways ||
                                      params.config.upways_superres);
-        const bool isFfxRrActive = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration);
+        const bool isSplitSignalDenoiserActive =
+            (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+             params.config.denoiser_mode == DenoiserMode::Reblur);
         const bool isTrainingCapture = !params.config.capture_training_data_dir.empty();
-        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isFfxRrActive;
+        const bool useCompactMlLive = isUpwaysActive && !isTrainingCapture && !isSplitSignalDenoiserActive;
         const bool needMlGbuffers =
-            (isUpwaysActive || isFfxRrActive || isTrainingCapture);
+            (isUpwaysActive || isSplitSignalDenoiserActive || isTrainingCapture);
         bool needNormals = (needMlGbuffers ||
                             params.config.enable_restir ||
                             params.config.enable_caustics);
@@ -688,12 +698,14 @@ void MultiGpuCoordinator::recordMergePass(
     }
 
     const bool needDecoupledPost = (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+                                    params.config.denoiser_mode == DenoiserMode::Reblur ||
                                     params.config.denoiser_mode == DenoiserMode::Upways ||
                                     params.config.upscaler_mode == UpscalerMode::Upways ||
                                     params.config.upscaler_mode == UpscalerMode::FSR);
     const bool isDenoisedWithoutRunningAvg =
         (params.config.denoiser_mode == DenoiserMode::Upways || params.config.upscaler_mode == UpscalerMode::Upways) ||
-        (params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration &&
+        ((params.config.denoiser_mode == DenoiserMode::FfxRayRegeneration ||
+          params.config.denoiser_mode == DenoiserMode::Reblur) &&
          params.config.capture_training_data_dir.empty());
     const bool useFusedMgpuTonemap = !m_hasDedicatedAsyncCompute && !needDecoupledPost && !params.skipRayTracing && !plan.isSampleBlendFsr3 &&
                                      !params.config.visualize_mgpu_split && (plan.slot == params.currentFrame) &&

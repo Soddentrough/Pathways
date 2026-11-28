@@ -503,14 +503,15 @@ UpwaysPipeline::UpwaysPipeline(
     bool enableSuperRes,
     VkFormat imageFormat,
     UpwaysComputePrecision precision,
-    uint32_t outputFullHeight
+    uint32_t outputFullHeight,
+    const std::vector<char>& v5StabilizeSpv
 )
     : m_version(UpwaysRuntimeVersion::V5)
     , m_v5Engine(std::make_unique<UpwaysV5Engine>(
           device, physicalDevice, allocator,
           inputWidth, inputHeight, outputWidth, outputHeight,
           v5PrepSpv, v5UnetWmmaSpv, v5AffinitySpv, v5UpscalerWmmaSpv, v5ResolveSpv,
-          weightsPath, enableSuperRes, imageFormat, precision, outputFullHeight
+          weightsPath, enableSuperRes, imageFormat, precision, outputFullHeight, v5StabilizeSpv
       ))
     , m_device(device)
     , m_physDevice(physicalDevice)

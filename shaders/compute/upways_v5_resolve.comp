@@ -359,6 +359,10 @@ void main() {
 
     float gateSr   = zeroCenteredGate(to0.x);
     float alphaHr  = (isSky || validHr <= 1e-4) ? 0.0 : (0.97 * zeroCenteredGate(to0.y));
+    if (isUpwaysLiveCamV5() && !isSky && centerRough < 0.04) {
+        // Curved smooth mirrors: never smear reflections along surface dilatedMv.
+        alphaHr = 0.0;
+    }
     float gateConf = zeroCenteredGate(to0.z);
 
     float rLog[9];
