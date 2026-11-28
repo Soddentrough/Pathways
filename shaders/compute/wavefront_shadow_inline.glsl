@@ -6,6 +6,10 @@
 // terminate on dielectrics and emitters). UBO bit 26 (--transparent-shadows) is the
 // biased fast mode in which dielectrics and emissives do not occlude NEE.
 
+#ifndef SIMPLE_OPAQUE_INLINE_SHADOW
+#define SIMPLE_OPAQUE_INLINE_SHADOW 0
+#endif
+
 #ifdef USE_GLOBAL_RAY_QUERY
 #define LOCAL_RQ_DECL /* reuse g_rq */
 #define RQ_OBJ g_rq
@@ -16,6 +20,15 @@
 
 bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaque, uint numOpaqueTriangles) {
     bool transparentShadows = (ubo.flags & (1u << 26)) != 0u;
+#if SIMPLE_OPAQUE_INLINE_SHADOW
+    LOCAL_RQ_DECL
+    uint rqFlags = gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT;
+    uint rayMask = (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL;
+    rayQueryInitializeEXT(RQ_OBJ, topLevelAS, rqFlags, rayMask,
+                          origin, EPSILON, dir, maxDist - EPSILON * 2.0);
+    rayQueryProceedEXT(RQ_OBJ);
+    return (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+#else
     bool enableCaustics = (ubo.flags & (1u << 8)) != 0u && (ubo.flags & (1u << 6)) != 0u; // approximate light check
     bool hasAlphaShadow = (ubo.flags & (1u << 27)) != 0u;
     bool simpleOpaque = !hasAlphaShadow && (!transparentShadows || !enableCaustics);
@@ -70,4 +83,5 @@ bool traceShadowRayInline(vec3 origin, vec3 dir, float maxDist, bool hasNonOpaqu
     }
 
     return (rayQueryGetIntersectionTypeEXT(RQ_OBJ, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+#endif
 }

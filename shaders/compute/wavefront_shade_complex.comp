@@ -1593,8 +1593,8 @@ void main() {
                 // clearcoat (prob ccProb), else base spec (specProb), else cosine
                 // (transmitted with prob diffTrans). weight = f·|cos| / pdf_mixture.
 #if !IS_SECONDARY_BOUNCE
-                    bool useRestirNonV4Sobol = (pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u);
-                    bool useBounce0Sobol = (bounce == 0u) && (pc.captureMlData != 0u || useRestirNonV4Sobol || pc.secondarySortMode < 2u);
+                    // Always enable Bounce-0 Morton Z-Sobol Owen-scrambled sampling regardless of secondarySortMode.
+                    bool useBounce0Sobol = (bounce == 0u);
                     uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                     float lobeSelect = useBounce0Sobol
                         ? sampleSobolOwen1D(globalPixelIdx, pc.width, sobolSampleIdx, 0u)
@@ -1649,8 +1649,9 @@ void main() {
                                     ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
                                     : sampleCosineHemisphere(lobeN, seed));
 #else
-                            bool useBounce1Sobol = (bounce == 1u) &&
-                                ((pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u));
+                            bool useBounce1Sobol = (bounce == 1u) && (
+                                (pc.enableNrc == 0u) ||
+                                ((pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u)));
                             nextDirection = useBounce1Sobol
                                 ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(globalPixelIdx, pc.width, frameRot, 8u))
                                 : ((pc.secondarySortMode >= 2u && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u))

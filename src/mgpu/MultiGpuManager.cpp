@@ -1827,13 +1827,15 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                     loadShaderSPIRV("restir_di_reuse.comp.spv"),
                     loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv"),
                     loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+                    config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
                 );
             } else if (secNeedAlpha) {
                 secNode->wavefrontPipeline->initAlphaIntersectPipeline(
                     loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
                     loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+                    config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
                 );
             } else if (secNeedRestir) {
                 secNode->wavefrontPipeline->initRestirVariants(
@@ -1846,6 +1848,14 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                     loadShaderSPIRV("restir_gi_reuse.comp.spv"),
                     loadShaderSPIRV("restir_di_reuse.comp.spv"),
                     loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+                );
+            }
+            if (secNode->wavefrontPipeline && !secNode->wavefrontPipeline->hasCoherenceSortPipelines()) {
+                secNode->wavefrontPipeline->initCoherenceSortPipelines(
+                    loadShaderSPIRV("wavefront_coherence_sort_prep.comp.spv"),
+                    loadShaderSPIRV("wavefront_coherence_sort_hist.comp.spv"),
+                    loadShaderSPIRV("wavefront_coherence_sort_prefix.comp.spv"),
+                    loadShaderSPIRV("wavefront_coherence_sort_scatter.comp.spv")
                 );
             }
             secNode->restirManager = std::make_unique<ReSTIRManager>(secDevice, secAlloc);
@@ -4143,7 +4153,8 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
             secNode->wavefrontPipeline->initAlphaIntersectPipeline(
                 loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
                 loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-                loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+                loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+                m_config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
             );
             secNode->context->savePipelineCache();
         }

@@ -8,6 +8,13 @@
 #extension GL_EXT_nonuniform_qualifier : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
+#ifndef ENABLE_ALPHA_MASK
+#define ENABLE_ALPHA_MASK 0
+#endif
+#ifndef SIMPLE_OPAQUE_SHADOW
+#define SIMPLE_OPAQUE_SHADOW 1
+#endif
+
 #include "wavefront_common.glsl"
 #include "wavefront_radiance_output.glsl"
 
@@ -56,9 +63,20 @@ layout(std430, binding = 25) readonly buffer LightTreeBuffer {
     LightTreeNode lightNodes[];
 };
 
+layout(std430, binding = 53) readonly buffer CoherenceSortMetaRO {
+    uvec4 indirectCmd;
+    uint activeCount;
+    uint activeFlag;
+} cohMeta;
+
+layout(std430, binding = 55) readonly buffer CoherenceSortedIndicesRO {
+    uint indices[];
+} cohSortedIndices;
+
 rayQueryEXT g_rq;
 #define USE_GLOBAL_RAY_QUERY 1
 #define ENABLE_INLINE_SHADOWS 1
+#define SIMPLE_OPAQUE_INLINE_SHADOW SIMPLE_OPAQUE_SHADOW
 #include "wavefront_shadow_inline.glsl"
 #include "mis_common.glsl"
 #include "bsdf_standard.glsl"
@@ -71,11 +89,12 @@ layout(push_constant) uniform PushConstants {
 };
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (idx >= queueCounters.activeRayCount || idx >= pc.maxQueueCapacity) {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= queueCounters.activeRayCount || tid >= pc.maxQueueCapacity) {
         return;
     }
 
+    uint idx = (pc.useCoherenceSort != 0u && cohMeta.activeFlag != 0u) ? cohSortedIndices.indices[tid] : tid;
     RayGeometry geom = inGeoms[idx];
     RayState state = inStates[idx];
 
@@ -93,7 +112,9 @@ void main() {
     vec3 accumRadiance = vec3(0.0);
     f16vec3 accumMlDiffuse = f16vec3(0.0);
     f16vec3 accumMlSpecular = f16vec3(0.0);
+#if ENABLE_ALPHA_MASK
     bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
+#endif
 
     for (uint bounce = pc.currentBounce; bounce < pc.maxBounces; ++bounce) {
         float closestT = (pc.maxRayDistance > 0.0) ? pc.maxRayDistance : 10000.0;
@@ -104,6 +125,10 @@ void main() {
         uint hitInstMatOffset = 0u;
 
         // Trace scene intersection with single-site hardware rayQueryEXT
+#if !ENABLE_ALPHA_MASK
+        rayQueryInitializeEXT(g_rq, topLevelAS, gl_RayFlagsOpaqueEXT, RAY_MASK_ALL, rayOrigin, EPSILON, rayDir, closestT);
+        rayQueryProceedEXT(g_rq);
+#else
         uint sceneRqFlags = hasAlphaMask ? gl_RayFlagsNoneEXT : gl_RayFlagsOpaqueEXT;
         rayQueryInitializeEXT(g_rq, topLevelAS, sceneRqFlags, RAY_MASK_ALL, rayOrigin, EPSILON, rayDir, closestT);
         while (rayQueryProceedEXT(g_rq)) {
@@ -134,6 +159,7 @@ void main() {
                 rayQueryConfirmIntersectionEXT(g_rq);
             }
         }
+#endif
 
         if (rayQueryGetIntersectionTypeEXT(g_rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
             closestT = rayQueryGetIntersectionTEXT(g_rq, true);

@@ -111,6 +111,7 @@ struct WavefrontShadowPC {
     wf_uint numOpaqueTriangles;
     wf_uint captureMlData;
     wf_uint currentBounce;
+    wf_uint useCoherenceSort;
 };
 
 struct WavefrontIntersectPC {
@@ -131,6 +132,13 @@ struct WavefrontIntersectPC {
     wf_uint octantBin;
     float maxRayDistance;
     wf_uint minRayThreshold;
+    float boundsMinX;
+    float boundsMinY;
+    float boundsMinZ;
+    float boundsInvExtentX;
+    float boundsInvExtentY;
+    float boundsInvExtentZ;
+    wf_uint useCoherenceSort;
 };
 
 struct WavefrontTailPC {
@@ -154,6 +162,24 @@ struct WavefrontTailPC {
     wf_uint captureMlData;
     float indirectClamp;
     float maxRayDistance;
+    wf_uint useCoherenceSort;
+};
+
+struct WavefrontCoherenceSortPC {
+    wf_uint sourceMode;
+    wf_uint queueSlot;
+    wf_uint maxQueueCapacity;
+    wf_uint minSortCount;
+    wf_uint keyMode;
+    wf_uint longAxis0;
+    wf_uint longAxis1;
+    wf_uint pad0;
+    float boundsMinX;
+    float boundsMinY;
+    float boundsMinZ;
+    float boundsInvExtentX;
+    float boundsInvExtentY;
+    float boundsInvExtentZ;
 };
 
 #ifdef __cplusplus
@@ -161,9 +187,10 @@ static_assert(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 2
 static_assert(offsetof(QueueCountersBuffer, activeMaterialSequenceCount) == 172, "activeMaterialSequenceCount offset must be 172");
 static_assert(sizeof(WavefrontClassifyPC) == 80, "WavefrontClassifyPC must be 80 bytes");
 static_assert(sizeof(WavefrontShadePC) == 92, "WavefrontShadePC must be 92 bytes");
-static_assert(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
-static_assert(sizeof(WavefrontIntersectPC) == 68, "WavefrontIntersectPC must be 68 bytes");
-static_assert(sizeof(WavefrontTailPC) == 80, "WavefrontTailPC must be 80 bytes");
+static_assert(sizeof(WavefrontShadowPC) == 44, "WavefrontShadowPC must be 44 bytes");
+static_assert(sizeof(WavefrontIntersectPC) == 96, "WavefrontIntersectPC must be 96 bytes");
+static_assert(sizeof(WavefrontTailPC) == 84, "WavefrontTailPC must be 84 bytes");
+static_assert(sizeof(WavefrontCoherenceSortPC) == 56, "WavefrontCoherenceSortPC must be 56 bytes");
 } // namespace pathways
 #else
 #undef wf_uint

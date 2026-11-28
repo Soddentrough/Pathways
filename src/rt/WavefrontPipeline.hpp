@@ -150,13 +150,20 @@ public:
         const std::vector<char>& restirDiReuseCode = {},
         const std::vector<char>& shadeDielectricSecRestirCode = {},
         const std::vector<char>& classifyAlphaCode = {},
-        const std::vector<char>& shadowAlphaCode = {});
+        const std::vector<char>& shadowAlphaCode = {},
+        const std::vector<char>& tailMegakernelAlphaCode = {});
 
     void initAlphaIntersectPipeline(
         const std::vector<char>& intersectAlphaCode,
         const std::vector<char>& classifyAlphaCode = {},
-        const std::vector<char>& shadowAlphaCode = {});
+        const std::vector<char>& shadowAlphaCode = {},
+        const std::vector<char>& tailMegakernelAlphaCode = {});
     void initTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode);
+    void initCoherenceSortPipelines(
+        const std::vector<char>& prepCode,
+        const std::vector<char>& histCode,
+        const std::vector<char>& prefixCode,
+        const std::vector<char>& scatterCode);
     void initRestirVariants(
         const std::vector<char>& shadeDiffuseRestirCode,
         const std::vector<char>& shadeDiffuseSecRestirCode,
@@ -185,9 +192,16 @@ public:
     bool hasAlphaTraversalPipelines() const noexcept {
         return m_intersectAlphaPipeline != VK_NULL_HANDLE &&
                m_classifyAlphaPipeline != VK_NULL_HANDLE &&
-               m_shadowAlphaPipeline != VK_NULL_HANDLE;
+               m_shadowAlphaPipeline != VK_NULL_HANDLE &&
+               (!hasTailMegakernelPipeline() || m_tailMegakernelAlphaPipeline != VK_NULL_HANDLE);
     }
     bool hasTailMegakernelPipeline() const noexcept { return m_tailMegakernelPipeline != VK_NULL_HANDLE; }
+    bool hasCoherenceSortPipelines() const noexcept {
+        return m_cohSortPrepPipeline != VK_NULL_HANDLE &&
+               m_cohSortHistPipeline != VK_NULL_HANDLE &&
+               m_cohSortPrefixPipeline != VK_NULL_HANDLE &&
+               m_cohSortScatterPipeline != VK_NULL_HANDLE;
+    }
     bool hasRestirPipelines() const noexcept { return !m_restirPrimaryMatPipelines.empty(); }
     bool hasNrcPipelines() const noexcept { return !m_nrcPrimaryMatPipelines.empty(); }
 
@@ -272,6 +286,11 @@ private:
                          const std::vector<char>& tailMegakernelCode = {},
                          const std::vector<char>& shadeDielectricSecCode = {});
     void rebuildMaterialExecutionSets();
+    uint32_t getActiveCoherenceSortMask() const;
+    void updateAdaptiveCoherence(uint32_t frameSlot, const WavefrontProfilingData& data);
+    void recordCoherenceSort(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t sourceMode,
+                             uint32_t queueSlot, uint32_t maxCapacity,
+                             const glm::vec3& boundsMin, const glm::vec3& boundsMax);
 
     struct ComputePipelineSpec {
         const std::vector<char>* code = nullptr;
@@ -312,6 +331,9 @@ private:
     std::array<std::unique_ptr<Buffer>, 2> m_indirectArgs;     // Pure DEVICE_LOCAL indirect dispatch commands
     std::array<std::unique_ptr<Buffer>, 2> m_indirectReadback; // Host-cached telemetry readback per frame slot
     std::array<std::unique_ptr<Buffer>, 2> m_dgcStream;
+    std::array<std::unique_ptr<Buffer>, 2> m_coherenceSortMeta;
+    std::array<std::unique_ptr<Buffer>, 2> m_coherenceSortKeys;
+    std::array<std::unique_ptr<Buffer>, 2> m_coherenceSortedIndices;
 
     // Descriptors
     VkDescriptorPool m_descriptorPool = VK_NULL_HANDLE;
@@ -332,6 +354,7 @@ private:
     VkPipeline m_shadeComplexSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDielectricSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;
+    VkPipeline m_tailMegakernelAlphaPipeline = VK_NULL_HANDLE;
     VkPipeline m_intersectAlphaPipeline = VK_NULL_HANDLE;
     VkPipeline m_classifyAlphaPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowAlphaPipeline = VK_NULL_HANDLE;
@@ -350,6 +373,10 @@ private:
     VkPipeline m_shadeDielectricSecNrcPipeline = VK_NULL_HANDLE;
     VkPipeline m_restirDiReusePipeline = VK_NULL_HANDLE;
     VkPipeline m_restirGiReusePipeline = VK_NULL_HANDLE;
+    VkPipeline m_cohSortPrepPipeline = VK_NULL_HANDLE;
+    VkPipeline m_cohSortHistPipeline = VK_NULL_HANDLE;
+    VkPipeline m_cohSortPrefixPipeline = VK_NULL_HANDLE;
+    VkPipeline m_cohSortScatterPipeline = VK_NULL_HANDLE;
 
     std::vector<VkPipeline> m_primaryMatPipelines;
     std::vector<VkPipeline> m_secondaryMatPipelines;
@@ -417,6 +444,29 @@ private:
     bool m_supportsSubgroupSizeControl = true;
     bool m_secondaryIndexQueueEnabled = false;
     uint32_t m_warmupSppOverride = 0;
+    bool m_coherenceEnvOverride = false;
+    uint32_t m_coherenceSortMask = 6u; // Shadow (2) + Tail-MK (4): avoids scrambling B0 Intersect's materialIndices locality
+    uint32_t m_coherenceKeyMode = 0u;
+    uint32_t m_coherenceMinRays = 65536u;
+
+    struct AdaptiveCoherenceStage {
+        enum class Phase : uint8_t { MeasureOff, MeasureOn, Steady };
+        Phase phase = Phase::MeasureOff;
+        bool enabled = false;
+        uint32_t sampleCount = 0;
+        uint32_t steadyFrames = 0;
+        double offSumMs = 0.0;
+        double onSumMs = 0.0;
+        double offAvgMs = 0.0;
+        double refMs = 0.0;
+        double emaMs = 0.0;
+    };
+    AdaptiveCoherenceStage m_adaptShadow;
+    AdaptiveCoherenceStage m_adaptTail;
+    uint64_t m_recordFrameSeq = 0;
+    std::array<uint64_t, 2> m_slotFrameSeq = { 0, 0 };
+    std::array<uint32_t, 2> m_slotCoherenceSortMask = { 0, 0 };
+    uint64_t m_lastAdaptProcessedSeq = 0;
 };
 
 } // namespace pathways

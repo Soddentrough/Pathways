@@ -1086,7 +1086,8 @@ void Engine::ensureWavefrontAlphaPipeline() {
         m_rtOrchestrator->initWavefrontAlphaPipeline(
             loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
             loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+            m_config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
         );
         m_context->savePipelineCache();
     } catch (const std::exception& e) {
@@ -1202,13 +1203,15 @@ void Engine::initPipelines() {
             loadShaderSPIRV("restir_di_reuse.comp.spv"),
             loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv"),
             loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+            m_config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
         );
     } else if (needAlphaTraversal) {
         m_rtOrchestrator->initWavefrontAlphaPipeline(
             loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
             loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
-            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv"),
+            m_config.enable_tail_megakernel ? loadShaderSPIRV("wavefront_tail_megakernel_alpha.comp.spv") : std::vector<char>{}
         );
     } else if (isRestirActive()) {
         m_rtOrchestrator->initWavefrontRestirVariants(
@@ -1232,6 +1235,14 @@ void Engine::initPipelines() {
     // 6d. ReSTIR PT Subsystem (lazily allocated when enabled)
     createReSTIRResources();
     syncRayTracingPointers();
+    if (m_wavefrontPipeline && !m_wavefrontPipeline->hasCoherenceSortPipelines()) {
+        m_wavefrontPipeline->initCoherenceSortPipelines(
+            loadShaderSPIRV("wavefront_coherence_sort_prep.comp.spv"),
+            loadShaderSPIRV("wavefront_coherence_sort_hist.comp.spv"),
+            loadShaderSPIRV("wavefront_coherence_sort_prefix.comp.spv"),
+            loadShaderSPIRV("wavefront_coherence_sort_scatter.comp.spv")
+        );
+    }
 
     // 7. Post-Processing Pipeline Subsystem (ACES Tonemap, Fused Accum/Tonemap, Running Avg, Blend4K, Multi-GPU Merge)
     auto tonemapCode = loadShaderSPIRV("tonemap_aces.comp.spv");

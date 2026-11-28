@@ -1,0 +1,217 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+#ifndef COHERENCE_SORT_STAGE
+#define COHERENCE_SORT_STAGE 0
+#endif
+
+#ifndef COHERENCE_SORT_BITS
+#define COHERENCE_SORT_BITS 10
+#endif
+
+#define COHERENCE_NUM_BINS (1u << COHERENCE_SORT_BITS)
+#define COHERENCE_BINS_PER_THREAD (COHERENCE_NUM_BINS / 256u)
+
+#include "wavefront_common.glsl"
+
+layout(local_size_x = 256) in;
+
+WAVEFRONT_QUEUE_COUNTERS_BINDING(11);
+
+layout(std430, binding = 12) readonly buffer ShadowRayQueue {
+    PackedShadowRay shadowRays[];
+};
+
+layout(std430, binding = 53) buffer CoherenceSortMetaBuffer {
+    uvec4 indirectCmd;
+    uint activeCount;
+    uint activeFlag;
+    uint pad0;
+    uint pad1;
+    uint hist[COHERENCE_NUM_BINS];
+    uint offsets[COHERENCE_NUM_BINS];
+} cohMeta;
+
+layout(std430, binding = 54) buffer CoherenceSortKeysBuffer {
+    uint16_t keys[];
+} cohSortKeys;
+
+layout(std430, binding = 55) writeonly buffer CoherenceSortedIndicesBuffer {
+    uint indices[];
+} cohSortedIndices;
+
+layout(push_constant) uniform PushConstants {
+    WavefrontCoherenceSortPC pc;
+};
+
+#if COHERENCE_SORT_STAGE == 1
+shared uint s_hist[COHERENCE_NUM_BINS];
+
+uint computeCoherenceKey(vec3 origin, vec3 dir, vec3 boundsMin, vec3 boundsInvExtent) {
+    vec3 pNorm = clamp((origin - boundsMin) * boundsInvExtent, vec3(0.0), vec3(1.0));
+    vec2 octUv = octEncode(dir) * 0.5 + 0.5;
+#if COHERENCE_SORT_BITS >= 12
+    uint pos6 = morton3D_10bit(uvec3(clamp(pNorm * 4.0, vec3(0.0), vec3(3.0)))) & 0x3Fu;
+    uint dir6 = morton2D_8bit(uvec2(clamp(octUv * 8.0, vec2(0.0), vec2(7.0)))) & 0x3Fu;
+    return (pc.keyMode == 1u) ? ((dir6 << 6u) | pos6) : ((pos6 << 6u) | dir6);
+#else
+    if (pc.keyMode == 1u) {
+        vec2 p2 = vec2(pNorm[pc.longAxis0], pNorm[pc.longAxis1]);
+        uint pos4 = morton2D_8bit(uvec2(clamp(p2 * 4.0, vec2(0.0), vec2(3.0)))) & 0x0Fu;
+        uint dir6 = morton2D_8bit(uvec2(clamp(octUv * 8.0, vec2(0.0), vec2(7.0)))) & 0x3Fu;
+        return (pos4 << 6u) | dir6;
+    } else {
+        uint pos6 = morton3D_10bit(uvec3(clamp(pNorm * 4.0, vec3(0.0), vec3(3.0)))) & 0x3Fu;
+        uint dir4 = morton2D_8bit(uvec2(clamp(octUv * 4.0, vec2(0.0), vec2(3.0)))) & 0x0Fu;
+        return (pos6 << 4u) | dir4;
+    }
+#endif
+}
+#elif COHERENCE_SORT_STAGE == 2
+shared uint s_waveTotals[8];
+#elif COHERENCE_SORT_STAGE == 3
+shared uint s_bins[COHERENCE_NUM_BINS];
+#endif
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+
+#if COHERENCE_SORT_STAGE == 0
+    // Stage 0 (Prep): zero global histogram and publish indirect workgroup count
+    for (uint i = tid; i < COHERENCE_NUM_BINS; i += 256u) {
+        cohMeta.hist[i] = 0u;
+    }
+    if (tid == 0u) {
+        uint rawCount = (pc.sourceMode == 1u) ? queueCounters.currentShadowCount : queueCounters.activeRayCount;
+        uint count = min(rawCount, pc.maxQueueCapacity);
+        bool doSort = (count >= pc.minSortCount);
+        uint wgCount = doSort ? ((count + 2047u) / 2048u) : 0u;
+        cohMeta.indirectCmd = uvec4(wgCount, 1u, 1u, doSort ? count : 0u);
+        cohMeta.activeCount = doSort ? count : 0u;
+        cohMeta.activeFlag = doSort ? 1u : 0u;
+    }
+
+#elif COHERENCE_SORT_STAGE == 1
+    // Stage 1 (Histogram): compute key per ray, write u16 key, accumulate per-WG LDS hist
+    for (uint i = tid; i < COHERENCE_NUM_BINS; i += 256u) {
+        s_hist[i] = 0u;
+    }
+    barrier();
+
+    uint count = cohMeta.activeCount;
+    uint wgBase = gl_WorkGroupID.x * 2048u;
+    vec3 boundsMin = vec3(pc.boundsMinX, pc.boundsMinY, pc.boundsMinZ);
+    vec3 boundsInv = vec3(pc.boundsInvExtentX, pc.boundsInvExtentY, pc.boundsInvExtentZ);
+
+    [[unroll]]
+    for (uint r = 0u; r < 8u; ++r) {
+        uint idx = wgBase + r * 256u + tid;
+        if (idx < count) {
+            vec3 origin;
+            vec3 dir;
+            if (pc.sourceMode == 1u) {
+                PackedShadowRay sr = shadowRays[idx];
+                origin = sr.originDist.xyz;
+                dir = unpackOct32(sr.dirPixelRad.x);
+            } else {
+                RayGeometry rg = wfInGeomQueues[pc.queueSlot].d[idx];
+                origin = rg.originPackedDir.xyz;
+                dir = unpackOct32(floatBitsToUint(rg.originPackedDir.w));
+            }
+            uint k = computeCoherenceKey(origin, dir, boundsMin, boundsInv);
+            cohSortKeys.keys[idx] = uint16_t(k);
+            atomicAdd(s_hist[k], 1u);
+        }
+    }
+    barrier();
+
+    for (uint i = tid; i < COHERENCE_NUM_BINS; i += 256u) {
+        uint c = s_hist[i];
+        if (c > 0u) {
+            atomicAdd(cohMeta.hist[i], c);
+        }
+    }
+
+#elif COHERENCE_SORT_STAGE == 2
+    // Stage 2 (Prefix): exclusive prefix sum over COHERENCE_NUM_BINS histogram bins
+    if (cohMeta.activeFlag == 0u) {
+        return;
+    }
+    uint base = tid * COHERENCE_BINS_PER_THREAD;
+    uint vals[COHERENCE_BINS_PER_THREAD];
+    uint tSum = 0u;
+    [[unroll]]
+    for (uint i = 0u; i < COHERENCE_BINS_PER_THREAD; ++i) {
+        uint v = cohMeta.hist[base + i];
+        vals[i] = v;
+        tSum += v;
+    }
+    uint waveExcl = subgroupExclusiveAdd(tSum);
+    uint waveTot = subgroupAdd(tSum);
+    if (subgroupElect()) {
+        s_waveTotals[gl_SubgroupID] = waveTot;
+    }
+    barrier();
+
+    if (gl_SubgroupID == 0u) {
+        uint lane = gl_SubgroupInvocationID;
+        uint w = (lane < gl_NumSubgroups) ? s_waveTotals[lane] : 0u;
+        uint wExcl = subgroupExclusiveAdd(w);
+        if (lane < gl_NumSubgroups) {
+            s_waveTotals[lane] = wExcl;
+        }
+    }
+    barrier();
+
+    uint running = s_waveTotals[gl_SubgroupID] + waveExcl;
+    [[unroll]]
+    for (uint i = 0u; i < COHERENCE_BINS_PER_THREAD; ++i) {
+        cohMeta.offsets[base + i] = running;
+        running += vals[i];
+    }
+
+#elif COHERENCE_SORT_STAGE == 3
+    // Stage 3 (Scatter): two-level LDS rank + global bin base offset -> sorted ray index permutation
+    for (uint i = tid; i < COHERENCE_NUM_BINS; i += 256u) {
+        s_bins[i] = 0u;
+    }
+    barrier();
+
+    uint count = cohMeta.activeCount;
+    uint wgBase = gl_WorkGroupID.x * 2048u;
+    uint16_t myKeys[8];
+    uint myRanks[8];
+
+    [[unroll]]
+    for (uint r = 0u; r < 8u; ++r) {
+        uint idx = wgBase + r * 256u + tid;
+        if (idx < count) {
+            uint16_t k = cohSortKeys.keys[idx];
+            myKeys[r] = k;
+            myRanks[r] = atomicAdd(s_bins[uint(k)], 1u);
+        }
+    }
+    barrier();
+
+    for (uint i = tid; i < COHERENCE_NUM_BINS; i += 256u) {
+        uint c = s_bins[i];
+        if (c > 0u) {
+            s_bins[i] = atomicAdd(cohMeta.offsets[i], c);
+        }
+    }
+    barrier();
+
+    [[unroll]]
+    for (uint r = 0u; r < 8u; ++r) {
+        uint idx = wgBase + r * 256u + tid;
+        if (idx < count) {
+            uint dst = s_bins[uint(myKeys[r])] + myRanks[r];
+            cohSortedIndices.indices[dst] = idx;
+        }
+    }
+#endif
+}

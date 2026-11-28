@@ -48,6 +48,29 @@ WavefrontPipeline::WavefrontPipeline(VkDevice device, VmaAllocator allocator,
         }
     }
 
+    if (const char* cohEnv = std::getenv("PATHWAYS_COHERENCE_SORT")) {
+        char* endPtr = nullptr;
+        unsigned long parsed = std::strtoul(cohEnv, &endPtr, 0);
+        if (endPtr != cohEnv) {
+            m_coherenceEnvOverride = true;
+            m_coherenceSortMask = static_cast<uint32_t>(parsed) & 0x7u;
+        }
+    }
+    if (const char* keyEnv = std::getenv("PATHWAYS_COHERENCE_KEY")) {
+        char* endPtr = nullptr;
+        unsigned long parsed = std::strtoul(keyEnv, &endPtr, 0);
+        if (endPtr != keyEnv) {
+            m_coherenceKeyMode = (parsed != 0ul) ? 1u : 0u;
+        }
+    }
+    if (const char* minEnv = std::getenv("PATHWAYS_COHERENCE_MIN")) {
+        char* endPtr = nullptr;
+        unsigned long parsed = std::strtoul(minEnv, &endPtr, 0);
+        if (endPtr != minEnv) {
+            m_coherenceMinRays = static_cast<uint32_t>(parsed);
+        }
+    }
+
     m_maxCapacity = (maxBatchPixels > 0) ? std::min(m_width * m_height, maxBatchPixels) : (m_width * m_height);
 
     // Allocate fallback dummy storage images and 128B dummy buffer BEFORE
@@ -135,6 +158,7 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeComplexSecPipeline) vkDestroyPipeline(m_device, m_shadeComplexSecPipeline, nullptr);
     if (m_shadeDielectricSecPipeline) vkDestroyPipeline(m_device, m_shadeDielectricSecPipeline, nullptr);
     if (m_tailMegakernelPipeline) vkDestroyPipeline(m_device, m_tailMegakernelPipeline, nullptr);
+    if (m_tailMegakernelAlphaPipeline) vkDestroyPipeline(m_device, m_tailMegakernelAlphaPipeline, nullptr);
     if (m_intersectAlphaPipeline) vkDestroyPipeline(m_device, m_intersectAlphaPipeline, nullptr);
     if (m_classifyAlphaPipeline) vkDestroyPipeline(m_device, m_classifyAlphaPipeline, nullptr);
     if (m_shadowAlphaPipeline) vkDestroyPipeline(m_device, m_shadowAlphaPipeline, nullptr);
@@ -153,6 +177,10 @@ WavefrontPipeline::~WavefrontPipeline() {
     if (m_shadeDielectricSecNrcPipeline) vkDestroyPipeline(m_device, m_shadeDielectricSecNrcPipeline, nullptr);
     if (m_restirDiReusePipeline) vkDestroyPipeline(m_device, m_restirDiReusePipeline, nullptr);
     if (m_restirGiReusePipeline) vkDestroyPipeline(m_device, m_restirGiReusePipeline, nullptr);
+    if (m_cohSortPrepPipeline) vkDestroyPipeline(m_device, m_cohSortPrepPipeline, nullptr);
+    if (m_cohSortHistPipeline) vkDestroyPipeline(m_device, m_cohSortHistPipeline, nullptr);
+    if (m_cohSortPrefixPipeline) vkDestroyPipeline(m_device, m_cohSortPrefixPipeline, nullptr);
+    if (m_cohSortScatterPipeline) vkDestroyPipeline(m_device, m_cohSortScatterPipeline, nullptr);
 
     if (m_classifyPipeline) vkDestroyPipeline(m_device, m_classifyPipeline, nullptr);
     if (m_intersectPipeline) vkDestroyPipeline(m_device, m_intersectPipeline, nullptr);
@@ -230,7 +258,10 @@ void WavefrontPipeline::createDescriptorLayout() {
         { 49, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSurfaceMvImage (r32ui)
         { 50, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlDiffHitDistImage (r8)
         { 51, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSpecVmvImage (rg32ui)
-        { 52, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }              // uMlSkipCompactImage (r32ui)
+        { 52, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },             // uMlSkipCompactImage (r32ui)
+        { 53, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // CoherenceSortMetaBuffer
+        { 54, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },            // CoherenceSortKeysBuffer
+        { 55, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr }             // CoherenceSortedIndicesBuffer
     };
 
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -337,6 +368,13 @@ void WavefrontPipeline::allocateQueues(uint32_t capacity) {
 
         // DGCStream = 65536 bytes
         m_dgcStream[slot] = std::make_unique<Buffer>(m_allocator, 65536, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+
+        // Decoupled 10/12-bit (1024/4096-bin) ray coherence sort buffers (uint16_t keys + uint32_t sorted indices)
+        m_coherenceSortMeta[slot] = std::make_unique<Buffer>(m_allocator, 40960, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        VkDeviceSize cohKeyBytes = std::max<VkDeviceSize>(static_cast<VkDeviceSize>(m_maxCapacity) * sizeof(uint16_t), 256);
+        VkDeviceSize cohIdxBytes = std::max<VkDeviceSize>(static_cast<VkDeviceSize>(m_maxCapacity) * sizeof(uint32_t), 256);
+        m_coherenceSortKeys[slot] = std::make_unique<Buffer>(m_allocator, cohKeyBytes, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
+        m_coherenceSortedIndices[slot] = std::make_unique<Buffer>(m_allocator, cohIdxBytes, usage, VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE);
     }
 }
 
@@ -358,6 +396,9 @@ void WavefrontPipeline::updateQueueDescriptors() {
         VkDescriptorBufferInfo shadowQueueInfo{ m_shadowQueue[slot]->getBuffer(), 0, m_shadowQueue[slot]->getSize() };
         VkDescriptorBufferInfo dgcStreamInfo{ m_dgcStream[slot]->getBuffer(), 0, m_dgcStream[slot]->getSize() };
         VkDescriptorBufferInfo indirectInfo{ m_indirectArgs[slot]->getBuffer(), 0, m_indirectArgs[slot]->getSize() };
+        VkDescriptorBufferInfo cohMetaInfo{ m_coherenceSortMeta[slot]->getBuffer(), 0, m_coherenceSortMeta[slot]->getSize() };
+        VkDescriptorBufferInfo cohKeysInfo{ m_coherenceSortKeys[slot]->getBuffer(), 0, m_coherenceSortKeys[slot]->getSize() };
+        VkDescriptorBufferInfo cohIndicesInfo{ m_coherenceSortedIndices[slot]->getBuffer(), 0, m_coherenceSortedIndices[slot]->getSize() };
 
         // Unified descriptor set per frame slot (RayState & RayGeometry ping-pong queues bound as 2-element V# SSBO arrays)
         std::vector<VkWriteDescriptorSet> writes = {
@@ -371,7 +412,10 @@ void WavefrontPipeline::updateQueueDescriptors() {
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 16, 0, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, geomQueueInfos, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 17, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &hitInfo, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 18, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &matIndexInfo, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr }
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 19, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &secIndexInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 53, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cohMetaInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 54, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cohKeysInfo, nullptr },
+            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, m_descSetsEven[slot], 55, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cohIndicesInfo, nullptr }
         };
         vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
     }
@@ -640,6 +684,12 @@ void WavefrontPipeline::resize(uint32_t width, uint32_t height, uint32_t maxBatc
     m_maxCapacity = (maxBatchPixels > 0) ? std::min(m_width * m_height, maxBatchPixels) : (m_width * m_height);
     allocateQueues(m_maxCapacity);
     updateQueueDescriptors();
+    m_adaptShadow = {};
+    m_adaptTail = {};
+    m_recordFrameSeq = 0;
+    m_slotFrameSeq = { 0, 0 };
+    m_slotCoherenceSortMask = { 0, 0 };
+    m_lastAdaptProcessedSeq = 0;
     Logger::info("WavefrontPipeline resized to {}x{} (capacity: {} rays, batch budget: {}).",
                  m_width, m_height, m_maxCapacity, maxBatchPixels);
 }
@@ -865,11 +915,13 @@ VkPipeline WavefrontPipeline::buildComputePipeline(const std::vector<char>& code
 void WavefrontPipeline::initAlphaIntersectPipeline(
     const std::vector<char>& intersectAlphaCode,
     const std::vector<char>& classifyAlphaCode,
-    const std::vector<char>& shadowAlphaCode) {
+    const std::vector<char>& shadowAlphaCode,
+    const std::vector<char>& tailMegakernelAlphaCode) {
     buildComputePipelinesBatch({
-        { &intersectAlphaCode, "intersect_alpha", &m_intersectAlphaPipeline },
-        { &classifyAlphaCode,  "classify_alpha",  &m_classifyAlphaPipeline },
-        { &shadowAlphaCode,    "shadow_alpha",    &m_shadowAlphaPipeline }
+        { &intersectAlphaCode,      "intersect_alpha",       &m_intersectAlphaPipeline },
+        { &classifyAlphaCode,       "classify_alpha",        &m_classifyAlphaPipeline },
+        { &shadowAlphaCode,         "shadow_alpha",          &m_shadowAlphaPipeline },
+        { &tailMegakernelAlphaCode, "tail_megakernel_alpha", &m_tailMegakernelAlphaPipeline }
     });
 }
 
@@ -877,6 +929,113 @@ void WavefrontPipeline::initTailMegakernelPipeline(const std::vector<char>& tail
     buildComputePipelinesBatch({
         { &tailMegakernelCode, "tail_megakernel", &m_tailMegakernelPipeline }
     });
+}
+
+void WavefrontPipeline::initCoherenceSortPipelines(
+    const std::vector<char>& prepCode,
+    const std::vector<char>& histCode,
+    const std::vector<char>& prefixCode,
+    const std::vector<char>& scatterCode) {
+    buildComputePipelinesBatch({
+        { &prepCode,    "coh_sort_prep",    &m_cohSortPrepPipeline },
+        { &histCode,    "coh_sort_hist",    &m_cohSortHistPipeline },
+        { &prefixCode,  "coh_sort_prefix",  &m_cohSortPrefixPipeline },
+        { &scatterCode, "coh_sort_scatter", &m_cohSortScatterPipeline }
+    });
+    if (hasCoherenceSortPipelines()) {
+        if (m_coherenceEnvOverride) {
+            Logger::info("WavefrontPipeline: Decoupled 12-bit coherence sort pipelines active (override mask={}, key={}, minRays={}).",
+                         m_coherenceSortMask, m_coherenceKeyMode, m_coherenceMinRays);
+        } else {
+            Logger::info("WavefrontPipeline: Decoupled 12-bit coherence sort pipelines active (mode=adaptive Shadow+Tail, key={}, minRays={}).",
+                         m_coherenceKeyMode, m_coherenceMinRays);
+        }
+    }
+}
+
+uint32_t WavefrontPipeline::getActiveCoherenceSortMask() const {
+    if (m_coherenceEnvOverride) {
+        return m_coherenceSortMask;
+    }
+    auto stageOn = [](const AdaptiveCoherenceStage& st) -> bool {
+        return (st.phase == AdaptiveCoherenceStage::Phase::MeasureOn) ||
+               (st.phase == AdaptiveCoherenceStage::Phase::Steady && st.enabled);
+    };
+    uint32_t mask = 0u;
+    if (stageOn(m_adaptShadow)) mask |= 2u;
+    if (stageOn(m_adaptTail))   mask |= 4u;
+    return mask;
+}
+
+static inline void recordMemoryBarrier2(
+    VkCommandBuffer cmd,
+    VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+    VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess);
+
+void WavefrontPipeline::recordCoherenceSort(VkCommandBuffer cmd, uint32_t frameSlot, uint32_t sourceMode,
+                                            uint32_t queueSlot, uint32_t maxCapacity,
+                                            const glm::vec3& boundsMin, const glm::vec3& boundsMax) {
+    if (!hasCoherenceSortPipelines()) return;
+
+    const glm::vec3 sbMin = boundsMin;
+    const glm::vec3 sbExt = glm::max(boundsMax - boundsMin, glm::vec3(1e-3f));
+    const glm::vec3 sbInv = glm::vec3(1.0f) / sbExt;
+    uint32_t axes[3] = { 0u, 1u, 2u };
+    if (sbExt[axes[0]] < sbExt[axes[1]]) std::swap(axes[0], axes[1]);
+    if (sbExt[axes[1]] < sbExt[axes[2]]) std::swap(axes[1], axes[2]);
+    if (sbExt[axes[0]] < sbExt[axes[1]]) std::swap(axes[0], axes[1]);
+
+    WavefrontCoherenceSortPC sortPC{
+        .sourceMode = sourceMode,
+        .queueSlot = queueSlot,
+        .maxQueueCapacity = maxCapacity,
+        .minSortCount = m_coherenceMinRays,
+        .keyMode = m_coherenceKeyMode,
+        .longAxis0 = axes[0],
+        .longAxis1 = axes[1],
+        .pad0 = 0u,
+        .boundsMinX = sbMin.x,
+        .boundsMinY = sbMin.y,
+        .boundsMinZ = sbMin.z,
+        .boundsInvExtentX = sbInv.x,
+        .boundsInvExtentY = sbInv.y,
+        .boundsInvExtentZ = sbInv.z
+    };
+    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(sortPC), &sortPC);
+
+    const VkBuffer metaBuf = m_coherenceSortMeta[frameSlot]->getBuffer();
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cohSortPrepPipeline);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    recordMemoryBarrier2(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cohSortHistPipeline);
+    vkCmdDispatchIndirect(cmd, metaBuf, 0);
+    recordMemoryBarrier2(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cohSortPrefixPipeline);
+    vkCmdDispatch(cmd, 1, 1, 1);
+    recordMemoryBarrier2(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_cohSortScatterPipeline);
+    vkCmdDispatchIndirect(cmd, metaBuf, 0);
+    recordMemoryBarrier2(cmd,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
 }
 
 void WavefrontPipeline::rebuildMaterialExecutionSets() {
@@ -948,11 +1107,13 @@ void WavefrontPipeline::initSpecializedVariants(
     const std::vector<char>& restirDiReuseCode,
     const std::vector<char>& shadeDielectricSecRestirCode,
     const std::vector<char>& classifyAlphaCode,
-    const std::vector<char>& shadowAlphaCode) {
+    const std::vector<char>& shadowAlphaCode,
+    const std::vector<char>& tailMegakernelAlphaCode) {
     buildComputePipelinesBatch({
         { &intersectAlphaCode,           "intersect_alpha",            &m_intersectAlphaPipeline },
         { &classifyAlphaCode,            "classify_alpha",             &m_classifyAlphaPipeline },
         { &shadowAlphaCode,              "shadow_alpha",               &m_shadowAlphaPipeline },
+        { &tailMegakernelAlphaCode,      "tail_megakernel_alpha",      &m_tailMegakernelAlphaPipeline },
         { &shadeDiffuseRestirCode,       "shade_diffuse_restir",       &m_shadeDiffuseRestirPipeline },
         { &shadeDiffuseSecRestirCode,    "shade_diffuse_sec_restir",   &m_shadeDiffuseSecRestirPipeline },
         { &shadeComplexRestirCode,       "shade_complex_restir",       &m_shadeComplexRestirPipeline },
@@ -1054,6 +1215,10 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                                     uint32_t spp, uint32_t maxBounces,
                                     const WavefrontSceneData& sceneData) {
     if (frameSlot >= 2) frameSlot = 0;
+    ++m_recordFrameSeq;
+    m_slotFrameSeq[frameSlot] = m_recordFrameSeq;
+    const uint32_t activeCohMask = getActiveCoherenceSortMask();
+    m_slotCoherenceSortMask[frameSlot] = activeCohMask;
     m_hasRecordedSlot[frameSlot] = true;
     m_slotBounces[frameSlot] = maxBounces;
 
@@ -1380,6 +1545,19 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
             VkDeviceSize intersectOffset = useMaterialSort ? static_cast<VkDeviceSize>(b * 16 + 7) * 16
                                                            : static_cast<VkDeviceSize>(b * 3 + 2) * 16;
 
+            glm::vec3 sbMin = (sceneData.boundsMin.x < sceneData.boundsMax.x) ? sceneData.boundsMin : sceneData.sceneBoundsMin;
+            glm::vec3 sbMax = (sceneData.boundsMin.x < sceneData.boundsMax.x) ? sceneData.boundsMax : sceneData.sceneBoundsMax;
+            glm::vec3 sbExt = glm::max(sbMax - sbMin, glm::vec3(1e-3f));
+            glm::vec3 sbInv = glm::vec3(1.0f) / sbExt;
+
+            const bool useShadowCoh = needShadowDispatch &&
+                                      ((activeCohMask & 2u) != 0u) &&
+                                      hasCoherenceSortPipelines();
+            const bool useIntersectCoh = (b + 1 < cutoffBounce) &&
+                                         (effectiveSecondarySortMode != 1u) &&
+                                         ((activeCohMask & 1u) != 0u) &&
+                                         hasCoherenceSortPipelines();
+
             WavefrontShadowPC shadowPC{
                 .numTriangles = sceneData.numTriangles,
                 .numMaterials = sceneData.numMaterials,
@@ -1390,8 +1568,11 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .sppSampleIndex = sampleIdx,
                 .numOpaqueTriangles = sceneData.numOpaqueTriangles,
                 .captureMlData = sceneData.captureMlData,
-                .currentBounce = b
+                .currentBounce = b,
+                .useCoherenceSort = useShadowCoh ? 1u : 0u
             };
+            WavefrontShadowPC shadowPCReuse = shadowPC;
+            shadowPCReuse.useCoherenceSort = 0u;
 
             float maxRayDist = 10000.0f;
             if (sceneData.enableDistanceClamping) {
@@ -1423,7 +1604,14 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                 .secondarySortMode = effectiveSecondarySortMode,
                 .octantBin = 0,
                 .maxRayDistance = maxRayDist,
-                .minRayThreshold = minRayThreshold
+                .minRayThreshold = minRayThreshold,
+                .boundsMinX = sbMin.x,
+                .boundsMinY = sbMin.y,
+                .boundsMinZ = sbMin.z,
+                .boundsInvExtentX = sbInv.x,
+                .boundsInvExtentY = sbInv.y,
+                .boundsInvExtentZ = sbInv.z,
+                .useCoherenceSort = useIntersectCoh ? 1u : 0u
             };
 
             const bool needComplexShadow = ((sceneData.cameraFlags & (1u << 27)) != 0u) ||
@@ -1434,16 +1622,19 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
 
             // 4b. Shadow microkernel (100% coherent hardware ray queries via native vkCmdDispatchIndirect)
             if (needShadowDispatch) {
+                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.shadowStart);
+                if (useShadowCoh) {
+                    recordCoherenceSort(cmd, frameSlot, 1u, 0u, activeMaxCapacity, sbMin, sbMax);
+                }
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipe);
                 vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
-
-                if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.shadowStart);
                 vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), shadowOffset);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.shadowEnd);
             }
 
             // 4c. Intersect microkernel (pure BVH traversal for secondary rays)
-            // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint)
+            // Dispatched consecutively without inter-pass barrier against Shadow (queues and targets are disjoint,
+            // except when both Shadow and Intersect share m_coherenceSortedIndices on this bounce).
             if (b + 1 < cutoffBounce) {
                 VkPipeline intersectPipe = (((sceneData.cameraFlags & (1u << 10)) != 0u) && m_intersectAlphaPipeline != VK_NULL_HANDLE)
                     ? m_intersectAlphaPipeline
@@ -1466,10 +1657,19 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectEnd);
                 } else {
                     // Secondary sort disabled / single-queue indirect dispatch
+                    if (useIntersectCoh && useShadowCoh) {
+                        recordMemoryBarrier2(cmd,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+                    }
+                    if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectStart);
+                    if (useIntersectCoh) {
+                        recordCoherenceSort(cmd, frameSlot, 0u, (b & 1u) ^ 1u, activeMaxCapacity, sbMin, sbMax);
+                    }
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, intersectPipe);
                     vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(intersectPC), &intersectPC);
-
-                    if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectStart);
                     vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), intersectOffset);
                     if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectEnd);
                 }
@@ -1505,7 +1705,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipe);
-                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPCReuse), &shadowPCReuse);
                 const VkDeviceSize diReuseShadowOffset = static_cast<VkDeviceSize>(4) * 16;
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.diReuseShadowStart);
                 vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), diReuseShadowOffset);
@@ -1545,7 +1745,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
 
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shadowPipe);
-                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPC), &shadowPC);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shadowPCReuse), &shadowPCReuse);
                 const VkDeviceSize giReuseShadowOffset = static_cast<VkDeviceSize>(1 * 16 + 4) * 16;
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.giReuseShadowStart);
                 vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), giReuseShadowOffset);
@@ -1570,8 +1770,7 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
                 }
 
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_tailMegakernelPipeline);
-
+                const bool useTailCoh = ((activeCohMask & 4u) != 0u) && hasCoherenceSortPipelines();
                 WavefrontTailPC tailPC{
                     .numTriangles = sceneData.numTriangles,
                     .numMaterials = sceneData.numMaterials,
@@ -1592,13 +1791,22 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
                     .numOpaqueTriangles = sceneData.numOpaqueTriangles,
                     .captureMlData = sceneData.captureMlData,
                     .indirectClamp = sceneData.indirectClamp,
-                    .maxRayDistance = maxRayDist
+                    .maxRayDistance = maxRayDist,
+                    .useCoherenceSort = useTailCoh ? 1u : 0u
                 };
-                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tailPC), &tailPC);
 
                 VkDeviceSize tailOffset = useMaterialSort ? static_cast<VkDeviceSize>((cutoffBounce - 1) * 16 + 7) * 16
                                                          : static_cast<VkDeviceSize>((cutoffBounce - 1) * 3 + 2) * 16;
+                const bool needAlphaTail = ((sceneData.cameraFlags & (1u << 10)) != 0u) || needComplexShadow;
+                VkPipeline tailPipe = (needAlphaTail && m_tailMegakernelAlphaPipeline != VK_NULL_HANDLE)
+                    ? m_tailMegakernelAlphaPipeline
+                    : m_tailMegakernelPipeline;
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectStart, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
+                if (useTailCoh) {
+                    recordCoherenceSort(cmd, frameSlot, 0u, (cutoffBounce & 1u), activeMaxCapacity, sbMin, sbMax);
+                }
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, tailPipe);
+                vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(tailPC), &tailPC);
                 vkCmdDispatchIndirect(cmd, m_indirectArgs[frameSlot]->getBuffer(), tailOffset);
                 if (canProfileBounce) writeTimestamp(cmd, frameSlot, &bTs.intersectEnd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT);
             }
@@ -1831,7 +2039,86 @@ WavefrontPipeline::WavefrontProfilingData WavefrontPipeline::getProfilingData(ui
     totalTrafficBytes += primaryRays * (48.0 + (isMaterialMode ? 4.0 : 0.0));
     data.estimatedVramTrafficMb = totalTrafficBytes / (1024.0 * 1024.0);
 
+    updateAdaptiveCoherence(frameSlot, data);
     return data;
+}
+
+void WavefrontPipeline::updateAdaptiveCoherence(uint32_t frameSlot, const WavefrontProfilingData& data) {
+    if (m_coherenceEnvOverride || !data.valid || !hasCoherenceSortPipelines() || frameSlot >= 2) {
+        return;
+    }
+    const uint64_t seq = m_slotFrameSeq[frameSlot];
+    if (seq <= 3 || seq <= m_lastAdaptProcessedSeq) {
+        return;
+    }
+    m_lastAdaptProcessedSeq = seq;
+
+    double shadowMs = 0.0;
+    for (const auto& bp : data.bounces) {
+        shadowMs += bp.shadowMs;
+    }
+    const double tailMs = data.tailMegakernelMs;
+    const uint32_t slotMask = m_slotCoherenceSortMask[frameSlot];
+    const bool shadowWasOn = (slotMask & 2u) != 0u;
+    const bool tailWasOn = (slotMask & 4u) != 0u;
+
+    auto stepStage = [](AdaptiveCoherenceStage& st, const char* name, bool wasOn, double ms, double minFloorMs) {
+        if (ms <= 0.001) {
+            return;
+        }
+        using Phase = AdaptiveCoherenceStage::Phase;
+        switch (st.phase) {
+        case Phase::MeasureOff:
+            if (wasOn) return;
+            st.offSumMs += ms;
+            ++st.sampleCount;
+            if (st.sampleCount >= 2u) {
+                st.offAvgMs = st.offSumMs / static_cast<double>(st.sampleCount);
+                if (st.offAvgMs < minFloorMs) {
+                    st.phase = Phase::Steady;
+                    st.enabled = false;
+                    st.refMs = st.offAvgMs;
+                    st.emaMs = st.offAvgMs;
+                    st.steadyFrames = 0u;
+                    Logger::info("WavefrontPipeline: Adaptive coherence [{}] DISABLED (off={:.3f} ms < {:.2f} ms floor).",
+                                 name, st.offAvgMs, minFloorMs);
+                } else {
+                    st.phase = Phase::MeasureOn;
+                    st.sampleCount = 0u;
+                    st.onSumMs = 0.0;
+                }
+            }
+            break;
+        case Phase::MeasureOn:
+            if (!wasOn) return;
+            st.onSumMs += ms;
+            ++st.sampleCount;
+            if (st.sampleCount >= 2u) {
+                const double onAvgMs = st.onSumMs / static_cast<double>(st.sampleCount);
+                st.enabled = (onAvgMs < st.offAvgMs * 0.985);
+                st.refMs = st.enabled ? onAvgMs : st.offAvgMs;
+                st.emaMs = st.refMs;
+                st.phase = Phase::Steady;
+                st.steadyFrames = 0u;
+                Logger::info("WavefrontPipeline: Adaptive coherence [{}] {} (off={:.3f} ms -> on={:.3f} ms).",
+                             name, st.enabled ? "ENABLED" : "DISABLED", st.offAvgMs, onAvgMs);
+            }
+            break;
+        case Phase::Steady:
+            if (wasOn != st.enabled) return;
+            st.emaMs = 0.9 * st.emaMs + 0.1 * ms;
+            ++st.steadyFrames;
+            if (st.steadyFrames >= 60u && std::abs(st.emaMs - st.refMs) > std::max(st.refMs * 0.30, 0.5)) {
+                st.phase = Phase::MeasureOff;
+                st.sampleCount = 0u;
+                st.offSumMs = 0.0;
+            }
+            break;
+        }
+    };
+
+    stepStage(m_adaptShadow, "Shadow", shadowWasOn, shadowMs, 0.65);
+    stepStage(m_adaptTail, "Tail-MK", tailWasOn, tailMs, 2.0);
 }
 
 void WavefrontPipeline::printProfilingBreakdown(uint32_t frameSlot, double timestampPeriodNs, uint32_t maxBounces) {

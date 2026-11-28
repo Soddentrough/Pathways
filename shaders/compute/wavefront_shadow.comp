@@ -57,14 +57,25 @@ layout(std430, binding = 38) buffer GiCurrentReservoirsBuffer {
     uvec2 giCurrentData[];
 };
 
+layout(std430, binding = 53) readonly buffer CoherenceSortMetaRO {
+    uvec4 indirectCmd;
+    uint activeCount;
+    uint activeFlag;
+} cohMeta;
+
+layout(std430, binding = 55) readonly buffer CoherenceSortedIndicesRO {
+    uint indices[];
+} cohSortedIndices;
+
 layout(push_constant) uniform PushConstants {
     WavefrontShadowPC pc;
 };
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (expectEXT(idx >= queueCounters.currentShadowCount, false)) return;
+    uint tid = gl_GlobalInvocationID.x;
+    if (expectEXT(tid >= queueCounters.currentShadowCount, false)) return;
 
+    uint idx = (pc.useCoherenceSort != 0u && cohMeta.activeFlag != 0u) ? cohSortedIndices.indices[tid] : tid;
     PackedShadowRay sRay = shadowRays[idx];
     vec3 origin = sRay.originDist.xyz;
     float maxDist = sRay.originDist.w;

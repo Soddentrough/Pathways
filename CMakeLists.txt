@@ -281,6 +281,11 @@ function(add_specialized_wf_shader OUT_NAME SRC_FILE)
     set(SPV_FILES ${SPV_FILES} ${OUT_SPV} PARENT_SCOPE)
 endfunction()
 
+add_specialized_wf_shader(wavefront_coherence_sort_prep.comp wavefront_coherence_sort.comp -DCOHERENCE_SORT_STAGE=0 -DCOHERENCE_SORT_BITS=12)
+add_specialized_wf_shader(wavefront_coherence_sort_hist.comp wavefront_coherence_sort.comp -DCOHERENCE_SORT_STAGE=1 -DCOHERENCE_SORT_BITS=12)
+add_specialized_wf_shader(wavefront_coherence_sort_prefix.comp wavefront_coherence_sort.comp -DCOHERENCE_SORT_STAGE=2 -DCOHERENCE_SORT_BITS=12)
+add_specialized_wf_shader(wavefront_coherence_sort_scatter.comp wavefront_coherence_sort.comp -DCOHERENCE_SORT_STAGE=3 -DCOHERENCE_SORT_BITS=12)
+add_specialized_wf_shader(wavefront_tail_megakernel_alpha.comp wavefront_tail_megakernel.comp -DENABLE_ALPHA_MASK=1 -DSIMPLE_OPAQUE_SHADOW=0)
 add_specialized_wf_shader(wavefront_shade_dielectric_sec.comp wavefront_shade_dielectric.comp -DIS_SECONDARY_BOUNCE=1)
 
 # NRC specialized material shading variants (isolates NRC VGPR/descriptor pressure from Pure MC paths)

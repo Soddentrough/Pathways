@@ -273,9 +273,10 @@ int main() {
         check_true(sizeof(QueueCountersBuffer) == 256, "QueueCountersBuffer must be 256 bytes");
         check_true(sizeof(WavefrontClassifyPC) == 80, "WavefrontClassifyPC must be 80 bytes");
         check_true(sizeof(WavefrontShadePC) == 92, "WavefrontShadePC must be 92 bytes");
-        check_true(sizeof(WavefrontShadowPC) == 40, "WavefrontShadowPC must be 40 bytes");
-        check_true(sizeof(WavefrontIntersectPC) == 68, "WavefrontIntersectPC must be 68 bytes");
-        check_true(sizeof(WavefrontTailPC) == 80, "WavefrontTailPC must be 80 bytes");
+        check_true(sizeof(WavefrontShadowPC) == 44, "WavefrontShadowPC must be 44 bytes");
+        check_true(sizeof(WavefrontIntersectPC) == 96, "WavefrontIntersectPC must be 96 bytes");
+        check_true(sizeof(WavefrontTailPC) == 84, "WavefrontTailPC must be 84 bytes");
+        check_true(sizeof(WavefrontCoherenceSortPC) == 56, "WavefrontCoherenceSortPC must be 56 bytes");
 
         // Actual WavefrontPipeline::allocateQueues per-slot ray queue sizes:
         // RayGeometry (16 B x 2 ping-pong) + RayState (16 B x 2 ping-pong) +
