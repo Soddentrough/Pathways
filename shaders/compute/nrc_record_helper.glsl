@@ -35,14 +35,40 @@ void nrcEmitSelfTrainingRecord(
     float tailSpecRatio = 0.0;
 
     bool hasNonOpaque = (ubo.flags & (1u << 5)) != 0u;
+    bool hasAlphaMask = (ubo.flags & (1u << 10)) != 0u;
     rayQueryEXT tailRq;
+    uint tailRqFlags = (hasAlphaMask ? gl_RayFlagsNoneEXT : gl_RayFlagsOpaqueEXT) | gl_RayFlagsSkipClosestHitShaderEXT;
+    // Always trace RAY_MASK_ALL so training tail rays respect dielectric/glass occlusion
+    // instead of passing straight through glass to sample ceiling emitters behind it.
     rayQueryInitializeEXT(
         tailRq, topLevelAS,
-        gl_RayFlagsOpaqueEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-        hasNonOpaque ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
+        tailRqFlags,
+        RAY_MASK_ALL,
         nextOrigin, EPSILON, nextDirection, 10000.0
     );
-    rayQueryProceedEXT(tailRq);
+    while (rayQueryProceedEXT(tailRq)) {
+        if (hasAlphaMask && rayQueryGetIntersectionTypeEXT(tailRq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint cInstIdx = rayQueryGetIntersectionInstanceCustomIndexEXT(tailRq, false);
+            uint cGeomIdx = rayQueryGetIntersectionGeometryIndexEXT(tailRq, false);
+            uint cPrimIdx = rayQueryGetIntersectionPrimitiveIndexEXT(tailRq, false);
+            InstanceGPU cInst = instances[cInstIdx];
+            uint cTriIdx = cInst.firstTriangle + ((cGeomIdx == 0u) ? cPrimIdx : (cPrimIdx + cInst.numOpaqueTriangles));
+            ShadeMaterial cMat = shadeMaterials[triangles[cTriIdx].materialId + cInst.materialOffset];
+            if (smGetAlphaMode(cMat) == 1u) {
+                vec2 cBary = rayQueryGetIntersectionBarycentricsEXT(tailRq, false);
+                vec2 cUv = getTriangleUV(triangles[cTriIdx], cBary);
+                float cAlpha = cMat.albedo.a;
+                uint cAlbTex = smGetAlbedoTex(cMat);
+                if (cAlbTex > 0u && cAlbTex <= 512u) {
+                    cAlpha *= SAMPLE_SCENE_TEXTURE_LOD(cAlbTex, cUv, 4.0).a;
+                }
+                if (cAlpha < smGetAlphaCutoff(cMat)) {
+                    continue;
+                }
+            }
+            rayQueryConfirmIntersectionEXT(tailRq);
+        }
+    }
 
     float bestT = 10000.0;
     bool hitTri = (rayQueryGetIntersectionTypeEXT(tailRq, true) == gl_RayQueryCommittedIntersectionTriangleEXT);
@@ -52,6 +78,7 @@ void nrcEmitSelfTrainingRecord(
 
     bool hitOpaqueSurface = false;
     ShadeMaterial tMat;
+    uint tMatId = 0u;
     uint tType = 0u;
     vec3 tAlb = vec3(0.0);
     vec3 tEmit = vec3(0.0);
@@ -67,7 +94,7 @@ void nrcEmitSelfTrainingRecord(
         InstanceGPU inst = instances[instIdx];
         uint triIdx = inst.firstTriangle + ((geomIdx == 0u) ? primIdx : (primIdx + inst.numOpaqueTriangles));
         Triangle tri = triangles[triIdx];
-        uint tMatId = tri.materialId + inst.materialOffset;
+        tMatId = tri.materialId + inst.materialOffset;
         tMat = shadeMaterials[tMatId];
         tType = smGetTypeFlags(tMat);
 
@@ -106,7 +133,9 @@ void nrcEmitSelfTrainingRecord(
         if ((tType & 0xFFu) == 1u) {
             tMet = max(tMet, 1.0);
         }
-        bool isDeltaOrTransTail = ((tType & MATERIAL_TYPE_MASK) == 2u) || smIsTransmissive(tMat) || (tMet >= 0.9 && tRough < 0.20);
+        bool isDeltaOrTransTail = ((tType & MATERIAL_TYPE_MASK) == 2u) || smIsTransmissive(tMat) ||
+                                  (tMatId < pc.numMaterials && materialArchetypes[tMatId] == MATERIAL_ARCHETYPE_DIELECTRIC) ||
+                                  (tMet >= 0.9 && tRough < 0.20);
         if (!isDeltaOrTransTail) {
             if (length(tEmit) > 1e-3 && tMisW > 0.0) {
                 localRad += demodW * clampIndirectRadiance(tEmit * tMisW, nrcCap);
@@ -199,12 +228,14 @@ void nrcEmitSelfTrainingRecord(
                 }
             }
 
-                vec3 tailExactRefl = vec3(0.0);
-                nrcSurfaceReflectance(tDiff, tF0, tRough, 0.0, 1.0, clamp(dot(tailN, -nextDirection), 0.0, 1.0),
-                                      tailExactRefl, tailSpecRatio);
-                tailRough = clamp(tRough, 0.04, 1.0);
-                tailWeight = nrcClampChromaticity(demodW * tailExactRefl, 0.95);
-                hasTail = 1.0;
+                if (tRough >= 0.25) {
+                    vec3 tailExactRefl = vec3(0.0);
+                    nrcSurfaceReflectance(tDiff, tF0, tRough, 0.0, 1.0, clamp(dot(tailN, -nextDirection), 0.0, 1.0),
+                                          tailExactRefl, tailSpecRatio);
+                    tailRough = clamp(tRough, 0.04, 1.0);
+                    tailWeight = nrcClampChromaticity(demodW * tailExactRefl, 0.95);
+                    hasTail = 1.0;
+                }
             }
         }
     } else {

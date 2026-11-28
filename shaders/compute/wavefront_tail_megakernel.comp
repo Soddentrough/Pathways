@@ -319,7 +319,7 @@ void main() {
 
                 if (any(greaterThan(unshadowed, vec3(1e-5)))) {
                     bool keepShadow = true;
-                    uint shadowRrMinBounce = (pc.captureMlData != 0u) ? 2u : 1u;
+                    const uint shadowRrMinBounce = 3u;
                     if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                         float lum = max(unshadowed.r, max(unshadowed.g, unshadowed.b));
                         float prob = clamp(lum * 1.5, 0.20, 1.0);

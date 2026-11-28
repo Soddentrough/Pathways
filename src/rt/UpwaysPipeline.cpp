@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -245,6 +246,45 @@ CoopMatrixSupport queryCoopMatrixSupport(VkPhysicalDevice physicalDevice, VkInst
     return sup;
 }
 
+bool hasAvailableV5WeightsOnDisk() {
+    constexpr std::array<const char*, 2> kV5WeightNames = {
+        "upways_v5_weights.bin",
+        "upways_v5_weights_int8.bin"
+    };
+    const std::filesystem::path exeDir = getExecutableDirectory();
+    auto checkCandidate = [](const std::filesystem::path& path) -> bool {
+        if (path.empty()) {
+            return false;
+        }
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (!f.is_open()) {
+            return false;
+        }
+        return f.tellg() == static_cast<std::streamsize>(upways_v5::TOTAL_WEIGHT_BYTES);
+    };
+
+    for (const char* binName : kV5WeightNames) {
+        if (!exeDir.empty()) {
+            if (checkCandidate(exeDir / "data" / "models" / binName) ||
+                checkCandidate(exeDir / binName) ||
+                checkCandidate(exeDir / ".." / "share" / "pathways" / "data" / "models" / binName) ||
+                checkCandidate(exeDir / ".." / ".." / ".." / "data" / "models" / binName)) {
+                return true;
+            }
+        }
+        if (checkCandidate(std::filesystem::path("data/models") / binName) ||
+            checkCandidate(std::filesystem::path("../data/models") / binName) ||
+            checkCandidate(std::filesystem::path("../../data/models") / binName) ||
+            checkCandidate(std::filesystem::path("../../../data/models") / binName) ||
+            checkCandidate(std::filesystem::path("/usr/share/pathways/data/models") / binName) ||
+            checkCandidate(std::filesystem::path("/usr/local/share/pathways/data/models") / binName) ||
+            checkCandidate(std::filesystem::path(binName))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 bool UpwaysPipeline::supportsFp8CoopMatrix(VkPhysicalDevice physicalDevice, VkInstance instance) {
@@ -276,7 +316,13 @@ UpwaysRuntimeVersion UpwaysPipeline::resolveVersion(
             if (sz == static_cast<std::streamsize>(upways_v5::TOTAL_WEIGHT_BYTES)) {
                 return UpwaysRuntimeVersion::V5;
             }
+            if (sz == static_cast<std::streamsize>(upways::TOTAL_WEIGHT_BYTES)) {
+                return UpwaysRuntimeVersion::V4;
+            }
         }
+    }
+    if (hasAvailableV5WeightsOnDisk()) {
+        return UpwaysRuntimeVersion::V5;
     }
     return UpwaysRuntimeVersion::V4;
 }
@@ -300,23 +346,56 @@ UpwaysComputePrecision UpwaysPipeline::selectPrecision(
         );
     };
 
+    auto shouldWarnFallback = [&](UpwaysComputePrecision fallback) -> bool {
+        static std::atomic<uint32_t> s_warnedMask{ 0u };
+        const uint32_t verIdx = (version == UpwaysRuntimeVersion::V5) ? 1u : 0u;
+        const uint32_t reqIdx = (requested == UpwaysPrecision::Fp8) ? 1u
+                              : (requested == UpwaysPrecision::Int8) ? 2u
+                              : (requested == UpwaysPrecision::Fp16) ? 3u
+                              : 0u;
+        const uint32_t fbIdx = (fallback == UpwaysComputePrecision::Fp8) ? 0u
+                             : (fallback == UpwaysComputePrecision::Int8) ? 1u
+                             : 2u;
+        const uint32_t bit = 1u << (verIdx * 16u + reqIdx * 4u + fbIdx);
+        return (s_warnedMask.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u;
+    };
+
     switch (requested) {
         case UpwaysPrecision::Fp8:
             if (sup.fp8) return UpwaysComputePrecision::Fp8;
-            Logger::warn("UpwaysPipeline: Requested precision 'fp8' is unsupported on this GPU; falling back automatically.");
-            return pickAuto();
+            {
+                const UpwaysComputePrecision fallback = pickAuto();
+                if (shouldWarnFallback(fallback)) {
+                    Logger::warn("UpwaysPipeline: Requested precision 'fp8' is unsupported on this GPU; falling back to '{}'.",
+                                 upwaysPrecisionDisplayName(fallback));
+                }
+                return fallback;
+            }
         case UpwaysPrecision::Int8:
             if (sup.int8) return UpwaysComputePrecision::Int8;
-            Logger::warn("UpwaysPipeline: Requested precision 'int8' is unsupported on this GPU; falling back automatically.");
-            return pickAuto();
+            {
+                const UpwaysComputePrecision fallback = pickAuto();
+                if (shouldWarnFallback(fallback)) {
+                    Logger::warn("UpwaysPipeline: Requested precision 'int8' is unsupported on this GPU; falling back to '{}'.",
+                                 upwaysPrecisionDisplayName(fallback));
+                }
+                return fallback;
+            }
         case UpwaysPrecision::Fp16:
             if (allowFp16 && sup.fp16) return UpwaysComputePrecision::Fp16;
-            if (allowFp16) {
-                Logger::warn("UpwaysPipeline: Requested precision 'fp16' is unsupported on this GPU; falling back automatically.");
-            } else {
-                Logger::warn("UpwaysPipeline 5.0: Requested precision 'fp16' is unsupported (V5 supports FP8/INT8 only); falling back automatically.");
+            {
+                const UpwaysComputePrecision fallback = pickAuto();
+                if (shouldWarnFallback(fallback)) {
+                    if (allowFp16) {
+                        Logger::warn("UpwaysPipeline: Requested precision 'fp16' is unsupported on this GPU; falling back to '{}'.",
+                                     upwaysPrecisionDisplayName(fallback));
+                    } else {
+                        Logger::warn("UpwaysPipeline 5.0: Requested precision 'fp16' is unsupported (V5 supports FP8/INT8 only); falling back to '{}' (use --upways-version 4 for FP16).",
+                                     upwaysPrecisionDisplayName(fallback));
+                    }
+                }
+                return fallback;
             }
-            return pickAuto();
         case UpwaysPrecision::Auto:
         default:
             return pickAuto();

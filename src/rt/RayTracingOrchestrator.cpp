@@ -462,6 +462,8 @@ void RayTracingOrchestrator::recordRayTracing(
             b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
             b.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
             b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             b.image = img->getImage();
             b.subresourceRange = clearRange;
             clearBarriers.push_back(b);
@@ -473,6 +475,8 @@ void RayTracingOrchestrator::recordRayTracing(
             if (useCompactMlLive) {
                 addClearBarrier(mlIrradianceImage);
                 addClearBarrier(mlDiffHitDistImage);
+                addClearBarrier(mlSpecVmvImage);
+                addClearBarrier(mlSkipCompactImage);
             } else {
                 addClearBarrier(mlDiffuseImage);
                 addClearBarrier(mlSpecularImage);
@@ -532,7 +536,7 @@ void RayTracingOrchestrator::recordRayTracing(
         wfSceneData.deltaUnroll = config.delta_unroll;
         wfSceneData.inlineShadows = config.inline_primary_shadows;
         wfSceneData.restirMCap = config.restir_m_cap;
-        wfSceneData.earlyBounceCutoff = config.early_bounce_cutoff;
+        wfSceneData.earlyBounceCutoff = config.early_bounce_cutoff && !enableNrcThisFrame;
         wfSceneData.earlyBounceCutoffThreshold = config.early_bounce_cutoff_threshold;
 
         if (params.isMultiGpu) {
@@ -621,12 +625,14 @@ void RayTracingOrchestrator::recordRayTracing(
             uint32_t nrcW = (params.isMultiGpu && !isBandParallel) ? params.fullWidth : params.dispatchWidth;
             uint32_t nrcH = (params.isMultiGpu && !isBandParallel) ? params.fullHeight : params.dispatchHeight;
             const uint32_t adamStep = m_nrcManager->getAdamStep();
-            const bool nrcWarmBatch = (adamStep < 20u);
-            const bool nrcWarmLr = (adamStep < 20u);
-            float nrcLr = nrcWarmLr
+            const bool nrcWarmup = (adamStep < 64u);
+            float nrcLr = nrcWarmup
                 ? 5.8e-3f
                 : ((!params.cameraMovedLastFrame && config.progressive_accumulation) ? 2.3e-3f : 2.8e-3f);
-            uint32_t nrcBatch = nrcWarmBatch ? 64u : 32u;
+            // 1-WG online training runs concurrently with full-GPU inference (nrc_train.comp: 32 samples/step,
+            // numSteps clamped to [1, 16]). Warmup: 8 steps (256 samples/frame); steady-state: 6 steps (192
+            // samples/frame) under camera motion or 4 steps (128 samples/frame) when stationary.
+            uint32_t nrcBatch = nrcWarmup ? 256u : (params.cameraMovedLastFrame ? 192u : 128u);
             m_nrcManager->recordInferenceAndTraining(cmd, nrcW, nrcH, nrcBMin, nrcBMax,
                                                      0, params.frameSlot, wfSceneData.captureMlData,
                                                      std::min(config.indirect_clamp, 35.0f),

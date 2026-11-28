@@ -1423,15 +1423,15 @@ f16vec3 clampIndirectRadiance(f16vec3 rad, float maxLum) {
 }
 #endif
 
-// Progressive depth-aware Russian Roulette for unbiased path termination
+// Progressive depth-aware Russian Roulette for unbiased path termination (deferred to bounce >= 2)
 bool applyRussianRoulette(inout vec3 throughput, float pathLum, uint bounce, inout uint seed) {
     float maxThresh = max(pathLum, max(throughput.x, max(throughput.y, throughput.z)));
     if (!(maxThresh > 0.0)) { // only zero-throughput paths die uncompensated
         return true;
     }
-    if (bounce >= 1u) {
-        float minP = (bounce == 1u) ? 0.25 : 0.10;
-        float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
+    if (bounce >= 2u) {
+        float minP = (bounce == 2u) ? 0.25 : 0.10;
+        float depthDecay = (bounce >= 3u) ? pow(0.85, float(bounce - 2u)) : 1.0;
         float p = clamp(maxThresh * depthDecay, minP, 0.95);
         if (randFloat(seed) > p) {
             return true;
@@ -1447,9 +1447,9 @@ bool applyRussianRoulette16(inout f16vec3 throughput, float pathLum, uint bounce
     if (!(maxThresh > 0.0)) { // only zero-throughput paths die uncompensated
         return true;
     }
-    if (bounce >= 1u) {
-        float minP = (bounce == 1u) ? 0.25 : 0.10;
-        float depthDecay = (bounce >= 2u) ? pow(0.85, float(bounce - 1u)) : 1.0;
+    if (bounce >= 2u) {
+        float minP = (bounce == 2u) ? 0.25 : 0.10;
+        float depthDecay = (bounce >= 3u) ? pow(0.85, float(bounce - 2u)) : 1.0;
         float p = clamp(maxThresh * depthDecay, minP, 0.95);
         if (randFloat(seed) > p) {
             return true;

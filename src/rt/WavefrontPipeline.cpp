@@ -1141,7 +1141,8 @@ void WavefrontPipeline::recordFrame(VkCommandBuffer cmd, uint32_t frameSlot, uin
         }
 
         uint32_t batchPixels = curBatchW * curBatchH;
-        uint32_t minRayThreshold = (sceneData.earlyBounceCutoff && sceneData.earlyBounceCutoffThreshold > 0.0f)
+        const bool allowEarlyCutoff = sceneData.earlyBounceCutoff && !sceneData.enableNrc && (sceneData.earlyBounceCutoffThreshold > 0.0f);
+        uint32_t minRayThreshold = allowEarlyCutoff
             ? std::min(batchPixels > 0 ? batchPixels - 1u : 0u, static_cast<uint32_t>(std::round(batchPixels * sceneData.earlyBounceCutoffThreshold))) : 0u;
 
         // 4. Multi-Bounce Loop for this Frame

@@ -1855,8 +1855,15 @@ void Engine::renderFrame() {
                 if (m_totalFramesRendered >= MAX_FRAMES_IN_FLIGHT) {
                     m_lastWavefrontProfile = m_wavefrontPipeline->getProfilingData(m_currentFrame, m_timestampPeriod, m_config.max_bounces);
                     if (m_lastWavefrontProfile.valid && !m_lastWavefrontProfile.bounces.empty()) {
-                        uint32_t activeBouncesCount = static_cast<uint32_t>(m_lastWavefrontProfile.bounces.size());
-                        m_dynamicWavefrontBounces = activeBouncesCount;
+                        if (m_lastWavefrontProfile.tailMegakernelBounce > 0u || m_config.enable_nrc) {
+                            // Tail megakernel executes bounces >= tailMegakernelBounce internally (leaving
+                            // wavefront indirect counts zero), and NRC terminates diffuse rays early while
+                            // specular/dielectric chains still require full depth; preserve max_bounces.
+                            m_dynamicWavefrontBounces = m_config.max_bounces;
+                        } else {
+                            uint32_t activeBouncesCount = static_cast<uint32_t>(m_lastWavefrontProfile.bounces.size());
+                            m_dynamicWavefrontBounces = activeBouncesCount;
+                        }
                     }
                     static int wfProfCount = 0;
                     bool isBenchmarkMilestone = m_config.benchmark && (++wfProfCount == 10 || (m_config.frame_limit > 0 && m_totalFramesRendered + 1 >= m_config.frame_limit));
@@ -2403,7 +2410,7 @@ void Engine::renderFrame() {
     uint32_t activeSpp = m_config.spp;
     float activeFractionalSpp = 0.0f;
     uint32_t activeBounces = m_config.max_bounces;
-    if (m_config.early_bounce_cutoff && m_config.pipeline_type == PipelineType::Wavefront && m_dynamicWavefrontBounces > 0 && m_totalFramesRendered >= m_config.warmup_frames) {
+    if (m_config.early_bounce_cutoff && !m_config.enable_nrc && m_config.pipeline_type == PipelineType::Wavefront && m_dynamicWavefrontBounces > 0 && m_totalFramesRendered >= m_config.warmup_frames) {
         activeBounces = std::clamp(m_dynamicWavefrontBounces + 1u, std::min(1u, m_config.max_bounces), m_config.max_bounces);
     }
     if (m_governor && (m_config.adaptive_spp || m_config.target_fps > 0) && m_governor->getState().active) {

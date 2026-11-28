@@ -2314,8 +2314,8 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     const char* tooltip;
                 };
                 const VersionOption verOptions[] = {
-                    { UpwaysVersion::Auto, "Auto (Weight-Detected -> 4.0 / 5.0)",
-                      "Uses Upways 5.0 Pure-ML if a 190,208 B weights file is selected, otherwise defaults to Upways 4.0." },
+                    { UpwaysVersion::Auto, "Auto (Weight-Detected -> 5.0 / 4.0)",
+                      "Uses Upways 5.0 Pure-ML by default when V5 weights are available, falling back to Upways 4.0 if V5 weights are absent or a 24,064 B V4 weights file is selected." },
                     { UpwaysVersion::V4, "4.0 Compact (24,064 B)",
                       "Upways 4.0 compact U-Net + KPN + bicubic/neural SR." },
                     { UpwaysVersion::V5, "5.0 Pure-ML (190,208 B / 158,400 params)",
@@ -2388,7 +2388,7 @@ bool GuiManager::render(VkCommandBuffer cmd, VkImageView targetView, uint32_t wi
                     ImGui::EndCombo();
                 }
                 ImGui::TextDisabled("Active model: Upways %s [%s]",
-                                    (stats.upways_version_str.empty() || stats.upways_version_str == "none") ? "4.0" : stats.upways_version_str.c_str(),
+                                    (stats.upways_version_str.empty() || stats.upways_version_str == "none") ? "5.0" : stats.upways_version_str.c_str(),
                                     stats.upways_precision_str.c_str());
             }
 

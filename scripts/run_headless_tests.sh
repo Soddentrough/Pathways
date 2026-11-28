@@ -46,6 +46,24 @@ ninja -C "${BUILD_DIR}" -j"${BUILD_JOBS}"
 # Create output directory
 mkdir -p output
 
+# Optional fast mode: --motion-gate runs only the P0 Continuous-Motion Ground-Truth Quality Gate
+if [ "${1:-}" = "--motion-gate" ]; then
+    shift
+    echo ""
+    echo "[Motion Gate] Running P0 Continuous-Motion Ground-Truth Quality Gate..."
+    python3 scripts/motion_quality_gate.py \
+        --binary "${PATHWAYS_BIN}" \
+        --gpu "${MOTION_GATE_GPU:-1}" \
+        --out-dir output/motion_quality_gate \
+        --cache-ref \
+        "$@"
+    echo ""
+    echo "=========================================================="
+    echo "  Pathways: P0 Motion Quality Gate Passed Successfully!"
+    echo "=========================================================="
+    exit 0
+fi
+
 # 2b. Run CTest unit test suites (Camera controls, ImGui headless, Shadow denoiser, TAA/A-Trous, Telemetry)
 echo ""
 echo "[2b] Running CTest Unit Test Suites..."
@@ -409,8 +427,17 @@ python3 scripts/verify_visual_integrity.py
 
 # 13. Test Suite 10: 21-Scene 1080p/4K Single & Dual-GPU Performance Regression Matrix
 echo ""
-echo "[10/10] Running Test Suite 10: 21-Scene Performance Regression Matrix..."
+echo "[10/11] Running Test Suite 10: 21-Scene Performance Regression Matrix..."
 python3 scripts/verify_performance_matrix.py
+
+# 14. Test Suite 11: P0 Continuous-Motion Ground-Truth Quality Gate (Cornell Box Pan+Dolly)
+echo ""
+echo "[11/11] Running Test Suite 11: P0 Continuous-Motion Ground-Truth Quality Gate..."
+python3 scripts/motion_quality_gate.py \
+    --binary "${PATHWAYS_BIN}" \
+    --gpu "${MOTION_GATE_GPU:-1}" \
+    --out-dir output/motion_quality_gate \
+    --cache-ref
 
 echo ""
 echo "=========================================================="

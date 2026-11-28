@@ -79,9 +79,10 @@ void nrcSurfaceReflectance(
     out vec3 outRefl,
     out float outSpecRatio
 ) {
-    vec3 rDiff = max(diffuseColor, vec3(0.0));
     float ndv = clamp(ndotv, 0.0, 1.0);
     vec3 rSpec = nrcEnvBrdfApprox(max(F0, vec3(0.0)), clamp(roughness, 0.04, 1.0), ndv);
+    // Energy-conserving Fresnel complement (1 - F) so rDiff + rSpec never inflates Bellman bootstrap.
+    vec3 rDiff = max(diffuseColor, vec3(0.0)) * (vec3(1.0) - clamp(rSpec, vec3(0.0), vec3(1.0)));
     if (clearcoat > 1e-4) {
         vec3 rCoat = nrcEnvBrdfApprox(vec3(0.04), clamp(clearcoatRoughness, 0.04, 1.0), ndv);
         float coatWeight = clamp(clearcoat, 0.0, 1.0) * 0.25;

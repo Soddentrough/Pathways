@@ -887,7 +887,8 @@ int main(int argc, char** argv) {
 
         check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::V4, "") == UpwaysRuntimeVersion::V4, "resolveVersion(V4)");
         check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::V5, "") == UpwaysRuntimeVersion::V5, "resolveVersion(V5)");
-        check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::Auto, "") == UpwaysRuntimeVersion::V4, "resolveVersion(Auto, '') == V4");
+        check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::Auto, "") == UpwaysRuntimeVersion::V5,
+                   "resolveVersion(Auto, '') == V5 when upways_v5_weights*.bin is present");
         if (!v4Path.empty()) {
             check_true(UpwaysPipeline::resolveVersion(UpwaysVersion::Auto, v4Path.string()) == UpwaysRuntimeVersion::V4,
                        "resolveVersion(Auto, 24064 B V4 bin) == V4");

@@ -30,6 +30,8 @@ BIN = os.environ.get("PATHWAYS_BIN", os.path.join(ROOT, "build", "linux-release"
 FPS = 60.0
 
 SCENES = {
+    "cornell-box": ([],
+                    "tests/data/cornell_motion_path.json"),
     "living-room": (["--scene", "scenes/living-room/living_room_extended.glb"],
                     "scenes/living-room/living_room_flight.json"),
     "classroom": (["--scene", "scenes/classroom/classroom_extended.glb"],
@@ -41,13 +43,14 @@ SCENES = {
 CONFIGS = {
     "base": [],
     "restir": ["--restir"],
-    "svgf": ["--denoiser", "svgf"],
     "upways": ["--denoiser", "upways"],
-    "restir_svgf": ["--restir", "--denoiser", "svgf"],
+    "upways_v4": ["--denoiser", "upways", "--upways-version", "4"],
+    "upways_v5": ["--denoiser", "upways", "--upways-version", "5"],
     "restir_upways": ["--restir", "--denoiser", "upways"],
+    "restir_nrc": ["--restir", "--nrc"],
     "nrc": ["--nrc"],
     "nrc_b1": ["--nrc", "--nrc-bounce", "1"],
-    "nrc_b1_svgf": ["--nrc", "--nrc-bounce", "1", "--denoiser", "svgf"],
+    "nrc_upways": ["--nrc", "--denoiser", "upways"],
 }
 
 COMMON = ["--headless", "--no-validation", "--accum-format", "fp32",

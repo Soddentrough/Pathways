@@ -336,7 +336,7 @@ void Config::printUsage(const char* progName) {
               << "  --denoiser <mode>       Real-time denoiser: 'upways' (Wave32 WMMA U-Net + KPN), 'rayregen' (FFX 1.2.1), or 'none' [default: none]\n"
               << "  --upways                Shortcut to enable Upways real-time denoiser\n"
               << "  --scaler <algo> [preset] Super-resolution upscaler: 'upways', 'fsr' ('fsr3'/'fsr4'), or 'none' [default: none]\n"
-              << "  --upways-version <v>    Upways runtime version: 'auto' [default] (4.0 unless 5.0 weights), '4'/'v4', or '5'/'v5'\n"
+              << "  --upways-version <v>    Upways runtime version: 'auto' [default] (5.0 when V5 weights present, else 4.0), '4'/'v4', or '5'/'v5'\n"
               << "  --upways-precision <m>  Upways WMMA compute precision: 'auto' [default] (fp8->int8->fp16), 'fp8', 'int8', or 'fp16'\n"
               << "  --upways-band-halo <n>  mGPU Upways Band-Parallel LR halo rows per side (8..64, multiple of 4; default: 24)\n"
               << "  --upways-band-balance   Enable dynamic top/bottom band load balancing for mGPU Upways [default: enabled]\n"

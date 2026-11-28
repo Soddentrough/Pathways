@@ -690,18 +690,12 @@ void main() {
 #else
             uint effNrcBounce = max(pc.nrcBounce, 1u);
 #endif
-            bool nrcPrimaryTransmissive = (pc.enableNrc == 1u) &&
-                ((pc.captureMlData & ML_CAPTURE_UPWAYS_V4_BIT) != 0u) &&
-                (((pc.captureMlData & ML_CAPTURE_COMPACT_LIVE_BIT) != 0u)
-                    ? inPrimaryTrans
-                    : (imageLoad(uMlSpecularMotionImage, ivec2(int(pixelIndex % pc.width), int(pixelIndex / pc.width))).z < 0.0));
-            bool isNrcMirror = (metallic >= 0.85 && roughness < 0.06);
-            bool nrcKeepMirrorSharp = inNrcSkip && isNrcMirror && (bounce < 2u);
+            bool nrcPrimaryTransmissive = (pc.enableNrc == 1u) && inPrimaryTrans && (bounce < 2u);
             bool nrcVertexActive = !pathTerminated && !isDelta && enableIndirect &&
                 pc.enableNrc == 1u && !nrcPrimaryTransmissive && (diffTrans <= 0.001) &&
+                (roughness >= 0.25) &&
                 bounce >= effNrcBounce &&
-                (!inNrcSkip || bounce >= 2u || roughness >= 0.06) &&
-                (!nrcKeepMirrorSharp || !canContinueWavefront);
+                !inNrcSkip;
 #else
             const bool nrcTrainThisPath = false;
             const bool nrcQueryEmitted = false;
@@ -770,9 +764,8 @@ void main() {
                         candEmission = candLight.emission.rgb;
                         uint candLightType = uint(candLight.position.w);
                         if (candLightType == 0u || candLightType == 3u /* AREA QUAD / TRIANGLE */) {
-                            vec2 luv = (bounce == 1u && m == 0u &&
-                                        (pc.captureMlData != 0u || pc.enableNrc != 0u))
-                                ? sampleSobolOwen2D(pixelIndex, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, 6u)
+                            vec2 luv = (bounce == 1u && m == 0u)
+                                ? sampleSobolOwen2D(globalPixelIdx, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, 6u)
                                 : randVec2(seed);
                             vec2 uv = luv;
                             if (candLightType == 3u) {
@@ -863,20 +856,16 @@ void main() {
                         float giRadMax = max(giDirectClamped.r, max(giDirectClamped.g, giDirectClamped.b));
                         if (giRadMax > 1e-5) {
                             if (enableShadows) {
-                                float giLum = float(max(vec3(throughput).r * giDirectClamped.r, max(vec3(throughput).g * giDirectClamped.g, vec3(throughput).b * giDirectClamped.b)));
-                                float giShadowProb = (!isSpecularPath && (pc.captureMlData == 0u)) ? clamp(giLum * 1.5, 0.20, 1.0) : 1.0;
-                                if (giShadowProb >= 1.0 || randFloat(seed) < giShadowProb) {
-                                    giDirectClamped /= giShadowProb;
-                                    vec3 giShadowOrigin = isTransmitted ? offsetRayOrigin(hitPoint, -hitNormal) : offsetRayOrigin(hitPoint, hitNormal);
-                                    hasShadowRay = true;
-                                    shadowCandidate.originDist = vec4(giShadowOrigin, lightDist);
-                                    shadowCandidate.dirPixelRad = uvec4(
-                                        packOct32(lightDir),
-                                        pixelIndex | 0x80000000u,
-                                        packHalf2x16(vec2(giDirectClamped.rg)),
-                                        packHalf2x16(vec2(giDirectClamped.b, routeAllToSpec ? 2.0 : 0.0))
-                                    );
-                                }
+                                // giCaptureSelf is bounce 1; defer shadow-ray RR to bounce >= 2 to prevent 80%-kill GI speckles.
+                                vec3 giShadowOrigin = isTransmitted ? offsetRayOrigin(hitPoint, -hitNormal) : offsetRayOrigin(hitPoint, hitNormal);
+                                hasShadowRay = true;
+                                shadowCandidate.originDist = vec4(giShadowOrigin, lightDist);
+                                shadowCandidate.dirPixelRad = uvec4(
+                                    packOct32(lightDir),
+                                    pixelIndex | 0x80000000u,
+                                    packHalf2x16(vec2(giDirectClamped.rg)),
+                                    packHalf2x16(vec2(giDirectClamped.b, routeAllToSpec ? 2.0 : 0.0))
+                                );
                             } else {
                                 giL2 += f16vec3(giDirectClamped);
                             }
@@ -892,7 +881,7 @@ void main() {
 
                         if (length(vec3(unshadowed)) > 1e-5) {
                             bool keepShadow = true;
-                            uint shadowRrMinBounce = (pc.captureMlData != 0u) ? 2u : 1u;
+                            uint shadowRrMinBounce = (pc.enableNrc != 0u) ? 2u : 3u;
                             if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                                 float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
                                 float prob = clamp(lum * 1.5, 0.20, 1.0);
@@ -1116,7 +1105,7 @@ void main() {
 
                         if (length(vec3(unshadowed)) > 1e-5) {
                             bool keepShadow = true;
-                            uint shadowRrMinBounce = (pc.captureMlData != 0u) ? 2u : 1u;
+                            uint shadowRrMinBounce = (pc.enableNrc != 0u) ? 2u : 3u;
                             if (bounce >= shadowRrMinBounce && !isSpecularPath) {
                                 float lum = float(max(unshadowed.r, max(unshadowed.g, unshadowed.b)));
                                 float prob = clamp(lum * 1.5, 0.20, 1.0);
@@ -1361,8 +1350,8 @@ void main() {
 #if !IS_SECONDARY_BOUNCE
                         StdBsdf bsdf = makeStdBsdf(vec3(diffuseColor), vec3(F0), alphaRoughness, diffTrans, metallic,
                                                    NdotV, bsdfMode);
-                        bool useRestirNonV4Sobol = (pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u);
-                        bool useBounce0Sobol = (bounce == 0u) && (pc.captureMlData != 0u || pc.enableNrc != 0u || useRestirNonV4Sobol || pc.secondarySortMode < 2u);
+                        // Always enable Bounce-0 Morton Z-Sobol Owen-scrambled sampling regardless of secondarySortMode.
+                        bool useBounce0Sobol = (bounce == 0u);
                         uint sobolSampleIdx = pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex;
                         float rLobe = useBounce0Sobol
                             ? sampleSobolOwen1D(globalPixelIdx, pc.width, sobolSampleIdx, 0u)
@@ -1396,8 +1385,11 @@ void main() {
                                     ? sampleCosineHemisphereCoherent(lobeN, seed, clusterK, frameRot)
                                     : sampleCosineHemisphere(lobeN, seed));
 #else
-                            bool useBounce1Sobol = (bounce == 1u) &&
-                                ((pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u));
+                            // Enable Bounce-1 Morton Z-Sobol when NRC is off (or non-ML-denoiser ReSTIR capture)
+                            // to avoid 8-lane correlated clumps without perturbing bounce-2 NRC query/train distributions.
+                            bool useBounce1Sobol = (bounce == 1u) && (
+                                (pc.enableNrc == 0u) ||
+                                ((pc.captureMlData != 0u) && ((ubo.flags & (1u << 9)) != 0u) && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u)));
                             nextDirection = useBounce1Sobol
                                 ? sampleCosineHemisphereVec2(lobeN, sampleSobolOwen2D(globalPixelIdx, pc.width, frameRot, 8u))
                                 : ((pc.secondarySortMode >= 2u && ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u))
@@ -1471,7 +1463,9 @@ void main() {
                             bool matteNrcSpec = ((pc.captureMlData & ML_CAPTURE_ML_DENOISER_MASK) == 0u) && (roughness >= 0.70 && metallic < 0.05);
                             bool mergeMatteIndirectSpec = (pc.captureMlData != 0u) && matteNrcSpec;
                             bool outIsSpecularPath = (bounce == 0u) ? (sampledSpecularLobe && !mergeMatteIndirectSpec) : isSpecularPath;
-                            bool outNrcSkip = (bounce == 0u) ? (sampledSpecularLobe && metallic >= 0.85 && roughness < 0.06) : (inNrcSkip && bounce < 2u);
+                            bool outNrcSkip = (bounce == 0u)
+                                ? (sampledSpecularLobe && (isDelta || roughness < 0.25))
+                                : (inNrcSkip && (isDelta || roughness < 0.25) && bounce < 2u);
                             nextState = packRayState(throughput, seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, nextPdfCode, outNrcSkip, inPrimaryTrans);
                         }
                     }
@@ -1588,7 +1582,7 @@ void main() {
             dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            bool skipNextBounce = (b > 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            bool skipNextBounce = (b > 0u && pc.enableNrc == 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
             uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
 
             // Slot 7: Standard monolithic / Option 2 intersect dispatch

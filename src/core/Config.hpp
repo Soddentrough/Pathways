@@ -78,7 +78,7 @@ enum class UpwaysPrecision : uint8_t {
 };
 
 enum class UpwaysVersion : uint8_t {
-    Auto = 0, // Resolve from weight file (190,208 B -> V5), else default V4
+    Auto = 0, // Resolve V5 when 190,208 B V5 weights are available (else V4; respects explicit 24,064 B V4 file)
     V4   = 4, // Upways 4.0 (24,064 B compact U-Net + KPN)
     V5   = 5  // Upways 5.0 Pure-ML (190,208 B, 158,400 params)
 };
@@ -224,7 +224,7 @@ struct Config {
     bool upways_heuristic_fallback = false; // Debug bypass: force analytical temporal/spatial heuristic instead of WMMA U-Net + KPN
     std::string upways_weights_path = ""; // Custom path to upways_weights.bin
     UpwaysPrecision upways_precision = UpwaysPrecision::Auto; // WMMA precision tier: Auto (FP8->INT8->FP16), Fp8, Int8, Fp16
-    UpwaysVersion upways_version = UpwaysVersion::Auto; // Runtime model version: Auto (4.0 unless 5.0 weights), V4, V5
+    UpwaysVersion upways_version = UpwaysVersion::Auto; // Runtime model version: Auto (5.0 when V5 weights present, else 4.0), V4, V5
     uint32_t upways_band_halo = 24u;         // LR halo overlap rows per side in mGPU Upways Band-Parallel (8..64, multiple of 4; default: 24)
     bool upways_dynamic_band_balance = true; // Dynamic topFraction load balancing in mGPU Upways Band-Parallel [Default: true]
     UpscalerMode upscaler_mode = UpscalerMode::None; // Super-resolution upscaler [Default: None, opt-in via --upscaler]
@@ -238,7 +238,7 @@ struct Config {
     // Neural Radiance Caching (NRC) with Wave32 WMMA & AMD FSR Radiance Cache 0.9.0 (gfx1201 / Vulkan 1.4)
     bool enable_nrc = false;              // Neural Radiance Cache indirect query termination [Default: disabled]
     NrcBackend nrc_backend = NrcBackend::Auto; // Target NRC backend (Auto, NativeWave32, FfxRadianceCache)
-    uint32_t nrc_bounce = 1;              // Path bounce depth where NRC terminates tracing and queries cache (default: 1)
+    uint32_t nrc_bounce = 2;              // Path bounce depth where NRC terminates tracing and queries cache (default: 2)
     float nrc_train_ratio = 0.04f;        // Ratio of paths (2%-5%, default 0.04 = 4%) continuing tracing for self-training
 
     // Caustics & Forward Photon Injection (Vulkan 1.4 hardware rayQueryEXT)

@@ -701,11 +701,9 @@ void main() {
                 vec3 nextDirection = vec3(0.0);
                 vec3 nextOrigin;
 
-                float rFlip = (pc.captureMlData != 0u)
+                float rFlip = (bounce == 0u || pc.captureMlData != 0u || ((ubo.flags & (1u << 9)) != 0u))
                     ? sampleSobolOwen1D(globalPixelIdx, pc.width, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex, bounce * 4u + 1u)
-                    : ((pc.secondarySortMode >= 2u)
-                        ? randFloatCoherent(seed, (pc.secondarySortMode == 3u) ? 8u : 4u, pc.frameIndex * max(ubo.spp, 1u) + pc.sppSampleIndex + pc.currentBounce * 3u)
-                        : randFloat(seed));
+                    : randFloat(seed);
                 bool reflected0 = (cannotRefract || rFlip < reflectProb);
 #if !IS_SECONDARY_BOUNCE
                 vec3 preScatterTp = throughput;
@@ -771,7 +769,7 @@ void main() {
                     if (!pathTerminated) {
                         survivesToNext = true;
                         nextGeom.originPackedDir = vec4(nextOrigin, uintBitsToFloat(packOct32(nextDirection)));
-                        bool initNrcSkip = (bounce == 0u) ? reflected0 : (inNrcSkip && bounce < 2u);
+                        bool initNrcSkip = (bounce == 0u) ? true : (inNrcSkip && bounce < 2u);
                         nextState = packRayState(f16vec3(throughput), seed, pixelIndex, outIsSpecularPath, causticApplied, dispersionChannel, 0u, initNrcSkip, inPrimaryTrans);
 
                         // Delta-Chain Unrolling: Collapse consecutive smooth dielectric events on-chip
@@ -943,7 +941,8 @@ void main() {
                                         bounce >= max(pc.nrcBounce, 1u) && !inNrcSkip && dMatId < pc.numMaterials) {
                                         ShadeMaterial rSm = shadeMaterials[dMatId];
                                         uint rType = smGetTypeFlags(rSm);
-                                        if ((rType & MATERIAL_TYPE_MASK) != 2u && !smIsTransmissive(rSm)) {
+                                        if ((rType & MATERIAL_TYPE_MASK) != 2u && !smIsTransmissive(rSm) &&
+                                            ((rType & MATERIAL_TYPE_MASK) == 3u || rSm.pbrParams.x >= 0.25)) {
                                             vec3 dHitPt = currOrigin + closestT * currDirection;
                                             bool rFront = (dot(currDirection, dHitNormal) < 0.0);
                                             vec3 rN = rFront ? dHitNormal : -dHitNormal;
@@ -1025,7 +1024,7 @@ void main() {
 #endif
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
 #if !IS_SECONDARY_BOUNCE
-                                    bool curNrcSkip = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+                                    bool curNrcSkip = (bounce == 0u) ? true : (inNrcSkip && bounce < 2u);
 #else
                                     bool curNrcSkip = (inNrcSkip && bounce < 2u);
 #endif
@@ -1072,7 +1071,7 @@ void main() {
                                     currOrigin = offsetRayOrigin(dHitPoint, currDirection);
                                     nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
 #if !IS_SECONDARY_BOUNCE
-                                    bool curNrcSkipInt = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+                                    bool curNrcSkipInt = (bounce == 0u) ? true : (inNrcSkip && bounce < 2u);
 #else
                                     bool curNrcSkipInt = (inNrcSkip && bounce < 2u);
 #endif
@@ -1170,7 +1169,7 @@ void main() {
 
                                 nextGeom.originPackedDir = vec4(currOrigin, uintBitsToFloat(packOct32(currDirection)));
 #if !IS_SECONDARY_BOUNCE
-                                bool curNrcSkipEnd = (bounce == 0u) ? (reflected0 || hadInternalReflect) : (inNrcSkip && bounce < 2u);
+                                bool curNrcSkipEnd = (bounce == 0u) ? true : (inNrcSkip && bounce < 2u);
 #else
                                 bool curNrcSkipEnd = (inNrcSkip && bounce < 2u);
 #endif
@@ -1449,7 +1448,7 @@ void main() {
             dgcStream.commands[b * 16u + 6u].z = 1u;
 
             uint nextCount = queueCounters.nextActiveCount;
-            bool skipNextBounce = (b > 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
+            bool skipNextBounce = (b > 0u && pc.enableNrc == 0u && pc.minRayThreshold > 0u && nextCount <= pc.minRayThreshold);
             uint intersectGroups = skipNextBounce ? 0u : ((nextCount + 31u) / 32u);
 
             // Slot 7: Standard monolithic / Option 2 intersect dispatch
