@@ -5,6 +5,7 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_expect_assume : enable
 
 #define WF_IN_QUEUE_IDX  ((pc.currentBounce & 1u) ^ 1u)
 #define WF_OUT_QUEUE_IDX (pc.currentBounce & 1u)
@@ -99,7 +100,7 @@ void main() {
     uint hitInstMatOffset = 0u;
     uint hitInstIdx = 0u;
 
-    if (inRange) {
+    if (expectEXT(inRange, true)) {
         traceClosestSceneHit(
             origin, direction, EPSILON, closestT,
             closestT, closestTri, closestBary,
@@ -109,8 +110,8 @@ void main() {
 
     RayHit hit;
     uint archetype = MATERIAL_ARCHETYPE_DIFFUSE;
-    if (inRange) {
-        if (closestTri >= 0) {
+    if (expectEXT(inRange, true)) {
+        if (expectEXT(closestTri >= 0, true)) {
             uint triIdx = uint(closestTri);
             uint matId = triangles[triIdx].materialId + hitInstMatOffset;
             archetype = (matId < pc.numMaterials) ? materialArchetypes[matId] : MATERIAL_ARCHETYPE_DIFFUSE;
@@ -171,7 +172,7 @@ void main() {
             sourceIdx = subgroupShuffle(rayIdx, sortedLane);
         }
 
-        if (isUniformWave && activeCountInWave > 0u) {
+        if (expectEXT(isUniformWave && activeCountInWave > 0u, true)) {
             // Fast-path: All active lanes share leaderArchetype.
             // Bypasses 4-iteration ballot loop and writes contiguous sequential slots.
             uint laneSlot = subgroupBallotExclusiveBitCount(activeBallot);

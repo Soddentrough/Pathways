@@ -77,7 +77,9 @@ void RayTracingOrchestrator::initWavefrontSpecializedVariants(
     const std::vector<char>& shadeEmissiveRestirCode,
     const std::vector<char>& restirGiReuseCode,
     const std::vector<char>& restirDiReuseCode,
-    const std::vector<char>& shadeDielectricSecRestirCode
+    const std::vector<char>& shadeDielectricSecRestirCode,
+    const std::vector<char>& classifyAlphaCode,
+    const std::vector<char>& shadowAlphaCode
 ) {
     if (m_wavefrontPipeline) {
         m_wavefrontPipeline->initSpecializedVariants(
@@ -90,14 +92,19 @@ void RayTracingOrchestrator::initWavefrontSpecializedVariants(
             shadeEmissiveRestirCode,
             restirGiReuseCode,
             restirDiReuseCode,
-            shadeDielectricSecRestirCode
+            shadeDielectricSecRestirCode,
+            classifyAlphaCode,
+            shadowAlphaCode
         );
     }
 }
 
-void RayTracingOrchestrator::initWavefrontAlphaPipeline(const std::vector<char>& intersectAlphaCode) {
+void RayTracingOrchestrator::initWavefrontAlphaPipeline(
+    const std::vector<char>& intersectAlphaCode,
+    const std::vector<char>& classifyAlphaCode,
+    const std::vector<char>& shadowAlphaCode) {
     if (m_wavefrontPipeline) {
-        m_wavefrontPipeline->initAlphaIntersectPipeline(intersectAlphaCode);
+        m_wavefrontPipeline->initAlphaIntersectPipeline(intersectAlphaCode, classifyAlphaCode, shadowAlphaCode);
     }
 }
 

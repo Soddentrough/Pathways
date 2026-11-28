@@ -524,6 +524,21 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         if (std::strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
             m_hasMemoryBudget = true;
         }
+#ifdef VK_KHR_pipeline_executable_properties
+        if (std::strcmp(ext.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) == 0) {
+            m_hasPipelineExecutableProperties = true;
+        }
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+        if (std::strcmp(ext.extensionName, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) == 0) {
+            m_hasShaderMaximalReconvergence = true;
+        }
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+        if (std::strcmp(ext.extensionName, VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME) == 0) {
+            m_hasShaderSubgroupUniformControlFlow = true;
+        }
+#endif
 #ifdef _WIN32
         if (std::strcmp(ext.extensionName, "VK_KHR_external_memory_win32") == 0) {
             m_hasExternalMemoryWin32 = true;
@@ -616,6 +631,30 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
         featQueryNext = &mutableDescFeaturesQuery.pNext;
     }
 #endif
+#ifdef VK_KHR_pipeline_executable_properties
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeExecFeaturesQuery{};
+    pipeExecFeaturesQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR;
+    if (m_hasPipelineExecutableProperties) {
+        *featQueryNext = &pipeExecFeaturesQuery;
+        featQueryNext = &pipeExecFeaturesQuery.pNext;
+    }
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maxReconvFeaturesQuery{};
+    maxReconvFeaturesQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR;
+    if (m_hasShaderMaximalReconvergence) {
+        *featQueryNext = &maxReconvFeaturesQuery;
+        featQueryNext = &maxReconvFeaturesQuery.pNext;
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniformCfFeaturesQuery{};
+    uniformCfFeaturesQuery.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR;
+    if (m_hasShaderSubgroupUniformControlFlow) {
+        *featQueryNext = &uniformCfFeaturesQuery;
+        featQueryNext = &uniformCfFeaturesQuery.pNext;
+    }
+#endif
 
     VkPhysicalDeviceFeatures2 feat2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
     feat2.pNext = &vk11Features;
@@ -651,6 +690,21 @@ void VulkanContext::selectPhysicalDevice(const Config& config, VkSurfaceKHR surf
 #ifdef VK_EXT_mutable_descriptor_type
     if (m_hasMutableDescriptorType && !mutableDescFeaturesQuery.mutableDescriptorType) {
         m_hasMutableDescriptorType = false;
+    }
+#endif
+#ifdef VK_KHR_pipeline_executable_properties
+    if (m_hasPipelineExecutableProperties && !pipeExecFeaturesQuery.pipelineExecutableInfo) {
+        m_hasPipelineExecutableProperties = false;
+    }
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+    if (m_hasShaderMaximalReconvergence && !maxReconvFeaturesQuery.shaderMaximalReconvergence) {
+        m_hasShaderMaximalReconvergence = false;
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+    if (m_hasShaderSubgroupUniformControlFlow && !uniformCfFeaturesQuery.shaderSubgroupUniformControlFlow) {
+        m_hasShaderSubgroupUniformControlFlow = false;
     }
 #endif
 
@@ -1139,6 +1193,21 @@ void VulkanContext::createLogicalDevice(const Config& config) {
     if (m_hasMemoryBudget) {
         deviceExtensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     }
+#ifdef VK_KHR_pipeline_executable_properties
+    if (m_hasPipelineExecutableProperties) {
+        deviceExtensions.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+    if (m_hasShaderMaximalReconvergence) {
+        deviceExtensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+    if (m_hasShaderSubgroupUniformControlFlow) {
+        deviceExtensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
+    }
+#endif
 #ifdef _WIN32
     if (m_hasExternalMemoryWin32) {
         deviceExtensions.push_back("VK_KHR_external_memory_win32");
@@ -1161,6 +1230,15 @@ void VulkanContext::createLogicalDevice(const Config& config) {
 #endif
 #ifdef VK_EXT_mutable_descriptor_type
     VkPhysicalDeviceMutableDescriptorTypeFeaturesEXT mutableDescFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MUTABLE_DESCRIPTOR_TYPE_FEATURES_EXT };
+#endif
+#ifdef VK_KHR_pipeline_executable_properties
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR pipeExecFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+    VkPhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maxReconvFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MAXIMAL_RECONVERGENCE_FEATURES_KHR };
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+    VkPhysicalDeviceShaderSubgroupUniformControlFlowFeaturesKHR uniformCfFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_FEATURES_KHR };
 #endif
 
     VkPhysicalDeviceVulkan14Features features14{};
@@ -1283,6 +1361,24 @@ void VulkanContext::createLogicalDevice(const Config& config) {
         computeDerivativesFeatures.computeDerivativeGroupQuads = m_hasComputeDerivativeQuads ? VK_TRUE : VK_FALSE;
         computeDerivativesFeatures.computeDerivativeGroupLinear = m_hasComputeDerivativeLinear ? VK_TRUE : VK_FALSE;
         appendFeature(computeDerivativesFeatures);
+    }
+#endif
+#ifdef VK_KHR_pipeline_executable_properties
+    if (m_hasPipelineExecutableProperties) {
+        pipeExecFeatures.pipelineExecutableInfo = VK_TRUE;
+        appendFeature(pipeExecFeatures);
+    }
+#endif
+#ifdef VK_KHR_shader_maximal_reconvergence
+    if (m_hasShaderMaximalReconvergence) {
+        maxReconvFeatures.shaderMaximalReconvergence = VK_TRUE;
+        appendFeature(maxReconvFeatures);
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_uniform_control_flow
+    if (m_hasShaderSubgroupUniformControlFlow) {
+        uniformCfFeatures.shaderSubgroupUniformControlFlow = VK_TRUE;
+        appendFeature(uniformCfFeatures);
     }
 #endif
 

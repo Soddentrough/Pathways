@@ -148,9 +148,14 @@ public:
         const std::vector<char>& shadeEmissiveRestirCode,
         const std::vector<char>& restirGiReuseCode = {},
         const std::vector<char>& restirDiReuseCode = {},
-        const std::vector<char>& shadeDielectricSecRestirCode = {});
+        const std::vector<char>& shadeDielectricSecRestirCode = {},
+        const std::vector<char>& classifyAlphaCode = {},
+        const std::vector<char>& shadowAlphaCode = {});
 
-    void initAlphaIntersectPipeline(const std::vector<char>& intersectAlphaCode);
+    void initAlphaIntersectPipeline(
+        const std::vector<char>& intersectAlphaCode,
+        const std::vector<char>& classifyAlphaCode = {},
+        const std::vector<char>& shadowAlphaCode = {});
     void initTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode);
     void initRestirVariants(
         const std::vector<char>& shadeDiffuseRestirCode,
@@ -177,6 +182,11 @@ public:
     }
 
     bool hasAlphaIntersectPipeline() const noexcept { return m_intersectAlphaPipeline != VK_NULL_HANDLE; }
+    bool hasAlphaTraversalPipelines() const noexcept {
+        return m_intersectAlphaPipeline != VK_NULL_HANDLE &&
+               m_classifyAlphaPipeline != VK_NULL_HANDLE &&
+               m_shadowAlphaPipeline != VK_NULL_HANDLE;
+    }
     bool hasTailMegakernelPipeline() const noexcept { return m_tailMegakernelPipeline != VK_NULL_HANDLE; }
     bool hasRestirPipelines() const noexcept { return !m_restirPrimaryMatPipelines.empty(); }
     bool hasNrcPipelines() const noexcept { return !m_nrcPrimaryMatPipelines.empty(); }
@@ -269,12 +279,16 @@ private:
         VkPipeline* outPipeline = nullptr;
     };
     void buildComputePipelinesBatch(const std::vector<ComputePipelineSpec>& specs);
+    void logPipelineExecutableStats(VkPipeline pipeline, const char* name) const;
     VkPipeline buildComputePipeline(const std::vector<char>& code, const char* name);
     VkShaderModule createShaderModule(const std::vector<char>& code);
 
     VkDevice m_device = VK_NULL_HANDLE;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
     VkPipelineCache m_pipelineCache = VK_NULL_HANDLE;
+    bool m_capturePipelineStats = false;
+    PFN_vkGetPipelineExecutablePropertiesKHR m_pfnGetPipeExecProps = nullptr;
+    PFN_vkGetPipelineExecutableStatisticsKHR m_pfnGetPipeExecStats = nullptr;
 
     uint32_t m_width = 0;
     uint32_t m_height = 0;
@@ -319,6 +333,8 @@ private:
     VkPipeline m_shadeDielectricSecPipeline = VK_NULL_HANDLE;
     VkPipeline m_tailMegakernelPipeline = VK_NULL_HANDLE;
     VkPipeline m_intersectAlphaPipeline = VK_NULL_HANDLE;
+    VkPipeline m_classifyAlphaPipeline = VK_NULL_HANDLE;
+    VkPipeline m_shadowAlphaPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseRestirPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeDiffuseSecRestirPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadeComplexRestirPipeline = VK_NULL_HANDLE;

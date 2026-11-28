@@ -786,7 +786,7 @@ bool Engine::applyLoadedScene(SceneData newScene, const std::string& filepath) {
 
     // Update primary descriptor sets
     updateSceneDescriptors();
-    if (m_sceneHasAlphaMask) {
+    if (m_sceneHasAlphaMask || m_sceneHasAlphaShadow || (m_config.transparent_shadows && m_config.enable_caustics)) {
         ensureWavefrontAlphaPipeline();
     }
 
@@ -1080,13 +1080,17 @@ void Engine::ensureReblurDenoiserInitialized() {
 }
 
 void Engine::ensureWavefrontAlphaPipeline() {
-    if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasAlphaIntersectPipeline()) return;
+    if (!m_rtOrchestrator || !m_wavefrontPipeline || m_wavefrontPipeline->hasAlphaTraversalPipelines()) return;
     try {
         vkDeviceWaitIdle(m_context->getDevice());
-        m_rtOrchestrator->initWavefrontAlphaPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+        m_rtOrchestrator->initWavefrontAlphaPipeline(
+            loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+        );
         m_context->savePipelineCache();
     } catch (const std::exception& e) {
-        Logger::warn("Wavefront alpha intersect pipeline initialization failed: {}", e.what());
+        Logger::warn("Wavefront alpha traversal pipeline initialization failed: {}", e.what());
     }
 }
 
@@ -1184,7 +1188,8 @@ void Engine::initPipelines() {
         wfTailMegakernelCode,
         wfShadeDielectricSecCode
     );
-    if (m_sceneHasAlphaMask && isRestirActive()) {
+    const bool needAlphaTraversal = m_sceneHasAlphaMask || m_sceneHasAlphaShadow || (m_config.transparent_shadows && m_config.enable_caustics);
+    if (needAlphaTraversal && isRestirActive()) {
         m_rtOrchestrator->initWavefrontSpecializedVariants(
             loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
             loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
@@ -1195,10 +1200,16 @@ void Engine::initPipelines() {
             loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
             loadShaderSPIRV("restir_gi_reuse.comp.spv"),
             loadShaderSPIRV("restir_di_reuse.comp.spv"),
-            loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+            loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv"),
+            loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
         );
-    } else if (m_sceneHasAlphaMask) {
-        m_rtOrchestrator->initWavefrontAlphaPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+    } else if (needAlphaTraversal) {
+        m_rtOrchestrator->initWavefrontAlphaPipeline(
+            loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+            loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+        );
     } else if (isRestirActive()) {
         m_rtOrchestrator->initWavefrontRestirVariants(
             loadShaderSPIRV("wavefront_shade_diffuse_restir.comp.spv"),
@@ -2615,7 +2626,7 @@ void Engine::renderFrame() {
         updateMergeDescriptors();
     }
 
-    if (m_sceneHasAlphaMask) {
+    if (m_sceneHasAlphaMask || m_sceneHasAlphaShadow || (m_config.transparent_shadows && m_config.enable_caustics)) {
         ensureWavefrontAlphaPipeline();
     }
     if (m_config.enable_tail_megakernel) {

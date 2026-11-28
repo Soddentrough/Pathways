@@ -13,6 +13,7 @@
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_expect_assume : enable
 
 #include "wavefront_common.glsl"
 #include "wavefront_radiance_output.glsl"
@@ -175,7 +176,7 @@ void main() {
     RayState nextState;
     PackedShadowRay shadowCandidate;
 
-    if (inRange) {
+    if (expectEXT(inRange, true)) {
         uint rayIdx = materialIndices[0u * pc.maxQueueCapacity + idx];
         RayGeometry geom = inGeoms[rayIdx];
         RayHit hit = inHits[rayIdx];
@@ -213,7 +214,7 @@ void main() {
 #endif
 #endif
 
-        if (isMiss) {
+        if (expectEXT(isMiss, false)) {
 #if ENABLE_RESTIR_PT && !IS_SECONDARY_BOUNCE
             if (enableRestirFlag && bounce == 0u && pc.sppSampleIndex == 0u) {
                 giCurrentData[pixelIndex].y = 0u;

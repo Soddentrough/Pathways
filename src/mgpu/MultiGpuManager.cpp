@@ -1812,7 +1812,7 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                 secNode->context->getPipelineCache(),
                 wfShadeDielectricSecCode
             );
-            const bool secNeedAlpha = sceneHasAlphaMaterials(scene);
+            const bool secNeedAlpha = sceneHasAlphaMaterials(scene) || (config.transparent_shadows && config.enable_caustics);
             const bool secNeedRestir = config.enable_restir;
             if (secNeedAlpha && secNeedRestir) {
                 secNode->wavefrontPipeline->initSpecializedVariants(
@@ -1825,11 +1825,15 @@ void MultiGpuManager::initSecondaryDevice(const Config& config, const SceneData&
                     loadShaderSPIRV("wavefront_shade_emissive_restir.comp.spv"),
                     loadShaderSPIRV("restir_gi_reuse.comp.spv"),
                     loadShaderSPIRV("restir_di_reuse.comp.spv"),
-                    loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv")
+                    loadShaderSPIRV("wavefront_shade_dielectric_sec_restir.comp.spv"),
+                    loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
                 );
             } else if (secNeedAlpha) {
                 secNode->wavefrontPipeline->initAlphaIntersectPipeline(
-                    loadShaderSPIRV("wavefront_intersect_alpha.comp.spv")
+                    loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+                    loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+                    loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
                 );
             } else if (secNeedRestir) {
                 secNode->wavefrontPipeline->initRestirVariants(
@@ -4134,8 +4138,13 @@ bool MultiGpuManager::loadScene(const SceneData& scene, const std::string& scene
         }
     }
     if (secNode->wavefrontPipeline) {
-        if (sceneHasAlphaMaterials(scene) && !secNode->wavefrontPipeline->hasAlphaIntersectPipeline()) {
-            secNode->wavefrontPipeline->initAlphaIntersectPipeline(loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"));
+        if ((sceneHasAlphaMaterials(scene) || (m_config.transparent_shadows && m_config.enable_caustics)) &&
+            !secNode->wavefrontPipeline->hasAlphaTraversalPipelines()) {
+            secNode->wavefrontPipeline->initAlphaIntersectPipeline(
+                loadShaderSPIRV("wavefront_intersect_alpha.comp.spv"),
+                loadShaderSPIRV("wavefront_classify_alpha.comp.spv"),
+                loadShaderSPIRV("wavefront_shadow_alpha.comp.spv")
+            );
             secNode->context->savePipelineCache();
         }
         updateSecondaryWavefrontDescriptors(secNode.get());

@@ -91,10 +91,15 @@ public:
         const std::vector<char>& shadeEmissiveRestirCode,
         const std::vector<char>& restirGiReuseCode = {},
         const std::vector<char>& restirDiReuseCode = {},
-        const std::vector<char>& shadeDielectricSecRestirCode = {}
+        const std::vector<char>& shadeDielectricSecRestirCode = {},
+        const std::vector<char>& classifyAlphaCode = {},
+        const std::vector<char>& shadowAlphaCode = {}
     );
 
-    void initWavefrontAlphaPipeline(const std::vector<char>& intersectAlphaCode);
+    void initWavefrontAlphaPipeline(
+        const std::vector<char>& intersectAlphaCode,
+        const std::vector<char>& classifyAlphaCode = {},
+        const std::vector<char>& shadowAlphaCode = {});
     void initWavefrontTailMegakernelPipeline(const std::vector<char>& tailMegakernelCode);
     void initWavefrontRestirVariants(
         const std::vector<char>& shadeDiffuseRestirCode,

@@ -232,7 +232,18 @@ add_custom_command(
 )
 list(APPEND SPV_FILES ${SEC_COMPLEX_SPV})
 
-# Alpha-mask specialized secondary intersection shader (zero texture/UV overhead on opaque scenes)
+# Alpha-mask specialized primary/secondary/shadow traversal shaders (zero texture/UV overhead on opaque scenes)
+set(CLASSIFY_ALPHA_SPV ${SPV_OUTPUT_DIR}/wavefront_classify_alpha.comp.spv)
+set(BIN_CLASSIFY_ALPHA_SPV ${BIN_SPV_DIR}/wavefront_classify_alpha.comp.spv)
+add_custom_command(
+    OUTPUT ${CLASSIFY_ALPHA_SPV}
+    COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DENABLE_ALPHA_MASK=1 -O ${SHADER_DIR}/compute/wavefront_classify.comp -o ${CLASSIFY_ALPHA_SPV}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CLASSIFY_ALPHA_SPV} ${BIN_CLASSIFY_ALPHA_SPV}
+    DEPENDS ${SHADER_DIR}/compute/wavefront_classify.comp ${SHADER_INCLUDE_DEPS}
+    COMMENT "Compiling alpha-mask classify shader wavefront_classify_alpha.comp to SPIR-V"
+)
+list(APPEND SPV_FILES ${CLASSIFY_ALPHA_SPV})
+
 set(INTERSECT_ALPHA_SPV ${SPV_OUTPUT_DIR}/wavefront_intersect_alpha.comp.spv)
 set(BIN_INTERSECT_ALPHA_SPV ${BIN_SPV_DIR}/wavefront_intersect_alpha.comp.spv)
 add_custom_command(
@@ -243,6 +254,17 @@ add_custom_command(
     COMMENT "Compiling alpha-mask intersection shader wavefront_intersect_alpha.comp to SPIR-V"
 )
 list(APPEND SPV_FILES ${INTERSECT_ALPHA_SPV})
+
+set(SHADOW_ALPHA_SPV ${SPV_OUTPUT_DIR}/wavefront_shadow_alpha.comp.spv)
+set(BIN_SHADOW_ALPHA_SPV ${BIN_SPV_DIR}/wavefront_shadow_alpha.comp.spv)
+add_custom_command(
+    OUTPUT ${SHADOW_ALPHA_SPV}
+    COMMAND ${GLSLC} -I ${SHADER_DIR}/compute --target-env=vulkan1.4 -DSIMPLE_OPAQUE_SHADOW=0 -O ${SHADER_DIR}/compute/wavefront_shadow.comp -o ${SHADOW_ALPHA_SPV}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SHADOW_ALPHA_SPV} ${BIN_SHADOW_ALPHA_SPV}
+    DEPENDS ${SHADER_DIR}/compute/wavefront_shadow.comp ${SHADER_INCLUDE_DEPS}
+    COMMENT "Compiling alpha-mask/complex shadow shader wavefront_shadow_alpha.comp to SPIR-V"
+)
+list(APPEND SPV_FILES ${SHADOW_ALPHA_SPV})
 
 # ReSTIR PT specialized material shading variants (isolates reservoir VGPR pressure from non-ReSTIR paths)
 function(add_specialized_wf_shader OUT_NAME SRC_FILE)

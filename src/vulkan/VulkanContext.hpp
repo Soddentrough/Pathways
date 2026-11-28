@@ -175,6 +175,9 @@ public:
     bool hasPositionFetch() const { return m_hasPositionFetch; }
     bool hasDescriptorHeap() const { return m_hasDescriptorHeap; }
     bool hasUnifiedImageLayouts() const { return m_hasUnifiedImageLayouts; }
+    bool hasPipelineExecutableProperties() const { return m_hasPipelineExecutableProperties; }
+    bool hasShaderMaximalReconvergence() const { return m_hasShaderMaximalReconvergence; }
+    bool hasShaderSubgroupUniformControlFlow() const { return m_hasShaderSubgroupUniformControlFlow; }
 #ifdef _WIN32
     bool hasExternalMemoryWin32() const { return m_hasExternalMemoryWin32; }
     bool hasExternalSemaphoreWin32() const { return m_hasExternalSemaphoreWin32; }
@@ -257,6 +260,9 @@ private:
     bool m_hasComputeShaderDerivatives = false;
     bool m_hasComputeDerivativeQuads = false;
     bool m_hasComputeDerivativeLinear = false;
+    bool m_hasPipelineExecutableProperties = false;
+    bool m_hasShaderMaximalReconvergence = false;
+    bool m_hasShaderSubgroupUniformControlFlow = false;
 #ifdef _WIN32
     bool m_hasExternalMemoryWin32 = false;
     bool m_hasExternalSemaphoreWin32 = false;

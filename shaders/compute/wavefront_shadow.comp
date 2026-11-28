@@ -2,6 +2,11 @@
 #extension GL_EXT_ray_query : enable
 #extension GL_EXT_shader_image_load_formatted : require
 #extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_expect_assume : enable
+
+#ifndef SIMPLE_OPAQUE_SHADOW
+#define SIMPLE_OPAQUE_SHADOW 1
+#endif
 
 #include "wavefront_common.glsl"
 #include "wavefront_radiance_output.glsl"
@@ -27,12 +32,16 @@ layout(binding = 1) uniform CameraUBO {
     uint flags;
 } ubo;
 
+#if !SIMPLE_OPAQUE_SHADOW
 layout(std430, binding = 2) readonly buffer TrianglesBuffer {
     Triangle triangles[];
 };
+#endif
 
 layout(binding = 6) uniform accelerationStructureEXT topLevelAS;
+#if !SIMPLE_OPAQUE_SHADOW
 DECLARE_SCENE_TEXTURES_BINDING(8)
+#endif
 
 layout(std430, binding = 12) readonly buffer ShadowRayQueue {
     PackedShadowRay shadowRays[];
@@ -54,7 +63,7 @@ layout(push_constant) uniform PushConstants {
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
-    if (idx >= queueCounters.currentShadowCount) return;
+    if (expectEXT(idx >= queueCounters.currentShadowCount, false)) return;
 
     PackedShadowRay sRay = shadowRays[idx];
     vec3 origin = sRay.originDist.xyz;
@@ -85,6 +94,18 @@ void main() {
     // the whole TLAS is traversed with gl_RayFlagsOpaqueEXT (no candidate loop). In the
     // transparent-shadow mode, dielectric instances are culled via RAY_MASK_OPAQUE (0x01)
     // when caustics are off or the ray is on a specular transmission path.
+    // Fast path: opaque-only shadow traversal (zero candidate loop, zero triangle/texture VGPRs)
+#if SIMPLE_OPAQUE_SHADOW
+    {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topLevelAS,
+                              gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                              (transparentShadows && hasNonOpaque) ? RAY_MASK_OPAQUE : RAY_MASK_ALL,
+                              origin, EPSILON, dir, maxDist - EPSILON * 2.0);
+        rayQueryProceedEXT(rq);
+        occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
+    }
+#else
     if (!hasAlphaShadow && (!transparentShadows || !enableCaustics || isSpecularPath)) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topLevelAS,
@@ -143,6 +164,7 @@ void main() {
         }
         occluded = (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT);
     }
+#endif
 
     if (!occluded) {
         if (isDiVisTest) {
